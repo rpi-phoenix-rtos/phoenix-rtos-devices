@@ -347,13 +347,17 @@ int main(void)
 		return EXIT_FAILURE;
 	}
 
+	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register tty0\r\n");
 	if (create_dev(&pl011_common.uart.oid, "/dev/tty0") < 0) {
+		pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 failed\r\n");
 		fprintf(stderr, "pl011-tty: failed to register /dev/tty0\n");
 		return EXIT_FAILURE;
 	}
 	pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 ready\r\n");
 
+	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register console\r\n");
 	if (create_dev(&pl011_common.uart.oid, _PATH_CONSOLE) < 0) {
+		pl011_writeRaw(&pl011_common.uart, "pl011-tty: console failed\r\n");
 		fprintf(stderr, "pl011-tty: failed to register %s\n", _PATH_CONSOLE);
 		return EXIT_FAILURE;
 	}
