@@ -109,11 +109,27 @@ static int pl011_createTty0(pl011_t *uart)
 	static const char name[] = "tty0";
 	oid_t odev;
 	msg_t msg = { 0 };
+	int err;
+	unsigned int i;
 
 	pl011_writeRaw(uart, "pl011-tty: tty0 lookup\r\n");
-	if (lookup("devfs", NULL, &odev) < 0) {
+	err = -ENODEV;
+	for (i = 0; i < 50; ++i) {
+		err = lookup("devfs", NULL, &odev);
+		if (err >= 0) {
+			break;
+		}
+
+		if ((i == 0U) || (((i + 1U) % 10U) == 0U)) {
+			pl011_writeRaw(uart, "pl011-tty: tty0 lookup retry\r\n");
+		}
+
+		usleep(100000);
+	}
+
+	if (err < 0) {
 		pl011_writeRaw(uart, "pl011-tty: tty0 lookup failed\r\n");
-		return -ENODEV;
+		return err;
 	}
 
 	pl011_writeRaw(uart, "pl011-tty: tty0 lookup ok\r\n");
