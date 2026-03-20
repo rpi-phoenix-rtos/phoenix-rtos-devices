@@ -125,6 +125,9 @@ static int pl011_createTty0(pl011_t *uart)
 		}
 
 		usleep(100000);
+		if (i == 0U) {
+			pl011_writeRaw(uart, "pl011-tty: tty0 wake\r\n");
+		}
 	}
 
 	if (err < 0) {
