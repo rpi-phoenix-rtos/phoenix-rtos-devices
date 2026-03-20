@@ -22,6 +22,7 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
+#include <sys/stat.h>
 #include <sys/threads.h>
 #include <sys/types.h>
 
@@ -100,6 +101,40 @@ static void pl011_writeRaw(pl011_t *uart, const char *s)
 
 		pl011_write(uart, dr, (unsigned char)*s++);
 	}
+}
+
+
+static int pl011_createTty0(pl011_t *uart)
+{
+	static const char name[] = "tty0";
+	oid_t odev;
+	msg_t msg = { 0 };
+
+	pl011_writeRaw(uart, "pl011-tty: tty0 lookup\r\n");
+	if (lookup("devfs", NULL, &odev) < 0) {
+		pl011_writeRaw(uart, "pl011-tty: tty0 lookup failed\r\n");
+		return -ENODEV;
+	}
+
+	pl011_writeRaw(uart, "pl011-tty: tty0 lookup ok\r\n");
+
+	msg.type = mtCreate;
+	msg.oid = odev;
+	msg.i.create.dev = uart->oid;
+	msg.i.create.type = otDev;
+	msg.i.create.mode = 0666;
+	msg.i.data = name;
+	msg.i.size = sizeof(name);
+
+	pl011_writeRaw(uart, "pl011-tty: tty0 send\r\n");
+	if (msgSend(odev.port, &msg) != EOK) {
+		pl011_writeRaw(uart, "pl011-tty: tty0 send failed\r\n");
+		return -ENOMEM;
+	}
+
+	pl011_writeRaw(uart, "pl011-tty: tty0 send done\r\n");
+
+	return msg.o.err;
 }
 
 
@@ -348,7 +383,7 @@ int main(void)
 	}
 
 	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register tty0\r\n");
-	if (create_dev(&pl011_common.uart.oid, "/dev/tty0") < 0) {
+	if (pl011_createTty0(&pl011_common.uart) < 0) {
 		pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 failed\r\n");
 		fprintf(stderr, "pl011-tty: failed to register /dev/tty0\n");
 		return EXIT_FAILURE;
