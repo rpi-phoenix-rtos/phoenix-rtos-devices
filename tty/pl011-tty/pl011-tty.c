@@ -351,6 +351,7 @@ int main(void)
 		fprintf(stderr, "pl011-tty: failed to register /dev/tty0\n");
 		return EXIT_FAILURE;
 	}
+	pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 ready\r\n");
 
 	if (create_dev(&pl011_common.uart.oid, _PATH_CONSOLE) < 0) {
 		fprintf(stderr, "pl011-tty: failed to register %s\n", _PATH_CONSOLE);
