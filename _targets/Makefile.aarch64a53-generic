@@ -1,0 +1,9 @@
+#
+# Makefile for Phoenix-RTOS 3 device drivers
+#
+# Generic AArch64 drivers
+#
+# Copyright 2026 Phoenix Systems
+#
+
+DEFAULT_COMPONENTS :=
