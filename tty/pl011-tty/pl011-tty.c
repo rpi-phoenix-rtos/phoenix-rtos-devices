@@ -356,6 +356,7 @@ int main(void)
 		fprintf(stderr, "pl011-tty: failed to register %s\n", _PATH_CONSOLE);
 		return EXIT_FAILURE;
 	}
+	pl011_writeRaw(&pl011_common.uart, "pl011-tty: console ready\r\n");
 
 	libklog_init(pl011_klogClbk);
 	oid_t kmsgctrl = { .port = port, .id = KMSG_CTRL_ID };
