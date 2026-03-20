@@ -92,6 +92,17 @@ static inline void pl011_write(pl011_t *uart, unsigned int reg, uint32_t val)
 }
 
 
+static void pl011_writeRaw(pl011_t *uart, const char *s)
+{
+	while (*s != '\0') {
+		while ((pl011_read(uart, fr) & fr_txff) != 0) {
+		}
+
+		pl011_write(uart, dr, (unsigned char)*s++);
+	}
+}
+
+
 static uint32_t pl011_lcrh(tcflag_t cflag)
 {
 	uint32_t val = lcrh_fen;
@@ -213,6 +224,7 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 	uart->oid.id = 0;
 
 	pl011_configure(uart);
+	pl011_writeRaw(uart, "pl011-tty: started\r\n");
 
 	return EOK;
 }
