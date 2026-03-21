@@ -23,8 +23,14 @@
 #define XHCI_REG_CAP_CAPLENGTH   0x00u
 #define XHCI_REG_CAP_HCIVERSION  0x02u
 #define XHCI_REG_CAP_HCSPARAMS1  0x04u
+#define XHCI_REG_CAP_HCSPARAMS2  0x08u
+#define XHCI_REG_CAP_HCCPARAMS1  0x10u
+#define XHCI_REG_CAP_HCSPARAMS1_MAX_SLOTS__MASK 0xffu
 #define XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT 24u
 #define XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__MASK  (0xffu << XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT)
+#define XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT 27u
+#define XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__MASK  (0x1fu << XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT)
+#define XHCI_REG_CAP_HCCPARAMS1_CSZ (1u << 2)
 #define XHCI_REG_OP_USBCMD       0x00u
 #define XHCI_REG_OP_USBSTS       0x04u
 #define XHCI_REG_OP_PAGESIZE     0x08u
@@ -42,8 +48,13 @@ typedef struct {
 	uint8_t caplength;
 	uint16_t version;
 	uint32_t hcsparams1;
+	uint32_t hcsparams2;
+	uint32_t hccparams1;
 	uint32_t pagesize;
+	uint32_t nslots;
 	uint32_t nports;
+	uint32_t nscratchpad;
+	uint32_t contextSize;
 } xhci_t;
 
 
@@ -134,6 +145,8 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 	xhci->caplength = xhci_read8(xhci, XHCI_REG_CAP_CAPLENGTH);
 	xhci->version = xhci_read16(xhci, XHCI_REG_CAP_HCIVERSION);
 	xhci->hcsparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCSPARAMS1);
+	xhci->hcsparams2 = xhci_read32(xhci, XHCI_REG_CAP_HCSPARAMS2);
+	xhci->hccparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCCPARAMS1);
 
 	if ((xhci->caplength < 0x20u) || (xhci->caplength > 0xffu)) {
 		fprintf(stderr, "xhci: invalid caplength 0x%02x\n", xhci->caplength);
@@ -199,15 +212,28 @@ static int xhci_reset(xhci_t *xhci)
 static int xhci_validateRuntime(xhci_t *xhci)
 {
 	xhci->pagesize = xhci_opRead32(xhci, XHCI_REG_OP_PAGESIZE);
+	xhci->nslots = xhci->hcsparams1 & XHCI_REG_CAP_HCSPARAMS1_MAX_SLOTS__MASK;
 	xhci->nports = (xhci->hcsparams1 & XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__MASK) >> XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT;
+	xhci->nscratchpad = (xhci->hcsparams2 & XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__MASK) >> XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT;
+	xhci->contextSize = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_CSZ) != 0u) ? 64u : 32u;
 
 	if ((xhci->pagesize & XHCI_REG_OP_PAGESIZE_4K) == 0u) {
 		fprintf(stderr, "xhci: 4k page size unsupported\n");
 		return -ENODEV;
 	}
 
+	if (xhci->nslots == 0u) {
+		fprintf(stderr, "xhci: no slots reported\n");
+		return -ENODEV;
+	}
+
 	if (xhci->nports == 0u) {
 		fprintf(stderr, "xhci: no ports reported\n");
+		return -ENODEV;
+	}
+
+	if (xhci->contextSize != 32u) {
+		fprintf(stderr, "xhci: unsupported context size %u\n", xhci->contextSize);
 		return -ENODEV;
 	}
 
