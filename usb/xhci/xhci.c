@@ -28,8 +28,13 @@
 #define XHCI_REG_CAP_DBOFF       0x14u
 #define XHCI_REG_CAP_RTSOFF      0x18u
 #define XHCI_REG_CAP_HCSPARAMS1_MAX_SLOTS__MASK 0xffu
+#define XHCI_REG_CAP_HCSPARAMS1_MAX_INTRS__SHIFT 8u
+#define XHCI_REG_CAP_HCSPARAMS1_MAX_INTRS__MASK (0x7ffu << XHCI_REG_CAP_HCSPARAMS1_MAX_INTRS__SHIFT)
 #define XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT 24u
 #define XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__MASK  (0xffu << XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT)
+#define XHCI_REG_CAP_HCSPARAMS2_IST__MASK 0xfu
+#define XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__SHIFT 4u
+#define XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__MASK (0xfu << XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__SHIFT)
 #define XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT 27u
 #define XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__MASK  (0x1fu << XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT)
 #define XHCI_REG_CAP_HCCPARAMS1_CSZ (1u << 2)
@@ -57,8 +62,11 @@ typedef struct {
 	uint32_t dboff;
 	uint32_t rtsoff;
 	uint32_t pagesize;
+	uint32_t nintrs;
 	uint32_t nslots;
 	uint32_t nports;
+	uint32_t erstMax;
+	uint32_t ist;
 	uint32_t nscratchpad;
 	uint32_t contextSize;
 } xhci_t;
@@ -220,8 +228,11 @@ static int xhci_reset(xhci_t *xhci)
 static int xhci_validateRuntime(xhci_t *xhci)
 {
 	xhci->pagesize = xhci_opRead32(xhci, XHCI_REG_OP_PAGESIZE);
+	xhci->nintrs = (xhci->hcsparams1 & XHCI_REG_CAP_HCSPARAMS1_MAX_INTRS__MASK) >> XHCI_REG_CAP_HCSPARAMS1_MAX_INTRS__SHIFT;
 	xhci->nslots = xhci->hcsparams1 & XHCI_REG_CAP_HCSPARAMS1_MAX_SLOTS__MASK;
 	xhci->nports = (xhci->hcsparams1 & XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__MASK) >> XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT;
+	xhci->ist = xhci->hcsparams2 & XHCI_REG_CAP_HCSPARAMS2_IST__MASK;
+	xhci->erstMax = (xhci->hcsparams2 & XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__MASK) >> XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__SHIFT;
 	xhci->nscratchpad = (xhci->hcsparams2 & XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__MASK) >> XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT;
 	xhci->contextSize = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_CSZ) != 0u) ? 64u : 32u;
 
@@ -232,6 +243,11 @@ static int xhci_validateRuntime(xhci_t *xhci)
 
 	if (xhci->nslots == 0u) {
 		fprintf(stderr, "xhci: no slots reported\n");
+		return -ENODEV;
+	}
+
+	if (xhci->nintrs == 0u) {
+		fprintf(stderr, "xhci: no interrupters reported\n");
 		return -ENODEV;
 	}
 
