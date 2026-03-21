@@ -23,11 +23,15 @@
 #define XHCI_REG_CAP_CAPLENGTH   0x00u
 #define XHCI_REG_CAP_HCIVERSION  0x02u
 #define XHCI_REG_CAP_HCSPARAMS1  0x04u
+#define XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT 24u
+#define XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__MASK  (0xffu << XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT)
 #define XHCI_REG_OP_USBCMD       0x00u
 #define XHCI_REG_OP_USBSTS       0x04u
+#define XHCI_REG_OP_PAGESIZE     0x08u
 #define XHCI_SUPPORTED_VERSION   0x0100u
 #define XHCI_REG_OP_USBCMD_HCRST (1u << 1)
 #define XHCI_REG_OP_USBSTS_CNR   (1u << 11)
+#define XHCI_REG_OP_PAGESIZE_4K  (1u << 0)
 #define XHCI_CNR_TIMEOUT_MS      100u
 #define XHCI_HCRST_TIMEOUT_MS    20u
 
@@ -38,6 +42,8 @@ typedef struct {
 	uint8_t caplength;
 	uint16_t version;
 	uint32_t hcsparams1;
+	uint32_t pagesize;
+	uint32_t nports;
 } xhci_t;
 
 
@@ -190,6 +196,25 @@ static int xhci_reset(xhci_t *xhci)
 }
 
 
+static int xhci_validateRuntime(xhci_t *xhci)
+{
+	xhci->pagesize = xhci_opRead32(xhci, XHCI_REG_OP_PAGESIZE);
+	xhci->nports = (xhci->hcsparams1 & XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__MASK) >> XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT;
+
+	if ((xhci->pagesize & XHCI_REG_OP_PAGESIZE_4K) == 0u) {
+		fprintf(stderr, "xhci: 4k page size unsupported\n");
+		return -ENODEV;
+	}
+
+	if (xhci->nports == 0u) {
+		fprintf(stderr, "xhci: no ports reported\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
@@ -204,7 +229,10 @@ static int xhci_init(hcd_t *hcd)
 	if (err == -ENOSYS) {
 		err = xhci_reset(xhci);
 		if (err == 0) {
-			err = -ENOSYS;
+			err = xhci_validateRuntime(xhci);
+			if (err == 0) {
+				err = -ENOSYS;
+			}
 		}
 	}
 
