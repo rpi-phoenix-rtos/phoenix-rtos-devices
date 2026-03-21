@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <board_config.h>
@@ -22,12 +23,18 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
+#include <sys/platform.h>
 #include <sys/stat.h>
 #include <sys/threads.h>
 #include <sys/types.h>
 
 #include <libklog.h>
 #include <libtty.h>
+
+#if defined(__CPU_GENERIC)
+#include <phoenix/arch/aarch64/generic/generic.h>
+#include "../pc-tty/ttypc_fbfont.h"
+#endif
 
 
 #define KMSG_CTRL_ID 100
@@ -64,6 +71,9 @@ enum {
 
 enum { cr_uarten = 1 << 0, cr_txe = 1 << 8, cr_rxe = 1 << 9 };
 
+#define PL011_FBCON_BG 0xff000000u
+#define PL011_FBCON_FG 0xffffffffu
+
 
 typedef struct {
 	volatile uint32_t *base;
@@ -71,6 +81,14 @@ typedef struct {
 	libtty_common_t tty;
 	int speed;
 	tcflag_t cflag;
+	handle_t fbLock;
+	volatile uint32_t *fbaddr;
+	uint32_t fbmemsz;
+	uint16_t fbcols;
+	uint16_t fbrows;
+	uint16_t fbcol;
+	uint16_t fbrow;
+	uint16_t fbpitch;
 	char stack[1024] __attribute__((aligned(8)));
 } pl011_t;
 
@@ -91,6 +109,170 @@ static inline void pl011_write(pl011_t *uart, unsigned int reg, uint32_t val)
 {
 	*(uart->base + reg / sizeof(*uart->base)) = val;
 }
+
+
+#if defined(__CPU_GENERIC)
+static inline void pl011_fbcon_drawPixel(pl011_t *uart, uint16_t x, uint16_t y, uint32_t color)
+{
+	*(volatile uint32_t *)((char *)uart->fbaddr + y * uart->fbpitch + x * sizeof(uint32_t)) = color;
+}
+
+
+static void pl011_fbcon_drawChar(pl011_t *uart, uint16_t col, uint16_t row, unsigned char c)
+{
+	uint16_t x = col * TTYPC_FBFONT_W;
+	uint16_t y = row * TTYPC_FBFONT_H;
+	uint8_t *data = ttypc_fbcon_fbfont + (TTYPC_FBFONT_BYTES_PER_GLYPH * c);
+	uint16_t charPixY;
+	size_t i;
+
+	for (charPixY = y; charPixY < (y + TTYPC_FBFONT_H); ++charPixY) {
+		for (i = 0u; i < 8u; ++i) {
+			pl011_fbcon_drawPixel(uart, x + (7u - i), charPixY, ((*data & (1u << i)) != 0u) ? PL011_FBCON_FG : PL011_FBCON_BG);
+		}
+
+		data += TTYPC_FBFONT_W_BYTES;
+	}
+}
+
+
+static void pl011_fbcon_clearRow(pl011_t *uart, uint16_t row)
+{
+	uint16_t y;
+	uint16_t x;
+
+	for (y = row * TTYPC_FBFONT_H; y < (row + 1u) * TTYPC_FBFONT_H; ++y) {
+		for (x = 0u; x < uart->fbcols * TTYPC_FBFONT_W; ++x) {
+			pl011_fbcon_drawPixel(uart, x, y, PL011_FBCON_BG);
+		}
+	}
+}
+
+
+static void pl011_fbcon_scroll(pl011_t *uart)
+{
+	size_t rowsz = uart->fbpitch * TTYPC_FBFONT_H;
+	size_t visible = uart->fbpitch * uart->fbrows * TTYPC_FBFONT_H;
+
+	memmove((void *)uart->fbaddr, (const char *)uart->fbaddr + rowsz, visible - rowsz);
+	uart->fbrow = uart->fbrows - 1u;
+	pl011_fbcon_clearRow(uart, uart->fbrow);
+}
+
+
+static void pl011_fbcon_putc(pl011_t *uart, unsigned char c)
+{
+	if (uart->fbaddr == NULL) {
+		return;
+	}
+
+	switch (c) {
+		case '\r':
+			uart->fbcol = 0u;
+			return;
+
+		case '\n':
+			uart->fbcol = 0u;
+			uart->fbrow++;
+			break;
+
+		case '\b':
+			if (uart->fbcol > 0u) {
+				uart->fbcol--;
+				pl011_fbcon_drawChar(uart, uart->fbcol, uart->fbrow, ' ');
+			}
+			return;
+
+		default:
+			if ((c < ' ') || (c > '~')) {
+				c = '?';
+			}
+
+			pl011_fbcon_drawChar(uart, uart->fbcol, uart->fbrow, c);
+			uart->fbcol++;
+			if (uart->fbcol >= uart->fbcols) {
+				uart->fbcol = 0u;
+				uart->fbrow++;
+			}
+			break;
+	}
+
+	if (uart->fbrow >= uart->fbrows) {
+		pl011_fbcon_scroll(uart);
+	}
+}
+
+
+static void pl011_fbcon_write(pl011_t *uart, const char *data, size_t size)
+{
+	size_t i;
+
+	if (uart->fbaddr == NULL) {
+		return;
+	}
+
+	mutexLock(uart->fbLock);
+	for (i = 0u; i < size; ++i) {
+		pl011_fbcon_putc(uart, (unsigned char)data[i]);
+	}
+	mutexUnlock(uart->fbLock);
+}
+
+
+static int pl011_fbcon_init(pl011_t *uart)
+{
+	platformctl_t pctl = { .action = pctl_get, .type = pctl_graphmode };
+	uint16_t row;
+	int err;
+
+	err = platformctl(&pctl);
+	if (err < 0) {
+		return err;
+	}
+
+	if ((pctl.task.graphmode.bpp != 32u) || (pctl.task.graphmode.framebuffer == 0u) || (pctl.task.graphmode.pitch == 0u)) {
+		return -ENOSYS;
+	}
+
+	uart->fbmemsz = (pctl.task.graphmode.pitch * pctl.task.graphmode.height + _PAGE_SIZE - 1u) & ~(_PAGE_SIZE - 1u);
+	uart->fbaddr = mmap(NULL, uart->fbmemsz, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_SHARED | MAP_UNCACHED | MAP_ANONYMOUS | MAP_PHYSMEM, -1, pctl.task.graphmode.framebuffer);
+	if (uart->fbaddr == MAP_FAILED) {
+		uart->fbaddr = NULL;
+		return -ENOMEM;
+	}
+
+	uart->fbpitch = pctl.task.graphmode.pitch;
+	uart->fbcols = pctl.task.graphmode.width / TTYPC_FBFONT_W;
+	uart->fbrows = pctl.task.graphmode.height / TTYPC_FBFONT_H;
+	uart->fbcol = 0u;
+	uart->fbrow = 6u;
+	if (uart->fbrow >= uart->fbrows) {
+		uart->fbrow = 0u;
+	}
+
+	for (row = 0u; row < uart->fbrows; ++row) {
+		pl011_fbcon_clearRow(uart, row);
+	}
+
+	pl011_fbcon_write(uart, "Phoenix-RTOS HDMI console\r\n", sizeof("Phoenix-RTOS HDMI console\r\n") - 1u);
+
+	return EOK;
+}
+#else
+static void pl011_fbcon_write(pl011_t *uart, const char *data, size_t size)
+{
+	(void)uart;
+	(void)data;
+	(void)size;
+}
+
+
+static int pl011_fbcon_init(pl011_t *uart)
+{
+	(void)uart;
+	return -ENOSYS;
+}
+#endif
 
 
 static void pl011_writeRaw(pl011_t *uart, const char *s)
@@ -258,6 +440,10 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 		return -ENODEV;
 	}
 
+	if (mutexCreate(&uart->fbLock) < 0) {
+		return -ENOMEM;
+	}
+
 	uart->base = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (off_t)PL011_TTY_BASE);
 	if (uart->base == MAP_FAILED) {
 		return -ENOMEM;
@@ -278,6 +464,7 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 	uart->oid.id = 0;
 
 	pl011_configure(uart);
+	(void)pl011_fbcon_init(uart);
 	pl011_writeRaw(uart, "pl011-tty: started\r\n");
 
 	return EOK;
@@ -371,7 +558,10 @@ static void pl011_thr(void *arg)
 		}
 
 		while ((libtty_txready(&uart->tty) != 0) && ((pl011_read(uart, fr) & fr_txff) == 0)) {
-			pl011_write(uart, dr, libtty_popchar(&uart->tty));
+			unsigned char c = libtty_popchar(&uart->tty);
+
+			pl011_write(uart, dr, c);
+			pl011_fbcon_write(uart, (const char *)&c, 1u);
 			wake_writer = 1;
 		}
 
