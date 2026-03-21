@@ -89,8 +89,34 @@ typedef struct {
 } pcie_ecam_ctx_t;
 
 
+typedef struct {
+	uint32_t *base;
+} pcie_bcm2711_ctx_t;
+
+
 static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus);
 
+
+static inline uint16_t pcie_cfgRead16(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
+{
+	uint32_t value_u32 = cfgio->read32(cfgio->ctx, bus, dev, fn, off);
+	if (off & 2) {
+		return value_u32 >> 16;
+	}
+	else {
+		return value_u32 & 0xffff;
+	}
+}
+
+
+static inline uint8_t pcie_cfgRead8(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
+{
+	uint32_t value_u32 = cfgio->read32(cfgio->ctx, bus, dev, fn, off);
+	return (value_u32 >> ((off & 3) * 8)) & 0xff;
+}
+
+
+#ifndef PCI_EXPRESS_BCM2711_INDEXED_CFG
 
 static inline volatile uint32_t *ecamRegPtr(pcie_ecam_ctx_t *ecam, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t reg)
 {
@@ -116,25 +142,6 @@ static void ecamWrite32(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn, uint16_
 	pcie_ecam_ctx_t *ecam = (pcie_ecam_ctx_t *)ctx;
 
 	*ecamRegPtr(ecam, bus, dev, fn, off & ~0x3) = val;
-}
-
-
-static inline uint16_t pcie_cfgRead16(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
-{
-	uint32_t value_u32 = cfgio->read32(cfgio->ctx, bus, dev, fn, off);
-	if (off & 2) {
-		return value_u32 >> 16;
-	}
-	else {
-		return value_u32 & 0xffff;
-	}
-}
-
-
-static inline uint8_t pcie_cfgRead8(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
-{
-	uint32_t value_u32 = cfgio->read32(cfgio->ctx, bus, dev, fn, off);
-	return (value_u32 >> ((off & 3) * 8)) & 0xff;
 }
 
 
@@ -176,6 +183,112 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 
 	return EOK;
 }
+
+#endif
+
+
+#ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
+
+#define BCM2711_PCIE_EXT_CFG_DATA  0x8000u
+#define BCM2711_PCIE_EXT_CFG_INDEX 0x9000u
+
+#define BCM2711_PCIE_BUSNUM_SHIFT 20
+#define BCM2711_PCIE_SLOT_SHIFT   15
+#define BCM2711_PCIE_FUNC_SHIFT   12
+
+
+static inline int bcm2711_cfgIndex(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
+{
+	return ((dev & 0x1f) << BCM2711_PCIE_SLOT_SHIFT) |
+		((fn & 0x07) << BCM2711_PCIE_FUNC_SHIFT) |
+		((int)bus << BCM2711_PCIE_BUSNUM_SHIFT) |
+		(off & ~0x3);
+}
+
+
+static inline volatile uint32_t *bcm2711RootCfgPtr(pcie_bcm2711_ctx_t *ctx, uint16_t off)
+{
+	return (volatile uint32_t *)((uintptr_t)ctx->base + (off & ~0x3));
+}
+
+
+static uint32_t bcm2711Read32(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
+{
+	pcie_bcm2711_ctx_t *bcm = (pcie_bcm2711_ctx_t *)ctx;
+
+	if (bus == 0) {
+		if ((dev != 0) || (fn != 0)) {
+			return UINT32_MAX;
+		}
+
+		return *bcm2711RootCfgPtr(bcm, off);
+	}
+
+	writeReg(bcm->base, BCM2711_PCIE_EXT_CFG_INDEX, bcm2711_cfgIndex(bus, dev, fn, off));
+
+	return readReg(bcm->base, BCM2711_PCIE_EXT_CFG_DATA + (off & ~0x3));
+}
+
+
+static void bcm2711Write32(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off, uint32_t val)
+{
+	pcie_bcm2711_ctx_t *bcm = (pcie_bcm2711_ctx_t *)ctx;
+
+	if (bus == 0) {
+		if ((dev != 0) || (fn != 0)) {
+			return;
+		}
+
+		*bcm2711RootCfgPtr(bcm, off) = val;
+		return;
+	}
+
+	writeReg(bcm->base, BCM2711_PCIE_EXT_CFG_INDEX, bcm2711_cfgIndex(bus, dev, fn, off));
+	writeReg(bcm->base, BCM2711_PCIE_EXT_CFG_DATA + (off & ~0x3), val);
+}
+
+
+static void pcie_cfgDestroyBcm2711(void *ctx)
+{
+	pcie_bcm2711_ctx_t *bcm = (pcie_bcm2711_ctx_t *)ctx;
+
+	if (bcm == NULL) {
+		return;
+	}
+
+	if (bcm->base != MAP_FAILED) {
+		munmap((void *)bcm->base, PCIE_BCM2711_HOST_SIZE);
+	}
+
+	free(bcm);
+}
+
+
+static int pcie_cfgInitBcm2711(pcie_cfgio_t *cfgio)
+{
+	pcie_bcm2711_ctx_t *bcm;
+
+	bcm = calloc(1, sizeof(*bcm));
+	if (bcm == NULL) {
+		return -ENOMEM;
+	}
+
+	bcm->base = mmap(NULL, PCIE_BCM2711_HOST_SIZE, PROT_WRITE | PROT_READ,
+			MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, PCIE_BCM2711_HOST_BASE);
+	if (bcm->base == MAP_FAILED) {
+		free(bcm);
+		return -ENOMEM;
+	}
+
+	cfgio->ctx = bcm;
+	cfgio->read32 = bcm2711Read32;
+	cfgio->write32 = bcm2711Write32;
+	cfgio->destroy = pcie_cfgDestroyBcm2711;
+
+	return EOK;
+}
+
+#endif
 
 
 static void print_bars(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn, uint8_t hdr)
@@ -354,9 +467,13 @@ int main(int argc, char **argv)
 	}
 #endif
 
+#ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
+	ret = pcie_cfgInitBcm2711(&cfgio);
+#else
 	ret = pcie_cfgInitEcam(&cfgio);
+#endif
 	if (ret != EOK) {
-		fprintf(stderr, "pcie: fail to map ECAM memory\n");
+		fprintf(stderr, "pcie: fail to initialize config-space backend\n");
 		return ret;
 	}
 
