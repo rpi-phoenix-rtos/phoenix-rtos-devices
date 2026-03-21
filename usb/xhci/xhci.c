@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -61,6 +62,10 @@
 #define XHCI_REG_OP_CRCR_CRR     (1u << 3)
 #define XHCI_REG_OP_CRCR_CR_PTR_LO__MASK 0xffffffc0u
 #define XHCI_REG_OP_DCBAAP__MASK 0xffffffc0u
+#define XHCI_DCBAA_ALIGN         0x1000u
+#define XHCI_DCBAA_SIZE          0x1000u
+#define XHCI_CMD_RING_ALIGN      0x10000u
+#define XHCI_CMD_RING_SIZE       0x10000u
 #define XHCI_CNR_TIMEOUT_MS      100u
 #define XHCI_HCRST_TIMEOUT_MS    20u
 
@@ -90,6 +95,12 @@ typedef struct {
 	uint32_t dcbaapHi;
 	uint64_t crcr;
 	uint64_t dcbaap;
+	void *dcbaa;
+	void *cmdRing;
+	size_t dcbaaSize;
+	size_t cmdRingSize;
+	uint64_t dcbaaPhys;
+	uint64_t cmdRingPhys;
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
@@ -141,6 +152,14 @@ static void xhci_destroy(xhci_t *xhci)
 
 	if (xhci->mmio != MAP_FAILED) {
 		munmap(xhci->mmio, xhci->mapSz);
+	}
+
+	if (xhci->dcbaa != NULL) {
+		usb_freeAligned(xhci->dcbaa, xhci->dcbaaSize);
+	}
+
+	if (xhci->cmdRing != NULL) {
+		usb_freeAligned(xhci->cmdRing, xhci->cmdRingSize);
 	}
 
 	free(xhci);
@@ -319,6 +338,39 @@ static int xhci_validateRuntime(xhci_t *xhci)
 }
 
 
+static int xhci_allocCommandSpace(xhci_t *xhci)
+{
+	xhci->dcbaaSize = XHCI_DCBAA_SIZE;
+	xhci->cmdRingSize = XHCI_CMD_RING_SIZE;
+
+	xhci->dcbaa = usb_allocAligned(xhci->dcbaaSize, XHCI_DCBAA_ALIGN);
+	if (xhci->dcbaa == NULL) {
+		fprintf(stderr, "xhci: failed to allocate dcbaa\n");
+		return -ENOMEM;
+	}
+
+	xhci->cmdRing = usb_allocAligned(xhci->cmdRingSize, XHCI_CMD_RING_ALIGN);
+	if (xhci->cmdRing == NULL) {
+		fprintf(stderr, "xhci: failed to allocate command ring\n");
+		return -ENOMEM;
+	}
+
+	memset(xhci->dcbaa, 0, xhci->dcbaaSize);
+	memset(xhci->cmdRing, 0, xhci->cmdRingSize);
+
+	xhci->dcbaaPhys = va2pa(xhci->dcbaa);
+	xhci->cmdRingPhys = va2pa(xhci->cmdRing);
+
+	if (((xhci->dcbaaPhys & (XHCI_DCBAA_ALIGN - 1u)) != 0u) ||
+		((xhci->cmdRingPhys & (XHCI_CMD_RING_ALIGN - 1u)) != 0u)) {
+		fprintf(stderr, "xhci: invalid command space alignment\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
@@ -335,7 +387,10 @@ static int xhci_init(hcd_t *hcd)
 		if (err == 0) {
 			err = xhci_validateRuntime(xhci);
 			if (err == 0) {
-				err = -ENOSYS;
+				err = xhci_allocCommandSpace(xhci);
+				if (err == 0) {
+					err = -ENOSYS;
+				}
 			}
 		}
 	}
