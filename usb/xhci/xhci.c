@@ -35,9 +35,13 @@
 #define XHCI_REG_CAP_HCSPARAMS2_IST__MASK 0xfu
 #define XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__SHIFT 4u
 #define XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__MASK (0xfu << XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__SHIFT)
+#define XHCI_REG_CAP_HCSPARAMS2_SPR (1u << 26)
 #define XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT 27u
 #define XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__MASK  (0x1fu << XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT)
+#define XHCI_REG_CAP_HCCPARAMS1_AC64 (1u << 0)
 #define XHCI_REG_CAP_HCCPARAMS1_CSZ (1u << 2)
+#define XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__SHIFT 12u
+#define XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__MASK (0xfu << XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__SHIFT)
 #define XHCI_REG_CAP_DBOFF__MASK 0xfffffffcu
 #define XHCI_REG_CAP_RTSOFF__MASK 0xffffffe0u
 #define XHCI_REG_OP_USBCMD       0x00u
@@ -68,7 +72,10 @@ typedef struct {
 	uint32_t erstMax;
 	uint32_t ist;
 	uint32_t nscratchpad;
+	uint32_t maxPsaSize;
 	uint32_t contextSize;
+	unsigned ac64 : 1;
+	unsigned spr : 1;
 } xhci_t;
 
 
@@ -233,8 +240,11 @@ static int xhci_validateRuntime(xhci_t *xhci)
 	xhci->nports = (xhci->hcsparams1 & XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__MASK) >> XHCI_REG_CAP_HCSPARAMS1_MAX_PORTS__SHIFT;
 	xhci->ist = xhci->hcsparams2 & XHCI_REG_CAP_HCSPARAMS2_IST__MASK;
 	xhci->erstMax = (xhci->hcsparams2 & XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__MASK) >> XHCI_REG_CAP_HCSPARAMS2_ERST_MAX__SHIFT;
+	xhci->spr = ((xhci->hcsparams2 & XHCI_REG_CAP_HCSPARAMS2_SPR) != 0u) ? 1u : 0u;
 	xhci->nscratchpad = (xhci->hcsparams2 & XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__MASK) >> XHCI_REG_CAP_HCSPARAMS2_MAX_SCRATCHPAD_BUFS__SHIFT;
+	xhci->ac64 = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_AC64) != 0u) ? 1u : 0u;
 	xhci->contextSize = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_CSZ) != 0u) ? 64u : 32u;
+	xhci->maxPsaSize = (xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__MASK) >> XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__SHIFT;
 
 	if ((xhci->pagesize & XHCI_REG_OP_PAGESIZE_4K) == 0u) {
 		fprintf(stderr, "xhci: 4k page size unsupported\n");
