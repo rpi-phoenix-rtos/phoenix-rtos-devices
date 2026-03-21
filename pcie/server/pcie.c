@@ -196,6 +196,20 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 #define BCM2711_PCIE_SLOT_SHIFT   15
 #define BCM2711_PCIE_FUNC_SHIFT   12
 
+#define BCM2711_PCIE_MISC_CTRL            0x4008u
+#define BCM2711_PCIE_MISC_REVISION        0x406cu
+#define BCM2711_PCIE_HARD_DEBUG           0x4204u
+#define BCM2711_PCIE_RGR1_SW_INIT_1       0x9210u
+
+#define BCM2711_PCIE_RGR1_PERST_MASK        0x1u
+#define BCM2711_PCIE_RGR1_INIT_GENERIC_MASK 0x2u
+
+#define BCM2711_PCIE_MISC_CTRL_SCB_ACCESS_EN   0x1000u
+#define BCM2711_PCIE_MISC_CTRL_CFG_READ_UR_MODE 0x2000u
+#define BCM2711_PCIE_MISC_CTRL_MAX_BURST_MASK  0x300000u
+
+#define BCM2711_PCIE_HARD_DEBUG_SERDES_IDDQ_MASK 0x08000000u
+
 
 static inline int bcm2711_cfgIndex(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
 {
@@ -209,6 +223,45 @@ static inline int bcm2711_cfgIndex(uint8_t bus, uint8_t dev, uint8_t fn, uint16_
 static inline volatile uint32_t *bcm2711RootCfgPtr(pcie_bcm2711_ctx_t *ctx, uint16_t off)
 {
 	return (volatile uint32_t *)((uintptr_t)ctx->base + (off & ~0x3));
+}
+
+
+static void bcm2711BridgeSwInitSet(pcie_bcm2711_ctx_t *ctx, uint32_t val)
+{
+	writeRegMsk(ctx->base, BCM2711_PCIE_RGR1_SW_INIT_1,
+		BCM2711_PCIE_RGR1_INIT_GENERIC_MASK,
+		val ? BCM2711_PCIE_RGR1_INIT_GENERIC_MASK : 0u);
+}
+
+
+static void bcm2711PerstSet(pcie_bcm2711_ctx_t *ctx, uint32_t val)
+{
+	writeRegMsk(ctx->base, BCM2711_PCIE_RGR1_SW_INIT_1,
+		BCM2711_PCIE_RGR1_PERST_MASK,
+		val ? BCM2711_PCIE_RGR1_PERST_MASK : 0u);
+}
+
+
+static void bcm2711PrepareHostBridge(pcie_bcm2711_ctx_t *ctx)
+{
+	uint32_t misc;
+
+	bcm2711BridgeSwInitSet(ctx, 1u);
+	bcm2711PerstSet(ctx, 1u);
+	usleep(200);
+
+	bcm2711BridgeSwInitSet(ctx, 0u);
+	writeRegMsk(ctx->base, BCM2711_PCIE_HARD_DEBUG,
+		BCM2711_PCIE_HARD_DEBUG_SERDES_IDDQ_MASK, 0u);
+	usleep(200);
+
+	(void)readReg(ctx->base, BCM2711_PCIE_MISC_REVISION);
+
+	misc = readReg(ctx->base, BCM2711_PCIE_MISC_CTRL);
+	misc |= BCM2711_PCIE_MISC_CTRL_SCB_ACCESS_EN;
+	misc |= BCM2711_PCIE_MISC_CTRL_CFG_READ_UR_MODE;
+	misc &= ~BCM2711_PCIE_MISC_CTRL_MAX_BURST_MASK;
+	writeReg(ctx->base, BCM2711_PCIE_MISC_CTRL, misc);
 }
 
 
@@ -284,6 +337,8 @@ static int pcie_cfgInitBcm2711(pcie_cfgio_t *cfgio)
 	cfgio->read32 = bcm2711Read32;
 	cfgio->write32 = bcm2711Write32;
 	cfgio->destroy = pcie_cfgDestroyBcm2711;
+
+	bcm2711PrepareHostBridge(bcm);
 
 	return EOK;
 }
