@@ -202,6 +202,74 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 
 #ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
 
+#if defined(RPI_MAILBOX_BASE_ADDRESS) && defined(XHCI_BCM2711_PCIE_BUS) && defined(XHCI_BCM2711_PCIE_SLOT) && defined(XHCI_BCM2711_PCIE_FUNC) && defined(XHCI_BCM2711_PCI_CLASS_CODE)
+
+#define RPI_MBOX_READ          0x00u
+#define RPI_MBOX_STATUS        0x18u
+#define RPI_MBOX_WRITE         0x20u
+#define RPI_MBOX_RESPONSE      0x80000000u
+#define RPI_MBOX_FULL          0x80000000u
+#define RPI_MBOX_EMPTY         0x40000000u
+#define RPI_MBOX_PROP_CHANNEL  8u
+#define RPI_PROP_REQUEST       0u
+#define RPI_PROP_END           0u
+#define RPI_PROP_NOTIFY_XHCI_RESET 0x00030058u
+#define RPI_PROP_NOTIFY_MSG_WORDS 7u
+
+static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
+{
+	volatile uint32_t *mailbox;
+	uint32_t *msgbuf;
+	uint32_t msg;
+	uintptr_t msgaddr;
+	int ret;
+
+	mailbox = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, RPI_MAILBOX_BASE_ADDRESS);
+	if (mailbox == MAP_FAILED) {
+		return -ENOMEM;
+	}
+
+	msgbuf = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
+	if (msgbuf == MAP_FAILED) {
+		munmap((void *)mailbox, _PAGE_SIZE);
+		return -ENOMEM;
+	}
+
+	msgbuf[0] = RPI_PROP_NOTIFY_MSG_WORDS * sizeof(uint32_t);
+	msgbuf[1] = RPI_PROP_REQUEST;
+	msgbuf[2] = RPI_PROP_NOTIFY_XHCI_RESET;
+	msgbuf[3] = sizeof(uint32_t);
+	msgbuf[4] = sizeof(uint32_t);
+	msgbuf[5] = ((uint32_t)bus << 20) | ((uint32_t)dev << 15) | ((uint32_t)fun << 12);
+	msgbuf[6] = RPI_PROP_END;
+
+	msgaddr = va2pa(msgbuf);
+	msg = ((uint32_t)msgaddr & ~0xfu) | RPI_MBOX_PROP_CHANNEL;
+
+	while ((*(mailbox + (RPI_MBOX_STATUS / sizeof(uint32_t))) & RPI_MBOX_FULL) != 0u) {
+	}
+
+	*(mailbox + (RPI_MBOX_WRITE / sizeof(uint32_t))) = msg;
+
+	for (;;) {
+		while ((*(mailbox + (RPI_MBOX_STATUS / sizeof(uint32_t))) & RPI_MBOX_EMPTY) != 0u) {
+		}
+
+		if (*(mailbox + (RPI_MBOX_READ / sizeof(uint32_t))) == msg) {
+			break;
+		}
+	}
+
+	ret = (msgbuf[1] == RPI_MBOX_RESPONSE) ? EOK : -EIO;
+
+	munmap(msgbuf, _PAGE_SIZE);
+	munmap((void *)mailbox, _PAGE_SIZE);
+
+	return ret;
+}
+
+#endif
+
 #define BCM2711_PCIE_EXT_CFG_DATA  0x8000u
 #define BCM2711_PCIE_EXT_CFG_INDEX 0x9000u
 
@@ -654,6 +722,16 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			vendor, device,
 			classBase, classSub, progIF,
 			hdr);
+
+#if defined(PCI_EXPRESS_BCM2711_INDEXED_CFG) && defined(RPI_MAILBOX_BASE_ADDRESS) && defined(XHCI_BCM2711_PCIE_BUS) && defined(XHCI_BCM2711_PCIE_SLOT) && defined(XHCI_BCM2711_PCIE_FUNC) && defined(XHCI_BCM2711_PCI_CLASS_CODE)
+	if ((bus == XHCI_BCM2711_PCIE_BUS) && (dev == XHCI_BCM2711_PCIE_SLOT) &&
+		(fun == XHCI_BCM2711_PCIE_FUNC) && ((class24 >> 8) == XHCI_BCM2711_PCI_CLASS_CODE)) {
+		int err = bcm2711NotifyXhciReset(bus, dev, fun);
+		if (err < 0) {
+			fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
+		}
+	}
+#endif
 
 	/* Enable MEM-space and Bus Master if still disabled */
 	uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
