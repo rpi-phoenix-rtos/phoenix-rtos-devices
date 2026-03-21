@@ -68,9 +68,17 @@
 #define PCI_MEMORY_BASE     0x20
 #define PCI_MEMORY_LIMIT    0x22
 #define PCI_CAP_PTR         0x34
+#define PCI_BRIDGE_CONTROL  0x3e
 
 
 #define PCI_HT_MULTI_FUNC 0x80
+
+#define PCI_BRIDGE_CTL_PARITY 0x01
+
+#define PCI_CAP_LIST_ID    0x00
+#define PCI_CAP_ID_EXP     0x10
+#define PCI_EXP_RTCTL      0x1c
+#define PCI_EXP_RTCTL_CRSSVE 0x0010
 
 
 /* ECAM addressing */
@@ -202,6 +210,7 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 #define BCM2711_PCIE_FUNC_SHIFT   12
 
 #define BCM2711_PCIE_MISC_CTRL            0x4008u
+#define BCM2711_PCIE_CAP_REGS             0x00acu
 #define BCM2711_PCIE_MEM_WIN0_LO          0x400cu
 #define BCM2711_PCIE_MEM_WIN0_HI          0x4010u
 #define BCM2711_PCIE_RC_CFG_PRIV1_ID_VAL3 0x043cu
@@ -273,6 +282,14 @@ static uint16_t bcm2711RootRead16(pcie_bcm2711_ctx_t *ctx, uint16_t off)
 	uint32_t value = bcm2711RootRead32(ctx, off);
 
 	return ((off & 2u) != 0u) ? (uint16_t)(value >> 16) : (uint16_t)(value & 0xffffu);
+}
+
+
+static uint8_t bcm2711RootRead8(pcie_bcm2711_ctx_t *ctx, uint16_t off)
+{
+	uint32_t value = bcm2711RootRead32(ctx, off);
+
+	return (uint8_t)((value >> ((off & 3u) * 8u)) & 0xffu);
 }
 
 
@@ -443,6 +460,8 @@ static void bcm2711ExposeDownstreamBridge(pcie_bcm2711_ctx_t *ctx)
 {
 	uint32_t buses = bcm2711RootRead32(ctx, PCI_PRIMARY_BUS);
 	uint16_t command = bcm2711RootRead16(ctx, PCI_COMMAND);
+	uint16_t bridgeControl = bcm2711RootRead16(ctx, PCI_BRIDGE_CONTROL);
+	uint16_t rootControl;
 
 	bcm2711RootWrite8(ctx, PCI_CACHE_LINE_SIZE, 64u / 4u);
 
@@ -452,6 +471,15 @@ static void bcm2711ExposeDownstreamBridge(pcie_bcm2711_ctx_t *ctx)
 
 	bcm2711RootWrite16(ctx, PCI_MEMORY_BASE, (uint16_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE >> 16));
 	bcm2711RootWrite16(ctx, PCI_MEMORY_LIMIT, (uint16_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE >> 16));
+
+	bridgeControl |= PCI_BRIDGE_CTL_PARITY;
+	bcm2711RootWrite16(ctx, PCI_BRIDGE_CONTROL, bridgeControl);
+
+	if (bcm2711RootRead8(ctx, BCM2711_PCIE_CAP_REGS + PCI_CAP_LIST_ID) == PCI_CAP_ID_EXP) {
+		rootControl = bcm2711RootRead16(ctx, BCM2711_PCIE_CAP_REGS + PCI_EXP_RTCTL);
+		rootControl |= PCI_EXP_RTCTL_CRSSVE;
+		bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + PCI_EXP_RTCTL, rootControl);
+	}
 
 	command |= PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE |
 		PCI_CMD_PARITY_ERR_ENABLE | PCI_CMD_SERR_ERR_ENABLE;
