@@ -47,10 +47,20 @@
 #define XHCI_REG_OP_USBCMD       0x00u
 #define XHCI_REG_OP_USBSTS       0x04u
 #define XHCI_REG_OP_PAGESIZE     0x08u
+#define XHCI_REG_OP_CRCR         0x18u
+#define XHCI_REG_OP_CRCR_HI      0x1cu
+#define XHCI_REG_OP_DCBAAP       0x30u
+#define XHCI_REG_OP_DCBAAP_HI    0x34u
 #define XHCI_SUPPORTED_VERSION   0x0100u
 #define XHCI_REG_OP_USBCMD_HCRST (1u << 1)
 #define XHCI_REG_OP_USBSTS_CNR   (1u << 11)
 #define XHCI_REG_OP_PAGESIZE_4K  (1u << 0)
+#define XHCI_REG_OP_CRCR_RCS     (1u << 0)
+#define XHCI_REG_OP_CRCR_CS      (1u << 1)
+#define XHCI_REG_OP_CRCR_CA      (1u << 2)
+#define XHCI_REG_OP_CRCR_CRR     (1u << 3)
+#define XHCI_REG_OP_CRCR_CR_PTR_LO__MASK 0xffffffc0u
+#define XHCI_REG_OP_DCBAAP__MASK 0xffffffc0u
 #define XHCI_CNR_TIMEOUT_MS      100u
 #define XHCI_HCRST_TIMEOUT_MS    20u
 
@@ -74,6 +84,12 @@ typedef struct {
 	uint32_t nscratchpad;
 	uint32_t maxPsaSize;
 	uint32_t contextSize;
+	uint32_t crcrLo;
+	uint32_t crcrHi;
+	uint32_t dcbaapLo;
+	uint32_t dcbaapHi;
+	uint64_t crcr;
+	uint64_t dcbaap;
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
@@ -245,6 +261,12 @@ static int xhci_validateRuntime(xhci_t *xhci)
 	xhci->ac64 = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_AC64) != 0u) ? 1u : 0u;
 	xhci->contextSize = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_CSZ) != 0u) ? 64u : 32u;
 	xhci->maxPsaSize = (xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__MASK) >> XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__SHIFT;
+	xhci->crcrLo = xhci_opRead32(xhci, XHCI_REG_OP_CRCR);
+	xhci->crcrHi = xhci_opRead32(xhci, XHCI_REG_OP_CRCR_HI);
+	xhci->dcbaapLo = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP);
+	xhci->dcbaapHi = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP_HI);
+	xhci->crcr = ((uint64_t)xhci->crcrHi << 32) | (xhci->crcrLo & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK);
+	xhci->dcbaap = ((uint64_t)xhci->dcbaapHi << 32) | (xhci->dcbaapLo & XHCI_REG_OP_DCBAAP__MASK);
 
 	if ((xhci->pagesize & XHCI_REG_OP_PAGESIZE_4K) == 0u) {
 		fprintf(stderr, "xhci: 4k page size unsupported\n");
@@ -278,6 +300,18 @@ static int xhci_validateRuntime(xhci_t *xhci)
 
 	if ((xhci->rtsoff == 0u) || (xhci->rtsoff >= xhci->mapSz)) {
 		fprintf(stderr, "xhci: invalid runtime offset 0x%08x\n", xhci->rtsoff);
+		return -ENODEV;
+	}
+
+	if ((!xhci->ac64) && ((xhci->crcrHi != 0u) || (xhci->dcbaapHi != 0u))) {
+		fprintf(stderr, "xhci: unexpected high register state without ac64 support\n");
+		return -ENODEV;
+	}
+
+	if (((xhci->crcrLo & ~(XHCI_REG_OP_CRCR_CR_PTR_LO__MASK | XHCI_REG_OP_CRCR_RCS | XHCI_REG_OP_CRCR_CS |
+			XHCI_REG_OP_CRCR_CA | XHCI_REG_OP_CRCR_CRR)) != 0u) ||
+		((xhci->dcbaapLo & ~XHCI_REG_OP_DCBAAP__MASK) != 0u)) {
+		fprintf(stderr, "xhci: invalid operational layout register state\n");
 		return -ENODEV;
 	}
 
