@@ -11,6 +11,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <paths.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -55,6 +56,14 @@
 #define PL011_TTY_POLL_US 1000
 #endif
 
+#ifndef PL011_TTY_KBD_PATH
+#define PL011_TTY_KBD_PATH ((const char *)NULL)
+#endif
+
+#ifndef PL011_TTY_KBD_RETRY_US
+#define PL011_TTY_KBD_RETRY_US 500000
+#endif
+
 
 enum { dr = 0x00, fr = 0x18, ibrd = 0x24, fbrd = 0x28, lcrh = 0x2c, cr = 0x30, imsc = 0x38, icr = 0x44 };
 
@@ -90,6 +99,7 @@ typedef struct {
 	uint16_t fbrow;
 	uint16_t fbpitch;
 	char stack[1024] __attribute__((aligned(8)));
+	char kbdstack[1024] __attribute__((aligned(8)));
 } pl011_t;
 
 
@@ -578,6 +588,60 @@ static void pl011_thr(void *arg)
 }
 
 
+static void pl011_kbdthr(void *arg)
+{
+	pl011_t *uart = (pl011_t *)arg;
+	const char *path = PL011_TTY_KBD_PATH;
+	char buf[64];
+	ssize_t len;
+	int fd;
+
+	if (path == NULL) {
+		endthread();
+	}
+
+	for (;;) {
+		fd = open(path, O_RDONLY);
+		if (fd < 0) {
+			usleep(PL011_TTY_KBD_RETRY_US);
+			continue;
+		}
+
+		for (;;) {
+			int wake_reader = 0;
+			size_t i;
+
+			len = read(fd, buf, sizeof(buf));
+			if (len == 0) {
+				break;
+			}
+			if (len < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				break;
+			}
+
+			libtty_putchar_lock(&uart->tty);
+			for (i = 0u; i < (size_t)len; ++i) {
+				int woke = 0;
+
+				(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &woke);
+				wake_reader |= woke;
+			}
+			libtty_putchar_unlock(&uart->tty);
+
+			if (wake_reader != 0) {
+				libtty_wake_reader(&uart->tty);
+			}
+		}
+
+		close(fd);
+		usleep(PL011_TTY_KBD_RETRY_US);
+	}
+}
+
+
 int main(void)
 {
 	uint32_t port;
@@ -612,6 +676,9 @@ int main(void)
 	libklog_ctrlRegister(&kmsgctrl);
 
 	beginthread(pl011_thr, 4, pl011_common.uart.stack, sizeof(pl011_common.uart.stack), &pl011_common.uart);
+	if (PL011_TTY_KBD_PATH != NULL) {
+		beginthread(pl011_kbdthr, 4, pl011_common.uart.kbdstack, sizeof(pl011_common.uart.kbdstack), &pl011_common.uart);
+	}
 	beginthread(poolthr, 4, pl011_common.stack, sizeof(pl011_common.stack), (void *)(uintptr_t)port);
 	poolthr((void *)(uintptr_t)port);
 
