@@ -199,13 +199,25 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 #define BCM2711_PCIE_FUNC_SHIFT   12
 
 #define BCM2711_PCIE_MISC_CTRL            0x4008u
+#define BCM2711_PCIE_MEM_WIN0_LO          0x400cu
+#define BCM2711_PCIE_MEM_WIN0_HI          0x4010u
+#define BCM2711_PCIE_RC_CFG_PRIV1_ID_VAL3 0x043cu
+#define BCM2711_PCIE_RC_BAR2_CONFIG_LO    0x4034u
+#define BCM2711_PCIE_RC_BAR2_CONFIG_HI    0x4038u
 #define BCM2711_PCIE_MISC_STATUS          0x4068u
 #define BCM2711_PCIE_MISC_REVISION        0x406cu
+#define BCM2711_PCIE_MEM_WIN0_BASE_LIMIT  0x4070u
+#define BCM2711_PCIE_MEM_WIN0_BASE_HI     0x4080u
+#define BCM2711_PCIE_MEM_WIN0_LIMIT_HI    0x4084u
 #define BCM2711_PCIE_HARD_DEBUG           0x4204u
 #define BCM2711_PCIE_RGR1_SW_INIT_1       0x9210u
 
 #define BCM2711_PCIE_RGR1_PERST_MASK        0x1u
 #define BCM2711_PCIE_RGR1_INIT_GENERIC_MASK 0x2u
+
+#define BCM2711_PCIE_RC_CLASS_CODE_MASK      0x00ffffffu
+#define BCM2711_PCIE_RC_BRIDGE_CLASS_CODE    0x00060400u
+#define BCM2711_PCIE_RC_BAR2_SIZE_MASK       0x1fu
 
 #define BCM2711_PCIE_MISC_CTRL_SCB_ACCESS_EN   0x1000u
 #define BCM2711_PCIE_MISC_CTRL_CFG_READ_UR_MODE 0x2000u
@@ -216,6 +228,14 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 #define BCM2711_PCIE_MISC_STATUS_PCIE_PORT_MASK       0x80u
 #define BCM2711_PCIE_MISC_STATUS_PCIE_DL_ACTIVE_MASK  0x20u
 #define BCM2711_PCIE_MISC_STATUS_PCIE_PHYLINKUP_MASK  0x10u
+
+#define BCM2711_PCIE_MEM_WIN0_BASE_MASK           0x0000fff0u
+#define BCM2711_PCIE_MEM_WIN0_LIMIT_MASK          0xfff00000u
+#define BCM2711_PCIE_MEM_WIN0_BASE_HI_MASK        0x000000ffu
+#define BCM2711_PCIE_MEM_WIN0_LIMIT_HI_MASK       0x000000ffu
+#define BCM2711_PCIE_MEM_WIN0_BASE_LIMIT_SHIFT    20u
+#define BCM2711_PCIE_MEM_WIN0_BASE_SHIFT          4u
+#define BCM2711_PCIE_MEM_WIN0_NUM_MASK_BITS       12u
 
 
 static inline int bcm2711_cfgIndex(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
@@ -296,6 +316,75 @@ static void bcm2711PrepareLinkState(pcie_bcm2711_ctx_t *ctx)
 
 	ctx->linkUp = bcm2711LinkUp(ctx);
 	ctx->rcMode = bcm2711RcMode(ctx);
+}
+
+
+static uint32_t bcm2711EncodeBar2Size(uint64_t size)
+{
+	unsigned shift = 20;
+	uint64_t value = size;
+
+	while ((value > 1u) && ((value & 1u) == 0u)) {
+		value >>= 1;
+		shift++;
+	}
+
+	if ((size == 0u) || (value != 1u) || (shift < 15u)) {
+		return 0u;
+	}
+
+	return shift - 15u;
+}
+
+
+static void bcm2711SetOutboundWindow0(pcie_bcm2711_ctx_t *ctx, uint64_t cpuAddr, uint64_t pcieAddr, uint64_t size)
+{
+	uint64_t cpuAddrMb = cpuAddr >> 20;
+	uint64_t limitAddrMb = (cpuAddr + size - 1u) >> 20;
+	uint32_t baseLimit;
+	uint32_t value;
+
+	writeReg(ctx->base, BCM2711_PCIE_MEM_WIN0_LO, LOWER_32_BITS(pcieAddr));
+	writeReg(ctx->base, BCM2711_PCIE_MEM_WIN0_HI, UPPER_32_BITS(pcieAddr));
+
+	baseLimit = readReg(ctx->base, BCM2711_PCIE_MEM_WIN0_BASE_LIMIT);
+	baseLimit &= ~(BCM2711_PCIE_MEM_WIN0_BASE_MASK | BCM2711_PCIE_MEM_WIN0_LIMIT_MASK);
+	baseLimit |= ((uint32_t)cpuAddrMb << BCM2711_PCIE_MEM_WIN0_BASE_SHIFT) & BCM2711_PCIE_MEM_WIN0_BASE_MASK;
+	baseLimit |= ((uint32_t)limitAddrMb << BCM2711_PCIE_MEM_WIN0_BASE_LIMIT_SHIFT) & BCM2711_PCIE_MEM_WIN0_LIMIT_MASK;
+	writeReg(ctx->base, BCM2711_PCIE_MEM_WIN0_BASE_LIMIT, baseLimit);
+
+	value = readReg(ctx->base, BCM2711_PCIE_MEM_WIN0_BASE_HI);
+	value &= ~BCM2711_PCIE_MEM_WIN0_BASE_HI_MASK;
+	value |= (uint32_t)(cpuAddrMb >> BCM2711_PCIE_MEM_WIN0_NUM_MASK_BITS) & BCM2711_PCIE_MEM_WIN0_BASE_HI_MASK;
+	writeReg(ctx->base, BCM2711_PCIE_MEM_WIN0_BASE_HI, value);
+
+	value = readReg(ctx->base, BCM2711_PCIE_MEM_WIN0_LIMIT_HI);
+	value &= ~BCM2711_PCIE_MEM_WIN0_LIMIT_HI_MASK;
+	value |= (uint32_t)(limitAddrMb >> BCM2711_PCIE_MEM_WIN0_NUM_MASK_BITS) & BCM2711_PCIE_MEM_WIN0_LIMIT_HI_MASK;
+	writeReg(ctx->base, BCM2711_PCIE_MEM_WIN0_LIMIT_HI, value);
+}
+
+
+static void bcm2711SetRcBar2(pcie_bcm2711_ctx_t *ctx, uint64_t pcieAddr, uint64_t size)
+{
+	uint32_t value = readReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_LO);
+
+	value &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
+	value |= bcm2711EncodeBar2Size(size) & BCM2711_PCIE_RC_BAR2_SIZE_MASK;
+	value &= ~0xfffffff0u;
+	value |= LOWER_32_BITS(pcieAddr) & 0xfffffff0u;
+	writeReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_LO, value);
+	writeReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_HI, UPPER_32_BITS(pcieAddr));
+}
+
+
+static void bcm2711ShapeRootBridge(pcie_bcm2711_ctx_t *ctx)
+{
+	uint32_t value = readReg(ctx->base, BCM2711_PCIE_RC_CFG_PRIV1_ID_VAL3);
+
+	value &= ~BCM2711_PCIE_RC_CLASS_CODE_MASK;
+	value |= BCM2711_PCIE_RC_BRIDGE_CLASS_CODE;
+	writeReg(ctx->base, BCM2711_PCIE_RC_CFG_PRIV1_ID_VAL3, value);
 }
 
 
@@ -382,6 +471,12 @@ static int pcie_cfgInitBcm2711(pcie_cfgio_t *cfgio)
 
 	bcm2711PrepareHostBridge(bcm);
 	bcm2711PrepareLinkState(bcm);
+	if (bcm->linkUp && bcm->rcMode) {
+		bcm2711SetOutboundWindow0(bcm, PCIE_BCM2711_OUTBOUND_CPU_BASE,
+			PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
+		bcm2711SetRcBar2(bcm, 0u, 0x100000000ull);
+		bcm2711ShapeRootBridge(bcm);
+	}
 
 	return EOK;
 }
