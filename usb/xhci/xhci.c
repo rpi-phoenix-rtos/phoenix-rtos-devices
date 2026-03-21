@@ -23,7 +23,13 @@
 #define XHCI_REG_CAP_CAPLENGTH   0x00u
 #define XHCI_REG_CAP_HCIVERSION  0x02u
 #define XHCI_REG_CAP_HCSPARAMS1  0x04u
+#define XHCI_REG_OP_USBCMD       0x00u
+#define XHCI_REG_OP_USBSTS       0x04u
 #define XHCI_SUPPORTED_VERSION   0x0100u
+#define XHCI_REG_OP_USBCMD_HCRST (1u << 1)
+#define XHCI_REG_OP_USBSTS_CNR   (1u << 11)
+#define XHCI_CNR_TIMEOUT_MS      100u
+#define XHCI_HCRST_TIMEOUT_MS    20u
 
 
 typedef struct {
@@ -56,6 +62,20 @@ static inline uint32_t xhci_read32(xhci_t *xhci, uintptr_t off)
 	volatile uint32_t *reg = (volatile uint32_t *)((volatile uint8_t *)xhci->mmio + off);
 
 	return *reg;
+}
+
+
+static inline uint32_t xhci_opRead32(xhci_t *xhci, uintptr_t off)
+{
+	return xhci_read32(xhci, xhci->caplength + off);
+}
+
+
+static inline void xhci_opWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
+{
+	volatile uint32_t *reg = (volatile uint32_t *)((volatile uint8_t *)xhci->mmio + xhci->caplength + off);
+
+	*reg = val;
 }
 
 
@@ -123,6 +143,53 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 }
 
 
+static int xhci_waitOpBits(xhci_t *xhci, uintptr_t off, uint32_t mask, uint32_t value, unsigned timeoutMs)
+{
+	uint32_t reg;
+
+	for (; timeoutMs > 0u; --timeoutMs) {
+		reg = xhci_opRead32(xhci, off);
+		if ((reg & mask) == value) {
+			return EOK;
+		}
+
+		usleep(1000);
+	}
+
+	return -ETIMEDOUT;
+}
+
+
+static int xhci_reset(xhci_t *xhci)
+{
+	uint32_t usbcmd;
+	int err;
+
+	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_CNR, 0u, XHCI_CNR_TIMEOUT_MS);
+	if (err < 0) {
+		fprintf(stderr, "xhci: controller not ready before reset\n");
+		return err;
+	}
+
+	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_HCRST);
+
+	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBCMD, XHCI_REG_OP_USBCMD_HCRST, 0u, XHCI_HCRST_TIMEOUT_MS);
+	if (err < 0) {
+		fprintf(stderr, "xhci: reset timeout\n");
+		return err;
+	}
+
+	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_CNR, 0u, XHCI_CNR_TIMEOUT_MS);
+	if (err < 0) {
+		fprintf(stderr, "xhci: controller not ready after reset\n");
+		return err;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
@@ -134,6 +201,13 @@ static int xhci_init(hcd_t *hcd)
 	}
 
 	err = xhci_capProbe(hcd, xhci);
+	if (err == -ENOSYS) {
+		err = xhci_reset(xhci);
+		if (err == 0) {
+			err = -ENOSYS;
+		}
+	}
+
 	if (err != 0) {
 		xhci_destroy(xhci);
 		hcd->priv = NULL;
