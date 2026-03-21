@@ -91,6 +91,8 @@ typedef struct {
 
 typedef struct {
 	uint32_t *base;
+	bool linkUp;
+	bool rcMode;
 } pcie_bcm2711_ctx_t;
 
 
@@ -197,6 +199,7 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 #define BCM2711_PCIE_FUNC_SHIFT   12
 
 #define BCM2711_PCIE_MISC_CTRL            0x4008u
+#define BCM2711_PCIE_MISC_STATUS          0x4068u
 #define BCM2711_PCIE_MISC_REVISION        0x406cu
 #define BCM2711_PCIE_HARD_DEBUG           0x4204u
 #define BCM2711_PCIE_RGR1_SW_INIT_1       0x9210u
@@ -209,6 +212,10 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 #define BCM2711_PCIE_MISC_CTRL_MAX_BURST_MASK  0x300000u
 
 #define BCM2711_PCIE_HARD_DEBUG_SERDES_IDDQ_MASK 0x08000000u
+
+#define BCM2711_PCIE_MISC_STATUS_PCIE_PORT_MASK       0x80u
+#define BCM2711_PCIE_MISC_STATUS_PCIE_DL_ACTIVE_MASK  0x20u
+#define BCM2711_PCIE_MISC_STATUS_PCIE_PHYLINKUP_MASK  0x10u
 
 
 static inline int bcm2711_cfgIndex(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
@@ -265,6 +272,33 @@ static void bcm2711PrepareHostBridge(pcie_bcm2711_ctx_t *ctx)
 }
 
 
+static bool bcm2711LinkUp(pcie_bcm2711_ctx_t *ctx)
+{
+	uint32_t status = readReg(ctx->base, BCM2711_PCIE_MISC_STATUS);
+
+	return ((status & BCM2711_PCIE_MISC_STATUS_PCIE_DL_ACTIVE_MASK) != 0u) &&
+		((status & BCM2711_PCIE_MISC_STATUS_PCIE_PHYLINKUP_MASK) != 0u);
+}
+
+
+static bool bcm2711RcMode(pcie_bcm2711_ctx_t *ctx)
+{
+	uint32_t status = readReg(ctx->base, BCM2711_PCIE_MISC_STATUS);
+
+	return (status & BCM2711_PCIE_MISC_STATUS_PCIE_PORT_MASK) != 0u;
+}
+
+
+static void bcm2711PrepareLinkState(pcie_bcm2711_ctx_t *ctx)
+{
+	bcm2711PerstSet(ctx, 0u);
+	usleep(100000);
+
+	ctx->linkUp = bcm2711LinkUp(ctx);
+	ctx->rcMode = bcm2711RcMode(ctx);
+}
+
+
 static uint32_t bcm2711Read32(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
 {
 	pcie_bcm2711_ctx_t *bcm = (pcie_bcm2711_ctx_t *)ctx;
@@ -275,6 +309,10 @@ static uint32_t bcm2711Read32(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn, u
 		}
 
 		return *bcm2711RootCfgPtr(bcm, off);
+	}
+
+	if (!bcm->linkUp || !bcm->rcMode) {
+		return UINT32_MAX;
 	}
 
 	writeReg(bcm->base, BCM2711_PCIE_EXT_CFG_INDEX, bcm2711_cfgIndex(bus, dev, fn, off));
@@ -293,6 +331,10 @@ static void bcm2711Write32(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn, uint
 		}
 
 		*bcm2711RootCfgPtr(bcm, off) = val;
+		return;
+	}
+
+	if (!bcm->linkUp || !bcm->rcMode) {
 		return;
 	}
 
@@ -339,6 +381,7 @@ static int pcie_cfgInitBcm2711(pcie_cfgio_t *cfgio)
 	cfgio->destroy = pcie_cfgDestroyBcm2711;
 
 	bcm2711PrepareHostBridge(bcm);
+	bcm2711PrepareLinkState(bcm);
 
 	return EOK;
 }
