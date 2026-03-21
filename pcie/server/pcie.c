@@ -59,11 +59,14 @@
 #define PCI_COMMAND         0x04
 #define PCI_STATUS          0x06
 #define PCI_CLASSCODE       0x08
+#define PCI_CACHE_LINE_SIZE 0x0c
 #define PCI_HEADER_TYPE     0x0e
 #define PCI_BAR0            0x10
 #define PCI_PRIMARY_BUS     0x18
 #define PCI_SECONDARY_BUS   0x19
 #define PCI_SUBORDINATE_BUS 0x1a
+#define PCI_MEMORY_BASE     0x20
+#define PCI_MEMORY_LIMIT    0x22
 #define PCI_CAP_PTR         0x34
 
 
@@ -253,6 +256,54 @@ static inline volatile uint32_t *bcm2711RootCfgPtr(pcie_bcm2711_ctx_t *ctx, uint
 }
 
 
+static uint32_t bcm2711RootRead32(pcie_bcm2711_ctx_t *ctx, uint16_t off)
+{
+	return *bcm2711RootCfgPtr(ctx, off);
+}
+
+
+static void bcm2711RootWrite32(pcie_bcm2711_ctx_t *ctx, uint16_t off, uint32_t val)
+{
+	*bcm2711RootCfgPtr(ctx, off) = val;
+}
+
+
+static uint16_t bcm2711RootRead16(pcie_bcm2711_ctx_t *ctx, uint16_t off)
+{
+	uint32_t value = bcm2711RootRead32(ctx, off);
+
+	return ((off & 2u) != 0u) ? (uint16_t)(value >> 16) : (uint16_t)(value & 0xffffu);
+}
+
+
+static void bcm2711RootWrite16(pcie_bcm2711_ctx_t *ctx, uint16_t off, uint16_t val)
+{
+	uint32_t value = bcm2711RootRead32(ctx, off);
+
+	if ((off & 2u) != 0u) {
+		value &= 0x0000ffffu;
+		value |= (uint32_t)val << 16;
+	}
+	else {
+		value &= 0xffff0000u;
+		value |= val;
+	}
+
+	bcm2711RootWrite32(ctx, off, value);
+}
+
+
+static void bcm2711RootWrite8(pcie_bcm2711_ctx_t *ctx, uint16_t off, uint8_t val)
+{
+	uint32_t value = bcm2711RootRead32(ctx, off);
+	unsigned shift = (off & 3u) * 8u;
+
+	value &= ~(0xffu << shift);
+	value |= (uint32_t)val << shift;
+	bcm2711RootWrite32(ctx, off, value);
+}
+
+
 static void bcm2711BridgeSwInitSet(pcie_bcm2711_ctx_t *ctx, uint32_t val)
 {
 	writeRegMsk(ctx->base, BCM2711_PCIE_RGR1_SW_INIT_1,
@@ -388,6 +439,26 @@ static void bcm2711ShapeRootBridge(pcie_bcm2711_ctx_t *ctx)
 }
 
 
+static void bcm2711ExposeDownstreamBridge(pcie_bcm2711_ctx_t *ctx)
+{
+	uint32_t buses = bcm2711RootRead32(ctx, PCI_PRIMARY_BUS);
+	uint16_t command = bcm2711RootRead16(ctx, PCI_COMMAND);
+
+	bcm2711RootWrite8(ctx, PCI_CACHE_LINE_SIZE, 64u / 4u);
+
+	buses &= 0xff000000u;
+	buses |= 0x00010100u;
+	bcm2711RootWrite32(ctx, PCI_PRIMARY_BUS, buses);
+
+	bcm2711RootWrite16(ctx, PCI_MEMORY_BASE, (uint16_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE >> 16));
+	bcm2711RootWrite16(ctx, PCI_MEMORY_LIMIT, (uint16_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE >> 16));
+
+	command |= PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE |
+		PCI_CMD_PARITY_ERR_ENABLE | PCI_CMD_SERR_ERR_ENABLE;
+	bcm2711RootWrite16(ctx, PCI_COMMAND, command);
+}
+
+
 static uint32_t bcm2711Read32(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
 {
 	pcie_bcm2711_ctx_t *bcm = (pcie_bcm2711_ctx_t *)ctx;
@@ -476,6 +547,7 @@ static int pcie_cfgInitBcm2711(pcie_cfgio_t *cfgio)
 			PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
 		bcm2711SetRcBar2(bcm, 0u, 0x100000000ull);
 		bcm2711ShapeRootBridge(bcm);
+		bcm2711ExposeDownstreamBridge(bcm);
 	}
 
 	return EOK;
