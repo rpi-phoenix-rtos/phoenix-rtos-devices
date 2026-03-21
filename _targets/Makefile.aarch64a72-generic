@@ -6,4 +6,4 @@
 # Copyright 2026 Phoenix Systems
 #
 
-DEFAULT_COMPONENTS := pl011-tty
+DEFAULT_COMPONENTS := pl011-tty pcie
