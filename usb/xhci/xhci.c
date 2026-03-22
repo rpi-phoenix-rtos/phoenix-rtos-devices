@@ -128,6 +128,7 @@
 #define XHCI_TRANSFER_TRB_CONTROL_IDT (1u << 6)
 #define XHCI_TRANSFER_TRB_CONTROL_DIR_IN (1u << 16)
 #define XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT 16u
+#define XHCI_TRANSFER_TRB_CONTROL_TRT_NONE 0u
 #define XHCI_TRANSFER_TRB_CONTROL_TRT_IN 3u
 #define XHCI_TRB_TYPE_LINK       6u
 #define XHCI_TRB_TYPE_SETUP_STAGE 2u
@@ -1363,6 +1364,101 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 }
 
 
+static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
+{
+	xhci_trb_t *ring;
+	xhci_trb_t *event;
+	uint64_t statusTrbPhys;
+	uint32_t type;
+	uint32_t completion;
+	uint32_t endpointId;
+	uint32_t slotId;
+	unsigned timeoutMs;
+	int err;
+
+	if ((xhci == NULL) || (t == NULL) || (t->setup == NULL) || (t->size != 0u) || (t->setup->wLength != 0u)) {
+		return -EINVAL;
+	}
+
+	ring = (xhci_trb_t *)xhci->ep0Ring;
+	memset(ring, 0, xhci->ep0RingSize);
+
+	ring[0].parameter =
+		(uint64_t)t->setup->bmRequestType |
+		((uint64_t)t->setup->bRequest << 8) |
+		((uint64_t)t->setup->wValue << 16) |
+		((uint64_t)t->setup->wIndex << 32) |
+		((uint64_t)t->setup->wLength << 48);
+	ring[0].status = sizeof(usb_setup_packet_t);
+	ring[0].control = XHCI_TRB_CONTROL_C |
+		(XHCI_TRB_TYPE_SETUP_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
+		(XHCI_TRANSFER_TRB_CONTROL_TRT_NONE << XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT) |
+		XHCI_TRANSFER_TRB_CONTROL_IDT;
+
+	ring[1].parameter = 0u;
+	ring[1].status = 0u;
+	ring[1].control = XHCI_TRB_CONTROL_C |
+		(XHCI_TRB_TYPE_STATUS_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
+		XHCI_TRANSFER_TRB_CONTROL_DIR_IN |
+		XHCI_TRANSFER_TRB_CONTROL_IOC;
+
+	ring[xhci->ep0RingCount - 1u].parameter = xhci->ep0RingPhys;
+	ring[xhci->ep0RingCount - 1u].status = 0u;
+	ring[xhci->ep0RingCount - 1u].control = XHCI_TRB_CONTROL_C |
+		XHCI_LINK_TRB_CONTROL_TC |
+		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+
+	statusTrbPhys = xhci->ep0RingPhys + XHCI_TRB_SIZE;
+	event = (xhci_trb_t *)xhci->eventRing;
+	memset(event, 0, sizeof(*event));
+
+	err = xhci_enterRunState(xhci);
+	if (err < 0) {
+		return err;
+	}
+
+	xhci_dbWrite32(xhci, xhci->slotId * sizeof(uint32_t), 1u);
+
+	for (timeoutMs = XHCI_CMD_TIMEOUT_MS; timeoutMs > 0u; --timeoutMs) {
+		if ((event->control & XHCI_TRB_CONTROL_C) == (xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
+			break;
+		}
+
+		usleep(1000);
+	}
+
+	if (timeoutMs == 0u) {
+		fprintf(stderr, "xhci: transfer completion timeout\n");
+		(void)xhci_enterHaltedState(xhci);
+		return -ETIMEDOUT;
+	}
+
+	type = (event->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+	completion = (event->status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+	endpointId = (event->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
+	slotId = (event->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
+
+	if ((type != XHCI_TRB_TYPE_EVENT_TRANSFER) || (event->parameter != statusTrbPhys) ||
+		(endpointId != 1u) || (slotId != xhci->slotId)) {
+		fprintf(stderr, "xhci: invalid transfer completion event\n");
+		(void)xhci_enterHaltedState(xhci);
+		return -ENODEV;
+	}
+
+	err = xhci_enterHaltedState(xhci);
+	if (err < 0) {
+		return err;
+	}
+
+	if (completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) {
+		fprintf(stderr, "xhci: transfer completion code %u\n", completion);
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+
 static int xhci_programEventRing(xhci_t *xhci)
 {
 	uint32_t erstbaLo;
@@ -1815,6 +1911,34 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		}
 
 		usb_transferFinished(t, err);
+		return 0;
+	}
+
+	if ((xhci != NULL) && (setup != NULL) &&
+		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub == NULL) &&
+		(pipe->dev->address == (int)xhci->slotId) &&
+		(t->type == usb_transfer_control) &&
+		(t->direction == usb_dir_out) &&
+		(t->size == 0u) &&
+		(setup->wLength == 0u) &&
+		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_HOST2DEV) &&
+		((((EXTRACT_REQ_TYPE(setup->bmRequestType) == REQUEST_TYPE_STANDARD) &&
+			((setup->bmRequestType & 0x1f) == REQUEST_RECIPIENT_DEVICE) &&
+			(setup->bRequest == REQ_SET_CONFIGURATION)) ||
+			((EXTRACT_REQ_TYPE(setup->bmRequestType) == REQUEST_TYPE_CLASS) &&
+			((setup->bmRequestType & 0x1f) == REQUEST_RECIPIENT_INTERFACE) &&
+			((setup->bRequest == CLASS_REQ_SET_PROTOCOL) || (setup->bRequest == CLASS_REQ_SET_IDLE)))))) {
+		err = xhci_initEp0Ring(xhci);
+		if (err < 0) {
+			return err;
+		}
+
+		err = xhci_ep0ControlWriteNoData(xhci, t);
+		if (err < 0) {
+			return err;
+		}
+
+		usb_transferFinished(t, 0);
 		return 0;
 	}
 
