@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/minmax.h>
+#include <sys/threads.h>
 #include <unistd.h>
 
 #include <hcd.h>
@@ -204,6 +205,7 @@ typedef struct {
 typedef struct {
 	void *mmio;
 	size_t mapSz;
+	char statusStack[2048] __attribute__((aligned(8)));
 	uint8_t caplength;
 	uint16_t version;
 	uint32_t hcsparams1;
@@ -254,6 +256,9 @@ typedef struct {
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
+
+
+static uint32_t xhci_getHubStatus(usb_dev_t *hub);
 
 
 static inline uint8_t xhci_read8(xhci_t *xhci, uintptr_t off)
@@ -372,6 +377,27 @@ static void xhci_destroy(xhci_t *xhci)
 	}
 
 	free(xhci);
+}
+
+
+static void xhci_roothubStatusThread(void *arg)
+{
+	hcd_t *hcd = (hcd_t *)arg;
+	usb_dev_t *hub;
+	uint32_t status;
+
+	for (;;) {
+		hub = hcd->roothub;
+		if ((hub != NULL) && (hub->statusTransfer != NULL) && !usb_transferCheck(hub->statusTransfer)) {
+			status = xhci_getHubStatus(hub);
+			if (status != 0u) {
+				memcpy(hub->statusTransfer->buffer, &status, sizeof(status));
+				usb_transferFinished(hub->statusTransfer, hub->statusTransfer->size);
+			}
+		}
+
+		usleep(100000);
+	}
 }
 
 
@@ -970,6 +996,12 @@ static int xhci_init(hcd_t *hcd)
 		xhci_destroy(xhci);
 		hcd->priv = NULL;
 		hcd->base = NULL;
+	}
+	else if (beginthread(xhci_roothubStatusThread, 4, xhci->statusStack, sizeof(xhci->statusStack), hcd) != 0) {
+		xhci_destroy(xhci);
+		hcd->priv = NULL;
+		hcd->base = NULL;
+		err = -ENOMEM;
 	}
 
 	return err;
