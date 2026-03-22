@@ -125,6 +125,7 @@
 #define XHCI_TRB_CONTROL_TRB_TYPE__SHIFT 10u
 #define XHCI_TRB_TYPE_LINK       6u
 #define XHCI_TRB_TYPE_CMD_ENABLE_SLOT 9u
+#define XHCI_TRB_TYPE_CMD_ADDRESS_DEVICE 11u
 #define XHCI_TRB_TYPE_CMD_NO_OP  23u
 #define XHCI_TRB_TYPE_EVENT_CMD_COMPLETION 33u
 #define XHCI_LINK_TRB_CONTROL_TC (1u << 1)
@@ -132,6 +133,8 @@
 #define XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK (0xffu << XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT)
 #define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK (0xffu << XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT)
+#define XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_BSR (1u << 9)
+#define XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_TRB_COMPLETION_CODE_SUCCESS 1u
 #define XHCI_PORT_SPEED_FULL     1u
 #define XHCI_PORT_SPEED_LOW      2u
@@ -1064,6 +1067,29 @@ static int xhci_cmdEnableSlot(xhci_t *xhci, uint8_t *slotId)
 }
 
 
+static int xhci_cmdAddressDevice(xhci_t *xhci, int setAddress)
+{
+	uint32_t control;
+
+	if ((xhci->slotId == 0u) || (xhci->inputCtxPhys == 0u)) {
+		return -EINVAL;
+	}
+
+	if ((!xhci->ac64) && ((xhci->inputCtxPhys >> 32) != 0u)) {
+		fprintf(stderr, "xhci: input context above 32-bit address space\n");
+		return -ENODEV;
+	}
+
+	control = (XHCI_TRB_TYPE_CMD_ADDRESS_DEVICE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
+		((uint32_t)xhci->slotId << XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_SLOTID__SHIFT);
+	if (setAddress == 0) {
+		control |= XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_BSR;
+	}
+
+	return xhci_cmdExec(xhci, xhci->inputCtxPhys, 0u, control, NULL);
+}
+
+
 static int xhci_allocSlotSpace(xhci_t *xhci)
 {
 	uint64_t *dcbaa;
@@ -1610,6 +1636,7 @@ static int xhci_roothubReq(usb_dev_t *hub, usb_transfer_t *t)
 static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 {
 	xhci_t *xhci = (xhci_t *)hcd->priv;
+	usb_setup_packet_t *setup = t->setup;
 	int err;
 
 	if (usb_isRoothub(pipe->dev) != 0) {
@@ -1625,6 +1652,22 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		err = xhci_prepareAddressContext(xhci, pipe->dev);
 		if (err < 0) {
 			return err;
+		}
+
+		if ((setup != NULL) && (setup->bRequest == REQ_SET_ADDRESS)) {
+			if ((uint8_t)setup->wValue != xhci->slotId) {
+				fprintf(stderr, "xhci: requested address %u mismatches slot %u\n",
+					(uint8_t)setup->wValue, xhci->slotId);
+				return -ENOSYS;
+			}
+
+			err = xhci_cmdAddressDevice(xhci, 1);
+			if (err < 0) {
+				return err;
+			}
+
+			usb_transferFinished(t, 0);
+			return 0;
 		}
 	}
 
