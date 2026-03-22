@@ -111,6 +111,12 @@
 #define XHCI_ERST_ALIGN          0x40u
 #define XHCI_ERST_SIZE           0x40u
 #define XHCI_ERST_ENTRY_COUNT    1u
+#define XHCI_CONTEXT_ALIGN       0x40u
+#define XHCI_TRANSFER_RING_ALIGN 0x40u
+#define XHCI_TRANSFER_RING_SIZE  0x1000u
+#define XHCI_MAX_ENDPOINTS       31u
+#define XHCI_CONTEXT_INPUT       1u
+#define XHCI_DCBAA_ENTRY_SIZE    sizeof(uint64_t)
 #define XHCI_TRB_SIZE            16u
 #define XHCI_CNR_TIMEOUT_MS      100u
 #define XHCI_HCRST_TIMEOUT_MS    20u
@@ -199,6 +205,43 @@ typedef struct {
 
 
 typedef struct {
+	uint32_t routeString_speed_mtt_hub_entries;
+	uint32_t maxExitLatency_rootHubPort_ports;
+	uint32_t ttHubSlot_ttPort_ttt_intrTarget;
+	uint32_t usbAddr_slotState;
+	uint32_t reserved[4];
+} __attribute__((packed)) xhci_slot_ctx_t;
+
+
+typedef struct {
+	uint32_t epState_mult_streams_interval;
+	uint32_t cerr_type_burst_packet;
+	uint64_t trDequeuePtr;
+	uint32_t averageTrbLen_maxEsitPayload;
+	uint32_t reserved[3];
+} __attribute__((packed)) xhci_ep_ctx_t;
+
+
+typedef struct {
+	xhci_slot_ctx_t slot;
+	xhci_ep_ctx_t ep[XHCI_MAX_ENDPOINTS];
+} __attribute__((packed)) xhci_dev_ctx_t;
+
+
+typedef struct {
+	uint32_t dropContextFlags;
+	uint32_t addContextFlags;
+	uint32_t reserved[6];
+} __attribute__((packed)) xhci_input_ctrl_ctx_t;
+
+
+typedef struct {
+	xhci_input_ctrl_ctx_t control;
+	xhci_dev_ctx_t device;
+} __attribute__((packed)) xhci_input_ctx_t;
+
+
+typedef struct {
 	uint64_t ringSegmentBase;
 	uint32_t ringSegmentSize;
 	uint32_t reserved;
@@ -241,10 +284,19 @@ typedef struct {
 	uint64_t cmdRingPhys;
 	void *eventRing;
 	void *erst;
+	void *devCtx;
+	void *inputCtx;
+	void *ep0Ring;
 	size_t eventRingSize;
 	size_t erstSize;
+	size_t devCtxSize;
+	size_t inputCtxSize;
+	size_t ep0RingSize;
 	uint64_t eventRingPhys;
 	uint64_t erstPhys;
+	uint64_t devCtxPhys;
+	uint64_t inputCtxPhys;
+	uint64_t ep0RingPhys;
 	uint32_t cmdRingCount;
 	uint32_t cmdCycleState;
 	uint32_t eventRingTrbs;
@@ -379,6 +431,18 @@ static void xhci_destroy(xhci_t *xhci)
 
 	if (xhci->erst != NULL) {
 		usb_freeAligned(xhci->erst, xhci->erstSize);
+	}
+
+	if (xhci->devCtx != NULL) {
+		usb_freeAligned(xhci->devCtx, xhci->devCtxSize);
+	}
+
+	if (xhci->inputCtx != NULL) {
+		usb_freeAligned(xhci->inputCtx, xhci->inputCtxSize);
+	}
+
+	if (xhci->ep0Ring != NULL) {
+		usb_freeAligned(xhci->ep0Ring, xhci->ep0RingSize);
 	}
 
 	free(xhci);
@@ -952,6 +1016,71 @@ static int xhci_cmdEnableSlot(xhci_t *xhci, uint8_t *slotId)
 }
 
 
+static int xhci_allocSlotSpace(xhci_t *xhci)
+{
+	uint64_t *dcbaa;
+	size_t dcbaaOffs;
+
+	if ((xhci->slotId == 0u) || (xhci->slotId > xhci->nslots)) {
+		fprintf(stderr, "xhci: invalid slot id for slot space %u\n", xhci->slotId);
+		return -EINVAL;
+	}
+
+	xhci->devCtxSize = xhci->contextSize * (1u + XHCI_MAX_ENDPOINTS);
+	xhci->inputCtxSize = xhci->contextSize * (XHCI_CONTEXT_INPUT + 1u + XHCI_MAX_ENDPOINTS);
+	xhci->ep0RingSize = XHCI_TRANSFER_RING_SIZE;
+
+	xhci->devCtx = usb_allocAligned(xhci->devCtxSize, XHCI_CONTEXT_ALIGN);
+	if (xhci->devCtx == NULL) {
+		fprintf(stderr, "xhci: failed to allocate device context\n");
+		return -ENOMEM;
+	}
+
+	xhci->inputCtx = usb_allocAligned(xhci->inputCtxSize, XHCI_CONTEXT_ALIGN);
+	if (xhci->inputCtx == NULL) {
+		fprintf(stderr, "xhci: failed to allocate input context\n");
+		return -ENOMEM;
+	}
+
+	xhci->ep0Ring = usb_allocAligned(xhci->ep0RingSize, XHCI_TRANSFER_RING_ALIGN);
+	if (xhci->ep0Ring == NULL) {
+		fprintf(stderr, "xhci: failed to allocate ep0 ring\n");
+		return -ENOMEM;
+	}
+
+	memset(xhci->devCtx, 0, xhci->devCtxSize);
+	memset(xhci->inputCtx, 0, xhci->inputCtxSize);
+	memset(xhci->ep0Ring, 0, xhci->ep0RingSize);
+
+	xhci->devCtxPhys = va2pa(xhci->devCtx);
+	xhci->inputCtxPhys = va2pa(xhci->inputCtx);
+	xhci->ep0RingPhys = va2pa(xhci->ep0Ring);
+
+	if (((xhci->devCtxPhys & (XHCI_CONTEXT_ALIGN - 1u)) != 0u) ||
+		((xhci->inputCtxPhys & (XHCI_CONTEXT_ALIGN - 1u)) != 0u) ||
+		((xhci->ep0RingPhys & (XHCI_TRANSFER_RING_ALIGN - 1u)) != 0u)) {
+		fprintf(stderr, "xhci: invalid slot-space alignment\n");
+		return -ENODEV;
+	}
+
+	dcbaaOffs = xhci->slotId * XHCI_DCBAA_ENTRY_SIZE;
+	if ((dcbaaOffs + XHCI_DCBAA_ENTRY_SIZE) > xhci->dcbaaSize) {
+		fprintf(stderr, "xhci: slot id %u exceeds dcbaa size\n", xhci->slotId);
+		return -ENODEV;
+	}
+
+	dcbaa = (uint64_t *)xhci->dcbaa;
+	dcbaa[xhci->slotId] = xhci->devCtxPhys;
+
+	if (dcbaa[xhci->slotId] != xhci->devCtxPhys) {
+		fprintf(stderr, "xhci: failed to bind dcbaa slot entry\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_programEventRing(xhci_t *xhci)
 {
 	uint32_t erstbaLo;
@@ -1026,6 +1155,9 @@ static int xhci_init(hcd_t *hcd)
 									err = xhci_cmdNoopSelftest(xhci);
 									if (err == 0) {
 										err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
+										if (err == 0) {
+											err = xhci_allocSlotSpace(xhci);
+										}
 									}
 								}
 							}
