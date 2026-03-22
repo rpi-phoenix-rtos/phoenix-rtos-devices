@@ -53,6 +53,14 @@
 #define XHCI_REG_OP_DCBAAP       0x30u
 #define XHCI_REG_OP_DCBAAP_HI    0x34u
 #define XHCI_REG_OP_CONFIG       0x38u
+#define XHCI_REG_RT_IR0          0x20u
+#define XHCI_REG_RT_IR_IMAN      0x00u
+#define XHCI_REG_RT_IR_ERSTSZ    0x08u
+#define XHCI_REG_RT_IR_ERSTBA_LO 0x10u
+#define XHCI_REG_RT_IR_ERSTBA_HI 0x14u
+#define XHCI_REG_RT_IR_ERDP_LO   0x18u
+#define XHCI_REG_RT_IR_ERDP_HI   0x1cu
+#define XHCI_REG_RT_IR__SIZE     0x20u
 #define XHCI_SUPPORTED_VERSION   0x0100u
 #define XHCI_REG_OP_USBCMD_RS    (1u << 0)
 #define XHCI_REG_OP_USBCMD_HCRST (1u << 1)
@@ -68,6 +76,10 @@
 #define XHCI_REG_OP_CRCR_CR_PTR_LO__MASK 0xffffffc0u
 #define XHCI_REG_OP_DCBAAP__MASK 0xffffffc0u
 #define XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK 0xffu
+#define XHCI_REG_RT_IR_ERSTSZ__MASK 0xffffu
+#define XHCI_REG_RT_IR_ERSTBA_LO__MASK 0xffffffc0u
+#define XHCI_REG_RT_IR_ERDP_LO_EHB (1u << 3)
+#define XHCI_REG_RT_IR_ERDP_LO__MASK 0xfffffff0u
 #define XHCI_DCBAA_ALIGN         0x1000u
 #define XHCI_DCBAA_SIZE          0x1000u
 #define XHCI_CMD_RING_ALIGN      0x10000u
@@ -136,6 +148,13 @@ typedef struct {
 	uint64_t eventRingPhys;
 	uint64_t erstPhys;
 	uint32_t eventRingTrbs;
+	uint32_t erstsz;
+	uint32_t erstbaLo;
+	uint32_t erstbaHi;
+	uint32_t erdpLo;
+	uint32_t erdpHi;
+	uint64_t erstba;
+	uint64_t erdp;
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
@@ -174,6 +193,20 @@ static inline uint32_t xhci_opRead32(xhci_t *xhci, uintptr_t off)
 static inline void xhci_opWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
 {
 	volatile uint32_t *reg = (volatile uint32_t *)((volatile uint8_t *)xhci->mmio + xhci->caplength + off);
+
+	*reg = val;
+}
+
+
+static inline uint32_t xhci_rtRead32(xhci_t *xhci, uintptr_t off)
+{
+	return xhci_read32(xhci, xhci->rtsoff + XHCI_REG_RT_IR0 + off);
+}
+
+
+static inline void xhci_rtWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
+{
+	volatile uint32_t *reg = (volatile uint32_t *)((volatile uint8_t *)xhci->mmio + xhci->rtsoff + XHCI_REG_RT_IR0 + off);
 
 	*reg = val;
 }
@@ -563,6 +596,49 @@ static int xhci_allocEventRing(xhci_t *xhci)
 }
 
 
+static int xhci_programEventRing(xhci_t *xhci)
+{
+	uint32_t erstbaLo;
+	uint32_t erstbaHi;
+	uint32_t erdpLo;
+	uint32_t erdpHi;
+
+	erstbaLo = (uint32_t)(xhci->erstPhys & XHCI_REG_RT_IR_ERSTBA_LO__MASK);
+	erstbaHi = (uint32_t)(xhci->erstPhys >> 32);
+	erdpLo = (uint32_t)(xhci->eventRingPhys & XHCI_REG_RT_IR_ERDP_LO__MASK);
+	erdpHi = (uint32_t)(xhci->eventRingPhys >> 32);
+
+	if ((!xhci->ac64) && ((erstbaHi != 0u) || (erdpHi != 0u))) {
+		fprintf(stderr, "xhci: event ring state above 32-bit address space\n");
+		return -ENODEV;
+	}
+
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTSZ, XHCI_ERST_ENTRY_COUNT & XHCI_REG_RT_IR_ERSTSZ__MASK);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_HI, erstbaHi);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_LO, erstbaLo);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, erdpHi);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO, erdpLo);
+
+	xhci->erstsz = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTSZ);
+	xhci->erstbaLo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO);
+	xhci->erstbaHi = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_HI);
+	xhci->erdpLo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO);
+	xhci->erdpHi = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_HI);
+	xhci->erstba = ((uint64_t)xhci->erstbaHi << 32) | (xhci->erstbaLo & XHCI_REG_RT_IR_ERSTBA_LO__MASK);
+	xhci->erdp = ((uint64_t)xhci->erdpHi << 32) | (xhci->erdpLo & XHCI_REG_RT_IR_ERDP_LO__MASK);
+
+	if (((xhci->erstsz & XHCI_REG_RT_IR_ERSTSZ__MASK) != XHCI_ERST_ENTRY_COUNT) ||
+		(xhci->erstba != xhci->erstPhys) ||
+		(xhci->erdp != xhci->eventRingPhys) ||
+		((xhci->erdpLo & XHCI_REG_RT_IR_ERDP_LO_EHB) != 0u)) {
+		fprintf(stderr, "xhci: event ring register program mismatch\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
@@ -587,7 +663,10 @@ static int xhci_init(hcd_t *hcd)
 						if (err == 0) {
 							err = xhci_allocEventRing(xhci);
 							if (err == 0) {
-								err = -ENOSYS;
+								err = xhci_programEventRing(xhci);
+								if (err == 0) {
+									err = -ENOSYS;
+								}
 							}
 						}
 					}
