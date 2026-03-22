@@ -136,6 +136,7 @@
 #define XHCI_TRB_TYPE_STATUS_STAGE 4u
 #define XHCI_TRB_TYPE_CMD_ENABLE_SLOT 9u
 #define XHCI_TRB_TYPE_CMD_ADDRESS_DEVICE 11u
+#define XHCI_TRB_TYPE_CMD_CONFIGURE_ENDPOINT 12u
 #define XHCI_TRB_TYPE_CMD_NO_OP  23u
 #define XHCI_TRB_TYPE_EVENT_TRANSFER 32u
 #define XHCI_TRB_TYPE_EVENT_CMD_COMPLETION 33u
@@ -151,6 +152,8 @@
 #define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK (0xffu << XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT)
 #define XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_BSR (1u << 9)
 #define XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_SLOTID__SHIFT 24u
+#define XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_DC (1u << 9)
+#define XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_TRB_COMPLETION_CODE_SUCCESS 1u
 #define XHCI_TRB_COMPLETION_CODE_SHORT_PACKET 13u
 #define XHCI_PORT_SPEED_FULL     1u
@@ -162,8 +165,12 @@
 #define XHCI_EP_CTX_CERR__SHIFT  1u
 #define XHCI_EP_CTX_TYPE__SHIFT  3u
 #define XHCI_EP_CTX_TYPE_CONTROL 4u
+#define XHCI_EP_CTX_TYPE_INTERRUPT_IN 7u
+#define XHCI_EP_CTX_INTERVAL__SHIFT 16u
+#define XHCI_EP_CTX_MAX_BURST__SHIFT 8u
 #define XHCI_EP_CTX_MAX_PACKET__SHIFT 16u
 #define XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS (1u << 0)
+#define XHCI_EP_CTX_MAX_ESIT_PAYLOAD__SHIFT 16u
 #define XHCI_INPUT_CTRL_CTX_ADD_A0_A1 0x3u
 #define XHCI_CMD_TIMEOUT_MS      100u
 #define XHCI_PORT_RESET_TIMEOUT_MS 100u
@@ -346,6 +353,17 @@ typedef struct {
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
+
+
+typedef struct {
+	void *ring;
+	size_t ringSize;
+	uint64_t ringPhys;
+	uint32_t ringCount;
+	uint32_t cycleState;
+	uint8_t endpointId;
+	uint8_t endpointType;
+} xhci_pipePriv_t;
 
 
 static uint32_t xhci_getHubStatus(usb_dev_t *hub);
@@ -1107,6 +1125,24 @@ static int xhci_cmdAddressDevice(xhci_t *xhci, int setAddress)
 }
 
 
+static int xhci_cmdConfigureEndpoint(xhci_t *xhci, int deconfigure)
+{
+	uint32_t control;
+
+	if ((xhci->slotId == 0u) || (xhci->inputCtxPhys == 0u)) {
+		return -EINVAL;
+	}
+
+	control = (XHCI_TRB_TYPE_CMD_CONFIGURE_ENDPOINT << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
+		((uint32_t)xhci->slotId << XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_SLOTID__SHIFT);
+	if (deconfigure != 0) {
+		control |= XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_DC;
+	}
+
+	return xhci_cmdExec(xhci, xhci->inputCtxPhys, 0u, control, NULL);
+}
+
+
 static int xhci_allocSlotSpace(xhci_t *xhci)
 {
 	uint64_t *dcbaa;
@@ -1206,6 +1242,54 @@ static int xhci_initEp0Ring(xhci_t *xhci)
 }
 
 
+static uint8_t xhci_pipeEndpointId(const usb_pipe_t *pipe)
+{
+	uint8_t endpointId;
+
+	if ((pipe == NULL) || (pipe->num <= 0) || (pipe->num > 15)) {
+		return 0u;
+	}
+
+	endpointId = (uint8_t)(pipe->num * 2);
+	if (pipe->dir == usb_dir_in) {
+		endpointId++;
+	}
+
+	return endpointId;
+}
+
+
+static uint8_t xhci_convertInterval(const usb_pipe_t *pipe)
+{
+	unsigned interval;
+	unsigned i;
+
+	if ((pipe == NULL) || (pipe->interval <= 0)) {
+		return 0u;
+	}
+
+	interval = (unsigned)pipe->interval;
+	if (pipe->dev->speed == usb_high_speed) {
+		if (interval < 1u) {
+			interval = 1u;
+		}
+		if (interval > 16u) {
+			interval = 16u;
+		}
+
+		return (uint8_t)(interval - 1u);
+	}
+
+	for (i = 3u; i < 11u; ++i) {
+		if ((125u * (1u << i)) >= (1000u * interval)) {
+			break;
+		}
+	}
+
+	return (uint8_t)i;
+}
+
+
 static int xhci_prepareAddressContext(xhci_t *xhci, usb_dev_t *dev)
 {
 	xhci_input_ctx_t *input;
@@ -1253,6 +1337,97 @@ static int xhci_prepareAddressContext(xhci_t *xhci, usb_dev_t *dev)
 	}
 
 	return EOK;
+}
+
+
+static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
+{
+	xhci_input_ctx_t *input;
+	xhci_ep_ctx_t *epctx;
+	xhci_trb_t *ring;
+	xhci_trb_t *link;
+	xhci_pipePriv_t *priv;
+	uint8_t endpointId;
+	uint32_t interval;
+	int err;
+
+	if ((xhci == NULL) || (pipe == NULL)) {
+		return -EINVAL;
+	}
+
+	if (pipe->hcdpriv != NULL) {
+		return 0;
+	}
+
+	if ((pipe->type != usb_transfer_interrupt) || (pipe->dir != usb_dir_in) ||
+		(pipe->dev->hub == NULL) || (pipe->dev->hub->hub != NULL) ||
+		(pipe->dev->address != (int)xhci->slotId)) {
+		return -EINVAL;
+	}
+
+	endpointId = xhci_pipeEndpointId(pipe);
+	if (endpointId == 0u) {
+		return -EINVAL;
+	}
+
+	priv = calloc(1, sizeof(*priv));
+	if (priv == NULL) {
+		return -ENOMEM;
+	}
+
+	priv->ringSize = XHCI_TRANSFER_RING_SIZE;
+	priv->endpointId = endpointId;
+	priv->endpointType = XHCI_EP_CTX_TYPE_INTERRUPT_IN;
+	priv->ring = usb_allocAligned(priv->ringSize, XHCI_TRANSFER_RING_ALIGN);
+	if (priv->ring == NULL) {
+		free(priv);
+		return -ENOMEM;
+	}
+
+	memset(priv->ring, 0, priv->ringSize);
+	priv->ringPhys = va2pa(priv->ring);
+	priv->ringCount = priv->ringSize / XHCI_TRB_SIZE;
+	priv->cycleState = 1u;
+	if (((priv->ringPhys & (XHCI_TRANSFER_RING_ALIGN - 1u)) != 0u) || (priv->ringCount <= 1u)) {
+		usb_freeAligned(priv->ring, priv->ringSize);
+		free(priv);
+		return -EINVAL;
+	}
+
+	ring = (xhci_trb_t *)priv->ring;
+	link = &ring[priv->ringCount - 1u];
+	link->parameter = priv->ringPhys;
+	link->status = 0u;
+	link->control = XHCI_TRB_CONTROL_C |
+		XHCI_LINK_TRB_CONTROL_TC |
+		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+
+	memset(xhci->inputCtx, 0, xhci->inputCtxSize);
+	input = (xhci_input_ctx_t *)xhci->inputCtx;
+	input->control.addContextFlags = 1u << endpointId;
+	input->control.dropContextFlags = 1u << endpointId;
+
+	epctx = &input->device.ep[endpointId - 1u];
+	interval = xhci_convertInterval(pipe);
+	epctx->epState_mult_streams_interval = interval << XHCI_EP_CTX_INTERVAL__SHIFT;
+	epctx->cerr_type_burst_packet =
+		(3u << XHCI_EP_CTX_CERR__SHIFT) |
+		((uint32_t)priv->endpointType << XHCI_EP_CTX_TYPE__SHIFT) |
+		(0u << XHCI_EP_CTX_MAX_BURST__SHIFT) |
+		((uint32_t)pipe->maxPacketLen << XHCI_EP_CTX_MAX_PACKET__SHIFT);
+	epctx->trDequeuePtr = priv->ringPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS;
+	epctx->averageTrbLen_maxEsitPayload = 16u |
+		((uint32_t)pipe->maxPacketLen << XHCI_EP_CTX_MAX_ESIT_PAYLOAD__SHIFT);
+
+	err = xhci_cmdConfigureEndpoint(xhci, 0);
+	if (err < 0) {
+		usb_freeAligned(priv->ring, priv->ringSize);
+		free(priv);
+		return err;
+	}
+
+	pipe->hcdpriv = priv;
+	return 0;
 }
 
 
@@ -1942,6 +2117,19 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		return 0;
 	}
 
+	if ((xhci != NULL) &&
+		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub == NULL) &&
+		(pipe->dev->address == (int)xhci->slotId) &&
+		(t->type == usb_transfer_interrupt) &&
+		(t->direction == usb_dir_in)) {
+		err = xhci_initInterruptInPipe(xhci, pipe);
+		if (err < 0) {
+			return err;
+		}
+
+		return -ENOSYS;
+	}
+
 	return -ENOSYS;
 }
 
@@ -1955,8 +2143,22 @@ static void xhci_transferDequeue(hcd_t *hcd, usb_transfer_t *t)
 
 static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 {
+	xhci_pipePriv_t *priv;
+
 	(void)hcd;
-	(void)pipe;
+
+	if ((pipe == NULL) || (pipe->hcdpriv == NULL)) {
+		return;
+	}
+
+	priv = (xhci_pipePriv_t *)pipe->hcdpriv;
+	pipe->hcdpriv = NULL;
+
+	if (priv->ring != NULL) {
+		usb_freeAligned(priv->ring, priv->ringSize);
+	}
+
+	free(priv);
 }
 
 
