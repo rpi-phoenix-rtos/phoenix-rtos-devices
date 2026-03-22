@@ -15,9 +15,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/minmax.h>
 #include <unistd.h>
 
 #include <hcd.h>
+#include <hub.h>
 
 
 #define XHCI_MAP_SIZE            0x10000u
@@ -53,6 +55,9 @@
 #define XHCI_REG_OP_DCBAAP       0x30u
 #define XHCI_REG_OP_DCBAAP_HI    0x34u
 #define XHCI_REG_OP_CONFIG       0x38u
+#define XHCI_REG_OP_PORTS_BASE   0x400u
+#define XHCI_REG_OP_PORT__SIZE   0x10u
+#define XHCI_REG_OP_PORT_PORTSC  0x00u
 #define XHCI_REG_RT_IR0          0x20u
 #define XHCI_REG_RT_IR_IMAN      0x00u
 #define XHCI_REG_RT_IR_ERSTSZ    0x08u
@@ -76,6 +81,22 @@
 #define XHCI_REG_OP_CRCR_CR_PTR_LO__MASK 0xffffffc0u
 #define XHCI_REG_OP_DCBAAP__MASK 0xffffffc0u
 #define XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK 0xffu
+#define XHCI_REG_OP_PORT_PORTSC_CCS (1u << 0)
+#define XHCI_REG_OP_PORT_PORTSC_PED (1u << 1)
+#define XHCI_REG_OP_PORT_PORTSC_OCA (1u << 3)
+#define XHCI_REG_OP_PORT_PORTSC_PR  (1u << 4)
+#define XHCI_REG_OP_PORT_PORTSC_PLS__SHIFT 5u
+#define XHCI_REG_OP_PORT_PORTSC_PLS__MASK  (0xfu << XHCI_REG_OP_PORT_PORTSC_PLS__SHIFT)
+#define XHCI_REG_OP_PORT_PORTSC_PLS_U0     0u
+#define XHCI_REG_OP_PORT_PORTSC_PP  (1u << 9)
+#define XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__SHIFT 10u
+#define XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__MASK  (0xfu << XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__SHIFT)
+#define XHCI_REG_OP_PORT_PORTSC_CSC (1u << 17)
+#define XHCI_REG_OP_PORT_PORTSC_PEC (1u << 18)
+#define XHCI_REG_OP_PORT_PORTSC_OCC (1u << 20)
+#define XHCI_REG_OP_PORT_PORTSC_PRC (1u << 21)
+#define XHCI_REG_OP_PORT_PORTSC_RW1C (XHCI_REG_OP_PORT_PORTSC_CSC | XHCI_REG_OP_PORT_PORTSC_PEC | \
+	XHCI_REG_OP_PORT_PORTSC_OCC | XHCI_REG_OP_PORT_PORTSC_PRC)
 #define XHCI_REG_RT_IR_ERSTSZ__MASK 0xffffu
 #define XHCI_REG_RT_IR_ERSTBA_LO__MASK 0xffffffc0u
 #define XHCI_REG_RT_IR_ERDP_LO_EHB (1u << 3)
@@ -103,6 +124,67 @@
 #define XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK (0xffu << XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT)
 #define XHCI_TRB_COMPLETION_CODE_SUCCESS 1u
 #define XHCI_CMD_TIMEOUT_MS      100u
+#define XHCI_PORT_RESET_TIMEOUT_MS 100u
+#define XHCI_PORT_POWER_GOOD_DELAY_US 20000u
+
+
+static const struct {
+	usb_device_desc_t dev;
+	usb_configuration_desc_t cfg;
+	usb_interface_desc_t iface;
+	usb_endpoint_desc_t ep;
+	const char langID[2];
+	const char product[16];
+	const char manufacturer[16];
+} __attribute__((packed)) xhci_descs = {
+	{
+		.bLength = sizeof(xhci_descs.dev),
+		.bcdUSB = 0x0300,
+		.bDeviceClass = USB_CLASS_HUB,
+		.bDeviceSubClass = 0,
+		.bDeviceProtocol = USB_HUB_PROTO_ROOT,
+		.bMaxPacketSize0 = 64,
+		.idVendor = 0x0,
+		.idProduct = 0x0,
+		.bcdDevice = 0x0,
+		.iManufacturer = 2,
+		.iProduct = 1,
+		.iSerialNumber = 0,
+		.bNumConfigurations = 1,
+	},
+	{
+		.bLength = sizeof(xhci_descs.cfg),
+		.bDescriptorType = USB_DESC_CONFIG,
+		.wTotalLength = sizeof(xhci_descs.cfg) + sizeof(xhci_descs.iface) + sizeof(xhci_descs.ep),
+		.bNumInterfaces = 1,
+		.bConfigurationValue = 1,
+		.iConfiguration = 0,
+		.bmAttributes = 0,
+		.bMaxPower = 0,
+	},
+	{
+		.bLength = sizeof(xhci_descs.iface),
+		.bDescriptorType = USB_DESC_INTERFACE,
+		.bInterfaceNumber = 0,
+		.bAlternateSetting = 0,
+		.bNumEndpoints = 1,
+		.bInterfaceClass = USB_CLASS_HUB,
+		.bInterfaceSubClass = 0,
+		.bInterfaceProtocol = 0,
+		.iInterface = 0,
+	},
+	{
+		.bLength = sizeof(xhci_descs.ep),
+		.bDescriptorType = USB_DESC_ENDPOINT,
+		.bEndpointAddress = USB_ENDPT_DIR_IN | (1 << 7),
+		.bmAttributes = USB_ENDPT_TYPE_INTR,
+		.wMaxPacketSize = 4,
+		.bInterval = 0xff,
+	},
+	{ 0x04, 0x09 },
+	"3.0 root hub",
+	"Phoenix Systems"
+};
 
 
 typedef struct {
@@ -231,6 +313,35 @@ static inline void xhci_dbWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
 	volatile uint32_t *reg = (volatile uint32_t *)((volatile uint8_t *)xhci->mmio + xhci->dboff + off);
 
 	*reg = val;
+}
+
+
+static inline uint32_t xhci_portRead32(xhci_t *xhci, unsigned int port, uintptr_t off)
+{
+	return xhci_opRead32(xhci, XHCI_REG_OP_PORTS_BASE + ((port - 1u) * XHCI_REG_OP_PORT__SIZE) + off);
+}
+
+
+static inline void xhci_portWrite32(xhci_t *xhci, unsigned int port, uintptr_t off, uint32_t val)
+{
+	xhci_opWrite32(xhci, XHCI_REG_OP_PORTS_BASE + ((port - 1u) * XHCI_REG_OP_PORT__SIZE) + off, val);
+}
+
+
+static int xhci_portWaitBits(xhci_t *xhci, unsigned int port, uint32_t mask, uint32_t value, unsigned int timeoutMs)
+{
+	uint32_t reg;
+
+	for (; timeoutMs > 0u; --timeoutMs) {
+		reg = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
+		if ((reg & mask) == value) {
+			return EOK;
+		}
+
+		usleep(1000);
+	}
+
+	return -ETIMEDOUT;
 }
 
 
@@ -868,11 +979,301 @@ static int xhci_init(hcd_t *hcd)
 }
 
 
+static int xhci_getStringDesc(int index, char *buf, size_t size)
+{
+	usb_string_desc_t *desc;
+	size_t len = 0u;
+	const char *src;
+	int i;
+
+	switch (index) {
+		case 0:
+			len = 4u;
+			src = xhci_descs.langID;
+			break;
+		case 1:
+			len = strlen(xhci_descs.product) * 2u + 3u;
+			src = xhci_descs.product;
+			break;
+		case 2:
+			len = strlen(xhci_descs.manufacturer) * 2u + 3u;
+			src = xhci_descs.manufacturer;
+			break;
+		default:
+			return 0;
+	}
+
+	if (size < len) {
+		return -1;
+	}
+
+	desc = (usb_string_desc_t *)buf;
+	desc->bDescriptorType = USB_DESC_STRING;
+	desc->bLength = len;
+
+	if (index == 0) {
+		memcpy(buf, src, len - 2u);
+	}
+	else {
+		memset(desc->wData, 0, len - 2u);
+
+		for (i = 0; src[i] != '\0'; ++i) {
+			desc->wData[i * 2] = src[i];
+		}
+	}
+
+	return len;
+}
+
+
+static int xhci_getDesc(usb_dev_t *hub, int type, int index, char *buf, size_t size)
+{
+	hcd_t *hcd = hub->hcd;
+	xhci_t *xhci = (xhci_t *)hcd->priv;
+	usb_hub_desc_t *hdesc;
+	int bytes = 0;
+
+	switch (type) {
+		case USB_DESC_DEVICE:
+			bytes = min(size, xhci_descs.dev.bLength);
+			memcpy(buf, &xhci_descs.dev, bytes);
+			break;
+
+		case USB_DESC_CONFIG:
+			bytes = min(size, xhci_descs.cfg.wTotalLength);
+			memcpy(buf, &xhci_descs.cfg, bytes);
+			break;
+
+		case USB_DESC_STRING:
+			bytes = xhci_getStringDesc(index, buf, size);
+			break;
+
+		case USB_DESC_TYPE_HUB:
+			if (size < sizeof(usb_hub_desc_t) + 2u) {
+				break;
+			}
+
+			hdesc = (usb_hub_desc_t *)buf;
+			hdesc->bDescLength = 9;
+			hdesc->bDescriptorType = USB_DESC_TYPE_HUB;
+			hdesc->wHubCharacteristics = 0x1;
+			hdesc->bPwrOn2PwrGood = 10;
+			hdesc->bHubContrCurrent = 0;
+			hdesc->bNbrPorts = min((unsigned int)USB_HUB_MAX_PORTS, xhci->nports);
+			hdesc->variable[0] = 0;
+			hdesc->variable[1] = 0xff;
+			bytes = hdesc->bDescLength;
+			break;
+	}
+
+	return bytes;
+}
+
+
+static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *status)
+{
+	hcd_t *hcd = hub->hcd;
+	xhci_t *xhci = (xhci_t *)hcd->priv;
+	uint32_t portsc;
+	uint32_t speed;
+
+	if ((port <= 0) || (port > hub->nports)) {
+		return -1;
+	}
+
+	memset(status, 0, sizeof(*status));
+
+	portsc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) {
+		status->wPortStatus |= USB_PORT_STAT_CONNECTION;
+	}
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_PED) != 0u) {
+		status->wPortStatus |= USB_PORT_STAT_ENABLE;
+	}
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_OCA) != 0u) {
+		status->wPortStatus |= USB_PORT_STAT_OVERCURRENT;
+	}
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_PR) != 0u) {
+		status->wPortStatus |= USB_PORT_STAT_RESET;
+	}
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_PP) != 0u) {
+		status->wPortStatus |= USB_PORT_STAT_POWER;
+	}
+
+	speed = (portsc & XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__MASK) >> XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__SHIFT;
+	if (speed == 2u) {
+		status->wPortStatus |= USB_PORT_STAT_LOW_SPEED;
+	}
+	else if (speed == 3u) {
+		status->wPortStatus |= USB_PORT_STAT_HIGH_SPEED;
+	}
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_CSC) != 0u) {
+		status->wPortChange |= USB_PORT_STAT_C_CONNECTION;
+	}
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_PEC) != 0u) {
+		status->wPortChange |= USB_PORT_STAT_C_ENABLE;
+	}
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_OCC) != 0u) {
+		status->wPortChange |= USB_PORT_STAT_C_OVERCURRENT;
+	}
+
+	if ((portsc & XHCI_REG_OP_PORT_PORTSC_PRC) != 0u) {
+		status->wPortChange |= USB_PORT_STAT_C_RESET;
+	}
+
+	return 0;
+}
+
+
+static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
+{
+	hcd_t *hcd = hub->hcd;
+	xhci_t *xhci = (xhci_t *)hcd->priv;
+	uint32_t portsc;
+	int err;
+
+	if ((port <= 0) || (port > hub->nports)) {
+		return -1;
+	}
+
+	portsc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
+
+	switch (wValue) {
+		case USB_PORT_FEAT_RESET:
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc | XHCI_REG_OP_PORT_PORTSC_PR) & ~XHCI_REG_OP_PORT_PORTSC_PED);
+			err = xhci_portWaitBits(xhci, port, XHCI_REG_OP_PORT_PORTSC_PR, 0u, XHCI_PORT_RESET_TIMEOUT_MS);
+			if (err < 0) {
+				return err;
+			}
+			err = xhci_portWaitBits(xhci, port, XHCI_REG_OP_PORT_PORTSC_PLS__MASK,
+				XHCI_REG_OP_PORT_PORTSC_PLS_U0 << XHCI_REG_OP_PORT_PORTSC_PLS__SHIFT, XHCI_PORT_RESET_TIMEOUT_MS);
+			if (err < 0) {
+				return err;
+			}
+			break;
+
+		case USB_PORT_FEAT_POWER:
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc | XHCI_REG_OP_PORT_PORTSC_PP);
+			usleep(XHCI_PORT_POWER_GOOD_DELAY_US);
+			break;
+
+		case USB_PORT_FEAT_SUSPEND:
+		case USB_PORT_FEAT_TEST:
+		case USB_PORT_FEAT_INDICATOR:
+			break;
+
+		default:
+			return -1;
+	}
+
+	return 0;
+}
+
+
+static int xhci_clearPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
+{
+	hcd_t *hcd = hub->hcd;
+	xhci_t *xhci = (xhci_t *)hcd->priv;
+	uint32_t portsc;
+
+	if ((port <= 0) || (port > hub->nports)) {
+		return -1;
+	}
+
+	portsc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
+
+	switch (wValue) {
+		case USB_PORT_FEAT_C_CONNECTION:
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_CSC);
+			break;
+
+		case USB_PORT_FEAT_C_ENABLE:
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_PEC);
+			break;
+
+		case USB_PORT_FEAT_C_OVER_CURRENT:
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_OCC);
+			break;
+
+		case USB_PORT_FEAT_C_RESET:
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_PRC);
+			break;
+
+		case USB_PORT_FEAT_ENABLE:
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C));
+			break;
+
+		case USB_PORT_FEAT_POWER:
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc & ~(XHCI_REG_OP_PORT_PORTSC_PP | XHCI_REG_OP_PORT_PORTSC_RW1C));
+			break;
+
+		case USB_PORT_FEAT_INDICATOR:
+		case USB_PORT_FEAT_SUSPEND:
+		case USB_PORT_FEAT_C_SUSPEND:
+			break;
+
+		default:
+			return -1;
+	}
+
+	return 0;
+}
+
+
+static int xhci_roothubReq(usb_dev_t *hub, usb_transfer_t *t)
+{
+	usb_setup_packet_t *setup = t->setup;
+	int ret;
+
+	if (t->type == usb_transfer_interrupt) {
+		return 0;
+	}
+
+	switch (setup->bRequest) {
+		case REQ_GET_STATUS:
+			ret = xhci_getPortStatus(hub, setup->wIndex, (usb_port_status_t *)t->buffer);
+			break;
+
+		case REQ_SET_FEATURE:
+			ret = xhci_setPortFeature(hub, setup->wIndex, setup->wValue);
+			break;
+
+		case REQ_CLEAR_FEATURE:
+			ret = xhci_clearPortFeature(hub, setup->wIndex, setup->wValue);
+			break;
+
+		case REQ_GET_DESCRIPTOR:
+			ret = xhci_getDesc(hub, setup->wValue >> 8, setup->wValue & 0xff, t->buffer, t->size);
+			break;
+
+		case REQ_SET_ADDRESS:
+		case REQ_SET_CONFIGURATION:
+			ret = 0;
+			break;
+
+		default:
+			ret = -1;
+	}
+
+	usb_transferFinished(t, ret);
+
+	return 0;
+}
+
+
 static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 {
-	(void)hcd;
-	(void)t;
-	(void)pipe;
+	if (usb_isRoothub(pipe->dev) != 0) {
+		return xhci_roothubReq(pipe->dev, t);
+	}
 
 	return -ENOSYS;
 }
@@ -894,9 +1295,20 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 
 static uint32_t xhci_getHubStatus(usb_dev_t *hub)
 {
-	(void)hub;
+	hcd_t *hcd = hub->hcd;
+	xhci_t *xhci = (xhci_t *)hcd->priv;
+	uint32_t status = 0u;
+	uint32_t portsc;
+	int i;
 
-	return 0u;
+	for (i = 0; i < hub->nports; ++i) {
+		portsc = xhci_portRead32(xhci, i + 1, XHCI_REG_OP_PORT_PORTSC);
+		if ((portsc & XHCI_REG_OP_PORT_PORTSC_RW1C) != 0u) {
+			status |= 1u << (i + 1);
+		}
+	}
+
+	return status;
 }
 
 
