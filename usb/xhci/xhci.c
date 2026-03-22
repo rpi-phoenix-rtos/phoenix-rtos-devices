@@ -131,6 +131,7 @@
 #define XHCI_TRANSFER_TRB_CONTROL_TRT_NONE 0u
 #define XHCI_TRANSFER_TRB_CONTROL_TRT_IN 3u
 #define XHCI_TRB_TYPE_LINK       6u
+#define XHCI_TRB_TYPE_NORMAL     1u
 #define XHCI_TRB_TYPE_SETUP_STAGE 2u
 #define XHCI_TRB_TYPE_DATA_STAGE 3u
 #define XHCI_TRB_TYPE_STATUS_STAGE 4u
@@ -350,12 +351,13 @@ typedef struct {
 	uint32_t erdpHi;
 	uint64_t erstba;
 	uint64_t erdp;
+	struct xhci_pipePriv *interruptPriv;
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
 
 
-typedef struct {
+typedef struct xhci_pipePriv {
 	void *ring;
 	size_t ringSize;
 	uint64_t ringPhys;
@@ -363,11 +365,14 @@ typedef struct {
 	uint32_t cycleState;
 	uint8_t endpointId;
 	uint8_t endpointType;
+	usb_transfer_t *pendingTransfer;
+	uint64_t pendingTrbPhys;
 } xhci_pipePriv_t;
 
 
 static uint32_t xhci_getHubStatus(usb_dev_t *hub);
 static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId);
+static int xhci_enterHaltedState(xhci_t *xhci);
 
 
 static inline uint8_t xhci_read8(xhci_t *xhci, uintptr_t off)
@@ -504,10 +509,22 @@ static void xhci_destroy(xhci_t *xhci)
 static void xhci_roothubStatusThread(void *arg)
 {
 	hcd_t *hcd = (hcd_t *)arg;
+	xhci_t *xhci = (xhci_t *)hcd->priv;
 	usb_dev_t *hub;
+	xhci_pipePriv_t *priv;
+	xhci_trb_t *event;
+	usb_transfer_t *t;
 	uint32_t status;
+	uint32_t type;
+	uint32_t completion;
+	uint32_t endpointId;
+	uint32_t slotId;
+	uint32_t residual;
+	unsigned sleepUs;
+	int ret;
 
 	for (;;) {
+		sleepUs = 100000u;
 		hub = hcd->roothub;
 		if ((hub != NULL) && (hub->statusTransfer != NULL) && !usb_transferCheck(hub->statusTransfer)) {
 			status = xhci_getHubStatus(hub);
@@ -517,7 +534,44 @@ static void xhci_roothubStatusThread(void *arg)
 			}
 		}
 
-		usleep(100000);
+		priv = xhci->interruptPriv;
+		if ((priv != NULL) && (priv->pendingTransfer != NULL)) {
+			sleepUs = 1000u;
+			event = (xhci_trb_t *)xhci->eventRing;
+			if ((event->control & XHCI_TRB_CONTROL_C) == (xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
+				t = priv->pendingTransfer;
+				type = (event->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+				completion = (event->status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
+					XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+				endpointId = (event->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >>
+					XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
+				slotId = (event->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >>
+					XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
+				residual = event->status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
+
+				if ((type == XHCI_TRB_TYPE_EVENT_TRANSFER) && (event->parameter == priv->pendingTrbPhys) &&
+					(endpointId == priv->endpointId) && (slotId == xhci->slotId) &&
+					(residual <= t->size) &&
+					((completion == XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
+					(completion == XHCI_TRB_COMPLETION_CODE_SHORT_PACKET))) {
+					ret = (int)(t->size - residual);
+				}
+				else {
+					ret = -ENODEV;
+				}
+
+				memset(event, 0, sizeof(*event));
+				xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, (uint32_t)(xhci->eventRingPhys >> 32));
+				xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO,
+					(uint32_t)(xhci->eventRingPhys & XHCI_REG_RT_IR_ERDP_LO__MASK) | XHCI_REG_RT_IR_ERDP_LO_EHB);
+				(void)xhci_enterHaltedState(xhci);
+
+				priv->pendingTransfer = NULL;
+				usb_transferFinished(t, ret);
+			}
+		}
+
+		usleep(sleepUs);
 	}
 }
 
@@ -1427,6 +1481,63 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	}
 
 	pipe->hcdpriv = priv;
+	xhci->interruptPriv = priv;
+	return 0;
+}
+
+
+static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
+{
+	xhci_pipePriv_t *priv;
+	xhci_trb_t *ring;
+	xhci_trb_t *event;
+	xhci_trb_t *link;
+	int err;
+
+	if ((xhci == NULL) || (t == NULL) || (pipe == NULL) || (t->buffer == NULL) || (t->size == 0u)) {
+		return -EINVAL;
+	}
+
+	priv = (xhci_pipePriv_t *)pipe->hcdpriv;
+	if ((priv == NULL) || (priv->endpointId == 0u) || (priv->ring == NULL)) {
+		return -EINVAL;
+	}
+
+	if (priv->pendingTransfer != NULL) {
+		return -EBUSY;
+	}
+
+	ring = (xhci_trb_t *)priv->ring;
+	memset(ring, 0, priv->ringSize);
+	ring[0].parameter = va2pa(t->buffer);
+	ring[0].status = (uint32_t)t->size;
+	ring[0].control = XHCI_TRB_CONTROL_C |
+		XHCI_TRANSFER_TRB_CONTROL_IOC |
+		XHCI_TRANSFER_TRB_CONTROL_ISP |
+		(XHCI_TRB_TYPE_NORMAL << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+
+	link = &ring[priv->ringCount - 1u];
+	link->parameter = priv->ringPhys;
+	link->status = 0u;
+	link->control = XHCI_TRB_CONTROL_C |
+		XHCI_LINK_TRB_CONTROL_TC |
+		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+
+	event = (xhci_trb_t *)xhci->eventRing;
+	memset(event, 0, sizeof(*event));
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, (uint32_t)(xhci->eventRingPhys >> 32));
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO,
+		(uint32_t)(xhci->eventRingPhys & XHCI_REG_RT_IR_ERDP_LO__MASK) | XHCI_REG_RT_IR_ERDP_LO_EHB);
+
+	err = xhci_enterRunState(xhci);
+	if (err < 0) {
+		return err;
+	}
+
+	priv->pendingTransfer = t;
+	priv->pendingTrbPhys = priv->ringPhys;
+	xhci_dbWrite32(xhci, xhci->slotId * sizeof(uint32_t), priv->endpointId);
+
 	return 0;
 }
 
@@ -2127,7 +2238,7 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 			return err;
 		}
 
-		return -ENOSYS;
+		return xhci_submitInterruptIn(xhci, t, pipe);
 	}
 
 	return -ENOSYS;
@@ -2144,8 +2255,7 @@ static void xhci_transferDequeue(hcd_t *hcd, usb_transfer_t *t)
 static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 {
 	xhci_pipePriv_t *priv;
-
-	(void)hcd;
+	xhci_t *xhci = (xhci_t *)hcd->priv;
 
 	if ((pipe == NULL) || (pipe->hcdpriv == NULL)) {
 		return;
@@ -2153,6 +2263,9 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 
 	priv = (xhci_pipePriv_t *)pipe->hcdpriv;
 	pipe->hcdpriv = NULL;
+	if (xhci->interruptPriv == priv) {
+		xhci->interruptPriv = NULL;
+	}
 
 	if (priv->ring != NULL) {
 		usb_freeAligned(priv->ring, priv->ringSize);
