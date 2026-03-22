@@ -952,17 +952,14 @@ static int xhci_init(hcd_t *hcd)
 							err = xhci_runStateSelftest(xhci);
 							if (err == 0) {
 								err = xhci_allocEventRing(xhci);
+							if (err == 0) {
+								err = xhci_programEventRing(xhci);
 								if (err == 0) {
-									err = xhci_programEventRing(xhci);
-									if (err == 0) {
-										err = xhci_cmdNoopSelftest(xhci);
-										if (err == 0) {
-											err = -ENOSYS;
-										}
-									}
+									err = xhci_cmdNoopSelftest(xhci);
 								}
 							}
 						}
+					}
 					}
 				}
 			}
