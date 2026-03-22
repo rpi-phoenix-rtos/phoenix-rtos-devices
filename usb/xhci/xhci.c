@@ -52,6 +52,7 @@
 #define XHCI_REG_OP_CRCR_HI      0x1cu
 #define XHCI_REG_OP_DCBAAP       0x30u
 #define XHCI_REG_OP_DCBAAP_HI    0x34u
+#define XHCI_REG_OP_CONFIG       0x38u
 #define XHCI_SUPPORTED_VERSION   0x0100u
 #define XHCI_REG_OP_USBCMD_HCRST (1u << 1)
 #define XHCI_REG_OP_USBSTS_CNR   (1u << 11)
@@ -62,6 +63,7 @@
 #define XHCI_REG_OP_CRCR_CRR     (1u << 3)
 #define XHCI_REG_OP_CRCR_CR_PTR_LO__MASK 0xffffffc0u
 #define XHCI_REG_OP_DCBAAP__MASK 0xffffffc0u
+#define XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK 0xffu
 #define XHCI_DCBAA_ALIGN         0x1000u
 #define XHCI_DCBAA_SIZE          0x1000u
 #define XHCI_CMD_RING_ALIGN      0x10000u
@@ -93,6 +95,7 @@ typedef struct {
 	uint32_t crcrHi;
 	uint32_t dcbaapLo;
 	uint32_t dcbaapHi;
+	uint32_t config;
 	uint64_t crcr;
 	uint64_t dcbaap;
 	void *dcbaa;
@@ -371,6 +374,57 @@ static int xhci_allocCommandSpace(xhci_t *xhci)
 }
 
 
+static int xhci_programCommandSpace(xhci_t *xhci)
+{
+	uint32_t config;
+	uint32_t crcrLo;
+	uint32_t crcrHi;
+	uint32_t dcbaapLo;
+	uint32_t dcbaapHi;
+
+	dcbaapLo = (uint32_t)(xhci->dcbaaPhys & XHCI_REG_OP_DCBAAP__MASK);
+	dcbaapHi = (uint32_t)(xhci->dcbaaPhys >> 32);
+	if ((!xhci->ac64) && (dcbaapHi != 0u)) {
+		fprintf(stderr, "xhci: dcbaa above 32-bit address space\n");
+		return -ENODEV;
+	}
+
+	crcrLo = (uint32_t)(xhci->cmdRingPhys & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK) | XHCI_REG_OP_CRCR_RCS;
+	crcrHi = (uint32_t)(xhci->cmdRingPhys >> 32);
+	if ((!xhci->ac64) && (crcrHi != 0u)) {
+		fprintf(stderr, "xhci: command ring above 32-bit address space\n");
+		return -ENODEV;
+	}
+
+	config = xhci_opRead32(xhci, XHCI_REG_OP_CONFIG);
+	config &= ~XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK;
+	config |= xhci->nslots & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK;
+
+	xhci_opWrite32(xhci, XHCI_REG_OP_DCBAAP_HI, dcbaapHi);
+	xhci_opWrite32(xhci, XHCI_REG_OP_DCBAAP, dcbaapLo);
+	xhci_opWrite32(xhci, XHCI_REG_OP_CRCR_HI, crcrHi);
+	xhci_opWrite32(xhci, XHCI_REG_OP_CRCR, crcrLo);
+	xhci_opWrite32(xhci, XHCI_REG_OP_CONFIG, config);
+
+	xhci->dcbaapLo = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP);
+	xhci->dcbaapHi = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP_HI);
+	xhci->crcrLo = xhci_opRead32(xhci, XHCI_REG_OP_CRCR);
+	xhci->crcrHi = xhci_opRead32(xhci, XHCI_REG_OP_CRCR_HI);
+	xhci->config = xhci_opRead32(xhci, XHCI_REG_OP_CONFIG);
+	xhci->dcbaap = ((uint64_t)xhci->dcbaapHi << 32) | (xhci->dcbaapLo & XHCI_REG_OP_DCBAAP__MASK);
+	xhci->crcr = ((uint64_t)xhci->crcrHi << 32) | (xhci->crcrLo & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK);
+
+	if ((xhci->dcbaap != xhci->dcbaaPhys) || (xhci->crcr != xhci->cmdRingPhys) ||
+		((xhci->crcrLo & XHCI_REG_OP_CRCR_RCS) == 0u) ||
+		((xhci->config & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK) != (xhci->nslots & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK))) {
+		fprintf(stderr, "xhci: command space register program mismatch\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
@@ -389,7 +443,10 @@ static int xhci_init(hcd_t *hcd)
 			if (err == 0) {
 				err = xhci_allocCommandSpace(xhci);
 				if (err == 0) {
-					err = -ENOSYS;
+					err = xhci_programCommandSpace(xhci);
+					if (err == 0) {
+						err = -ENOSYS;
+					}
 				}
 			}
 		}
