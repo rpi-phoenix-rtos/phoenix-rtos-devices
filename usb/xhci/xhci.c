@@ -133,6 +133,18 @@
 #define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK (0xffu << XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT)
 #define XHCI_TRB_COMPLETION_CODE_SUCCESS 1u
+#define XHCI_PORT_SPEED_FULL     1u
+#define XHCI_PORT_SPEED_LOW      2u
+#define XHCI_PORT_SPEED_HIGH     3u
+#define XHCI_SLOT_CTX_SPEED__SHIFT 20u
+#define XHCI_SLOT_CTX_CONTEXT_ENTRIES__SHIFT 27u
+#define XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT 16u
+#define XHCI_EP_CTX_CERR__SHIFT  1u
+#define XHCI_EP_CTX_TYPE__SHIFT  3u
+#define XHCI_EP_CTX_TYPE_CONTROL 4u
+#define XHCI_EP_CTX_MAX_PACKET__SHIFT 16u
+#define XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS (1u << 0)
+#define XHCI_INPUT_CTRL_CTX_ADD_A0_A1 0x3u
 #define XHCI_CMD_TIMEOUT_MS      100u
 #define XHCI_PORT_RESET_TIMEOUT_MS 100u
 #define XHCI_PORT_POWER_GOOD_DELAY_US 20000u
@@ -299,6 +311,8 @@ typedef struct {
 	uint64_t ep0RingPhys;
 	uint32_t cmdRingCount;
 	uint32_t cmdCycleState;
+	uint32_t ep0RingCount;
+	uint32_t ep0CycleState;
 	uint32_t eventRingTrbs;
 	uint32_t eventCycleState;
 	uint8_t slotId;
@@ -913,6 +927,40 @@ static int xhci_allocEventRing(xhci_t *xhci)
 }
 
 
+static unsigned int xhci_usbSpeedToPsi(enum usb_speed speed)
+{
+	switch (speed) {
+		case usb_full_speed:
+			return XHCI_PORT_SPEED_FULL;
+
+		case usb_low_speed:
+			return XHCI_PORT_SPEED_LOW;
+
+		case usb_high_speed:
+			return XHCI_PORT_SPEED_HIGH;
+
+		default:
+			return 0u;
+	}
+}
+
+
+static uint16_t xhci_ep0MaxPacket(enum usb_speed speed)
+{
+	switch (speed) {
+		case usb_low_speed:
+		case usb_full_speed:
+			return 8u;
+
+		case usb_high_speed:
+			return 64u;
+
+		default:
+			return 0u;
+	}
+}
+
+
 static int xhci_cmdNoopSelftest(xhci_t *xhci)
 {
 	return xhci_cmdExec(xhci, 0u, 0u, XHCI_TRB_TYPE_CMD_NO_OP << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT, NULL);
@@ -1074,6 +1122,90 @@ static int xhci_allocSlotSpace(xhci_t *xhci)
 
 	if (dcbaa[xhci->slotId] != xhci->devCtxPhys) {
 		fprintf(stderr, "xhci: failed to bind dcbaa slot entry\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
+static int xhci_initEp0Ring(xhci_t *xhci)
+{
+	xhci_trb_t *ring;
+	xhci_trb_t *link;
+
+	xhci->ep0RingCount = xhci->ep0RingSize / XHCI_TRB_SIZE;
+	if (xhci->ep0RingCount <= 1u) {
+		fprintf(stderr, "xhci: ep0 ring too small\n");
+		return -ENODEV;
+	}
+
+	memset(xhci->ep0Ring, 0, xhci->ep0RingSize);
+	xhci->ep0CycleState = 1u;
+
+	ring = (xhci_trb_t *)xhci->ep0Ring;
+	link = &ring[xhci->ep0RingCount - 1u];
+	link->parameter = xhci->ep0RingPhys;
+	link->status = 0u;
+	link->control = XHCI_TRB_CONTROL_C |
+		XHCI_LINK_TRB_CONTROL_TC |
+		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+
+	if ((link->parameter != xhci->ep0RingPhys) ||
+		(((link->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu) != XHCI_TRB_TYPE_LINK) ||
+		((link->control & (XHCI_TRB_CONTROL_C | XHCI_LINK_TRB_CONTROL_TC)) !=
+			(XHCI_TRB_CONTROL_C | XHCI_LINK_TRB_CONTROL_TC))) {
+		fprintf(stderr, "xhci: invalid ep0 ring link trb\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
+static int xhci_prepareAddressContext(xhci_t *xhci, usb_dev_t *dev)
+{
+	xhci_input_ctx_t *input;
+	xhci_slot_ctx_t *slot;
+	xhci_ep_ctx_t *ep0;
+	unsigned int psi;
+	uint16_t maxPacket;
+
+	if ((dev == NULL) || (dev->hub == NULL) || (dev->hub->hub != NULL)) {
+		return -ENOSYS;
+	}
+
+	psi = xhci_usbSpeedToPsi(dev->speed);
+	maxPacket = xhci_ep0MaxPacket(dev->speed);
+	if ((psi == 0u) || (maxPacket == 0u)) {
+		fprintf(stderr, "xhci: unsupported device speed for address context\n");
+		return -ENOSYS;
+	}
+
+	memset(xhci->inputCtx, 0, xhci->inputCtxSize);
+
+	input = (xhci_input_ctx_t *)xhci->inputCtx;
+	slot = &input->device.slot;
+	ep0 = &input->device.ep[0];
+
+	input->control.addContextFlags = XHCI_INPUT_CTRL_CTX_ADD_A0_A1;
+
+	slot->routeString_speed_mtt_hub_entries =
+		(psi << XHCI_SLOT_CTX_SPEED__SHIFT) |
+		(1u << XHCI_SLOT_CTX_CONTEXT_ENTRIES__SHIFT);
+	slot->maxExitLatency_rootHubPort_ports = ((uint32_t)dev->port & 0xffu) << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT;
+
+	ep0->cerr_type_burst_packet =
+		(3u << XHCI_EP_CTX_CERR__SHIFT) |
+		(XHCI_EP_CTX_TYPE_CONTROL << XHCI_EP_CTX_TYPE__SHIFT) |
+		((uint32_t)maxPacket << XHCI_EP_CTX_MAX_PACKET__SHIFT);
+	ep0->trDequeuePtr = xhci->ep0RingPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS;
+	ep0->averageTrbLen_maxEsitPayload = 8u;
+
+	if ((input->control.addContextFlags != XHCI_INPUT_CTRL_CTX_ADD_A0_A1) ||
+		(slot->maxExitLatency_rootHubPort_ports != (((uint32_t)dev->port & 0xffu) << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT)) ||
+		(ep0->trDequeuePtr != (xhci->ep0RingPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS))) {
+		fprintf(stderr, "xhci: invalid address context preparation\n");
 		return -ENODEV;
 	}
 
@@ -1477,8 +1609,23 @@ static int xhci_roothubReq(usb_dev_t *hub, usb_transfer_t *t)
 
 static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 {
+	xhci_t *xhci = (xhci_t *)hcd->priv;
+	int err;
+
 	if (usb_isRoothub(pipe->dev) != 0) {
 		return xhci_roothubReq(pipe->dev, t);
+	}
+
+	if ((pipe->dev->address == 0) && (xhci != NULL)) {
+		err = xhci_initEp0Ring(xhci);
+		if (err < 0) {
+			return err;
+		}
+
+		err = xhci_prepareAddressContext(xhci, pipe->dev);
+		if (err < 0) {
+			return err;
+		}
 	}
 
 	return -ENOSYS;
