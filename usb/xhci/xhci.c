@@ -96,7 +96,13 @@
 #define XHCI_TRB_CONTROL_C       (1u << 0)
 #define XHCI_TRB_CONTROL_TRB_TYPE__SHIFT 10u
 #define XHCI_TRB_TYPE_LINK       6u
+#define XHCI_TRB_TYPE_CMD_NO_OP  23u
+#define XHCI_TRB_TYPE_EVENT_CMD_COMPLETION 33u
 #define XHCI_LINK_TRB_CONTROL_TC (1u << 1)
+#define XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT 24u
+#define XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK (0xffu << XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT)
+#define XHCI_TRB_COMPLETION_CODE_SUCCESS 1u
+#define XHCI_CMD_TIMEOUT_MS      100u
 
 
 typedef struct {
@@ -155,6 +161,7 @@ typedef struct {
 	uint32_t cmdRingCount;
 	uint32_t cmdCycleState;
 	uint32_t eventRingTrbs;
+	uint32_t eventCycleState;
 	uint32_t erstsz;
 	uint32_t erstbaLo;
 	uint32_t erstbaHi;
@@ -214,6 +221,14 @@ static inline uint32_t xhci_rtRead32(xhci_t *xhci, uintptr_t off)
 static inline void xhci_rtWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
 {
 	volatile uint32_t *reg = (volatile uint32_t *)((volatile uint8_t *)xhci->mmio + xhci->rtsoff + XHCI_REG_RT_IR0 + off);
+
+	*reg = val;
+}
+
+
+static inline void xhci_dbWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
+{
+	volatile uint32_t *reg = (volatile uint32_t *)((volatile uint8_t *)xhci->mmio + xhci->dboff + off);
 
 	*reg = val;
 }
@@ -588,6 +603,62 @@ static int xhci_runStateSelftest(xhci_t *xhci)
 }
 
 
+static int xhci_enterRunState(xhci_t *xhci)
+{
+	uint32_t usbcmd;
+	uint32_t usbsts;
+	int err;
+
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+		fprintf(stderr, "xhci: controller error state before run\n");
+		return -ENODEV;
+	}
+
+	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
+
+	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, 0u, XHCI_RUNSTOP_TIMEOUT_MS);
+	if (err < 0) {
+		fprintf(stderr, "xhci: run transition timeout\n");
+		return err;
+	}
+
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+		fprintf(stderr, "xhci: controller error state after run\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
+static int xhci_enterHaltedState(xhci_t *xhci)
+{
+	uint32_t usbcmd;
+	uint32_t usbsts;
+	int err;
+
+	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd & ~XHCI_REG_OP_USBCMD_RS);
+
+	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, XHCI_REG_OP_USBSTS_HCH, XHCI_RUNSTOP_TIMEOUT_MS);
+	if (err < 0) {
+		fprintf(stderr, "xhci: halt transition timeout\n");
+		return err;
+	}
+
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+		fprintf(stderr, "xhci: controller error state after halt\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_allocEventRing(xhci_t *xhci)
 {
 	xhci_erst_entry_t *erst;
@@ -613,6 +684,7 @@ static int xhci_allocEventRing(xhci_t *xhci)
 	xhci->eventRingPhys = va2pa(xhci->eventRing);
 	xhci->erstPhys = va2pa(xhci->erst);
 	xhci->eventRingTrbs = xhci->eventRingSize / XHCI_TRB_SIZE;
+	xhci->eventCycleState = 1u;
 
 	if (((xhci->eventRingPhys & (XHCI_EVENT_RING_ALIGN - 1u)) != 0u) ||
 		((xhci->erstPhys & (XHCI_ERST_ALIGN - 1u)) != 0u) ||
@@ -630,6 +702,72 @@ static int xhci_allocEventRing(xhci_t *xhci)
 		fprintf(stderr, "xhci: failed to populate erst entry\n");
 		return -ENODEV;
 	}
+
+	return EOK;
+}
+
+
+static int xhci_cmdNoopSelftest(xhci_t *xhci)
+{
+	xhci_trb_t *cmd;
+	xhci_trb_t *event;
+	uint64_t cmdPhys;
+	uint32_t type;
+	uint32_t completion;
+	unsigned timeoutMs;
+	int err;
+
+	cmd = &xhci->cmdRingTrbs[0];
+	memset(cmd, 0, sizeof(*cmd));
+	cmd->control = (xhci->cmdCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u) |
+		(XHCI_TRB_TYPE_CMD_NO_OP << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+	cmdPhys = xhci->cmdRingPhys;
+
+	if (((cmd->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu) != XHCI_TRB_TYPE_CMD_NO_OP) {
+		fprintf(stderr, "xhci: failed to initialize noop command trb\n");
+		return -ENODEV;
+	}
+
+	event = (xhci_trb_t *)xhci->eventRing;
+	memset(event, 0, sizeof(*event));
+
+	err = xhci_enterRunState(xhci);
+	if (err < 0) {
+		return err;
+	}
+
+	xhci_dbWrite32(xhci, 0u, 0u);
+
+	for (timeoutMs = XHCI_CMD_TIMEOUT_MS; timeoutMs > 0u; --timeoutMs) {
+		if ((event->control & XHCI_TRB_CONTROL_C) == (xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
+			break;
+		}
+
+		usleep(1000);
+	}
+
+	if (timeoutMs == 0u) {
+		fprintf(stderr, "xhci: command completion timeout\n");
+		(void)xhci_enterHaltedState(xhci);
+		return -ETIMEDOUT;
+	}
+
+	type = (event->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+	completion = (event->status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+	if ((type != XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) ||
+		(completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
+		(event->parameter != cmdPhys)) {
+		fprintf(stderr, "xhci: invalid noop completion event\n");
+		(void)xhci_enterHaltedState(xhci);
+		return -ENODEV;
+	}
+
+	err = xhci_enterHaltedState(xhci);
+	if (err < 0) {
+		return err;
+	}
+
+	memset(cmd, 0, sizeof(*cmd));
 
 	return EOK;
 }
@@ -706,7 +844,10 @@ static int xhci_init(hcd_t *hcd)
 								if (err == 0) {
 									err = xhci_programEventRing(xhci);
 									if (err == 0) {
-										err = -ENOSYS;
+										err = xhci_cmdNoopSelftest(xhci);
+										if (err == 0) {
+											err = -ENOSYS;
+										}
 									}
 								}
 							}
