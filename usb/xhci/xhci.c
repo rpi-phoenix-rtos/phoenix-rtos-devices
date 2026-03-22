@@ -54,8 +54,12 @@
 #define XHCI_REG_OP_DCBAAP_HI    0x34u
 #define XHCI_REG_OP_CONFIG       0x38u
 #define XHCI_SUPPORTED_VERSION   0x0100u
+#define XHCI_REG_OP_USBCMD_RS    (1u << 0)
 #define XHCI_REG_OP_USBCMD_HCRST (1u << 1)
+#define XHCI_REG_OP_USBSTS_HCH   (1u << 0)
+#define XHCI_REG_OP_USBSTS_HSE   (1u << 2)
 #define XHCI_REG_OP_USBSTS_CNR   (1u << 11)
+#define XHCI_REG_OP_USBSTS_HCE   (1u << 12)
 #define XHCI_REG_OP_PAGESIZE_4K  (1u << 0)
 #define XHCI_REG_OP_CRCR_RCS     (1u << 0)
 #define XHCI_REG_OP_CRCR_CS      (1u << 1)
@@ -70,6 +74,7 @@
 #define XHCI_CMD_RING_SIZE       0x10000u
 #define XHCI_CNR_TIMEOUT_MS      100u
 #define XHCI_HCRST_TIMEOUT_MS    20u
+#define XHCI_RUNSTOP_TIMEOUT_MS  20u
 
 
 typedef struct {
@@ -425,6 +430,57 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 }
 
 
+static int xhci_runStateSelftest(xhci_t *xhci)
+{
+	uint32_t usbcmd;
+	uint32_t usbsts;
+	int err;
+
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+		fprintf(stderr, "xhci: controller error state before run\n");
+		return -ENODEV;
+	}
+
+	if ((usbsts & XHCI_REG_OP_USBSTS_HCH) == 0u) {
+		fprintf(stderr, "xhci: controller not halted before run\n");
+		return -ENODEV;
+	}
+
+	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
+
+	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, 0u, XHCI_RUNSTOP_TIMEOUT_MS);
+	if (err < 0) {
+		fprintf(stderr, "xhci: run transition timeout\n");
+		return err;
+	}
+
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+		fprintf(stderr, "xhci: controller error state after run\n");
+		return -ENODEV;
+	}
+
+	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd & ~XHCI_REG_OP_USBCMD_RS);
+
+	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, XHCI_REG_OP_USBSTS_HCH, XHCI_RUNSTOP_TIMEOUT_MS);
+	if (err < 0) {
+		fprintf(stderr, "xhci: halt transition timeout\n");
+		return err;
+	}
+
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+		fprintf(stderr, "xhci: controller error state after halt\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
@@ -445,7 +501,10 @@ static int xhci_init(hcd_t *hcd)
 				if (err == 0) {
 					err = xhci_programCommandSpace(xhci);
 					if (err == 0) {
-						err = -ENOSYS;
+						err = xhci_runStateSelftest(xhci);
+						if (err == 0) {
+							err = -ENOSYS;
+						}
 					}
 				}
 			}
