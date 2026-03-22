@@ -72,9 +72,29 @@
 #define XHCI_DCBAA_SIZE          0x1000u
 #define XHCI_CMD_RING_ALIGN      0x10000u
 #define XHCI_CMD_RING_SIZE       0x10000u
+#define XHCI_EVENT_RING_ALIGN    0x1000u
+#define XHCI_EVENT_RING_SIZE     0x1000u
+#define XHCI_ERST_ALIGN          0x40u
+#define XHCI_ERST_SIZE           0x40u
+#define XHCI_ERST_ENTRY_COUNT    1u
+#define XHCI_TRB_SIZE            16u
 #define XHCI_CNR_TIMEOUT_MS      100u
 #define XHCI_HCRST_TIMEOUT_MS    20u
 #define XHCI_RUNSTOP_TIMEOUT_MS  20u
+
+
+typedef struct {
+	uint64_t parameter;
+	uint32_t status;
+	uint32_t control;
+} __attribute__((packed)) xhci_trb_t;
+
+
+typedef struct {
+	uint64_t ringSegmentBase;
+	uint32_t ringSegmentSize;
+	uint32_t reserved;
+} __attribute__((packed)) xhci_erst_entry_t;
 
 
 typedef struct {
@@ -109,6 +129,13 @@ typedef struct {
 	size_t cmdRingSize;
 	uint64_t dcbaaPhys;
 	uint64_t cmdRingPhys;
+	void *eventRing;
+	void *erst;
+	size_t eventRingSize;
+	size_t erstSize;
+	uint64_t eventRingPhys;
+	uint64_t erstPhys;
+	uint32_t eventRingTrbs;
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
@@ -168,6 +195,14 @@ static void xhci_destroy(xhci_t *xhci)
 
 	if (xhci->cmdRing != NULL) {
 		usb_freeAligned(xhci->cmdRing, xhci->cmdRingSize);
+	}
+
+	if (xhci->eventRing != NULL) {
+		usb_freeAligned(xhci->eventRing, xhci->eventRingSize);
+	}
+
+	if (xhci->erst != NULL) {
+		usb_freeAligned(xhci->erst, xhci->erstSize);
 	}
 
 	free(xhci);
@@ -481,6 +516,53 @@ static int xhci_runStateSelftest(xhci_t *xhci)
 }
 
 
+static int xhci_allocEventRing(xhci_t *xhci)
+{
+	xhci_erst_entry_t *erst;
+
+	xhci->eventRingSize = XHCI_EVENT_RING_SIZE;
+	xhci->erstSize = XHCI_ERST_SIZE;
+
+	xhci->eventRing = usb_allocAligned(xhci->eventRingSize, XHCI_EVENT_RING_ALIGN);
+	if (xhci->eventRing == NULL) {
+		fprintf(stderr, "xhci: failed to allocate event ring\n");
+		return -ENOMEM;
+	}
+
+	xhci->erst = usb_allocAligned(xhci->erstSize, XHCI_ERST_ALIGN);
+	if (xhci->erst == NULL) {
+		fprintf(stderr, "xhci: failed to allocate erst\n");
+		return -ENOMEM;
+	}
+
+	memset(xhci->eventRing, 0, xhci->eventRingSize);
+	memset(xhci->erst, 0, xhci->erstSize);
+
+	xhci->eventRingPhys = va2pa(xhci->eventRing);
+	xhci->erstPhys = va2pa(xhci->erst);
+	xhci->eventRingTrbs = xhci->eventRingSize / XHCI_TRB_SIZE;
+
+	if (((xhci->eventRingPhys & (XHCI_EVENT_RING_ALIGN - 1u)) != 0u) ||
+		((xhci->erstPhys & (XHCI_ERST_ALIGN - 1u)) != 0u) ||
+		(xhci->eventRingTrbs == 0u)) {
+		fprintf(stderr, "xhci: invalid event ring allocation layout\n");
+		return -ENODEV;
+	}
+
+	erst = (xhci_erst_entry_t *)xhci->erst;
+	erst[0].ringSegmentBase = xhci->eventRingPhys;
+	erst[0].ringSegmentSize = xhci->eventRingTrbs;
+
+	if ((erst[0].ringSegmentBase != xhci->eventRingPhys) ||
+		(erst[0].ringSegmentSize != xhci->eventRingTrbs)) {
+		fprintf(stderr, "xhci: failed to populate erst entry\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
@@ -503,7 +585,10 @@ static int xhci_init(hcd_t *hcd)
 					if (err == 0) {
 						err = xhci_runStateSelftest(xhci);
 						if (err == 0) {
-							err = -ENOSYS;
+							err = xhci_allocEventRing(xhci);
+							if (err == 0) {
+								err = -ENOSYS;
+							}
 						}
 					}
 				}
