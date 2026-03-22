@@ -93,6 +93,10 @@
 #define XHCI_CNR_TIMEOUT_MS      100u
 #define XHCI_HCRST_TIMEOUT_MS    20u
 #define XHCI_RUNSTOP_TIMEOUT_MS  20u
+#define XHCI_TRB_CONTROL_C       (1u << 0)
+#define XHCI_TRB_CONTROL_TRB_TYPE__SHIFT 10u
+#define XHCI_TRB_TYPE_LINK       6u
+#define XHCI_LINK_TRB_CONTROL_TC (1u << 1)
 
 
 typedef struct {
@@ -137,6 +141,7 @@ typedef struct {
 	uint64_t dcbaap;
 	void *dcbaa;
 	void *cmdRing;
+	xhci_trb_t *cmdRingTrbs;
 	size_t dcbaaSize;
 	size_t cmdRingSize;
 	uint64_t dcbaaPhys;
@@ -147,6 +152,8 @@ typedef struct {
 	size_t erstSize;
 	uint64_t eventRingPhys;
 	uint64_t erstPhys;
+	uint32_t cmdRingCount;
+	uint32_t cmdCycleState;
 	uint32_t eventRingTrbs;
 	uint32_t erstsz;
 	uint32_t erstbaLo;
@@ -447,6 +454,38 @@ static int xhci_allocCommandSpace(xhci_t *xhci)
 }
 
 
+static int xhci_initCommandRing(xhci_t *xhci)
+{
+	xhci_trb_t *link;
+
+	xhci->cmdRingCount = xhci->cmdRingSize / XHCI_TRB_SIZE;
+	if (xhci->cmdRingCount <= 1u) {
+		fprintf(stderr, "xhci: command ring too small\n");
+		return -ENODEV;
+	}
+
+	xhci->cmdRingTrbs = (xhci_trb_t *)xhci->cmdRing;
+	xhci->cmdCycleState = 1u;
+
+	link = &xhci->cmdRingTrbs[xhci->cmdRingCount - 1u];
+	link->parameter = xhci->cmdRingPhys;
+	link->status = 0u;
+	link->control = XHCI_TRB_CONTROL_C |
+		XHCI_LINK_TRB_CONTROL_TC |
+		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+
+	if ((link->parameter != xhci->cmdRingPhys) ||
+		(((link->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu) != XHCI_TRB_TYPE_LINK) ||
+		((link->control & (XHCI_TRB_CONTROL_C | XHCI_LINK_TRB_CONTROL_TC)) !=
+			(XHCI_TRB_CONTROL_C | XHCI_LINK_TRB_CONTROL_TC))) {
+		fprintf(stderr, "xhci: invalid command ring link trb\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
 static int xhci_programCommandSpace(xhci_t *xhci)
 {
 	uint32_t config;
@@ -657,15 +696,18 @@ static int xhci_init(hcd_t *hcd)
 			if (err == 0) {
 				err = xhci_allocCommandSpace(xhci);
 				if (err == 0) {
-					err = xhci_programCommandSpace(xhci);
+					err = xhci_initCommandRing(xhci);
 					if (err == 0) {
-						err = xhci_runStateSelftest(xhci);
+						err = xhci_programCommandSpace(xhci);
 						if (err == 0) {
-							err = xhci_allocEventRing(xhci);
+							err = xhci_runStateSelftest(xhci);
 							if (err == 0) {
-								err = xhci_programEventRing(xhci);
+								err = xhci_allocEventRing(xhci);
 								if (err == 0) {
-									err = -ENOSYS;
+									err = xhci_programEventRing(xhci);
+									if (err == 0) {
+										err = -ENOSYS;
+									}
 								}
 							}
 						}
