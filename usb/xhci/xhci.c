@@ -118,11 +118,14 @@
 #define XHCI_TRB_CONTROL_C       (1u << 0)
 #define XHCI_TRB_CONTROL_TRB_TYPE__SHIFT 10u
 #define XHCI_TRB_TYPE_LINK       6u
+#define XHCI_TRB_TYPE_CMD_ENABLE_SLOT 9u
 #define XHCI_TRB_TYPE_CMD_NO_OP  23u
 #define XHCI_TRB_TYPE_EVENT_CMD_COMPLETION 33u
 #define XHCI_LINK_TRB_CONTROL_TC (1u << 1)
 #define XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT 24u
 #define XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK (0xffu << XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT)
+#define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT 24u
+#define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK (0xffu << XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT)
 #define XHCI_TRB_COMPLETION_CODE_SUCCESS 1u
 #define XHCI_CMD_TIMEOUT_MS      100u
 #define XHCI_PORT_RESET_TIMEOUT_MS 100u
@@ -246,6 +249,7 @@ typedef struct {
 	uint32_t cmdCycleState;
 	uint32_t eventRingTrbs;
 	uint32_t eventCycleState;
+	uint8_t slotId;
 	uint32_t erstsz;
 	uint32_t erstbaLo;
 	uint32_t erstbaHi;
@@ -259,6 +263,7 @@ typedef struct {
 
 
 static uint32_t xhci_getHubStatus(usb_dev_t *hub);
+static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId);
 
 
 static inline uint8_t xhci_read8(xhci_t *xhci, uintptr_t off)
@@ -846,6 +851,12 @@ static int xhci_allocEventRing(xhci_t *xhci)
 
 static int xhci_cmdNoopSelftest(xhci_t *xhci)
 {
+	return xhci_cmdExec(xhci, 0u, 0u, XHCI_TRB_TYPE_CMD_NO_OP << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT, NULL);
+}
+
+
+static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId)
+{
 	xhci_trb_t *cmd;
 	xhci_trb_t *event;
 	uint64_t cmdPhys;
@@ -856,20 +867,17 @@ static int xhci_cmdNoopSelftest(xhci_t *xhci)
 
 	cmd = &xhci->cmdRingTrbs[0];
 	memset(cmd, 0, sizeof(*cmd));
-	cmd->control = (xhci->cmdCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u) |
-		(XHCI_TRB_TYPE_CMD_NO_OP << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+	cmd->parameter = parameter;
+	cmd->status = status;
+	cmd->control = (control & ~XHCI_TRB_CONTROL_C) | (xhci->cmdCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
 	cmdPhys = xhci->cmdRingPhys;
-
-	if (((cmd->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu) != XHCI_TRB_TYPE_CMD_NO_OP) {
-		fprintf(stderr, "xhci: failed to initialize noop command trb\n");
-		return -ENODEV;
-	}
 
 	event = (xhci_trb_t *)xhci->eventRing;
 	memset(event, 0, sizeof(*event));
 
 	err = xhci_enterRunState(xhci);
 	if (err < 0) {
+		memset(cmd, 0, sizeof(*cmd));
 		return err;
 	}
 
@@ -886,25 +894,59 @@ static int xhci_cmdNoopSelftest(xhci_t *xhci)
 	if (timeoutMs == 0u) {
 		fprintf(stderr, "xhci: command completion timeout\n");
 		(void)xhci_enterHaltedState(xhci);
+		memset(cmd, 0, sizeof(*cmd));
 		return -ETIMEDOUT;
 	}
 
 	type = (event->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
 	completion = (event->status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
-	if ((type != XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) ||
-		(completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
-		(event->parameter != cmdPhys)) {
-		fprintf(stderr, "xhci: invalid noop completion event\n");
+	if ((type != XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) || (event->parameter != cmdPhys)) {
+		fprintf(stderr, "xhci: invalid command completion event\n");
 		(void)xhci_enterHaltedState(xhci);
+		memset(cmd, 0, sizeof(*cmd));
 		return -ENODEV;
+	}
+
+	if (slotId != NULL) {
+		*slotId = (event->control & XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK) >>
+			XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT;
 	}
 
 	err = xhci_enterHaltedState(xhci);
 	if (err < 0) {
+		memset(cmd, 0, sizeof(*cmd));
 		return err;
 	}
 
 	memset(cmd, 0, sizeof(*cmd));
+
+	if (completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) {
+		fprintf(stderr, "xhci: command completion code %u\n", completion);
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
+static int xhci_cmdEnableSlot(xhci_t *xhci, uint8_t *slotId)
+{
+	uint8_t cmdSlotId = 0u;
+	int err;
+
+	err = xhci_cmdExec(xhci, 0u, 0u, XHCI_TRB_TYPE_CMD_ENABLE_SLOT << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT, &cmdSlotId);
+	if (err < 0) {
+		return err;
+	}
+
+	if ((cmdSlotId == 0u) || (cmdSlotId > xhci->nslots)) {
+		fprintf(stderr, "xhci: invalid enable-slot id %u\n", cmdSlotId);
+		return -ENODEV;
+	}
+
+	if (slotId != NULL) {
+		*slotId = cmdSlotId;
+	}
 
 	return EOK;
 }
@@ -982,6 +1024,9 @@ static int xhci_init(hcd_t *hcd)
 								err = xhci_programEventRing(xhci);
 								if (err == 0) {
 									err = xhci_cmdNoopSelftest(xhci);
+									if (err == 0) {
+										err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
+									}
 								}
 							}
 						}
