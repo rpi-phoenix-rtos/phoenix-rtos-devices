@@ -662,6 +662,117 @@ static int pwm_initDMAChannel(pwm_tim_id_t timer, pwm_ch_id_t chn)
 	return res;
 }
 
+static void pwm_fillBitSequence(uint16_t value, uint16_t hcmp, uint16_t lcmp, uint16_t seq[PWM_BITSEQ4_BITS + 2])
+{
+	int bit;
+
+	for (bit = 0; bit < PWM_BITSEQ4_BITS; ++bit) {
+		uint16_t mask = (uint16_t)(1u << (PWM_BITSEQ4_BITS - 1 - bit));
+		seq[bit] = ((value & mask) != 0u) ? hcmp : lcmp;
+	}
+
+	/* Add two "idle" values at the end of the DMA buffer.
+	 * One value is necessary because after DMA writes the last compare value, `libdma_tx` exits and user may
+	 * disable the timer immediately without waiting for the final cycle to finish.
+	 * Another value is added because compare values are "delayed" - a write to the CCR register after an update event
+	 * will not take effect immediately, but during the next cycle.
+	 * Without those two "idle" values, the last value would not be transmitted and second-to-last value
+	 * would not be transmitted completely.
+	 */
+	seq[PWM_BITSEQ4_BITS] = 0;
+	seq[PWM_BITSEQ4_BITS + 1] = 0;
+}
+
+
+static int pwm_callBitSequence(pwm_tim_id_t timer, pwm_ch_id_t chn[PWM_CHN_NUM], uint16_t seq[PWM_CHN_NUM][PWM_BITSEQ4_BITS + 2])
+{
+#if USE_DSHOT_DMA
+	volatile uint32_t *base = pwm_setup.timer[timer].base;
+	const struct libdma_per *per[PWM_CHN_NUM];
+	volatile int done[PWM_CHN_NUM] = { 0 };
+	uint8_t started = 0;
+	bool udeMasked = false;
+	int res = 0, i;
+
+	mutexLock(pwm_common.dmalock);
+
+	for (i = 0; i < PWM_CHN_NUM; ++i) {
+		libdma_transfer_buffer_t buf = {
+			.buf = seq[i],
+			.bufSize = sizeof(seq[i]),
+			.elSize_log = 1,
+			.burstSize = 1,
+			.increment = 1,
+			.isCached = 1,
+			.transform = LIBXPDMA_TRANSFORM_ALIGNR0,
+		};
+
+		per[i] = pwm_common.timer[timer].dma_per[chn[i]];
+		if (per[i] == NULL) {
+			res = pwm_initDMAChannel(timer, chn[i]);
+			per[i] = pwm_common.timer[timer].dma_per[chn[i]];
+		}
+
+		if (res < 0) {
+			break;
+		}
+
+		res = libxpdma_configureMemory(per[i], dma_mem2per, 0, &buf, 1);
+		if (res < 0) {
+			break;
+		}
+
+		/* Start/arm the PWM channel in idle state. DMA will update CCR on timer update events. */
+		res = pwm_set(timer, chn[i], 0);
+		if (res < 0) {
+			break;
+		}
+	}
+
+	if (res >= 0) {
+		/* Request is disabled before DMA start and enabled after to prevent a possible race condition
+		 * between DMA start and timer update request. */
+		*(base + tim_dier) &= ~TIM_DIER_UDE;
+		udeMasked = true;
+
+		for (i = 0; i < PWM_CHN_NUM; ++i) {
+			res = libxpdma_startTransferWithFlag(per[i], dma_mem2per, &done[i]);
+			if (res < 0) {
+				break;
+			}
+			started++;
+		}
+	}
+
+	if (udeMasked) {
+		*(base + tim_dier) |= TIM_DIER_UDE;
+		udeMasked = false;
+	}
+
+	if (res >= 0) {
+		/* Wait for all transfers. Preserve the first error, but still drain all transactions. */
+		res = 0;
+		for (i = 0; i < PWM_CHN_NUM; ++i) {
+			int waitRes = libxpdma_waitForTransaction(per[i], &done[i], NULL, 0);
+			if ((res >= 0) && (waitRes < 0)) {
+				res = waitRes;
+			}
+		}
+	}
+	else if (started != 0u) {
+		for (i = 0; i < started; ++i) {
+			(void)libxpdma_waitForTransaction(per[i], &done[i], NULL, 0);
+		}
+	}
+
+	mutexUnlock(pwm_common.dmalock);
+	return res;
+#else
+	return -ENOSYS;
+#endif
+}
+
+
 int pwm_setBitSequence(pwm_tim_id_t timer, pwm_ch_id_t chn, void *data, uint32_t nbits, uint8_t datasize, int flags)
 {
 	int res;
@@ -684,7 +795,7 @@ int pwm_setBitSequence(pwm_tim_id_t timer, pwm_ch_id_t chn, void *data, uint32_t
 	}
 	if (nbits == 0) {
 		/* Treat as no-op */
-		return EOK;
+		return 0;
 	}
 
 #if USE_DSHOT_DMA
@@ -769,6 +880,44 @@ int pwm_setBitSequence(pwm_tim_id_t timer, pwm_ch_id_t chn, void *data, uint32_t
 #endif
 
 	return res;
+}
+
+
+int pwm_setBitSequence4(pwm_tim_id_t timer, const uint16_t chnRaw[4], const uint16_t val16[4], uint16_t hcmp, uint16_t lcmp, int flags)
+{
+	pwm_ch_id_t chn[PWM_CHN_NUM];
+	uint16_t seq[PWM_CHN_NUM][PWM_BITSEQ4_BITS + 2];
+	int res, i, j;
+
+	(void)flags;
+
+	res = pwm_validateTimer(timer);
+	if (res < 0) {
+		return res;
+	}
+
+	for (i = 0; i < PWM_CHN_NUM; ++i) {
+		chn[i] = (pwm_ch_id_t)chnRaw[i];
+
+		res = pwm_validateChannel(timer, chn[i]);
+		if (res < 0) {
+			return res;
+		}
+
+		for (j = 0; j < i; ++j) {
+			if (chn[i] == chn[j]) {
+				return -EINVAL;
+			}
+
+			if (PWM_CCR_REG(chn[i]) == PWM_CCR_REG(chn[j])) {
+				return -EINVAL;
+			}
+		}
+
+		pwm_fillBitSequence(val16[i], hcmp, lcmp, seq[i]);
+	}
+
+	return pwm_callBitSequence(timer, chn, seq);
 }
 
 
