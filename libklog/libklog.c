@@ -29,6 +29,13 @@
 
 #define ERROR_MSG "libklog: Fatal error, exiting\n"
 
+/* Minimal fbcon write for libklog debugging */
+static void libklog_fbcon_debug(const char *s)
+{
+        (void)s;
+}
+
+
 static struct {
 	char __attribute__((aligned(8))) stack[2048];
 	libklog_write_t ttywrite;
@@ -55,51 +62,57 @@ static void pumpthr(void *arg)
 	dev.port = 0;
 
 	_errno_new(&libklog_common.e);
-	fd = open(_PATH_KLOG, O_RDONLY);
+	libklog_fbcon_debug("libklog: pumpthr starting\n");
+	libklog_common.ttywrite("libklog: pumpthr starting\n", 26);	fd = open(_PATH_KLOG, O_RDONLY);
 	if (fd < 0) {
-		strcpy(buf, "devfs");
-		name = strrchr(_PATH_KLOG, '/');
-		if (name == NULL) {
-			_errno_remove(&libklog_common.e);
-			endthread();
-		}
+	        libklog_common.ttywrite("libklog: open /dev/kmsg failed, trying sys_open\n", 48);
+	        strcpy(buf, "devfs");
+	        name = strrchr(_PATH_KLOG, '/');
+	        if (name == NULL) {
+	                libklog_common.ttywrite("libklog: invalid /dev/kmsg path\n", 32);
+	                _errno_remove(&libklog_common.e);
+	                endthread();
+	        }
 
-		strcat(buf, name);
+	        strcat(buf, name);
 
-		if (createDevs == 0) {
-			/* Wait for KLOG device */
-			do {
-				fd = open(_PATH_KLOG, O_RDONLY);
-				if (fd < 0) {
-					fd = sys_open(buf, O_RDONLY, 0);
-				}
-				if (fd < 0) {
-					usleep(10000);
-				}
-			} while (fd < 0);
-		}
-		else {
-			/* On some architectures devFS might not be bound
-			 * to /dev directory yet, which makes /dev/kmsg path not resolvable.
-			 * To make devfs/kmsg resolvable, we need to register it first.
-			 */
+	        if (createDevs == 0) {
+	                /* Wait for KLOG device */
+	                do {
+	                        fd = open(_PATH_KLOG, O_RDONLY);
+	                        if (fd < 0) {
+	                                fd = sys_open(buf, O_RDONLY, 0);
+	                        }
+	                        if (fd < 0) {
+	                                usleep(10000);
+	                        }
+	                } while (fd < 0);
+	        }
+	        else {
+	                /* On some architectures devFS might not be bound
+	                 * to /dev directory yet, which makes /dev/kmsg path not resolvable.
+	                 * To make devfs/kmsg resolvable, we need to register it first.
+	                 */
 
-			if (portRegister(0, buf, &dev) != 0) {
-				_errno_remove(&libklog_common.e);
-				endthread();
-			}
+	                libklog_common.ttywrite("libklog: register kmsg\n", 23);
+	                if (portRegister(0, buf, &dev) != 0) {
+	                        libklog_common.ttywrite("libklog: register kmsg failed\n", 30);
+	                        _errno_remove(&libklog_common.e);
+	                        endthread();
+	                }
 
-			/* open() treats paths not starting with '/' slash as local */
-			fd = sys_open(buf, O_RDONLY, 0);
-			if (fd < 0) {
-				_errno_remove(&libklog_common.e);
-				endthread();
-			}
-		}
+	                /* open() treats paths not starting with '/' slash as local */
+	                fd = sys_open(buf, O_RDONLY, 0);
+	                if (fd < 0) {
+	                        libklog_common.ttywrite("libklog: sys_open kmsg failed\n", 30);
+	                        _errno_remove(&libklog_common.e);
+	                        endthread();
+	                }
+	        }
 	}
 
-	while (1) {
-		ret = read(fd, buf, sizeof(buf));
+	libklog_common.ttywrite("libklog: kmsg opened, pumping\n", 30);
+	while (1) {		ret = read(fd, buf, sizeof(buf));
 		if (ret <= 0) {
 			if ((ret == 0) || (errno == EINTR) || (errno == EPIPE)) {
 				continue;
