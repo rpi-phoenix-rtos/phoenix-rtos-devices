@@ -98,14 +98,14 @@ typedef struct {
 	uint16_t fbcol;
 	uint16_t fbrow;
 	uint16_t fbpitch;
-	char stack[1024] __attribute__((aligned(8)));
-	char kbdstack[1024] __attribute__((aligned(8)));
+	char stack[4096] __attribute__((aligned(8)));
+	char kbdstack[4096] __attribute__((aligned(8)));
 } pl011_t;
 
 
 static struct {
 	pl011_t uart;
-	char stack[2048] __attribute__((aligned(8)));
+	char stack[4096] __attribute__((aligned(8)));
 } pl011_common;
 
 
@@ -287,14 +287,18 @@ static int pl011_fbcon_init(pl011_t *uart)
 
 static void pl011_writeRaw(pl011_t *uart, const char *s)
 {
-        pl011_fbcon_write(uart, s, strlen(s));
-        while (*s != '\0') {
-                while ((pl011_read(uart, fr) & fr_txff) != 0) {
-                }
+	if (uart->fbaddr != NULL) {
+		pl011_fbcon_write(uart, s, strlen(s));
+	}
 
-                pl011_write(uart, dr, (unsigned char)*s++);
-        }
+	while (*s != '\0') {
+		while ((pl011_read(uart, fr) & fr_txff) != 0) {
+		}
+
+		pl011_write(uart, dr, (unsigned char)*s++);
+	}
 }
+
 
 static int pl011_createTty0(pl011_t *uart)
 {
@@ -475,11 +479,11 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 
 	pl011_configure(uart);
 	(void)pl011_fbcon_init(uart);
-	usleep(500000);
 	pl011_writeRaw(uart, "pl011-tty: started\r\n");
 
 	return EOK;
-	}
+}
+
 
 static void pl011_ioctl(unsigned int port, msg_t *msg)
 {
@@ -626,7 +630,7 @@ static void pl011_kbdthr(void *arg)
 			for (i = 0u; i < (size_t)len; ++i) {
 				int woke = 0;
 
-				(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &woke);
+				(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &wake_reader);
 				wake_reader |= woke;
 			}
 			libtty_putchar_unlock(&uart->tty);
@@ -644,33 +648,14 @@ static void pl011_kbdthr(void *arg)
 
 int main(void)
 {
-        uint32_t port;
-        void *gpio;
-        volatile uint32_t *gpioregs;
-        int i;
+	uint32_t port;
 
-        if (portCreate(&port) < 0) {
-                return EXIT_FAILURE;
-        }
+	if (portCreate(&port) < 0) {
+		return EXIT_FAILURE;
+	}
 
-        /* Diagnostic: blink ACT LED (GPIO42) from userspace */
-        gpio = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, 0xfe200000u);
-        if (gpio != MAP_FAILED) {
-                gpioregs = (volatile uint32_t *)gpio;
-                /* Set GPIO 42 as output */
-                gpioregs[4] = (gpioregs[4] & ~(7u << 6)) | (1u << 6);
-                for (i = 0; i < 10; ++i) {
-                        gpioregs[8] = (1u << 10); /* Set (LED ON) */
-                        usleep(100000);
-                        gpioregs[11] = (1u << 10); /* Clear (LED OFF) */
-                        usleep(100000);
-                }
-                /* Leave it ON as final heartbeat */
-                gpioregs[8] = (1u << 10);
-                munmap(gpio, _PAGE_SIZE);
-        }
-
-        if (pl011_init(&pl011_common.uart, port) < 0) {		fprintf(stderr, "pl011-tty: failed to initialize PL011 console\n");
+	if (pl011_init(&pl011_common.uart, port) < 0) {
+		fprintf(stderr, "pl011-tty: failed to initialize PL011 console\n");
 		return EXIT_FAILURE;
 	}
 
