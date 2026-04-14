@@ -231,8 +231,8 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 
 	msgbuf = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
 	if (msgbuf == MAP_FAILED) {
-		munmap((void *)mailbox, _PAGE_SIZE);
-		return -ENOMEM;
+	        munmap((void *)mailbox, _PAGE_SIZE);
+	        return -ENOMEM;
 	}
 
 	msgbuf[0] = RPI_PROP_NOTIFY_MSG_WORDS * sizeof(uint32_t);
@@ -244,8 +244,12 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 	msgbuf[6] = RPI_PROP_END;
 
 	msgaddr = va2pa(msgbuf);
+	if (msgaddr == (uintptr_t)-1) {
+	        munmap(msgbuf, _PAGE_SIZE);
+	        munmap((void *)mailbox, _PAGE_SIZE);
+	        return -EFAULT;
+	}
 	msg = ((uint32_t)msgaddr & ~0xfu) | RPI_MBOX_PROP_CHANNEL;
-
 	while ((*(mailbox + (RPI_MBOX_STATUS / sizeof(uint32_t))) & RPI_MBOX_FULL) != 0u) {
 	}
 
