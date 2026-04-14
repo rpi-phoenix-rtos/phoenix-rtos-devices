@@ -285,21 +285,6 @@ static int pl011_fbcon_init(pl011_t *uart)
 #endif
 
 
-static void pl011_writeRaw(pl011_t *uart, const char *s)
-{
-	if (uart->fbaddr != NULL) {
-		pl011_fbcon_write(uart, s, strlen(s));
-	}
-
-	while (*s != '\0') {
-		while ((pl011_read(uart, fr) & fr_txff) != 0) {
-		}
-
-		pl011_write(uart, dr, (unsigned char)*s++);
-	}
-}
-
-
 static int pl011_createTty0(pl011_t *uart)
 {
 	static const char name[] = "tty0";
@@ -308,7 +293,6 @@ static int pl011_createTty0(pl011_t *uart)
 	int err;
 	unsigned int i;
 
-	pl011_writeRaw(uart, "pl011-tty: tty0 lookup\r\n");
 	err = -ENODEV;
 	for (i = 0; i < 50; ++i) {
 		err = lookup("devfs", NULL, &odev);
@@ -316,22 +300,12 @@ static int pl011_createTty0(pl011_t *uart)
 			break;
 		}
 
-		if ((i == 0U) || (((i + 1U) % 10U) == 0U)) {
-			pl011_writeRaw(uart, "pl011-tty: tty0 lookup retry\r\n");
-		}
-
 		usleep(100000);
-		if (i == 0U) {
-			pl011_writeRaw(uart, "pl011-tty: tty0 wake\r\n");
-		}
 	}
 
 	if (err < 0) {
-		pl011_writeRaw(uart, "pl011-tty: tty0 lookup failed\r\n");
 		return err;
 	}
-
-	pl011_writeRaw(uart, "pl011-tty: tty0 lookup ok\r\n");
 
 	msg.type = mtCreate;
 	msg.oid = odev;
@@ -341,13 +315,9 @@ static int pl011_createTty0(pl011_t *uart)
 	msg.i.data = name;
 	msg.i.size = sizeof(name);
 
-	pl011_writeRaw(uart, "pl011-tty: tty0 send\r\n");
 	if (msgSend(odev.port, &msg) != EOK) {
-		pl011_writeRaw(uart, "pl011-tty: tty0 send failed\r\n");
 		return -ENOMEM;
 	}
-
-	pl011_writeRaw(uart, "pl011-tty: tty0 send done\r\n");
 
 	return msg.o.err;
 }
@@ -479,7 +449,6 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 
 	pl011_configure(uart);
 	(void)pl011_fbcon_init(uart);
-	pl011_writeRaw(uart, "pl011-tty: started\r\n");
 
 	return EOK;
 }
@@ -659,21 +628,15 @@ int main(void)
 		return EXIT_FAILURE;
 	}
 
-	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register tty0\r\n");
 	if (pl011_createTty0(&pl011_common.uart) < 0) {
-		pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 failed\r\n");
 		fprintf(stderr, "pl011-tty: failed to register /dev/tty0\n");
 		return EXIT_FAILURE;
 	}
-	pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 ready\r\n");
 
-	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register console\r\n");
 	if (create_dev(&pl011_common.uart.oid, _PATH_CONSOLE) < 0) {
-		pl011_writeRaw(&pl011_common.uart, "pl011-tty: console failed\r\n");
 		fprintf(stderr, "pl011-tty: failed to register %s\n", _PATH_CONSOLE);
 		return EXIT_FAILURE;
 	}
-	pl011_writeRaw(&pl011_common.uart, "pl011-tty: console ready\r\n");
 
 	libklog_init(pl011_klogClbk);
 	oid_t kmsgctrl = { .port = port, .id = KMSG_CTRL_ID };
