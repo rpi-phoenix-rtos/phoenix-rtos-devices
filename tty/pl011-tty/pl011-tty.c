@@ -493,12 +493,6 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 
 	pl011_configure(uart);
 	TD13_DBG("init: pl011_configure done");
-	if (pl011_fbcon_init(uart) == EOK) {
-		TD13_DBG("init: fbcon ok (HDMI console up)");
-	}
-	else {
-		TD13_DBG("init: fbcon unavailable");
-	}
 	pl011_writeRaw(uart, "pl011-tty: started\r\n");
 
 	return EOK;
@@ -712,6 +706,15 @@ int main(void)
 		beginthread(pl011_kbdthr, 4, pl011_common.uart.kbdstack, sizeof(pl011_common.uart.kbdstack), &pl011_common.uart);
 	}
 	beginthread(poolthr, 4, pl011_common.stack, sizeof(pl011_common.stack), (void *)(uintptr_t)port);
+
+	TD13_DBG("fbcon init deferred enter");
+	if (pl011_fbcon_init(&pl011_common.uart) == EOK) {
+		TD13_DBG("fbcon init deferred ok");
+	}
+	else {
+		TD13_DBG("fbcon init deferred unavailable");
+	}
+
 	poolthr((void *)(uintptr_t)port);
 
 	return EOK;
