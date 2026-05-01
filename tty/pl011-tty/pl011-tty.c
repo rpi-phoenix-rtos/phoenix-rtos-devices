@@ -19,6 +19,14 @@
 #include <string.h>
 #include <unistd.h>
 
+/* TD-13 diagnostic: route progress prints through the kernel's
+ * hal_consolePrint via the debug() syscall, so they appear on the
+ * kernel UART even before /dev/console is registered. Removed once
+ * the boot reliably reaches "pl011-tty: console ready" via its own
+ * pl011_writeRaw() path. */
+#include <sys/debug.h>
+#define TD13_DBG(s) debug("pl011-tty: " s "\n")
+
 #include <board_config.h>
 #include <posix/utils.h>
 #include <sys/file.h>
@@ -447,18 +455,25 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 {
 	libtty_callbacks_t callbacks;
 
+	TD13_DBG("init: enter");
+
 	if (PL011_TTY_BASE == 0u) {
+		TD13_DBG("init: PL011_TTY_BASE == 0");
 		return -ENODEV;
 	}
 
 	if (mutexCreate(&uart->fbLock) < 0) {
+		TD13_DBG("init: mutexCreate FAILED");
 		return -ENOMEM;
 	}
+	TD13_DBG("init: mutexCreate ok");
 
 	uart->base = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (off_t)PL011_TTY_BASE);
 	if (uart->base == MAP_FAILED) {
+		TD13_DBG("init: mmap PL011 FAILED");
 		return -ENOMEM;
 	}
+	TD13_DBG("init: mmap PL011 ok");
 
 	callbacks.arg = uart;
 	callbacks.set_baudrate = set_baudrate;
@@ -466,8 +481,10 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 	callbacks.signal_txready = signal_txready;
 
 	if (libtty_init(&uart->tty, &callbacks, _PAGE_SIZE, PL011_TTY_BAUDRATE) < 0) {
+		TD13_DBG("init: libtty_init FAILED");
 		return -ENOMEM;
 	}
+	TD13_DBG("init: libtty_init ok");
 
 	uart->speed = uart->tty.term.c_ospeed;
 	uart->cflag = uart->tty.term.c_cflag;
@@ -475,7 +492,13 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 	uart->oid.id = 0;
 
 	pl011_configure(uart);
-	(void)pl011_fbcon_init(uart);
+	TD13_DBG("init: pl011_configure done");
+	if (pl011_fbcon_init(uart) == EOK) {
+		TD13_DBG("init: fbcon ok (HDMI console up)");
+	}
+	else {
+		TD13_DBG("init: fbcon unavailable");
+	}
 	pl011_writeRaw(uart, "pl011-tty: started\r\n");
 
 	return EOK;
@@ -649,14 +672,20 @@ int main(void)
 {
 	uint32_t port;
 
+	TD13_DBG("main entry");
+
 	if (portCreate(&port) < 0) {
+		TD13_DBG("portCreate FAILED");
 		return EXIT_FAILURE;
 	}
+	TD13_DBG("portCreate ok");
 
 	if (pl011_init(&pl011_common.uart, port) < 0) {
+		TD13_DBG("pl011_init FAILED");
 		fprintf(stderr, "pl011-tty: failed to initialize PL011 console\n");
 		return EXIT_FAILURE;
 	}
+	TD13_DBG("pl011_init ok");
 
 	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register tty0\r\n");
 	if (pl011_createTty0(&pl011_common.uart) < 0) {
