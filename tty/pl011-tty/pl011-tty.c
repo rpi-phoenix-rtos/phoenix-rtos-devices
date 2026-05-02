@@ -450,6 +450,28 @@ static void pl011_klogClbk(const char *data, size_t size)
 }
 
 
+static void pl011_attrAll(struct _attrAll *attrs)
+{
+	memset(attrs, 0, sizeof(*attrs));
+	attrs->mode.val = S_IFCHR | 0666;
+	attrs->links.val = 1;
+	attrs->ioblock.val = 1;
+	attrs->pollStatus.val = libtty_poll_status(&pl011_common.uart.tty);
+}
+
+
+static void pl011_stat(struct stat *st, const oid_t *oid)
+{
+	memset(st, 0, sizeof(*st));
+	st->st_dev = oid->port;
+	st->st_ino = oid->id;
+	st->st_rdev = oid->port;
+	st->st_mode = S_IFCHR | 0666;
+	st->st_nlink = 1;
+	st->st_blksize = 1;
+}
+
+
 static int pl011_init(pl011_t *uart, unsigned int port)
 {
 	libtty_callbacks_t callbacks;
@@ -540,12 +562,40 @@ static void poolthr(void *arg)
 				break;
 
 			case mtGetAttr:
-				if (msg.i.attr.type != atPollStatus) {
+				switch (msg.i.attr.type) {
+					case atMode:
+						msg.o.attr.val = S_IFCHR | 0666;
+						msg.o.err = EOK;
+						break;
+
+					case atPollStatus:
+						msg.o.attr.val = libtty_poll_status(&pl011_common.uart.tty);
+						msg.o.err = EOK;
+						break;
+
+					default:
+						msg.o.err = -EINVAL;
+						break;
+				}
+				break;
+
+			case mtGetAttrAll:
+				if ((msg.o.data == NULL) || (msg.o.size < sizeof(struct _attrAll))) {
 					msg.o.err = -EINVAL;
 					break;
 				}
 
-				msg.o.attr.val = libtty_poll_status(&pl011_common.uart.tty);
+				pl011_attrAll(msg.o.data);
+				msg.o.err = EOK;
+				break;
+
+			case mtStat:
+				if ((msg.o.data == NULL) || (msg.o.size < sizeof(struct stat))) {
+					msg.o.err = -EINVAL;
+					break;
+				}
+
+				pl011_stat(msg.o.data, &msg.oid);
 				msg.o.err = EOK;
 				break;
 
@@ -690,6 +740,14 @@ int main(void)
 		pl011_writeRaw(&pl011_common.uart, "pl011-tty: console failed\r\n");
 		fprintf(stderr, "pl011-tty: failed to register %s\n", _PATH_CONSOLE);
 		return EXIT_FAILURE;
+	}
+
+	/* TODO(TD-14-console-alias): keep the direct kernel namespace alias
+	 * until Pi 4 bind/devfs lookup latency is fixed. create_dev() registers
+	 * the node in devfs; this alias preserves the fast /dev/console path used
+	 * by early shell startup and mirrors create_dev()'s fallback behavior. */
+	if (portRegister(port, _PATH_CONSOLE, &pl011_common.uart.oid) < 0) {
+		pl011_writeRaw(&pl011_common.uart, "pl011-tty: console alias skipped\r\n");
 	}
 	pl011_writeRaw(&pl011_common.uart, "pl011-tty: console ready\r\n");
 
