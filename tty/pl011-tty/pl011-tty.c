@@ -526,6 +526,11 @@ static void poolthr(void *arg)
 	msg_rid_t rid;
 	msg_t msg;
 
+	/* TODO(TD-14): poolthr-running marker. One-shot per thread (can be
+	 * called twice — main thread + spawned). Confirms message loop is
+	 * actually entered on real Pi 4. Remove once TD-14 is closed. */
+	debug("pl011-tty: poolthr enter\n");
+
 	for (;;) {
 		if (msgRecv(port, &msg, &rid) < 0) {
 			continue;
