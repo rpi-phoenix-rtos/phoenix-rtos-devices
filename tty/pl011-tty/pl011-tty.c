@@ -318,7 +318,14 @@ static int pl011_createTty0(pl011_t *uart)
 
 	pl011_writeRaw(uart, "pl011-tty: tty0 lookup\r\n");
 	err = -ENODEV;
-	for (i = 0; i < 50; ++i) {
+	/* TODO(TD-14-pl011-retry): originally 50 retries (5 s wall), bumped
+	 * to 500 (50 s) for slow Pi 4 IPC, then back DOWN to 30 (3 s) once
+	 * we made the caller TD-14-tty0-nonfatal. /dev/tty0 is now optional;
+	 * if devfs lookup is slow we'd rather give up quickly here and let
+	 * the create_dev() fallback path handle /dev/console registration
+	 * directly via portRegister. Restore to 50 after IPC slowness is
+	 * rooted out and the non-fatal hack is reverted. */
+	for (i = 0; i < 30; ++i) {
 		err = lookup("devfs", NULL, &odev);
 		if (err >= 0) {
 			break;
@@ -687,12 +694,23 @@ int main(void)
 	TD13_DBG("pl011_init ok");
 
 	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register tty0\r\n");
+	/* TODO(TD-14-tty0-nonfatal): pl011_createTty0() depends on a fast
+	 * lookup("devfs") that is intermittently slow on real Pi 4 (TD-04-
+	 * class IPC fragility). It runs the same lookup as create_dev()
+	 * below — but lacks the latter's fallback, so it can hang for tens
+	 * of seconds and block the entire pl011-tty bring-up. Treat its
+	 * failure as non-fatal: skip /dev/tty0 if it doesn't register
+	 * cleanly and proceed to register /dev/console (whose libphoenix
+	 * helper has its own portRegister fallback). /dev/tty0 is not
+	 * strictly required for psh's shell prompt to come up. Restore
+	 * the fatal path once the underlying IPC slowness is rooted out. */
 	if (pl011_createTty0(&pl011_common.uart) < 0) {
-		pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 failed\r\n");
-		fprintf(stderr, "pl011-tty: failed to register /dev/tty0\n");
-		return EXIT_FAILURE;
+		pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 failed (non-fatal)\r\n");
+		fprintf(stderr, "pl011-tty: tty0 register failed (non-fatal, continuing)\n");
 	}
-	pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 ready\r\n");
+	else {
+		pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 ready\r\n");
+	}
 
 	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register console\r\n");
 	if (create_dev(&pl011_common.uart.oid, _PATH_CONSOLE) < 0) {
