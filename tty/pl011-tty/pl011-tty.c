@@ -761,9 +761,26 @@ int main(void)
 	}
 	beginthread(poolthr, 4, pl011_common.stack, sizeof(pl011_common.stack), (void *)(uintptr_t)port);
 
-	if (pl011_fbcon_init(&pl011_common.uart) == EOK) {
-	}
-	else {
+	{
+		/* TD-15 / Stage 4 phase 1: instrument fbcon init result so we
+		 * can tell on real Pi whether (a) graphmode was never populated
+		 * (returns -ENOSYS — plo's mailbox path didn't fill it in), or
+		 * (b) framebuffer mmap failed (returns -ENOMEM), or (c) it
+		 * actually succeeded. Direct UART write via pl011_writeRaw to
+		 * avoid debug() IPC dependency. */
+		int fbres = pl011_fbcon_init(&pl011_common.uart);
+		if (fbres == EOK) {
+			pl011_writeRaw(&pl011_common.uart, "fbcon: ok\r\n");
+		}
+		else if (fbres == -ENOSYS) {
+			pl011_writeRaw(&pl011_common.uart, "fbcon: skip (graphmode not populated)\r\n");
+		}
+		else if (fbres == -ENOMEM) {
+			pl011_writeRaw(&pl011_common.uart, "fbcon: skip (framebuffer mmap failed)\r\n");
+		}
+		else {
+			pl011_writeRaw(&pl011_common.uart, "fbcon: skip (other error)\r\n");
+		}
 	}
 
 	poolthr((void *)(uintptr_t)port);
