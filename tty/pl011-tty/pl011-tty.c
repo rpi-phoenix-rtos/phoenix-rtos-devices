@@ -84,6 +84,22 @@ enum { cr_uarten = 1 << 0, cr_txe = 1 << 8, cr_rxe = 1 << 9 };
 #define PL011_FBCON_FG 0xffffffffu
 
 
+/* TD-15 Stage 4: minimal VT100/ANSI parser state for the HDMI fbcon
+ * path. Without this the literal escape bytes from psh / klog
+ * (e.g. "\x1b[0J", "\x1b[2J", "\x1b[H", "\x1b[r;cH") show up on
+ * screen as garbage characters ("?[0J(psh)%" in the user-captured
+ * HDMI screenshot). PL011_FBCON_ESC_MAX_PARAMS bounds the parameter
+ * list (max 8 params is well above the longest sequence psh
+ * realistically emits). */
+#define PL011_FBCON_ESC_MAX_PARAMS 8u
+
+typedef enum {
+	pl011_fbcon_esc_normal = 0,
+	pl011_fbcon_esc_gotEsc,    /* received \x1b, waiting for the next char */
+	pl011_fbcon_esc_inCsi,     /* in a CSI (Control Sequence Introducer) sequence \x1b[ */
+} pl011_fbcon_escState_t;
+
+
 typedef struct {
 	volatile uint32_t *base;
 	oid_t oid;
@@ -98,6 +114,13 @@ typedef struct {
 	uint16_t fbcol;
 	uint16_t fbrow;
 	uint16_t fbpitch;
+
+	/* TD-15 Stage 4: VT100/ANSI parser state. */
+	pl011_fbcon_escState_t fbescState;
+	uint16_t fbescParams[PL011_FBCON_ESC_MAX_PARAMS];
+	uint8_t fbescNumParams;
+	uint8_t fbescPad;
+
 	char stack[4096] __attribute__((aligned(8)));
 	char kbdstack[4096] __attribute__((aligned(8)));
 } pl011_t;
@@ -146,16 +169,63 @@ static void pl011_fbcon_drawChar(pl011_t *uart, uint16_t col, uint16_t row, unsi
 }
 
 
+/* TD-15 Stage 4: 64-bit BG fill primitive. With kernel D-cache disabled
+ * (Stage 1 parked, see TD-16-cache-enable), every framebuffer write
+ * goes straight to DDR and pays a per-store penalty. Switching from
+ * per-pixel uint32_t stores to 64-bit stores roughly halves the
+ * instruction count and lets the compiler emit STP pairs for inner
+ * loops. The full-screen clear is still observably slow on HDMI (the
+ * line-by-line wipe the user reported is the cache-off cost), but
+ * this halves it. */
+static inline void pl011_fbcon_fill64(volatile uint32_t *base, size_t bytes, uint32_t color)
+{
+	volatile uint64_t *p = (volatile uint64_t *)base;
+	size_t qwords = bytes / sizeof(uint64_t);
+	uint64_t pair = ((uint64_t)color << 32) | (uint64_t)color;
+	size_t i;
+
+	for (i = 0u; i < qwords; ++i) {
+		p[i] = pair;
+	}
+
+	/* Tail (a single u32 left over) — extremely unlikely with sane
+	 * pitch values, but cover it correctly anyway. */
+	if ((bytes & (sizeof(uint64_t) - 1u)) != 0u) {
+		base[bytes / sizeof(uint32_t) - 1u] = color;
+	}
+}
+
+
 static void pl011_fbcon_clearRow(pl011_t *uart, uint16_t row)
 {
 	uint16_t y;
-	uint16_t x;
+	size_t rowBytes = (size_t)uart->fbcols * (size_t)TTYPC_FBFONT_W * sizeof(uint32_t);
 
 	for (y = row * TTYPC_FBFONT_H; y < (row + 1u) * TTYPC_FBFONT_H; ++y) {
-		for (x = 0u; x < uart->fbcols * TTYPC_FBFONT_W; ++x) {
-			pl011_fbcon_drawPixel(uart, x, y, PL011_FBCON_BG);
-		}
+		volatile uint32_t *line = (volatile uint32_t *)((char *)uart->fbaddr + y * uart->fbpitch);
+		pl011_fbcon_fill64(line, rowBytes, PL011_FBCON_BG);
 	}
+}
+
+
+/* TD-15 Stage 4: clear a half-open row range. */
+static void pl011_fbcon_clearRowRange(pl011_t *uart, uint16_t firstRow, uint16_t lastRowExcl)
+{
+	uint16_t r;
+	for (r = firstRow; r < lastRowExcl; ++r) {
+		pl011_fbcon_clearRow(uart, r);
+	}
+}
+
+
+/* TD-15 Stage 4: clear the fbmemsz-bounded area to BG. Uses the
+ * 64-bit fill primitive to halve instruction count vs the previous
+ * per-pixel clearRow loop. */
+static void pl011_fbcon_clearAll(pl011_t *uart)
+{
+	pl011_fbcon_fill64(uart->fbaddr, uart->fbmemsz, PL011_FBCON_BG);
+	uart->fbcol = 0u;
+	uart->fbrow = 0u;
 }
 
 
@@ -170,10 +240,174 @@ static void pl011_fbcon_scroll(pl011_t *uart)
 }
 
 
+/* TD-15 Stage 4: dispatch a CSI sequence (ESC [ params final).
+ *
+ * We support the small set of sequences psh and klog actually emit:
+ *   J  - Erase in display.   0/missing: cursor to end. 2: entire screen.
+ *   K  - Erase in line.      0/missing: cursor to EOL. 2: entire line.
+ *   H  - Cursor position.    Optional row;col, defaulting to 1;1.
+ *   f  - Cursor position.    Same as H.
+ *   A  - Cursor up by N (default 1).
+ *   B  - Cursor down by N.
+ *   C  - Cursor forward by N.
+ *   D  - Cursor back by N.
+ *   m  - SGR (color/attr).   Consumed silently — fbcon is BG/FG only.
+ *
+ * Anything else is consumed silently. The cursor is row-clamped to
+ * [0, fbrows) and column-clamped to [0, fbcols).
+ */
+static void pl011_fbcon_dispatchCsi(pl011_t *uart, unsigned char final)
+{
+	uint16_t r;
+	uint16_t param0 = (uart->fbescNumParams > 0u) ? uart->fbescParams[0] : 0u;
+	uint16_t param1 = (uart->fbescNumParams > 1u) ? uart->fbescParams[1] : 0u;
+	uint16_t row;
+	uint16_t col;
+	uint16_t step;
+
+	switch (final) {
+		case 'J':
+			if (param0 == 0u) {
+				/* Cursor to end of screen */
+				for (r = uart->fbcol; r < uart->fbcols; ++r) {
+					pl011_fbcon_drawChar(uart, r, uart->fbrow, ' ');
+				}
+				pl011_fbcon_clearRowRange(uart, uart->fbrow + 1u, uart->fbrows);
+			}
+			else if (param0 == 2u) {
+				pl011_fbcon_clearRowRange(uart, 0u, uart->fbrows);
+			}
+			break;
+
+		case 'K':
+			if (param0 == 0u) {
+				/* Cursor to EOL */
+				for (r = uart->fbcol; r < uart->fbcols; ++r) {
+					pl011_fbcon_drawChar(uart, r, uart->fbrow, ' ');
+				}
+			}
+			else if (param0 == 2u) {
+				pl011_fbcon_clearRow(uart, uart->fbrow);
+			}
+			break;
+
+		case 'H':
+		case 'f':
+			row = (param0 > 0u) ? (param0 - 1u) : 0u;
+			col = (param1 > 0u) ? (param1 - 1u) : 0u;
+			if (row >= uart->fbrows) {
+				row = uart->fbrows - 1u;
+			}
+			if (col >= uart->fbcols) {
+				col = uart->fbcols - 1u;
+			}
+			uart->fbrow = row;
+			uart->fbcol = col;
+			break;
+
+		case 'A':
+			step = (param0 > 0u) ? param0 : 1u;
+			uart->fbrow = (uart->fbrow > step) ? (uart->fbrow - step) : 0u;
+			break;
+
+		case 'B':
+			step = (param0 > 0u) ? param0 : 1u;
+			uart->fbrow += step;
+			if (uart->fbrow >= uart->fbrows) {
+				uart->fbrow = uart->fbrows - 1u;
+			}
+			break;
+
+		case 'C':
+			step = (param0 > 0u) ? param0 : 1u;
+			uart->fbcol += step;
+			if (uart->fbcol >= uart->fbcols) {
+				uart->fbcol = uart->fbcols - 1u;
+			}
+			break;
+
+		case 'D':
+			step = (param0 > 0u) ? param0 : 1u;
+			uart->fbcol = (uart->fbcol > step) ? (uart->fbcol - step) : 0u;
+			break;
+
+		case 'm':
+			/* SGR — ignored; fbcon is BG/FG only. */
+			break;
+
+		default:
+			/* Unsupported final char — drop silently. */
+			break;
+	}
+}
+
+
 static void pl011_fbcon_putc(pl011_t *uart, unsigned char c)
 {
 	if (uart->fbaddr == NULL) {
 		return;
+	}
+
+	/* TD-15 Stage 4: VT100/ANSI ESC parser. Without this the raw
+	 * escape bytes from psh / klog are rendered literally on HDMI. */
+	switch (uart->fbescState) {
+		case pl011_fbcon_esc_gotEsc:
+			if (c == '[') {
+				uart->fbescState = pl011_fbcon_esc_inCsi;
+				uart->fbescNumParams = 0u;
+				uart->fbescParams[0] = 0u;
+			}
+			else if (c == 'c') {
+				/* RIS — reset to initial state. */
+				pl011_fbcon_clearAll(uart);
+				uart->fbescState = pl011_fbcon_esc_normal;
+			}
+			else {
+				/* Two-byte non-CSI sequence we don't model — drop. */
+				uart->fbescState = pl011_fbcon_esc_normal;
+			}
+			return;
+
+		case pl011_fbcon_esc_inCsi:
+			if ((c >= '0') && (c <= '9')) {
+				if (uart->fbescNumParams == 0u) {
+					uart->fbescNumParams = 1u;
+				}
+				uart->fbescParams[uart->fbescNumParams - 1u] =
+					(uart->fbescParams[uart->fbescNumParams - 1u] * 10u) + (c - '0');
+				return;
+			}
+			else if (c == ';') {
+				if (uart->fbescNumParams < PL011_FBCON_ESC_MAX_PARAMS) {
+					uart->fbescNumParams++;
+					uart->fbescParams[uart->fbescNumParams - 1u] = 0u;
+				}
+				return;
+			}
+			else if ((c == '?') || (c == '>')) {
+				/* Private CSI introducer — consume but treat the rest
+				 * as standard. */
+				return;
+			}
+			else if ((c >= 0x40u) && (c <= 0x7eu)) {
+				pl011_fbcon_dispatchCsi(uart, c);
+				uart->fbescState = pl011_fbcon_esc_normal;
+				return;
+			}
+			else {
+				/* Out-of-spec byte inside CSI — abort the sequence. */
+				uart->fbescState = pl011_fbcon_esc_normal;
+				return;
+			}
+			/* unreachable */
+
+		case pl011_fbcon_esc_normal:
+		default:
+			if (c == 0x1bu) {
+				uart->fbescState = pl011_fbcon_esc_gotEsc;
+				return;
+			}
+			break;
 	}
 
 	switch (c) {
@@ -254,15 +488,18 @@ static int pl011_fbcon_init(pl011_t *uart)
 	uart->fbpitch = pctl.task.graphmode.pitch;
 	uart->fbcols = pctl.task.graphmode.width / TTYPC_FBFONT_W;
 	uart->fbrows = pctl.task.graphmode.height / TTYPC_FBFONT_H;
-	uart->fbcol = 0u;
-	uart->fbrow = 6u;
-	if (uart->fbrow >= uart->fbrows) {
-		uart->fbrow = 0u;
-	}
 
-	for (row = 0u; row < uart->fbrows; ++row) {
-		pl011_fbcon_clearRow(uart, row);
-	}
+	/* TD-15 Stage 4: reset VT100 parser and clear the entire mapped
+	 * framebuffer (raw 32-bit fill of fbmemsz bytes — covers any
+	 * pitch padding / partial bottom row that the per-glyph clearRow
+	 * loop would skip). The previous boot left the firmware splash
+	 * visible in the lower half of the HDMI screen because the per-
+	 * glyph loop only covered fbrows*FONT_H rows. */
+	uart->fbescState = pl011_fbcon_esc_normal;
+	uart->fbescNumParams = 0u;
+	pl011_fbcon_clearAll(uart);
+
+	(void)row;
 
 	pl011_fbcon_write(uart, "Phoenix-RTOS HDMI console\r\n", sizeof("Phoenix-RTOS HDMI console\r\n") - 1u);
 
