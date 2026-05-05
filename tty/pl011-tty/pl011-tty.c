@@ -489,7 +489,22 @@ static int pl011_fbcon_init(pl011_t *uart)
 	}
 
 	uart->fbmemsz = (pctl.task.graphmode.pitch * pctl.task.graphmode.height + _PAGE_SIZE - 1u) & ~(_PAGE_SIZE - 1u);
-	uart->fbaddr = mmap(NULL, uart->fbmemsz, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_SHARED | MAP_UNCACHED | MAP_ANONYMOUS | MAP_PHYSMEM, -1, pctl.task.graphmode.framebuffer);
+	/* TD-15 Stage 4 phase 1d: drop MAP_DEVICE so the framebuffer is
+	 * mapped Normal Non-Cacheable (MAIR_IDX_NONCACHED) instead of
+	 * Strongly-Ordered (MAIR_IDX_S_ORDERED, MAIR_DEV_nGnRnE). With
+	 * S-Ordered memory every store must complete before the next can
+	 * issue — no write combining, no buffering. On real Pi 4 with
+	 * caches disabled (Stage 1 parked) the full-fbmemsz clear in
+	 * pl011_fbcon_clearAll never completed within the 600s netboot
+	 * capture window: the brown firmware splash was visible
+	 * progressively shrinking line by line for 10+ minutes. Normal
+	 * NC allows write combining, which on AArch64 lets adjacent
+	 * stores merge into burst writes — typically an order of
+	 * magnitude faster for sequential framebuffer fills. The
+	 * framebuffer is not a peripheral register, it is plain DRAM
+	 * accessed via the VC4 scanout engine, so Normal NC is the
+	 * architecturally correct attribute. */
+	uart->fbaddr = mmap(NULL, uart->fbmemsz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_UNCACHED | MAP_ANONYMOUS | MAP_PHYSMEM, -1, pctl.task.graphmode.framebuffer);
 	if (uart->fbaddr == MAP_FAILED) {
 		uart->fbaddr = NULL;
 		return -ENOMEM;
@@ -499,15 +514,31 @@ static int pl011_fbcon_init(pl011_t *uart)
 	uart->fbcols = pctl.task.graphmode.width / TTYPC_FBFONT_W;
 	uart->fbrows = pctl.task.graphmode.height / TTYPC_FBFONT_H;
 
-	/* TD-15 Stage 4: reset VT100 parser and clear the entire mapped
-	 * framebuffer (raw 32-bit fill of fbmemsz bytes — covers any
-	 * pitch padding / partial bottom row that the per-glyph clearRow
-	 * loop would skip). The previous boot left the firmware splash
-	 * visible in the lower half of the HDMI screen because the per-
-	 * glyph loop only covered fbrows*FONT_H rows. */
+	/* TD-15 Stage 4 phase 1e: reset VT100 parser state and the
+	 * cursor, but do NOT sweep the entire framebuffer to BG.
+	 * Rationale: with caches disabled (Stage 1 parked) every
+	 * framebuffer store is a single uncached DDR transaction. A full
+	 * fbmemsz wipe (786K stores at 1024x768x32) takes >>10 minutes on
+	 * real Pi 4 — longer than the entire 600s netboot capture window.
+	 * Boot blocks inside fbcon_init waiting for the wipe, fbcon: ok
+	 * never reaches UART, and the user sees a slow line-by-line
+	 * brown-rectangle wipe that never finishes.
+	 *
+	 * The firmware splash will remain in any framebuffer cell that
+	 * Phoenix never writes a glyph into. As Phoenix klog and psh
+	 * output streams in, each rendered character cell is overdrawn
+	 * (drawChar fills FG/BG for every pixel in its 8x16 cell), so
+	 * any cell touched by output gets a clean black background. The
+	 * splash naturally retreats as content is drawn. psh's
+	 * `\x1b[0J` / `\x1b[2J` clear sequences (now interpreted by the
+	 * parser added in phase 1b) provide an on-demand wipe when the
+	 * user wants one. Future fix: once Stage 1 cache enable lands,
+	 * DC ZVA gives ~64 bytes per instruction = ~10x speedup; full-FB
+	 * clear becomes affordable again. */
 	uart->fbescState = pl011_fbcon_esc_normal;
 	uart->fbescNumParams = 0u;
-	pl011_fbcon_clearAll(uart);
+	uart->fbcol = 0u;
+	uart->fbrow = 0u;
 
 	(void)row;
 
