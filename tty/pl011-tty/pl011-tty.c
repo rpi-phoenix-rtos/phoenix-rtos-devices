@@ -107,7 +107,17 @@ typedef struct {
 	int speed;
 	tcflag_t cflag;
 	handle_t fbLock;
-	volatile uint32_t *fbaddr;
+	/* TD-15 Stage 4 phase 1c: the POINTER itself is volatile (not just
+	 * the pointed-to data). pl011_thr starts before pl011_fbcon_init
+	 * (line 995 vs the fbcon_init call ~15 lines later) and reads
+	 * uart->fbaddr in its inner TX-drain loop to decide whether to
+	 * mirror tty bytes to HDMI. Without `* volatile` on the pointer
+	 * field the compiler is free to cache the initial NULL value in
+	 * a register and never re-read it after fbcon_init writes the
+	 * mmap result, which is exactly what we observed on real Pi 4
+	 * (banner + `fbcon: ok` show on HDMI but no klog or psh content
+	 * even though UART receives the full stream). */
+	volatile uint32_t *volatile fbaddr;
 	uint32_t fbmemsz;
 	uint16_t fbcols;
 	uint16_t fbrows;
