@@ -218,16 +218,6 @@ static void pl011_fbcon_clearRow(pl011_t *uart, uint16_t row)
 }
 
 
-/* TD-15 Stage 4: clear a half-open row range. */
-static void pl011_fbcon_clearRowRange(pl011_t *uart, uint16_t firstRow, uint16_t lastRowExcl)
-{
-	uint16_t r;
-	for (r = firstRow; r < lastRowExcl; ++r) {
-		pl011_fbcon_clearRow(uart, r);
-	}
-}
-
-
 /* TD-15 Stage 4: clear the fbmemsz-bounded area to BG. Uses the
  * 64-bit fill primitive to halve instruction count vs the previous
  * per-pixel clearRow loop. */
@@ -268,7 +258,6 @@ static void pl011_fbcon_scroll(pl011_t *uart)
  */
 static void pl011_fbcon_dispatchCsi(pl011_t *uart, unsigned char final)
 {
-	uint16_t r;
 	uint16_t param0 = (uart->fbescNumParams > 0u) ? uart->fbescParams[0] : 0u;
 	uint16_t param1 = (uart->fbescNumParams > 1u) ? uart->fbescParams[1] : 0u;
 	uint16_t row;
@@ -277,28 +266,24 @@ static void pl011_fbcon_dispatchCsi(pl011_t *uart, unsigned char final)
 
 	switch (final) {
 		case 'J':
-			if (param0 == 0u) {
-				/* Cursor to end of screen */
-				for (r = uart->fbcol; r < uart->fbcols; ++r) {
-					pl011_fbcon_drawChar(uart, r, uart->fbrow, ' ');
-				}
-				pl011_fbcon_clearRowRange(uart, uart->fbrow + 1u, uart->fbrows);
-			}
-			else if (param0 == 2u) {
-				pl011_fbcon_clearRowRange(uart, 0u, uart->fbrows);
-			}
+			/* TD-15 Stage 4 phase 1g: skip the actual clear.
+			 * On real Pi 4 with caches disabled (Stage 1 parked),
+			 * even one row clear (1024x16 = 16384 pixel writes) takes
+			 * ~16ms; full-screen clearAll (1024x768 = 786432 pixels)
+			 * takes >>10 minutes. psh emits `\x1b[0J` on every prompt
+			 * redraw, which would otherwise block pl011_thr inside
+			 * dispatchCsi for the entire boot. Accept the firmware
+			 * splash remaining in any cell never written by drawChar;
+			 * once cache enable lands and DC ZVA becomes available,
+			 * restore the real clear here. The state remains correct
+			 * (fbcol/fbrow not touched) so subsequent drawChar calls
+			 * land at the right cells. */
 			break;
 
 		case 'K':
-			if (param0 == 0u) {
-				/* Cursor to EOL */
-				for (r = uart->fbcol; r < uart->fbcols; ++r) {
-					pl011_fbcon_drawChar(uart, r, uart->fbrow, ' ');
-				}
-			}
-			else if (param0 == 2u) {
-				pl011_fbcon_clearRow(uart, uart->fbrow);
-			}
+			/* Same rationale as 'J' — line clear is also slow on
+			 * caches-off DRAM. Drop the actual clear; let drawChar
+			 * overpaint each cell as text is rendered. */
 			break;
 
 		case 'H':
