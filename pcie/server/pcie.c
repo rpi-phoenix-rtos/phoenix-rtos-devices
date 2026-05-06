@@ -223,6 +223,10 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 	uint32_t msg;
 	uintptr_t msgaddr;
 	int ret;
+	{
+		extern void debug(const char *s);
+		debug("pcie: bcm2711NotifyXhciReset enter\n");
+	}
 
 	mailbox = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, RPI_MAILBOX_BASE_ADDRESS);
 	if (mailbox == MAP_FAILED) {
@@ -265,6 +269,12 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 	}
 
 	ret = (msgbuf[1] == RPI_MBOX_RESPONSE) ? EOK : -EIO;
+	{
+		extern void debug(const char *s);
+		char m[80];
+		snprintf(m, sizeof(m), "pcie: notifyXhciReset ret=%d resp=%08x\n", ret, msgbuf[1]);
+		debug(m);
+	}
 
 	munmap(msgbuf, _PAGE_SIZE);
 	munmap((void *)mailbox, _PAGE_SIZE);
@@ -456,6 +466,12 @@ static void bcm2711PrepareLinkState(pcie_bcm2711_ctx_t *ctx)
 
 	ctx->linkUp = bcm2711LinkUp(ctx);
 	ctx->rcMode = bcm2711RcMode(ctx);
+	{
+		extern void debug(const char *s);
+		char m[64];
+		snprintf(m, sizeof(m), "pcie: linkUp=%d rcMode=%d\n", ctx->linkUp, ctx->rcMode);
+		debug(m);
+	}
 }
 
 
@@ -665,6 +681,12 @@ static void print_bars(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn
 	for (int i = 0; i < bar_count; ++i) {
 
 		uint32_t bar_low = cfgio->read32(cfgio->ctx, bus, dev, fn, PCI_BAR0 + i * 4);
+		{
+			extern void debug(const char *s);
+			char m[80];
+			snprintf(m, sizeof(m), "pcie: BAR%d raw=%08x\n", i, bar_low);
+			debug(m);
+		}
 		if (bar_low == 0) {
 			continue;
 		}
@@ -726,22 +748,92 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			vendor, device,
 			classBase, classSub, progIF,
 			hdr);
+	{
+		extern void debug(const char *s);
+		char m[120];
+		snprintf(m, sizeof(m), "pcie: %02x:%02x.%u ven=%04x dev=%04x cls=%02x%02x%02x hdr=%02x\n",
+			bus, dev, fun, vendor, device, classBase, classSub, progIF, hdr);
+		debug(m);
+	}
 
 #if defined(PCI_EXPRESS_BCM2711_INDEXED_CFG) && defined(RPI_MAILBOX_BASE_ADDRESS) && defined(XHCI_BCM2711_PCIE_BUS) && defined(XHCI_BCM2711_PCIE_SLOT) && defined(XHCI_BCM2711_PCIE_FUNC) && defined(XHCI_BCM2711_PCI_CLASS_CODE)
 	if ((bus == XHCI_BCM2711_PCIE_BUS) && (dev == XHCI_BCM2711_PCIE_SLOT) &&
 		(fun == XHCI_BCM2711_PCIE_FUNC) && ((class24 >> 8) == XHCI_BCM2711_PCI_CLASS_CODE)) {
+		/*
+		 * Enable Memory Space and Bus Master BEFORE the firmware mailbox
+		 * notify and BAR programming. Empirically, enabling BME *after*
+		 * the firmware reset leaves VL805 in a state where capability
+		 * reads return 0xdead (no completion) even though the BAR is
+		 * programmed and the cmd register read-back shows 0x0006.
+		 */
+		{
+			extern void debug(const char *s);
+			char m[80];
+			uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
+			uint16_t want = cmd | PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE;
+			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
+			uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
+			snprintf(m, sizeof(m), "pcie: VL805 cmd %04x->%04x rb=%04x\n", cmd, want, rb);
+			debug(m);
+		}
 		int err = bcm2711NotifyXhciReset(bus, dev, fun);
 		if (err < 0) {
 			fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
 		}
+		/* TD-15 Stage 4 phase 2: program VL805 BAR0 to the outbound
+		 * window's PCIe base address. The bcm2711NotifyXhciReset
+		 * mailbox call resets the VL805 and reloads its firmware, but
+		 * does NOT program BAR0 — that's the OS's job. Linux's
+		 * brcmstb pcie driver does standard PCI BAR allocation; here
+		 * we hardcode the assignment to PCIE_BCM2711_OUTBOUND_PCIE_BASE
+		 * (a single device fits in the outbound window so no
+		 * allocator is needed). The CPU-side mapping at
+		 * XHCI_BCM2711_MMIO_BASE = PCIE_BCM2711_OUTBOUND_CPU_BASE
+		 * already routes through the bridge to this PCIe-side
+		 * address.
+		 *
+		 * VL805 has a single 64-bit MEM BAR (BAR0). Write the low and
+		 * high words; the device preserves the type-bit (BAR0[2]=1
+		 * for 64-bit) on read-back. */
+		cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_BAR0,
+			(uint32_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE & 0xfffffff0u));
+		cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_BAR0 + 4,
+			(uint32_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE >> 32));
+		{
+			extern void debug(const char *s);
+			char m[80];
+			uint32_t bar_lo = cfgio->read32(cfgio->ctx, bus, dev, fun, PCI_BAR0);
+			uint32_t bar_hi = cfgio->read32(cfgio->ctx, bus, dev, fun, PCI_BAR0 + 4);
+			snprintf(m, sizeof(m), "pcie: VL805 BAR0 programmed lo=%08x hi=%08x\n", bar_lo, bar_hi);
+			debug(m);
+		}
 	}
 #endif
 
-	/* Enable MEM-space and Bus Master if still disabled */
-	uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
-	if (!(cmd & (PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE))) {
-		printf("pcie: enable memory space and bus master\n");
-		cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, cmd | PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE);
+	/*
+	 * Enable Memory Space and Bus Master.
+	 *
+	 * The previous form `if (!(cmd & (MSE|MASTER)))` only enabled the bits
+	 * when BOTH were already clear; if exactly one was set, the other was
+	 * never enabled. On the BCM2711 root + VL805, this manifested as MMIO
+	 * writes to operational xHCI registers (DCBAAP, CRCR, CONFIG) being
+	 * silently dropped after HCRST while capability reads still worked.
+	 * Always set both bits and only write back if anything changed.
+	 */
+	{
+		uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
+		uint16_t want = cmd | PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE;
+		if (want != cmd) {
+			printf("pcie: enable memory space and bus master (cmd %04x->%04x)\n", cmd, want);
+			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
+			{
+				extern void debug(const char *s);
+				char m[80];
+				uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
+				snprintf(m, sizeof(m), "pcie: cmd readback %04x (wanted %04x)\n", rb, want);
+				debug(m);
+			}
+		}
 	}
 
 	/* Print some info about this device */
@@ -811,10 +903,17 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 }
 
 
+/* TD-15 Stage 4 phase 2 DIAGNOSTIC: pcie daemon doesn't print to UART
+ * by default (uses fprintf which is buffered). Use debug() for direct
+ * kernel klog → UART output so we can see what's happening on real
+ * Pi 4. Remove once VL805 BAR-programming is fixed. */
+#include <sys/debug.h>
+
 int main(int argc, char **argv)
 {
 	pcie_cfgio_t cfgio = { 0 };
 	int ret = 0;
+	debug("pcie: enter main\n");
 
 #ifdef PCI_EXPRESS_INIT_TEBF0808_PHY
 	ret = tebf0808_pcieRefClkInit();
@@ -843,17 +942,23 @@ int main(int argc, char **argv)
 #endif
 
 #ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
+	debug("pcie: pre-cfgInitBcm2711\n");
 	ret = pcie_cfgInitBcm2711(&cfgio);
+	debug("pcie: post-cfgInitBcm2711\n");
 #else
 	ret = pcie_cfgInitEcam(&cfgio);
 #endif
 	if (ret != EOK) {
 		fprintf(stderr, "pcie: fail to initialize config-space backend\n");
+		debug("pcie: cfgInit FAIL\n");
 		return ret;
 	}
 
+	debug("pcie: pre-scanBus\n");
 	pcie_scanBus(&cfgio, 0);
+	debug("pcie: post-scanBus\n");
 	cfgio.destroy(cfgio.ctx);
+	debug("pcie: exit main\n");
 
 	return ret;
 }

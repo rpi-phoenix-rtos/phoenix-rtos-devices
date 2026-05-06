@@ -19,6 +19,7 @@
 
 #include <posix/idtree.h>
 #include <posix/utils.h>
+#include <sys/debug.h>
 #include <sys/file.h>
 #include <sys/msg.h>
 #include <sys/threads.h>
@@ -673,6 +674,8 @@ static int usbkbd_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, u
 	oid_t oid;
 	int err;
 
+	debug("usbkbd: handleInsertion fired\n");
+
 	mutexLock(usbkbd_common.lock);
 
 	dev = _usbkbd_devAlloc();
@@ -737,6 +740,7 @@ static int usbkbd_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, u
 	}
 
 	fprintf(stdout, "usbkbd: New device: %s\n", dev->path);
+	debug("usbkbd: New /dev/kbd0 device created\n");
 
 	event->deviceCreated = true;
 	event->dev = oid;

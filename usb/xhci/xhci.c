@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/debug.h>
 #include <sys/mman.h>
 #include <sys/minmax.h>
 #include <sys/threads.h>
@@ -697,42 +698,60 @@ static int xhci_validateRuntime(xhci_t *xhci)
 	xhci->crcr = ((uint64_t)xhci->crcrHi << 32) | (xhci->crcrLo & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK);
 	xhci->dcbaap = ((uint64_t)xhci->dcbaapHi << 32) | (xhci->dcbaapLo & XHCI_REG_OP_DCBAAP__MASK);
 
+	{
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"xhci: validateRuntime caps caplen=%02x ver=%04x p1=%08x p2=%08x cc1=%08x dboff=%08x rtsoff=%08x pagesize=%08x ctxSz=%u ac64=%u\n",
+			xhci->caplength, xhci->version, xhci->hcsparams1, xhci->hcsparams2, xhci->hccparams1,
+			(unsigned)xhci->dboff, (unsigned)xhci->rtsoff, (unsigned)xhci->pagesize,
+			xhci->contextSize, xhci->ac64);
+		debug(buf);
+	}
+
 	if ((xhci->pagesize & XHCI_REG_OP_PAGESIZE_4K) == 0u) {
+		debug("xhci: validateRuntime fail 4k\n");
 		fprintf(stderr, "xhci: 4k page size unsupported\n");
 		return -ENODEV;
 	}
 
 	if (xhci->nslots == 0u) {
+		debug("xhci: validateRuntime fail nslots\n");
 		fprintf(stderr, "xhci: no slots reported\n");
 		return -ENODEV;
 	}
 
 	if (xhci->nintrs == 0u) {
+		debug("xhci: validateRuntime fail nintrs\n");
 		fprintf(stderr, "xhci: no interrupters reported\n");
 		return -ENODEV;
 	}
 
 	if (xhci->nports == 0u) {
+		debug("xhci: validateRuntime fail nports\n");
 		fprintf(stderr, "xhci: no ports reported\n");
 		return -ENODEV;
 	}
 
 	if (xhci->contextSize != 32u) {
+		debug("xhci: validateRuntime fail context\n");
 		fprintf(stderr, "xhci: unsupported context size %u\n", xhci->contextSize);
 		return -ENODEV;
 	}
 
 	if ((xhci->dboff == 0u) || (xhci->dboff >= xhci->mapSz)) {
+		debug("xhci: validateRuntime fail dboff\n");
 		fprintf(stderr, "xhci: invalid doorbell offset 0x%08x\n", xhci->dboff);
 		return -ENODEV;
 	}
 
 	if ((xhci->rtsoff == 0u) || (xhci->rtsoff >= xhci->mapSz)) {
+		debug("xhci: validateRuntime fail rtsoff\n");
 		fprintf(stderr, "xhci: invalid runtime offset 0x%08x\n", xhci->rtsoff);
 		return -ENODEV;
 	}
 
 	if ((!xhci->ac64) && ((xhci->crcrHi != 0u) || (xhci->dcbaapHi != 0u))) {
+		debug("xhci: validateRuntime fail ac64-high\n");
 		fprintf(stderr, "xhci: unexpected high register state without ac64 support\n");
 		return -ENODEV;
 	}
@@ -740,6 +759,7 @@ static int xhci_validateRuntime(xhci_t *xhci)
 	if (((xhci->crcrLo & ~(XHCI_REG_OP_CRCR_CR_PTR_LO__MASK | XHCI_REG_OP_CRCR_RCS | XHCI_REG_OP_CRCR_CS |
 			XHCI_REG_OP_CRCR_CA | XHCI_REG_OP_CRCR_CRR)) != 0u) ||
 		((xhci->dcbaapLo & ~XHCI_REG_OP_DCBAAP__MASK) != 0u)) {
+		debug("xhci: validateRuntime fail oplayout\n");
 		fprintf(stderr, "xhci: invalid operational layout register state\n");
 		return -ENODEV;
 	}
@@ -755,12 +775,14 @@ static int xhci_allocCommandSpace(xhci_t *xhci)
 
 	xhci->dcbaa = usb_allocAligned(xhci->dcbaaSize, XHCI_DCBAA_ALIGN);
 	if (xhci->dcbaa == NULL) {
+		debug("xhci: allocCommandSpace fail dcbaa\n");
 		fprintf(stderr, "xhci: failed to allocate dcbaa\n");
 		return -ENOMEM;
 	}
 
 	xhci->cmdRing = usb_allocAligned(xhci->cmdRingSize, XHCI_CMD_RING_ALIGN);
 	if (xhci->cmdRing == NULL) {
+		debug("xhci: allocCommandSpace fail cmdRing\n");
 		fprintf(stderr, "xhci: failed to allocate command ring\n");
 		return -ENOMEM;
 	}
@@ -771,8 +793,20 @@ static int xhci_allocCommandSpace(xhci_t *xhci)
 	xhci->dcbaaPhys = va2pa(xhci->dcbaa);
 	xhci->cmdRingPhys = va2pa(xhci->cmdRing);
 
+	{
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"xhci: allocCommandSpace dcbaa va=%p phys=%08x%08x cmdRing va=%p phys=%08x%08x\n",
+			xhci->dcbaa,
+			(unsigned)(xhci->dcbaaPhys >> 32), (unsigned)(xhci->dcbaaPhys & 0xffffffffu),
+			xhci->cmdRing,
+			(unsigned)(xhci->cmdRingPhys >> 32), (unsigned)(xhci->cmdRingPhys & 0xffffffffu));
+		debug(buf);
+	}
+
 	if (((xhci->dcbaaPhys & (XHCI_DCBAA_ALIGN - 1u)) != 0u) ||
 		((xhci->cmdRingPhys & (XHCI_CMD_RING_ALIGN - 1u)) != 0u)) {
+		debug("xhci: allocCommandSpace fail align\n");
 		fprintf(stderr, "xhci: invalid command space alignment\n");
 		return -ENODEV;
 	}
@@ -824,6 +858,7 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 	dcbaapLo = (uint32_t)(xhci->dcbaaPhys & XHCI_REG_OP_DCBAAP__MASK);
 	dcbaapHi = (uint32_t)(xhci->dcbaaPhys >> 32);
 	if ((!xhci->ac64) && (dcbaapHi != 0u)) {
+		debug("xhci: programCommandSpace fail dcbaa-32bit\n");
 		fprintf(stderr, "xhci: dcbaa above 32-bit address space\n");
 		return -ENODEV;
 	}
@@ -831,6 +866,7 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 	crcrLo = (uint32_t)(xhci->cmdRingPhys & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK) | XHCI_REG_OP_CRCR_RCS;
 	crcrHi = (uint32_t)(xhci->cmdRingPhys >> 32);
 	if ((!xhci->ac64) && (crcrHi != 0u)) {
+		debug("xhci: programCommandSpace fail crcr-32bit\n");
 		fprintf(stderr, "xhci: command ring above 32-bit address space\n");
 		return -ENODEV;
 	}
@@ -853,9 +889,21 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 	xhci->dcbaap = ((uint64_t)xhci->dcbaapHi << 32) | (xhci->dcbaapLo & XHCI_REG_OP_DCBAAP__MASK);
 	xhci->crcr = ((uint64_t)xhci->crcrHi << 32) | (xhci->crcrLo & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK);
 
+	{
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"xhci: pcs writeReadback dcbaa=%08x%08x want=%08x%08x crcr=%08x%08x want=%08x%08x cfg=%08x slots=%u\n",
+			(unsigned)(xhci->dcbaap >> 32), (unsigned)(xhci->dcbaap & 0xffffffffu),
+			(unsigned)(xhci->dcbaaPhys >> 32), (unsigned)(xhci->dcbaaPhys & 0xffffffffu),
+			(unsigned)(xhci->crcr >> 32), (unsigned)(xhci->crcr & 0xffffffffu),
+			(unsigned)(xhci->cmdRingPhys >> 32), (unsigned)(xhci->cmdRingPhys & 0xffffffffu),
+			(unsigned)xhci->config, (unsigned)xhci->nslots);
+		debug(buf);
+	}
 	if ((xhci->dcbaap != xhci->dcbaaPhys) || (xhci->crcr != xhci->cmdRingPhys) ||
 		((xhci->crcrLo & XHCI_REG_OP_CRCR_RCS) == 0u) ||
 		((xhci->config & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK) != (xhci->nslots & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK))) {
+		debug("xhci: programCommandSpace fail mismatch\n");
 		fprintf(stderr, "xhci: command space register program mismatch\n");
 		return -ENODEV;
 	}
@@ -1792,35 +1840,88 @@ static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
 	int err;
+	unsigned attempt;
 
+	debug("xhci: pre map\n");
 	err = xhci_map(hcd, &xhci);
 	if (err < 0) {
+		debug("xhci: map fail\n");
 		return err;
 	}
+	debug("xhci: post map ok\n");
 
-	err = xhci_capProbe(hcd, xhci);
+	/*
+	 * The pcie daemon and the usb daemon are spawned concurrently from plo's
+	 * user.plo.yaml. xhci_capProbe needs the VL805 BAR0 already programmed by
+	 * pcie, otherwise HCIVERSION reads back 0xdead (BCM2711 PCIe bridge
+	 * no-device default) and the controller is not reachable. Poll for a
+	 * valid capability window for up to ~5 s before giving up.
+	 */
+	debug("xhci: pre capProbe retry-loop\n");
+	err = -ENODEV;
+	for (attempt = 0u; attempt < 50u; ++attempt) {
+		debug("xhci: capProbe iter pre\n");
+		err = xhci_capProbe(hcd, xhci);
+		if (err == -ENODEV) {
+			debug("xhci: capProbe iter ENODEV\n");
+		}
+		else if (err == -ENOSYS) {
+			debug("xhci: capProbe iter ENOSYS (ok)\n");
+		}
+		else {
+			debug("xhci: capProbe iter other\n");
+		}
+		if (err != -ENODEV) {
+			break;
+		}
+		usleep(100000);
+	}
+	debug("xhci: post capProbe\n");
+
 	if (err == -ENOSYS) {
+		debug("xhci: pre reset\n");
 		err = xhci_reset(xhci);
+		debug("xhci: post reset\n");
 		if (err == 0) {
+			debug("xhci: pre validateRuntime\n");
 			err = xhci_validateRuntime(xhci);
+			debug("xhci: post validateRuntime\n");
 			if (err == 0) {
+				debug("xhci: pre allocCommandSpace\n");
 				err = xhci_allocCommandSpace(xhci);
+				debug("xhci: post allocCommandSpace\n");
 				if (err == 0) {
+					debug("xhci: pre initCommandRing\n");
 					err = xhci_initCommandRing(xhci);
+					debug("xhci: post initCommandRing\n");
 					if (err == 0) {
+						debug("xhci: pre programCommandSpace\n");
 						err = xhci_programCommandSpace(xhci);
+						debug("xhci: post programCommandSpace\n");
 						if (err == 0) {
+							debug("xhci: pre runStateSelftest\n");
 							err = xhci_runStateSelftest(xhci);
+							debug("xhci: post runStateSelftest\n");
 							if (err == 0) {
+								debug("xhci: pre allocEventRing\n");
 								err = xhci_allocEventRing(xhci);
+								debug("xhci: post allocEventRing\n");
 							if (err == 0) {
+								debug("xhci: pre programEventRing\n");
 								err = xhci_programEventRing(xhci);
+								debug("xhci: post programEventRing\n");
 								if (err == 0) {
+									debug("xhci: pre cmdNoopSelftest\n");
 									err = xhci_cmdNoopSelftest(xhci);
+									debug("xhci: post cmdNoopSelftest\n");
 									if (err == 0) {
+										debug("xhci: pre cmdEnableSlot\n");
 										err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
+										debug("xhci: post cmdEnableSlot\n");
 										if (err == 0) {
+											debug("xhci: pre allocSlotSpace\n");
 											err = xhci_allocSlotSpace(xhci);
+											debug("xhci: post allocSlotSpace\n");
 										}
 									}
 								}
