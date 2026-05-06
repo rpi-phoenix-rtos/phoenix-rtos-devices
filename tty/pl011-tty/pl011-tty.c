@@ -906,7 +906,22 @@ static void pl011_thr(void *arg)
 			libtty_wake_writer(&uart->tty);
 		}
 
-		usleep(PL011_TTY_POLL_US);
+		/* TD-15 Stage 4 phase 1h: only sleep when there was nothing
+		 * to do AND there is nothing pending. With caches disabled
+		 * (Stage 1 parked) usleep can stretch to many seconds (TD-14
+		 * timing variance documents `proc_send` round trips of 1 ms
+		 * to 43 s on the same hardware), so a fixed-period sleep
+		 * after every drain causes pl011_thr to miss whole bursts of
+		 * libtty output. Tight-polling while work exists ensures
+		 * psh prompts and klog content flow to UART + fbcon without
+		 * being held in the libtty buffer. The inner loops both
+		 * already drain to completion, so once we exit them we
+		 * really are idle. */
+		if ((wake_reader == 0) && (wake_writer == 0) &&
+			(libtty_txready(&uart->tty) == 0) &&
+			((pl011_read(uart, fr) & fr_rxfe) != 0)) {
+			usleep(PL011_TTY_POLL_US);
+		}
 	}
 }
 
