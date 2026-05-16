@@ -1054,11 +1054,20 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 			(unsigned)xhci->config, (unsigned)xhci->nslots);
 		debug(buf);
 	}
-	if ((xhci->dcbaap != xhci->dcbaaPhys) || (xhci->crcr != xhci->cmdRingPhys) ||
-		((xhci->crcrLo & XHCI_REG_OP_CRCR_RCS) == 0u) ||
+	/* DCBAAP and CONFIG read back as written and are validated here.
+	 * CRCR is special per xHCI 1.0 §5.4.5: the Command Ring Pointer
+	 * (bits 63:6) and the write-only control bits (RCS/CS/CA, bits
+	 * 0:2) ALWAYS read back as zero. Only CRR (bit 3, Command Ring
+	 * Running) is readable. Comparing CRCR readback against the
+	 * written pointer is therefore a spec-required mismatch and
+	 * must NOT cause a programCommandSpace failure. The previous
+	 * check broke xhci init on VL805 / BCM2711 after the outbound
+	 * window started returning real device data.
+	 */
+	if ((xhci->dcbaap != xhci->dcbaaPhys) ||
 		((xhci->config & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK) != (xhci->nslots & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK))) {
 		debug("xhci: programCommandSpace fail mismatch\n");
-		fprintf(stderr, "xhci: command space register program mismatch\n");
+		fprintf(stderr, "xhci: command space register program mismatch (dcbaap or config)\n");
 		return -ENODEV;
 	}
 
@@ -2009,15 +2018,22 @@ static int xhci_init(hcd_t *hcd)
 	 * user.plo.yaml. xhci_capProbe needs the VL805 BAR0 already programmed by
 	 * pcie, otherwise HCIVERSION reads back 0xdead (BCM2711 PCIe bridge
 	 * no-device default) and the controller is not reachable. Poll for a
-	 * valid capability window for up to ~5 s before giving up.
+	 * valid capability window for up to ~30 s before giving up; on the
+	 * M-only Pi 4 kernel pcie can take 10-20 s to complete its scan, BAR0
+	 * programming, and the xhci-reset mailbox call, so the previous 5 s
+	 * limit was racing pcie and giving up too early.
 	 */
 	debug("xhci: pre capProbe retry-loop\n");
 	err = -ENODEV;
-	for (attempt = 0u; attempt < 50u; ++attempt) {
-		debug("xhci: capProbe iter pre\n");
+	for (attempt = 0u; attempt < 600u; ++attempt) {
 		err = xhci_capProbe(hcd, xhci);
 		if (err == -ENODEV) {
-			debug("xhci: capProbe iter ENODEV\n");
+			/* Stay quiet during the polling phase; emitting a line per
+			 * 50 ms drowns UART when pcie is also chatty.
+			 */
+			if ((attempt & 0x1fu) == 0u) {
+				debug("xhci: capProbe iter ENODEV\n");
+			}
 		}
 		else if (err == -ENOSYS) {
 			debug("xhci: capProbe iter ENOSYS (ok)\n");
@@ -2028,7 +2044,7 @@ static int xhci_init(hcd_t *hcd)
 		if (err != -ENODEV) {
 			break;
 		}
-		usleep(100000);
+		usleep(50000);  /* 50 ms × 600 iters = 30 s wait window */
 	}
 	debug("xhci: post capProbe\n");
 

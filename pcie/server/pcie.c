@@ -807,6 +807,33 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			snprintf(m, sizeof(m), "pcie: VL805 BAR0 programmed lo=%08x hi=%08x\n", bar_lo, bar_hi);
 			debug(m);
 		}
+		/* TD-USB diag 2026-05-16: read xhci CAPLENGTH + HCIVERSION
+		 * directly through the outbound window. If this reads the
+		 * expected 0x20 / 0x0100 the path CPU PA 0x600000000 ->
+		 * PCIe bus 0xf8000000 -> VL805 BAR0 works and xhci has a
+		 * different issue. If it reads 0xff/0xffff the outbound
+		 * window is broken (or VL805 doesn't respond on MMIO).
+		 */
+		{
+			extern void debug(const char *s);
+			volatile uint8_t *mmio = mmap(NULL, _PAGE_SIZE,
+				PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS,
+				-1, PCIE_BCM2711_OUTBOUND_CPU_BASE);
+			if (mmio == MAP_FAILED) {
+				debug("pcie: diag-mmap of outbound window FAILED\n");
+			}
+			else {
+				char m[120];
+				uint8_t cl = *mmio;
+				uint16_t ver = *(volatile uint16_t *)(mmio + 2);
+				uint32_t hcsp1 = *(volatile uint32_t *)(mmio + 4);
+				snprintf(m, sizeof(m),
+					"pcie: diag-outbound caplen=%02x ver=%04x hcsparams1=%08x\n",
+					cl, ver, hcsp1);
+				debug(m);
+				munmap((void *)mmio, _PAGE_SIZE);
+			}
+		}
 	}
 #endif
 
