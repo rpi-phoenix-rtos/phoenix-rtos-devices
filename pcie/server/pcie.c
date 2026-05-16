@@ -877,10 +877,17 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 	for (uint8_t dev = 0; dev < (bus ? 32 : 1); ++dev) {
 		/**
 		 * In case there is no device under certain identifier the bridge
-		 * returns all "ones" on read
+		 * returns all "ones" (0xffff) per PCIe spec, but the BCM2711
+		 * root complex returns all-zeros (0x0000) instead on empty
+		 * slots. Treat both as "no device" so we don't proceed into
+		 * scanFunc() for non-existent devices — doing so writes the
+		 * Command register and reads BARs against the bridge's
+		 * unmapped slot decoder, which in turn (observed on real Pi 4)
+		 * pushes the bridge into a state where subsequent VL805 reads
+		 * also return zero, breaking xhci_capProbe.
 		 */
 		uint16_t vendor_id = pcie_cfgRead16(cfgio, bus, dev, 0, PCI_VENDOR_ID);
-		if (vendor_id == 0xffff) {
+		if (vendor_id == 0xffff || vendor_id == 0x0000) {
 			continue;
 		}
 
@@ -893,7 +900,7 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 			printf("pcie: multiple func device %u\n", dev);
 			for (uint8_t fn = 1; fn < 8; fn++) {
 				vendor_id = pcie_cfgRead16(cfgio, bus, dev, fn, PCI_VENDOR_ID);
-				if (vendor_id == 0xffff) {
+				if (vendor_id == 0xffff || vendor_id == 0x0000) {
 					continue;
 				}
 				scanFunc(cfgio, bus, &next_bus, dev, fn);
