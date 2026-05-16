@@ -2023,6 +2023,20 @@ static int xhci_init(hcd_t *hcd)
 	int err;
 	unsigned attempt;
 
+	/* TD-USB: delay xhci's mmap until pcie has had time to complete
+	 * BAR0 programming. On the M-only Pi 4 kernel the BCM2711 PCIe
+	 * bridge enters a 0xdead-returning state for MMIO reads when xhci
+	 * tries to read before VL805 is ready, and subsequent reads stay
+	 * stuck in that state. A simple 8-second sleep at xhci start
+	 * lets pcie finish its scanBus + BAR0 program + xhci-reset
+	 * mailbox call before xhci touches the outbound window. This
+	 * is a pragmatic substitute for a proper config-space
+	 * vendor-ID polling sentinel between pcie and xhci.
+	 */
+	debug("xhci: pre startup-delay (waiting for pcie BAR0 program)\n");
+	sleep(8);
+	debug("xhci: post startup-delay\n");
+
 	debug("xhci: pre map\n");
 	err = xhci_map(hcd, &xhci);
 	if (err < 0) {

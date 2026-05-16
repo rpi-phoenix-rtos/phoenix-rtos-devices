@@ -1008,6 +1008,40 @@ int main(int argc, char **argv)
 	debug("pcie: pre-scanBus\n");
 	pcie_scanBus(&cfgio, 0);
 	debug("pcie: post-scanBus\n");
+
+	/* TD-USB: VL805-warm-up loop. The xhci_capProbe retry sometimes
+	 * stalls with "attempt=0 ENODEV" because the BCM2711 PCIe bridge
+	 * returns 0xdead-pattern MMIO reads when VL805 hasn't had a recent
+	 * host-initiated transaction. The earlier diag-outbound read
+	 * happens deep inside scanBus and the bridge can "cool" before
+	 * xhci's first read fires.
+	 *
+	 * Do a periodic read of VL805's CAPLENGTH/HCIVERSION through the
+	 * outbound window right before pcie exits. xhci will be in its
+	 * capProbe retry loop at the same time; one of pcie's reads will
+	 * coincide with xhci's first read, warming the bridge.
+	 *
+	 * Limit to 30 iterations × 100 ms = 3 s so pcie eventually exits.
+	 * After exit, xhci has at least 3 s of overlap during which the
+	 * bridge stays warm — empirically enough for capProbe to succeed.
+	 */
+	{
+		volatile uint8_t *mmio = mmap(NULL, _PAGE_SIZE, PROT_READ,
+			MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1,
+			PCIE_BCM2711_OUTBOUND_CPU_BASE);
+		if (mmio != MAP_FAILED) {
+			int i;
+			for (i = 0; i < 30; ++i) {
+				volatile uint8_t cl = *mmio;
+				volatile uint16_t ver = *(volatile uint16_t *)(mmio + 2);
+				(void)cl; (void)ver;
+				usleep(100000);
+			}
+			debug("pcie: warm-up done\n");
+			munmap((void *)mmio, _PAGE_SIZE);
+		}
+	}
+
 	cfgio.destroy(cfgio.ctx);
 	debug("pcie: exit main\n");
 
