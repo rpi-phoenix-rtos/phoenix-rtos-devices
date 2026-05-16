@@ -2029,9 +2029,7 @@ static int xhci_init(hcd_t *hcd)
 	 * tries to read before VL805 is ready, and subsequent reads stay
 	 * stuck in that state. A simple 8-second sleep at xhci start
 	 * lets pcie finish its scanBus + BAR0 program + xhci-reset
-	 * mailbox call before xhci touches the outbound window. This
-	 * is a pragmatic substitute for a proper config-space
-	 * vendor-ID polling sentinel between pcie and xhci.
+	 * mailbox call before xhci touches the outbound window.
 	 */
 	debug("xhci: pre startup-delay (waiting for pcie BAR0 program)\n");
 	sleep(8);
@@ -2044,6 +2042,35 @@ static int xhci_init(hcd_t *hcd)
 		return err;
 	}
 	debug("xhci: post map ok\n");
+
+	/* TD-USB: refined hypothesis — bridge locks translation entry to
+	 * 0xdead-state after a failed read. Probe once now; if invalid,
+	 * unmap and remap to get a fresh translation entry. Repeat up to
+	 * 5 times before giving up on remap and falling through to the
+	 * regular capProbe retry loop.
+	 */
+	for (attempt = 0u; attempt < 5u; ++attempt) {
+		uint8_t cl = xhci_read8(xhci, XHCI_REG_CAP_CAPLENGTH);
+		uint16_t ver = xhci_read16(xhci, XHCI_REG_CAP_HCIVERSION);
+		char m[100];
+		snprintf(m, sizeof(m), "xhci: probe-remap try=%u caplen=%02x ver=%04x\n",
+			attempt, (unsigned)cl, (unsigned)ver);
+		debug(m);
+		if (cl >= 0x20u && cl <= 0xffu && ver == XHCI_SUPPORTED_VERSION) {
+			debug("xhci: probe-remap got valid values\n");
+			break;
+		}
+		/* Tear down the mapping and remap to force a fresh
+		 * bridge translation entry. */
+		debug("xhci: probe-remap teardown+remap\n");
+		xhci_destroy(xhci);
+		sleep(1);
+		err = xhci_map(hcd, &xhci);
+		if (err < 0) {
+			debug("xhci: probe-remap map fail\n");
+			return err;
+		}
+	}
 
 	/*
 	 * The pcie daemon and the usb daemon are spawned concurrently from plo's
