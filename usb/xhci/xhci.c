@@ -105,8 +105,25 @@
 #define XHCI_REG_RT_IR_ERDP_LO__MASK 0xfffffff0u
 #define XHCI_DCBAA_ALIGN         0x1000u
 #define XHCI_DCBAA_SIZE          0x1000u
-#define XHCI_CMD_RING_ALIGN      0x10000u
-#define XHCI_CMD_RING_SIZE       0x10000u
+#define XHCI_SCRATCHPAD_PAGE_SIZE   0x1000u
+#define XHCI_SCRATCHPAD_PAGE_ALIGN  0x1000u
+#define XHCI_SCRATCHPAD_ARRAY_ALIGN 0x1000u
+#define XHCI_SCRATCHPAD_ENTRY_SIZE  sizeof(uint64_t)
+/*
+ * Command Ring sizing rationale:
+ *
+ * xHCI 1.0 §6.1: "The Command Ring shall be aligned to a 64 byte boundary
+ * and shall not cross a 64K Byte boundary." Phoenix's USB allocator
+ * (usb_allocAligned) only guarantees VA alignment up to a page (4 KB) and
+ * the corresponding va2pa() does not preserve larger alignments because
+ * pages are backed independently. Choosing a 4 KB ring satisfies both
+ * "64-byte aligned" and "no cross-64K" automatically (the entire ring fits
+ * within one page), without requiring deeper allocator changes. 4 KB
+ * holds 256 TRBs which is plenty for the command queue depth Phoenix
+ * issues during enumeration and steady-state.
+ */
+#define XHCI_CMD_RING_ALIGN      0x40u
+#define XHCI_CMD_RING_SIZE       0x1000u
 #define XHCI_EVENT_RING_ALIGN    0x1000u
 #define XHCI_EVENT_RING_SIZE     0x1000u
 #define XHCI_ERST_ALIGN          0x40u
@@ -323,6 +340,10 @@ typedef struct {
 	size_t cmdRingSize;
 	uint64_t dcbaaPhys;
 	uint64_t cmdRingPhys;
+	void *scratchpadArray;
+	void **scratchpadBufs;
+	size_t scratchpadArraySize;
+	uint64_t scratchpadArrayPhys;
 	void *eventRing;
 	void *erst;
 	void *devCtx;
@@ -473,6 +494,20 @@ static void xhci_destroy(xhci_t *xhci)
 
 	if (xhci->mmio != MAP_FAILED) {
 		munmap(xhci->mmio, xhci->mapSz);
+	}
+
+	if (xhci->scratchpadBufs != NULL) {
+		uint32_t i;
+		for (i = 0u; i < xhci->nscratchpad; ++i) {
+			if (xhci->scratchpadBufs[i] != NULL) {
+				usb_freeAligned(xhci->scratchpadBufs[i], XHCI_SCRATCHPAD_PAGE_SIZE);
+			}
+		}
+		free(xhci->scratchpadBufs);
+	}
+
+	if (xhci->scratchpadArray != NULL) {
+		usb_freeAligned(xhci->scratchpadArray, xhci->scratchpadArraySize);
 	}
 
 	if (xhci->dcbaa != NULL) {
@@ -840,6 +875,125 @@ static int xhci_initCommandRing(xhci_t *xhci)
 		((link->control & (XHCI_TRB_CONTROL_C | XHCI_LINK_TRB_CONTROL_TC)) !=
 			(XHCI_TRB_CONTROL_C | XHCI_LINK_TRB_CONTROL_TC))) {
 		fprintf(stderr, "xhci: invalid command ring link trb\n");
+		return -ENODEV;
+	}
+
+	return EOK;
+}
+
+
+/*
+ * xhci_allocScratchpads
+ *
+ * Per xHCI 1.0 §4.20: when HCSPARAMS2.Max_Scratchpad_Buffers > 0 the host
+ * controller requires the driver to provide an array of PAGESIZE-aligned
+ * scratchpad buffers for its private use. The 64-bit physical address of
+ * the pointer array is written into DCBAA[0] (slot 0 is reserved for this
+ * purpose). The buffers and the array must be in place before R/S is set,
+ * otherwise the run transition silently times out.
+ *
+ * VL805 reports HCSPARAMS2 = 0xfc000031 -> Max Scratchpad Buffers = 31,
+ * so without this we hang at "xhci: run transition timeout".
+ *
+ * NOTE: xhci_validateRuntime currently extracts only the "Lo" field of the
+ * scratchpad count (HCSPARAMS2[31:27]). Controllers reporting a non-zero
+ * "Hi" field (HCSPARAMS2[25:21]) would need a wider count; VL805 reports
+ * Hi=0 so this is sufficient for Pi 4 bring-up.
+ */
+static int xhci_allocScratchpads(xhci_t *xhci)
+{
+	uint64_t *array;
+	uint64_t bufPhys;
+	uint64_t *dcbaa;
+	uint32_t i;
+	void *buf;
+
+	if (xhci->nscratchpad == 0u) {
+		debug("xhci: allocScratchpads skip (nscratchpad=0)\n");
+		return EOK;
+	}
+
+	if ((xhci->pagesize & XHCI_REG_OP_PAGESIZE_4K) == 0u) {
+		debug("xhci: allocScratchpads fail pagesize\n");
+		fprintf(stderr, "xhci: scratchpad requires 4k page support\n");
+		return -ENODEV;
+	}
+
+	xhci->scratchpadArraySize = (size_t)xhci->nscratchpad * XHCI_SCRATCHPAD_ENTRY_SIZE;
+	if (xhci->scratchpadArraySize < XHCI_SCRATCHPAD_ARRAY_ALIGN) {
+		xhci->scratchpadArraySize = XHCI_SCRATCHPAD_ARRAY_ALIGN;
+	}
+
+	xhci->scratchpadArray = usb_allocAligned(xhci->scratchpadArraySize, XHCI_SCRATCHPAD_ARRAY_ALIGN);
+	if (xhci->scratchpadArray == NULL) {
+		debug("xhci: allocScratchpads fail array\n");
+		fprintf(stderr, "xhci: failed to allocate scratchpad array\n");
+		return -ENOMEM;
+	}
+	memset(xhci->scratchpadArray, 0, xhci->scratchpadArraySize);
+
+	xhci->scratchpadArrayPhys = va2pa(xhci->scratchpadArray);
+	if ((xhci->scratchpadArrayPhys & (XHCI_SCRATCHPAD_ARRAY_ALIGN - 1u)) != 0u) {
+		debug("xhci: allocScratchpads fail array-align\n");
+		fprintf(stderr, "xhci: scratchpad array misaligned\n");
+		return -ENODEV;
+	}
+	if ((!xhci->ac64) && ((xhci->scratchpadArrayPhys >> 32) != 0u)) {
+		debug("xhci: allocScratchpads fail array-32bit\n");
+		fprintf(stderr, "xhci: scratchpad array above 32-bit address space\n");
+		return -ENODEV;
+	}
+
+	xhci->scratchpadBufs = calloc(xhci->nscratchpad, sizeof(void *));
+	if (xhci->scratchpadBufs == NULL) {
+		debug("xhci: allocScratchpads fail bookkeep\n");
+		fprintf(stderr, "xhci: failed to allocate scratchpad bookkeeping\n");
+		return -ENOMEM;
+	}
+
+	array = (uint64_t *)xhci->scratchpadArray;
+	for (i = 0u; i < xhci->nscratchpad; ++i) {
+		buf = usb_allocAligned(XHCI_SCRATCHPAD_PAGE_SIZE, XHCI_SCRATCHPAD_PAGE_ALIGN);
+		if (buf == NULL) {
+			debug("xhci: allocScratchpads fail buf\n");
+			fprintf(stderr, "xhci: failed to allocate scratchpad buffer %u\n", (unsigned)i);
+			return -ENOMEM;
+		}
+		memset(buf, 0, XHCI_SCRATCHPAD_PAGE_SIZE);
+		xhci->scratchpadBufs[i] = buf;
+
+		bufPhys = va2pa(buf);
+		if ((bufPhys & (XHCI_SCRATCHPAD_PAGE_ALIGN - 1u)) != 0u) {
+			debug("xhci: allocScratchpads fail buf-align\n");
+			fprintf(stderr, "xhci: scratchpad buffer %u misaligned\n", (unsigned)i);
+			return -ENODEV;
+		}
+		if ((!xhci->ac64) && ((bufPhys >> 32) != 0u)) {
+			debug("xhci: allocScratchpads fail buf-32bit\n");
+			fprintf(stderr, "xhci: scratchpad buffer %u above 32-bit address space\n", (unsigned)i);
+			return -ENODEV;
+		}
+		array[i] = bufPhys;
+	}
+
+	dcbaa = (uint64_t *)xhci->dcbaa;
+	dcbaa[0] = xhci->scratchpadArrayPhys;
+
+	{
+		char buf2[160];
+		snprintf(buf2, sizeof(buf2),
+			"xhci: allocScratchpads n=%u arr phys=%08x%08x dcbaa[0]=%08x%08x\n",
+			(unsigned)xhci->nscratchpad,
+			(unsigned)(xhci->scratchpadArrayPhys >> 32),
+			(unsigned)(xhci->scratchpadArrayPhys & 0xffffffffu),
+			(unsigned)(dcbaa[0] >> 32),
+			(unsigned)(dcbaa[0] & 0xffffffffu));
+		debug(buf2);
+	}
+
+	if (dcbaa[0] != xhci->scratchpadArrayPhys) {
+		debug("xhci: allocScratchpads fail dcbaa[0]\n");
+		fprintf(stderr, "xhci: dcbaa[0] write-back mismatch\n");
 		return -ENODEV;
 	}
 
@@ -1894,6 +2048,11 @@ static int xhci_init(hcd_t *hcd)
 					debug("xhci: pre initCommandRing\n");
 					err = xhci_initCommandRing(xhci);
 					debug("xhci: post initCommandRing\n");
+					if (err == 0) {
+						debug("xhci: pre allocScratchpads\n");
+						err = xhci_allocScratchpads(xhci);
+						debug("xhci: post allocScratchpads\n");
+					}
 					if (err == 0) {
 						debug("xhci: pre programCommandSpace\n");
 						err = xhci_programCommandSpace(xhci);
