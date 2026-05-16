@@ -1009,6 +1009,24 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 	uint32_t dcbaapLo;
 	uint32_t dcbaapHi;
 
+	/* TD-USB diag: sample USBSTS + USBCMD before any write so we can
+	 * see if the controller is in an error state at this point. The
+	 * BCM2711 PCIe bridge returns 0xdead-pattern reads when the device
+	 * is unreachable; distinguish "error state" from "bridge unreachable"
+	 * by reading two different registers. */
+	{
+		uint32_t sts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+		uint32_t cmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+		char buf[120];
+		snprintf(buf, sizeof(buf),
+			"xhci: pcs preWrite USBSTS=%08x USBCMD=%08x HSE=%d HCE=%d CNR=%d\n",
+			(unsigned)sts, (unsigned)cmd,
+			(sts & XHCI_REG_OP_USBSTS_HSE) ? 1 : 0,
+			(sts & XHCI_REG_OP_USBSTS_HCE) ? 1 : 0,
+			(sts & XHCI_REG_OP_USBSTS_CNR) ? 1 : 0);
+		debug(buf);
+	}
+
 	dcbaapLo = (uint32_t)(xhci->dcbaaPhys & XHCI_REG_OP_DCBAAP__MASK);
 	dcbaapHi = (uint32_t)(xhci->dcbaaPhys >> 32);
 	if ((!xhci->ac64) && (dcbaapHi != 0u)) {
@@ -2028,11 +2046,14 @@ static int xhci_init(hcd_t *hcd)
 	for (attempt = 0u; attempt < 600u; ++attempt) {
 		err = xhci_capProbe(hcd, xhci);
 		if (err == -ENODEV) {
-			/* Stay quiet during the polling phase; emitting a line per
-			 * 50 ms drowns UART when pcie is also chatty.
+			/* Diagnostic: log only every 50 attempts (= ~5 s) so we
+			 * can see the loop is still alive without flooding UART
+			 * during the long wait for pcie to program VL805 BAR0.
 			 */
-			if ((attempt & 0x1fu) == 0u) {
-				debug("xhci: capProbe iter ENODEV\n");
+			if ((attempt % 50u) == 0u) {
+				char m[64];
+				snprintf(m, sizeof(m), "xhci: capProbe iter ENODEV attempt=%u\n", attempt);
+				debug(m);
 			}
 		}
 		else if (err == -ENOSYS) {
@@ -2044,7 +2065,7 @@ static int xhci_init(hcd_t *hcd)
 		if (err != -ENODEV) {
 			break;
 		}
-		usleep(50000);  /* 50 ms × 600 iters = 30 s wait window */
+		usleep(100000);  /* 100 ms × 600 iters = 60 s wait window */
 	}
 	debug("xhci: post capProbe\n");
 

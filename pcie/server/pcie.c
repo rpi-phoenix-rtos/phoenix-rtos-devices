@@ -780,6 +780,23 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		if (err < 0) {
 			fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
 		}
+		/* TD-USB: VL805 firmware load is async after the mailbox
+		 * reset call returns. Without an explicit wait, the next
+		 * config-space writes and (especially) MMIO reads to BAR0
+		 * race the VL805 boot ROM → firmware handoff and the
+		 * BCM2711 PCIe bridge returns 0xdead-pattern for any
+		 * register read until firmware is up. Empirically a 200 ms
+		 * settle is enough to make xhci_capProbe see valid
+		 * caplen / version values on the first try.
+		 *
+		 * Reference: Linux's xhci-pci driver waits for the device
+		 * to come out of CRS (Configuration Retry Status) via the
+		 * PCIe Vendor ID polling pattern; we don't have CRS-aware
+		 * helpers in this codebase yet so a simple usleep is the
+		 * pragmatic fix. Future cleanup should poll for stable
+		 * Vendor ID / caplen reads instead of a fixed delay.
+		 */
+		usleep(200000);
 		/* TD-15 Stage 4 phase 2: program VL805 BAR0 to the outbound
 		 * window's PCIe base address. The bcm2711NotifyXhciReset
 		 * mailbox call resets the VL805 and reloads its firmware, but
