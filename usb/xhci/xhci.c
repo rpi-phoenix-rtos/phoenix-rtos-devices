@@ -23,6 +23,13 @@
 #include <hcd.h>
 #include <hub.h>
 
+#if defined(__TARGET_AARCH64A72) && defined(PCI_EXPRESS_BCM2711_INDEXED_CFG)
+#include "bcm2711-pcie.h"
+#else
+/* Other boards' xhci PHYs don't need BCM2711 bring-up; provide a stub. */
+static inline int bcm2711_pcie_initVL805(void) { return 0; }
+#endif
+
 
 #define XHCI_MAP_SIZE            0x10000u
 #define XHCI_REG_CAP_CAPLENGTH   0x00u
@@ -2021,19 +2028,25 @@ static int xhci_init(hcd_t *hcd)
 {
 	xhci_t *xhci;
 	int err;
-	unsigned attempt;
 
-	/* TD-USB: delay xhci's mmap until pcie has had time to complete
-	 * BAR0 programming. On the M-only Pi 4 kernel the BCM2711 PCIe
-	 * bridge enters a 0xdead-returning state for MMIO reads when xhci
-	 * tries to read before VL805 is ready, and subsequent reads stay
-	 * stuck in that state. A simple 8-second sleep at xhci start
-	 * lets pcie finish its scanBus + BAR0 program + xhci-reset
-	 * mailbox call before xhci touches the outbound window.
+	/* Single-process merged design: this xhci HCD owns the BCM2711 PCIe
+	 * bridge bring-up. Call it here BEFORE mmap so that VL805 BAR0 is
+	 * programmed and the outbound window is set up against THIS process'
+	 * page table. Previously pcie was a separate fire-and-exit daemon
+	 * that brought up the bridge in its own address space; xhci's mmap
+	 * of the outbound window from a different process hit a per-mmap
+	 * bridge translation state and returned 0xdead patterns. Following
+	 * the canonical Phoenix-RTOS pattern (imx6ull, imxrt106x/117x, ia32)
+	 * where the USB process owns both bus init and HCD init eliminates
+	 * the cross-process race.
 	 */
-	debug("xhci: pre startup-delay (waiting for pcie BAR0 program)\n");
-	sleep(8);
-	debug("xhci: post startup-delay\n");
+	debug("xhci: pre bcm2711_pcie_initVL805\n");
+	err = bcm2711_pcie_initVL805();
+	if (err != 0) {
+		debug("xhci: bcm2711_pcie_initVL805 FAILED\n");
+		return err;
+	}
+	debug("xhci: post bcm2711_pcie_initVL805\n");
 
 	debug("xhci: pre map\n");
 	err = xhci_map(hcd, &xhci);
@@ -2043,70 +2056,16 @@ static int xhci_init(hcd_t *hcd)
 	}
 	debug("xhci: post map ok\n");
 
-	/* TD-USB: refined hypothesis — bridge locks translation entry to
-	 * 0xdead-state after a failed read. Probe once now; if invalid,
-	 * unmap and remap to get a fresh translation entry. Repeat up to
-	 * 5 times before giving up on remap and falling through to the
-	 * regular capProbe retry loop.
-	 */
-	for (attempt = 0u; attempt < 5u; ++attempt) {
-		uint8_t cl = xhci_read8(xhci, XHCI_REG_CAP_CAPLENGTH);
-		uint16_t ver = xhci_read16(xhci, XHCI_REG_CAP_HCIVERSION);
-		char m[100];
-		snprintf(m, sizeof(m), "xhci: probe-remap try=%u caplen=%02x ver=%04x\n",
-			attempt, (unsigned)cl, (unsigned)ver);
-		debug(m);
-		if (cl >= 0x20u && cl <= 0xffu && ver == XHCI_SUPPORTED_VERSION) {
-			debug("xhci: probe-remap got valid values\n");
-			break;
-		}
-		/* Tear down the mapping and remap to force a fresh
-		 * bridge translation entry. */
-		debug("xhci: probe-remap teardown+remap\n");
-		xhci_destroy(xhci);
-		sleep(1);
-		err = xhci_map(hcd, &xhci);
-		if (err < 0) {
-			debug("xhci: probe-remap map fail\n");
-			return err;
-		}
+	debug("xhci: pre capProbe\n");
+	err = xhci_capProbe(hcd, xhci);
+	if (err == -ENODEV) {
+		debug("xhci: capProbe ENODEV (no VL805 visible)\n");
 	}
-
-	/*
-	 * The pcie daemon and the usb daemon are spawned concurrently from plo's
-	 * user.plo.yaml. xhci_capProbe needs the VL805 BAR0 already programmed by
-	 * pcie, otherwise HCIVERSION reads back 0xdead (BCM2711 PCIe bridge
-	 * no-device default) and the controller is not reachable. Poll for a
-	 * valid capability window for up to ~30 s before giving up; on the
-	 * M-only Pi 4 kernel pcie can take 10-20 s to complete its scan, BAR0
-	 * programming, and the xhci-reset mailbox call, so the previous 5 s
-	 * limit was racing pcie and giving up too early.
-	 */
-	debug("xhci: pre capProbe retry-loop\n");
-	err = -ENODEV;
-	for (attempt = 0u; attempt < 600u; ++attempt) {
-		err = xhci_capProbe(hcd, xhci);
-		if (err == -ENODEV) {
-			/* Diagnostic: log only every 50 attempts (= ~5 s) so we
-			 * can see the loop is still alive without flooding UART
-			 * during the long wait for pcie to program VL805 BAR0.
-			 */
-			if ((attempt % 50u) == 0u) {
-				char m[64];
-				snprintf(m, sizeof(m), "xhci: capProbe iter ENODEV attempt=%u\n", attempt);
-				debug(m);
-			}
-		}
-		else if (err == -ENOSYS) {
-			debug("xhci: capProbe iter ENOSYS (ok)\n");
-		}
-		else {
-			debug("xhci: capProbe iter other\n");
-		}
-		if (err != -ENODEV) {
-			break;
-		}
-		usleep(100000);  /* 100 ms × 600 iters = 60 s wait window */
+	else if (err == -ENOSYS) {
+		debug("xhci: capProbe ENOSYS (valid xhci caps)\n");
+	}
+	else {
+		debug("xhci: capProbe other err\n");
 	}
 	debug("xhci: post capProbe\n");
 
