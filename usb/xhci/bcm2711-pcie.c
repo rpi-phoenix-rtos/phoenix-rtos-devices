@@ -922,6 +922,13 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 {
 	uint8_t next_bus = 1;
 
+	{
+		char m[48];
+		extern void debug(const char *s);
+		snprintf(m, sizeof(m), "pcie-scanBus: bus=%u enter\n", bus);
+		debug(m);
+	}
+
 	/* Iterate over all devices connected to the certain bus */
 	for (uint8_t dev = 0; dev < (bus ? 32 : 1); ++dev) {
 		/**
@@ -955,6 +962,13 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 				scanFunc(cfgio, bus, &next_bus, dev, fn);
 			}
 		}
+	}
+
+	{
+		char m[48];
+		extern void debug(const char *s);
+		snprintf(m, sizeof(m), "pcie-scanBus: bus=%u exit\n", bus);
+		debug(m);
 	}
 }
 
@@ -1019,8 +1033,10 @@ int bcm2711_pcie_initVL805(void)
 	 * between distinct peripherals. */
 	__asm__ volatile("dsb sy" ::: "memory");
 	__asm__ volatile("isb" ::: "memory");
+	debug("xhci-pcie: post-barrier\n");
 
 	cfgio.destroy(cfgio.ctx);
+	debug("xhci-pcie: post-cfgio.destroy\n");
 	debug("xhci-pcie: bcm2711_pcie_initVL805 done\n");
 
 	return ret;
