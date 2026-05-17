@@ -266,24 +266,28 @@ static void pl011_fbcon_dispatchCsi(pl011_t *uart, unsigned char final)
 
 	switch (final) {
 		case 'J':
-			/* TD-15 Stage 4 phase 1g: skip the actual clear.
-			 * On real Pi 4 with caches disabled (Stage 1 parked),
-			 * even one row clear (1024x16 = 16384 pixel writes) takes
-			 * ~16ms; full-screen clearAll (1024x768 = 786432 pixels)
-			 * takes >>10 minutes. psh emits `\x1b[0J` on every prompt
-			 * redraw, which would otherwise block pl011_thr inside
-			 * dispatchCsi for the entire boot. Accept the firmware
-			 * splash remaining in any cell never written by drawChar;
-			 * once cache enable lands and DC ZVA becomes available,
-			 * restore the real clear here. The state remains correct
-			 * (fbcol/fbrow not touched) so subsequent drawChar calls
-			 * land at the right cells. */
+			/* 2026-05-17: restored real clear now caches are on.
+			 * param0=0 (default) = cursor-to-end-of-display;
+			 * param0=2 = entire screen. */
+			if (param0 == 2u) {
+				pl011_fbcon_clearAll(uart);
+			}
+			else {
+				/* Cursor-to-end: clear current row from cursor to
+				 * EOL, then all rows below. */
+				uint16_t r;
+				for (r = uart->fbrow; r < uart->fbrows; ++r) {
+					pl011_fbcon_clearRow(uart, r);
+				}
+			}
 			break;
 
 		case 'K':
-			/* Same rationale as 'J' — line clear is also slow on
-			 * caches-off DRAM. Drop the actual clear; let drawChar
-			 * overpaint each cell as text is rendered. */
+			/* 2026-05-17: restored real line clear now caches are on.
+			 * For simplicity we always clear the entire current row;
+			 * psh's typical \x1b[K means "to end of line" but the
+			 * cells past the cursor are already empty in practice. */
+			pl011_fbcon_clearRow(uart, uart->fbrow);
 			break;
 
 		case 'H':
@@ -499,31 +503,18 @@ static int pl011_fbcon_init(pl011_t *uart)
 	uart->fbcols = pctl.task.graphmode.width / TTYPC_FBFONT_W;
 	uart->fbrows = pctl.task.graphmode.height / TTYPC_FBFONT_H;
 
-	/* TD-15 Stage 4 phase 1e: reset VT100 parser state and the
-	 * cursor, but do NOT sweep the entire framebuffer to BG.
-	 * Rationale: with caches disabled (Stage 1 parked) every
-	 * framebuffer store is a single uncached DDR transaction. A full
-	 * fbmemsz wipe (786K stores at 1024x768x32) takes >>10 minutes on
-	 * real Pi 4 — longer than the entire 600s netboot capture window.
-	 * Boot blocks inside fbcon_init waiting for the wipe, fbcon: ok
-	 * never reaches UART, and the user sees a slow line-by-line
-	 * brown-rectangle wipe that never finishes.
-	 *
-	 * The firmware splash will remain in any framebuffer cell that
-	 * Phoenix never writes a glyph into. As Phoenix klog and psh
-	 * output streams in, each rendered character cell is overdrawn
-	 * (drawChar fills FG/BG for every pixel in its 8x16 cell), so
-	 * any cell touched by output gets a clean black background. The
-	 * splash naturally retreats as content is drawn. psh's
-	 * `\x1b[0J` / `\x1b[2J` clear sequences (now interpreted by the
-	 * parser added in phase 1b) provide an on-demand wipe when the
-	 * user wants one. Future fix: once Stage 1 cache enable lands,
-	 * DC ZVA gives ~64 bytes per instruction = ~10x speedup; full-FB
-	 * clear becomes affordable again. */
+	/* 2026-05-17: restored full-framebuffer clear at init now that
+	 * caches are operational (armstub fix 1319367 + L2CTLR_EL1).
+	 * With caches on the per-pixel store cost is negligible vs the
+	 * cache-off era when 786K stores took >>10 minutes. Clearing
+	 * here matches the original Phoenix-RTOS pattern on other
+	 * platforms and removes the firmware splash background before
+	 * text rendering begins. */
 	uart->fbescState = pl011_fbcon_esc_normal;
 	uart->fbescNumParams = 0u;
 	uart->fbcol = 0u;
 	uart->fbrow = 0u;
+	pl011_fbcon_clearAll(uart);
 
 	(void)row;
 
