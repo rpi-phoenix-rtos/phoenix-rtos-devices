@@ -562,7 +562,6 @@ static int pl011_createTty0(pl011_t *uart)
 	int err;
 	unsigned int i;
 
-	pl011_writeRaw(uart, "pl011-tty: tty0 lookup\r\n");
 	err = -ENODEV;
 	/* TODO(TD-14-pl011-retry): originally 50 retries (5 s wall), bumped
 	 * to 500 (50 s) for slow Pi 4 IPC, then back DOWN to 30 (3 s) once
@@ -577,10 +576,6 @@ static int pl011_createTty0(pl011_t *uart)
 			break;
 		}
 
-		if ((i == 0U) || (((i + 1U) % 10U) == 0U)) {
-			pl011_writeRaw(uart, "pl011-tty: tty0 lookup retry\r\n");
-		}
-
 		usleep(100000);
 	}
 
@@ -588,8 +583,6 @@ static int pl011_createTty0(pl011_t *uart)
 		pl011_writeRaw(uart, "pl011-tty: tty0 lookup failed\r\n");
 		return err;
 	}
-
-	pl011_writeRaw(uart, "pl011-tty: tty0 lookup ok\r\n");
 
 	msg.type = mtCreate;
 	msg.oid = odev;
@@ -599,13 +592,10 @@ static int pl011_createTty0(pl011_t *uart)
 	msg.i.data = name;
 	msg.i.size = sizeof(name);
 
-	pl011_writeRaw(uart, "pl011-tty: tty0 send\r\n");
 	if (msgSend(odev.port, &msg) != EOK) {
 		pl011_writeRaw(uart, "pl011-tty: tty0 send failed\r\n");
 		return -ENOMEM;
 	}
-
-	pl011_writeRaw(uart, "pl011-tty: tty0 send done\r\n");
 
 	return msg.o.err;
 }
@@ -759,7 +749,6 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 	uart->oid.id = 0;
 
 	pl011_configure(uart);
-	pl011_writeRaw(uart, "pl011-tty: started\r\n");
 
 	return EOK;
 }
@@ -879,14 +868,38 @@ static void pl011_thr(void *arg)
 			libtty_putchar(&uart->tty, (unsigned char)pl011_read(uart, dr), &wake_reader);
 		}
 
-		while ((libtty_txready(&uart->tty) != 0) && ((pl011_read(uart, fr) & fr_txff) == 0)) {
-			unsigned char c = libtty_popchar(&uart->tty);
+		/* TD-12 boot-speed fix (2026-05-17): batch the TX drain so
+		 * the per-byte fbcon mirror's mutex acquire/release pair
+		 * amortizes across many bytes. Previously each byte =
+		 * 1× mutexLock(fbLock) + 1× pl011_fbcon_putc (~128 pixel
+		 * stores to MAP_UNCACHED memory) + 1× mutexUnlock, which
+		 * paced the drainer at ≈10 µs/byte and made the TX FIFO
+		 * back up under usb-daemon's printf flood, blocking psh's
+		 * tcgetattr/tcsetpgrp ioctls behind the queue. Now we pop
+		 * up to 64 bytes into a local buffer, write them all to
+		 * UART (still byte-by-byte since the HW FIFO is small),
+		 * then call pl011_fbcon_write once for the whole batch. */
+		{
+			char batch[64];
+			size_t n;
 
-			pl011_write(uart, dr, c);
-			if (uart->fbaddr != NULL) {
-				pl011_fbcon_write(uart, (const char *)&c, 1u);
+			while (libtty_txready(&uart->tty) != 0) {
+				n = 0u;
+				while ((n < sizeof(batch)) &&
+					(libtty_txready(&uart->tty) != 0) &&
+					((pl011_read(uart, fr) & fr_txff) == 0)) {
+					batch[n] = (char)libtty_popchar(&uart->tty);
+					pl011_write(uart, dr, (unsigned char)batch[n]);
+					++n;
+				}
+				if (n == 0u) {
+					break;
+				}
+				if (uart->fbaddr != NULL) {
+					pl011_fbcon_write(uart, batch, n);
+				}
+				wake_writer = 1;
 			}
-			wake_writer = 1;
 		}
 
 		if (wake_reader != 0) {
@@ -985,7 +998,6 @@ int main(void)
 		return EXIT_FAILURE;
 	}
 
-	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register tty0\r\n");
 	/* TODO(TD-14-tty0-nonfatal): pl011_createTty0() depends on a fast
 	 * lookup("devfs") that is intermittently slow on real Pi 4 (TD-04-
 	 * class IPC fragility). It runs the same lookup as create_dev()
@@ -997,16 +1009,10 @@ int main(void)
 	 * strictly required for psh's shell prompt to come up. Restore
 	 * the fatal path once the underlying IPC slowness is rooted out. */
 	if (pl011_createTty0(&pl011_common.uart) < 0) {
-		pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 failed (non-fatal)\r\n");
 		fprintf(stderr, "pl011-tty: tty0 register failed (non-fatal, continuing)\n");
 	}
-	else {
-		pl011_writeRaw(&pl011_common.uart, "pl011-tty: tty0 ready\r\n");
-	}
 
-	pl011_writeRaw(&pl011_common.uart, "pl011-tty: register console\r\n");
 	if (create_dev(&pl011_common.uart.oid, _PATH_CONSOLE) < 0) {
-		pl011_writeRaw(&pl011_common.uart, "pl011-tty: console failed\r\n");
 		fprintf(stderr, "pl011-tty: failed to register %s\n", _PATH_CONSOLE);
 		return EXIT_FAILURE;
 	}
@@ -1015,10 +1021,7 @@ int main(void)
 	 * until Pi 4 bind/devfs lookup latency is fixed. create_dev() registers
 	 * the node in devfs; this alias preserves the fast /dev/console path used
 	 * by early shell startup and mirrors create_dev()'s fallback behavior. */
-	if (portRegister(port, _PATH_CONSOLE, &pl011_common.uart.oid) < 0) {
-		pl011_writeRaw(&pl011_common.uart, "pl011-tty: console alias skipped\r\n");
-	}
-	pl011_writeRaw(&pl011_common.uart, "pl011-tty: console ready\r\n");
+	(void)portRegister(port, _PATH_CONSOLE, &pl011_common.uart.oid);
 
 	libklog_init(pl011_klogClbk);
 	oid_t kmsgctrl = { .port = port, .id = KMSG_CTRL_ID };
@@ -1031,24 +1034,15 @@ int main(void)
 	beginthread(poolthr, 4, pl011_common.stack, sizeof(pl011_common.stack), (void *)(uintptr_t)port);
 
 	{
-		/* TD-15 / Stage 4 phase 1: instrument fbcon init result so we
-		 * can tell on real Pi whether (a) graphmode was never populated
-		 * (returns -ENOSYS — plo's mailbox path didn't fill it in), or
-		 * (b) framebuffer mmap failed (returns -ENOMEM), or (c) it
-		 * actually succeeded. Direct UART write via pl011_writeRaw to
-		 * avoid debug() IPC dependency. */
+		/* fbcon init: emit a single boot marker so post-fbcon-ok timing
+		 * is visible on UART. Failure reasons go to stderr where useful;
+		 * direct pl011_writeRaw avoids debug() IPC on the success path. */
 		int fbres = pl011_fbcon_init(&pl011_common.uart);
 		if (fbres == EOK) {
 			pl011_writeRaw(&pl011_common.uart, "fbcon: ok\r\n");
 		}
-		else if (fbres == -ENOSYS) {
-			pl011_writeRaw(&pl011_common.uart, "fbcon: skip (graphmode not populated)\r\n");
-		}
-		else if (fbres == -ENOMEM) {
-			pl011_writeRaw(&pl011_common.uart, "fbcon: skip (framebuffer mmap failed)\r\n");
-		}
 		else {
-			pl011_writeRaw(&pl011_common.uart, "fbcon: skip (other error)\r\n");
+			fprintf(stderr, "pl011-tty: fbcon init failed: %d\n", fbres);
 		}
 	}
 

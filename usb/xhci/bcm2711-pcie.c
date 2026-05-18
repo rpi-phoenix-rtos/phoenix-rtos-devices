@@ -223,10 +223,6 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 	uint32_t msg;
 	uintptr_t msgaddr;
 	int ret;
-	{
-		extern void debug(const char *s);
-		debug("pcie: bcm2711NotifyXhciReset enter\n");
-	}
 
 	mailbox = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, RPI_MAILBOX_BASE_ADDRESS);
 	if (mailbox == MAP_FAILED) {
@@ -269,11 +265,8 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 	}
 
 	ret = (msgbuf[1] == RPI_MBOX_RESPONSE) ? EOK : -EIO;
-	{
-		extern void debug(const char *s);
-		char m[80];
-		snprintf(m, sizeof(m), "pcie: notifyXhciReset ret=%d resp=%08x\n", ret, msgbuf[1]);
-		debug(m);
+	if (ret != EOK) {
+		fprintf(stderr, "pcie: notifyXhciReset failed: ret=%d resp=%08x\n", ret, msgbuf[1]);
 	}
 
 	munmap(msgbuf, _PAGE_SIZE);
@@ -466,11 +459,8 @@ static void bcm2711PrepareLinkState(pcie_bcm2711_ctx_t *ctx)
 
 	ctx->linkUp = bcm2711LinkUp(ctx);
 	ctx->rcMode = bcm2711RcMode(ctx);
-	{
-		extern void debug(const char *s);
-		char m[64];
-		snprintf(m, sizeof(m), "pcie: linkUp=%d rcMode=%d\n", ctx->linkUp, ctx->rcMode);
-		debug(m);
+	if (ctx->linkUp == 0) {
+		fprintf(stderr, "pcie: link did not come up (rcMode=%d)\n", ctx->rcMode);
 	}
 }
 
@@ -681,12 +671,6 @@ static void print_bars(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn
 	for (int i = 0; i < bar_count; ++i) {
 
 		uint32_t bar_low = cfgio->read32(cfgio->ctx, bus, dev, fn, PCI_BAR0 + i * 4);
-		{
-			extern void debug(const char *s);
-			char m[80];
-			snprintf(m, sizeof(m), "pcie: BAR%d raw=%08x\n", i, bar_low);
-			debug(m);
-		}
 		if (bar_low == 0) {
 			continue;
 		}
@@ -748,13 +732,6 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			vendor, device,
 			classBase, classSub, progIF,
 			hdr);
-	{
-		extern void debug(const char *s);
-		char m[120];
-		snprintf(m, sizeof(m), "pcie: %02x:%02x.%u ven=%04x dev=%04x cls=%02x%02x%02x hdr=%02x\n",
-			bus, dev, fun, vendor, device, classBase, classSub, progIF, hdr);
-		debug(m);
-	}
 
 #if defined(PCI_EXPRESS_BCM2711_INDEXED_CFG) && defined(RPI_MAILBOX_BASE_ADDRESS) && defined(XHCI_BCM2711_PCIE_BUS) && defined(XHCI_BCM2711_PCIE_SLOT) && defined(XHCI_BCM2711_PCIE_FUNC) && defined(XHCI_BCM2711_PCI_CLASS_CODE)
 	if ((bus == XHCI_BCM2711_PCIE_BUS) && (dev == XHCI_BCM2711_PCIE_SLOT) &&
@@ -767,14 +744,14 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		 * programmed and the cmd register read-back shows 0x0006.
 		 */
 		{
-			extern void debug(const char *s);
-			char m[80];
 			uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
 			uint16_t want = cmd | PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE;
 			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
 			uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
-			snprintf(m, sizeof(m), "pcie: VL805 cmd %04x->%04x rb=%04x\n", cmd, want, rb);
-			debug(m);
+			if ((rb & (PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE)) !=
+				(PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE)) {
+				fprintf(stderr, "pcie: VL805 cmd readback %04x did not stick (wanted %04x)\n", rb, want);
+			}
 		}
 		int err = bcm2711NotifyXhciReset(bus, dev, fun);
 		if (err < 0) {
@@ -817,12 +794,14 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_BAR0 + 4,
 			(uint32_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE >> 32));
 		{
-			extern void debug(const char *s);
-			char m[80];
 			uint32_t bar_lo = cfgio->read32(cfgio->ctx, bus, dev, fun, PCI_BAR0);
 			uint32_t bar_hi = cfgio->read32(cfgio->ctx, bus, dev, fun, PCI_BAR0 + 4);
-			snprintf(m, sizeof(m), "pcie: VL805 BAR0 programmed lo=%08x hi=%08x\n", bar_lo, bar_hi);
-			debug(m);
+			uint32_t want_lo = (uint32_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE & 0xfffffff0u);
+			uint32_t want_hi = (uint32_t)(PCIE_BCM2711_OUTBOUND_PCIE_BASE >> 32);
+			if (((bar_lo & 0xfffffff0u) != want_lo) || (bar_hi != want_hi)) {
+				fprintf(stderr, "pcie: VL805 BAR0 programming failed: got lo=%08x hi=%08x wanted lo=%08x hi=%08x\n",
+					bar_lo, bar_hi, want_lo, want_hi);
+			}
 		}
 		/* TD-USB diag 2026-05-16: read xhci CAPLENGTH + HCIVERSION
 		 * directly through the outbound window. Confirms the path
@@ -837,23 +816,20 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		 * registers (otherwise the second mmap sees 0xdead).
 		 */
 		{
-			extern void debug(const char *s);
+			/* TODO(TD-USB-keepalive): the BCM2711 PCIe bridge appears
+			 * to invalidate its outbound translation entry when the
+			 * kernel removes the user mapping. Holding a read-only
+			 * mapping here keeps the bridge translation warm so xhci's
+			 * subsequent mmap of the same PA reads valid registers
+			 * (otherwise the second mmap sees 0xdead). Investigate the
+			 * bridge's outbound-window TLB lifetime and replace this
+			 * with explicit refcount in the kernel pmap layer. */
 			static volatile uint8_t *vl805_mmio_keepalive;
 			vl805_mmio_keepalive = mmap(NULL, _PAGE_SIZE,
 				PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS,
 				-1, PCIE_BCM2711_OUTBOUND_CPU_BASE);
 			if (vl805_mmio_keepalive == MAP_FAILED) {
-				debug("pcie: diag-mmap of outbound window FAILED\n");
-			}
-			else {
-				char m[120];
-				uint8_t cl = *vl805_mmio_keepalive;
-				uint16_t ver = *(volatile uint16_t *)(vl805_mmio_keepalive + 2);
-				uint32_t hcsp1 = *(volatile uint32_t *)(vl805_mmio_keepalive + 4);
-				snprintf(m, sizeof(m),
-					"pcie: diag-outbound caplen=%02x ver=%04x hcsparams1=%08x (KEPT)\n",
-					cl, ver, hcsp1);
-				debug(m);
+				fprintf(stderr, "pcie: VL805 outbound-window keepalive mmap failed\n");
 			}
 		}
 	}
@@ -873,14 +849,11 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
 		uint16_t want = cmd | PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE;
 		if (want != cmd) {
-			printf("pcie: enable memory space and bus master (cmd %04x->%04x)\n", cmd, want);
 			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
-			{
-				extern void debug(const char *s);
-				char m[80];
-				uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
-				snprintf(m, sizeof(m), "pcie: cmd readback %04x (wanted %04x)\n", rb, want);
-				debug(m);
+			uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
+			if ((rb & (PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE)) !=
+				(PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE)) {
+				fprintf(stderr, "pcie: cmd readback %04x (wanted %04x)\n", rb, want);
 			}
 		}
 	}
@@ -922,13 +895,6 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 {
 	uint8_t next_bus = 1;
 
-	{
-		char m[48];
-		extern void debug(const char *s);
-		snprintf(m, sizeof(m), "pcie-scanBus: bus=%u enter\n", bus);
-		debug(m);
-	}
-
 	/* Iterate over all devices connected to the certain bus */
 	for (uint8_t dev = 0; dev < (bus ? 32 : 1); ++dev) {
 		/**
@@ -963,21 +929,8 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 			}
 		}
 	}
-
-	{
-		char m[48];
-		extern void debug(const char *s);
-		snprintf(m, sizeof(m), "pcie-scanBus: bus=%u exit\n", bus);
-		debug(m);
-	}
 }
 
-
-/* TD-15 Stage 4 phase 2 DIAGNOSTIC: pcie daemon doesn't print to UART
- * by default (uses fprintf which is buffered). Use debug() for direct
- * kernel klog → UART output so we can see what's happening on real
- * Pi 4. Remove once VL805 BAR-programming is fixed. */
-#include <sys/debug.h>
 
 /*
  * bcm2711_pcie_initVL805 — BCM2711 PCIe bridge + VL805 USB controller bring-up.
@@ -1003,12 +956,9 @@ int bcm2711_pcie_initVL805(void)
 {
 	pcie_cfgio_t cfgio = { 0 };
 	int ret = 0;
-	debug("xhci-pcie: bcm2711_pcie_initVL805 enter\n");
 
 #ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
-	debug("xhci-pcie: pre-cfgInitBcm2711\n");
 	ret = pcie_cfgInitBcm2711(&cfgio);
-	debug("xhci-pcie: post-cfgInitBcm2711\n");
 #else
 	/* Non-BCM2711 boards reach this function only if their xhci PHY
 	 * also opts in to merged bus init. Wire up ECAM fallback so the
@@ -1017,13 +967,10 @@ int bcm2711_pcie_initVL805(void)
 #endif
 	if (ret != EOK) {
 		fprintf(stderr, "xhci-pcie: fail to initialize config-space backend\n");
-		debug("xhci-pcie: cfgInit FAIL\n");
 		return ret;
 	}
 
-	debug("xhci-pcie: pre-scanBus\n");
 	pcie_scanBus(&cfgio, 0);
-	debug("xhci-pcie: post-scanBus\n");
 
 	/* AXI ordering: make sure every config-space and bridge-register
 	 * write issued from scanBus + scanFunc is globally visible BEFORE
@@ -1033,11 +980,8 @@ int bcm2711_pcie_initVL805(void)
 	 * between distinct peripherals. */
 	__asm__ volatile("dsb sy" ::: "memory");
 	__asm__ volatile("isb" ::: "memory");
-	debug("xhci-pcie: post-barrier\n");
 
 	cfgio.destroy(cfgio.ctx);
-	debug("xhci-pcie: post-cfgio.destroy\n");
-	debug("xhci-pcie: bcm2711_pcie_initVL805 done\n");
 
 	return ret;
 }
