@@ -868,40 +868,33 @@ static void pl011_thr(void *arg)
 			libtty_putchar(&uart->tty, (unsigned char)pl011_read(uart, dr), &wake_reader);
 		}
 
-		/* TD-12 boot-speed fix (2026-05-17, refined 2026-05-18):
-		 * pop up to 64 bytes from libtty TX into a local buffer, write
-		 * them all to PL011 DR, then call pl011_fbcon_write once for
-		 * the whole batch. Batching the fbcon mirror amortises the
-		 * mutexLock/Unlock pair across many bytes; per-byte pacing
-		 * here was 10 µs/byte and back-pressured the libtty queue
-		 * under usb-daemon's printf flood.
-		 *
-		 * Critically, this routine pops only ONE batch per outer
-		 * pl011_thr iteration, then yields back to the for(;;) loop
-		 * so the RX-FIFO drain at the top runs again. An earlier
-		 * variant drained the entire libtty TX queue before yielding,
-		 * which meant up to ~2 s of TX work (klog backlog right after
-		 * boot) before RX was serviced — and at 16-byte PL011 RX FIFO
-		 * vs slow servicing, typed characters from the serial console
-		 * trickled in seconds late. With one-batch-per-iter the worst
-		 * case RX-to-libtty latency is one batch of UART writes
-		 * (~64 × 87 µs = 6 ms) plus one fbcon batch. The bottom
-		 * `wake_writer / wake_reader / idle-sleep` block still gates
-		 * the usleep on libtty_txready, so we keep tight-polling
-		 * while TX has more data — i.e. we drain the same total
-		 * volume, just with RX servicing interleaved. */
+		/* TD-12 boot-speed fix (2026-05-17): batch the TX drain so
+		 * the per-byte fbcon mirror's mutex acquire/release pair
+		 * amortizes across many bytes. Previously each byte =
+		 * 1× mutexLock(fbLock) + 1× pl011_fbcon_putc (~128 pixel
+		 * stores to MAP_UNCACHED memory) + 1× mutexUnlock, which
+		 * paced the drainer at ≈10 µs/byte and made the TX FIFO
+		 * back up under usb-daemon's printf flood, blocking psh's
+		 * tcgetattr/tcsetpgrp ioctls behind the queue. Now we pop
+		 * up to 64 bytes into a local buffer, write them all to
+		 * UART (still byte-by-byte since the HW FIFO is small),
+		 * then call pl011_fbcon_write once for the whole batch. */
 		{
 			char batch[64];
-			size_t n = 0u;
+			size_t n;
 
-			while ((n < sizeof(batch)) &&
-				(libtty_txready(&uart->tty) != 0) &&
-				((pl011_read(uart, fr) & fr_txff) == 0)) {
-				batch[n] = (char)libtty_popchar(&uart->tty);
-				pl011_write(uart, dr, (unsigned char)batch[n]);
-				++n;
-			}
-			if (n != 0u) {
+			while (libtty_txready(&uart->tty) != 0) {
+				n = 0u;
+				while ((n < sizeof(batch)) &&
+					(libtty_txready(&uart->tty) != 0) &&
+					((pl011_read(uart, fr) & fr_txff) == 0)) {
+					batch[n] = (char)libtty_popchar(&uart->tty);
+					pl011_write(uart, dr, (unsigned char)batch[n]);
+					++n;
+				}
+				if (n == 0u) {
+					break;
+				}
 				if (uart->fbaddr != NULL) {
 					pl011_fbcon_write(uart, batch, n);
 				}
