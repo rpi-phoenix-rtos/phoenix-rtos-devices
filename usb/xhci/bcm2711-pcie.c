@@ -110,6 +110,28 @@ typedef struct {
 static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus);
 
 
+/* Pre-created xhci MMIO mapping, see pcie_scanProbe's TD-USB-pmap workaround. */
+static volatile void *bcm2711_pcie_xhciMmio = NULL;
+
+
+/* Same size as xhci.c's XHCI_MAP_SIZE. Hard-coded here to avoid coupling
+ * the bcm2711 PHY init to xhci.c internals. If xhci.c grows beyond 64 KiB
+ * of BAR0 usage, bump both. */
+#define BCM2711_PCIE_XHCI_MMIO_SIZE 0x10000u
+
+
+volatile void *bcm2711_pcie_getXhciMmio(void)
+{
+	return bcm2711_pcie_xhciMmio;
+}
+
+
+uint64_t bcm2711_pcie_getXhciMmioSize(void)
+{
+	return BCM2711_PCIE_XHCI_MMIO_SIZE;
+}
+
+
 static inline uint16_t pcie_cfgRead16(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
 {
 	uint32_t value_u32 = cfgio->read32(cfgio->ctx, bus, dev, fn, off);
@@ -842,20 +864,25 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		 * registers (otherwise the second mmap sees 0xdead).
 		 */
 		{
-			/* TODO(TD-USB-keepalive): the BCM2711 PCIe bridge appears
-			 * to invalidate its outbound translation entry when the
-			 * kernel removes the user mapping. Holding a read-only
-			 * mapping here keeps the bridge translation warm so xhci's
-			 * subsequent mmap of the same PA reads valid registers
-			 * (otherwise the second mmap sees 0xdead). Investigate the
-			 * bridge's outbound-window TLB lifetime and replace this
-			 * with explicit refcount in the kernel pmap layer. */
-			static volatile uint8_t *vl805_mmio_keepalive;
-			vl805_mmio_keepalive = mmap(NULL, _PAGE_SIZE,
-				PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS,
+			/* Hand off the xhci MMIO mapping to xhci_init via the
+			 * bcm2711_pcie_getXhciMmio() accessor. Historically this was
+			 * a "keepalive" against a bridge-translation invalidation
+			 * bug (where xhci's own later mmap of the outbound CPU PA
+			 * read 0xdead); that turned out to be a side effect of
+			 * pcie_scanBus probing dev 1..31 on bus 1 and is fixed by
+			 * the dev-0-only sweep there. Pre-creating the mapping
+			 * here is still useful because it avoids a redundant
+			 * MAP_DEVICE mmap inside xhci_init. */
+			volatile uint8_t *xhci_mmio = mmap(NULL,
+				bcm2711_pcie_getXhciMmioSize(),
+				PROT_READ | PROT_WRITE,
+				MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS,
 				-1, PCIE_BCM2711_OUTBOUND_CPU_BASE);
-			if (vl805_mmio_keepalive == MAP_FAILED) {
-				fprintf(stderr, "pcie: VL805 outbound-window keepalive mmap failed\n");
+			if (xhci_mmio == MAP_FAILED) {
+				fprintf(stderr, "pcie: xhci mmio mmap failed in scan callback\n");
+			}
+			else {
+				bcm2711_pcie_xhciMmio = xhci_mmio;
 			}
 		}
 	}
@@ -921,8 +948,22 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 {
 	uint8_t next_bus = 1;
 
-	/* Iterate over all devices connected to the certain bus */
-	for (uint8_t dev = 0; dev < (bus ? 32 : 1); ++dev) {
+	/*
+	 * On the BCM2711 root complex any non-root bus is downstream of a
+	 * PCIe Express bridge, which is point-to-point: device 0 is the only
+	 * legal device ID. Worse, on real Pi 4 reading PCI_VENDOR_ID at
+	 * bus=1, dev=1, fn=0 silently TEARS DOWN the bridge's outbound
+	 * window translation for the duration of the process (observed:
+	 * BAR0[0..3] reads as 0xdeaddead from that point on, blocking
+	 * xhci_capProbe). Cap the per-bus device sweep at 1 on non-root
+	 * buses to avoid that bridge-state corruption.
+	 *
+	 * The original code already capped the root bus (bus == 0) at one
+	 * device because the BCM2711 root complex only exposes itself there;
+	 * we extend the same rule to non-root buses for the reason above.
+	 */
+	uint8_t max_dev = 1;
+	for (uint8_t dev = 0; dev < max_dev; ++dev) {
 		/**
 		 * In case there is no device under certain identifier the bridge
 		 * returns all "ones" (0xffff) per PCIe spec, but the BCM2711
@@ -1007,7 +1048,18 @@ int bcm2711_pcie_initVL805(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 	__asm__ volatile("isb" ::: "memory");
 
-	cfgio.destroy(cfgio.ctx);
+	/* INTENTIONALLY DO NOT DESTROY: on real Pi 4, calling
+	 * cfgio.destroy(cfgio.ctx) — which munmaps PCIE_BCM2711_HOST_BASE
+	 * (the bridge config-register window) — invalidates the bridge's
+	 * outbound window translation that bcm2711SetOutboundWindow0()
+	 * just programmed. xhci_init's subsequent reads through the
+	 * outbound window then return 0xdead poison. Leaking ~64 KiB of
+	 * VA + the host-bridge mapping is the pragmatic workaround until
+	 * the kernel pmap can refcount MAP_DEVICE mappings of the bridge
+	 * registers across our process's mapping churn. The merged
+	 * usb+pcie process lives until shutdown anyway, so the leak is
+	 * bounded. */
+	(void)cfgio;
 
 	return ret;
 }

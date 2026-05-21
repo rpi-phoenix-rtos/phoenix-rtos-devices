@@ -25,8 +25,10 @@
 #if defined(__TARGET_AARCH64A72) && defined(PCI_EXPRESS_BCM2711_INDEXED_CFG)
 #include "bcm2711-pcie.h"
 #else
-/* Other boards' xhci PHYs don't need BCM2711 bring-up; provide a stub. */
+/* Other boards' xhci PHYs don't need BCM2711 bring-up; provide stubs. */
 static inline int bcm2711_pcie_initVL805(void) { return 0; }
+static inline volatile void *bcm2711_pcie_getXhciMmio(void) { return NULL; }
+static inline uint64_t bcm2711_pcie_getXhciMmioSize(void) { return 0; }
 #endif
 
 
@@ -633,6 +635,7 @@ static int xhci_map(hcd_t *hcd, xhci_t **xhcip)
 {
 	xhci_t *xhci;
 	off_t offs;
+	volatile void *preMapped;
 
 	xhci = calloc(1, sizeof(*xhci));
 	if (xhci == NULL) {
@@ -641,12 +644,25 @@ static int xhci_map(hcd_t *hcd, xhci_t **xhcip)
 
 	xhci->mmio = MAP_FAILED;
 	xhci->mapSz = XHCI_MAP_SIZE;
-
 	offs = hcd->info->hcdaddr % _PAGE_SIZE;
-	xhci->mmio = mmap(NULL, xhci->mapSz, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, hcd->info->hcdaddr - offs);
-	if (xhci->mmio == MAP_FAILED) {
-		xhci_destroy(xhci);
-		return -ENOMEM;
+
+	/* On BCM2711 the bridge invalidates its outbound translation as
+	 * soon as a new MAP_DEVICE mapping of the outbound CPU PA happens
+	 * outside the pcie scan-probe callback (see TD-USB-pmap notes in
+	 * bcm2711-pcie.c). Prefer the pre-created mapping handed to us
+	 * from pcie_scanProbe; only fall back to a fresh mmap on non-
+	 * BCM2711 boards (which use a generic ECAM path). */
+	preMapped = bcm2711_pcie_getXhciMmio();
+	if (preMapped != NULL) {
+		xhci->mmio = (void *)preMapped;
+		xhci->mapSz = bcm2711_pcie_getXhciMmioSize();
+	}
+	else {
+		xhci->mmio = mmap(NULL, xhci->mapSz, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, hcd->info->hcdaddr - offs);
+		if (xhci->mmio == MAP_FAILED) {
+			xhci_destroy(xhci);
+			return -ENOMEM;
+		}
 	}
 
 	hcd->base = (volatile uint32_t *)((uintptr_t)xhci->mmio + offs);
@@ -670,12 +686,14 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 	xhci->rtsoff = xhci_read32(xhci, XHCI_REG_CAP_RTSOFF) & XHCI_REG_CAP_RTSOFF__MASK;
 
 	if ((xhci->caplength < 0x20u) || (xhci->caplength > 0xffu)) {
-		fprintf(stderr, "xhci: invalid caplength 0x%02x\n", xhci->caplength);
+		fprintf(stderr, "xhci: invalid caplength 0x%02x (HCIVERSION 0x%04x)\n",
+			xhci->caplength, xhci->version);
 		return -ENODEV;
 	}
 
 	if (xhci->version != XHCI_SUPPORTED_VERSION) {
-		fprintf(stderr, "xhci: unsupported version 0x%04x\n", xhci->version);
+		fprintf(stderr, "xhci: unsupported version 0x%04x (caplength 0x%02x)\n",
+			xhci->version, xhci->caplength);
 		return -ENODEV;
 	}
 
@@ -2025,6 +2043,13 @@ static int xhci_init(hcd_t *hcd)
 	}
 
 	if (err != 0) {
+		/* The chain above calls fprintf(stderr, ...) at each helper's
+		 * failure site, but the usb daemon switches stderr to 4 KiB
+		 * fully-buffered mode at boot (TD-12) — so without an explicit
+		 * flush these diagnostics never reach UART when xhci_init bails
+		 * before the buffer fills. Flush here so the operator can see
+		 * which xhci_* helper actually failed. */
+		fflush(stderr);
 		xhci_destroy(xhci);
 		hcd->priv = NULL;
 		hcd->base = NULL;

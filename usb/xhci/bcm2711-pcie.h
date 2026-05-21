@@ -61,4 +61,17 @@ static inline void writeRegMsk(uint32_t *base, uint32_t offset, uint32_t clr, ui
  */
 int bcm2711_pcie_initVL805(void);
 
+
+/*
+ * Return a pre-created CPU-virtual mapping of the BCM2711 PCIe outbound
+ * window suitable for xHCI's BAR0 access (size = bcm2711_pcie_getMmioSize()),
+ * or NULL if no such mapping is held. The mapping is created during
+ * bcm2711_pcie_initVL805's scan callback while the bridge translation is
+ * known-warm, then handed off to xhci_init so it does not need a second
+ * mmap (which empirically reads 0xdead — see the TD-USB-pmap comment in
+ * bcm2711-pcie.c).
+ */
+volatile void *bcm2711_pcie_getXhciMmio(void);
+uint64_t bcm2711_pcie_getXhciMmioSize(void);
+
 #endif
