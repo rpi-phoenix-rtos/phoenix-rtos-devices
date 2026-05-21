@@ -1054,6 +1054,21 @@ int bcm2711_pcie_initVL805(void)
 
 	pcie_scanBus(&cfgio, 0);
 
+#ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
+	{
+		/* The mailbox-driven xhci-reset issued during scanBus' VL805
+		 * probe invalidates the bridge's outbound window translation
+		 * we programmed in pcie_cfgInitBcm2711(). Re-program it now so
+		 * xhci's later reads of the outbound CPU PA return real BAR0
+		 * data instead of 0xdead poison. */
+		pcie_bcm2711_ctx_t *bcm = (pcie_bcm2711_ctx_t *)cfgio.ctx;
+		if ((bcm != NULL) && (bcm->base != MAP_FAILED) && bcm->linkUp && bcm->rcMode) {
+			bcm2711SetOutboundWindow0(bcm, PCIE_BCM2711_OUTBOUND_CPU_BASE,
+				PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
+		}
+	}
+#endif
+
 	/* AXI ordering: make sure every config-space and bridge-register
 	 * write issued from scanBus + scanFunc is globally visible BEFORE
 	 * the caller (xhci PHY init / xhci_init) starts reading from the
