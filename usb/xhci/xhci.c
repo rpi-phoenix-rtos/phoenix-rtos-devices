@@ -478,6 +478,17 @@ static inline void xhci_portWrite32(xhci_t *xhci, unsigned int port, uintptr_t o
 static int xhci_portWaitBits(xhci_t *xhci, unsigned int port, uint32_t mask, uint32_t value, unsigned int timeoutMs)
 {
 	uint32_t reg;
+	unsigned i;
+
+	/* Tight ~1ms burst at 50us catches the common fast transitions
+	 * (port-reset clear, PLS->U0) without paying a full 1ms per check. */
+	for (i = 0u; i < 20u; ++i) {
+		reg = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
+		if ((reg & mask) == value) {
+			return EOK;
+		}
+		usleep(50);
+	}
 
 	for (; timeoutMs > 0u; --timeoutMs) {
 		reg = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
@@ -675,6 +686,18 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 static int xhci_waitOpBits(xhci_t *xhci, uintptr_t off, uint32_t mask, uint32_t value, unsigned timeoutMs)
 {
 	uint32_t reg;
+	unsigned i;
+
+	/* Tight ~1ms burst at 50us catches the common case where the
+	 * controller flips the bit in tens of microseconds; then fall back
+	 * to 1ms granularity for the remainder of timeoutMs. */
+	for (i = 0u; i < 20u; ++i) {
+		reg = xhci_opRead32(xhci, off);
+		if ((reg & mask) == value) {
+			return EOK;
+		}
+		usleep(50);
+	}
 
 	for (; timeoutMs > 0u; --timeoutMs) {
 		reg = xhci_opRead32(xhci, off);
