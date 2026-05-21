@@ -454,13 +454,26 @@ static bool bcm2711RcMode(pcie_bcm2711_ctx_t *ctx)
 
 static void bcm2711PrepareLinkState(pcie_bcm2711_ctx_t *ctx)
 {
+	int polls;
+
 	bcm2711PerstSet(ctx, 0u);
-	usleep(100000);
+
+	/* Poll for link up rather than waiting a fixed 100 ms. On a healthy
+	 * Pi 4 the link typically comes up within 5–30 ms after PERST
+	 * deassert; the 100 ms ceiling matches Linux's brcmstb-pcie driver
+	 * worst-case. Save the rest. */
+	for (polls = 0; polls < 50; polls++) {
+		usleep(2000);
+		if (bcm2711LinkUp(ctx)) {
+			break;
+		}
+	}
 
 	ctx->linkUp = bcm2711LinkUp(ctx);
 	ctx->rcMode = bcm2711RcMode(ctx);
 	if (ctx->linkUp == 0) {
-		fprintf(stderr, "pcie: link did not come up (rcMode=%d)\n", ctx->rcMode);
+		fprintf(stderr, "pcie: link did not come up after %d ms (rcMode=%d)\n",
+			polls * 2, ctx->rcMode);
 	}
 }
 
@@ -757,23 +770,36 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		if (err < 0) {
 			fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
 		}
-		/* TD-USB: VL805 firmware load is async after the mailbox
-		 * reset call returns. Without an explicit wait, the next
-		 * config-space writes and (especially) MMIO reads to BAR0
-		 * race the VL805 boot ROM → firmware handoff and the
-		 * BCM2711 PCIe bridge returns 0xdead-pattern for any
-		 * register read until firmware is up. Empirically a 200 ms
-		 * settle is enough to make xhci_capProbe see valid
-		 * caplen / version values on the first try.
+		/* TD-USB: VL805 firmware load is async after the mailbox reset
+		 * call returns. Without an explicit wait, the next config-space
+		 * writes and (especially) MMIO reads to BAR0 race the VL805
+		 * boot ROM → firmware handoff and the BCM2711 PCIe bridge
+		 * returns 0xdead-pattern for any register read until firmware
+		 * is up. Linux's xhci-pci driver polls for the device to come
+		 * out of CRS via PCIe Vendor ID readback. Mirror that pattern:
+		 * after the mailbox reset, the bridge briefly returns CRS
+		 * (vendor=0xffff) or stale 0xdead until VL805 firmware is up;
+		 * the vendor ID stabilises at 0x1106 once it's ready.
 		 *
-		 * Reference: Linux's xhci-pci driver waits for the device
-		 * to come out of CRS (Configuration Retry Status) via the
-		 * PCIe Vendor ID polling pattern; we don't have CRS-aware
-		 * helpers in this codebase yet so a simple usleep is the
-		 * pragmatic fix. Future cleanup should poll for stable
-		 * Vendor ID / caplen reads instead of a fixed delay.
-		 */
-		usleep(200000);
+		 * Empirically the firmware load takes ~30–80 ms on a cold
+		 * boot. The previous fixed 200 ms wait wasted at least half
+		 * of that. Cap at 300 ms so a broken VL805 still bails out. */
+		{
+			int polls;
+			uint16_t v = 0;
+			for (polls = 0; polls < 60; polls++) {
+				usleep(5000);
+				v = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_VENDOR_ID);
+				if (v == 0x1106) {
+					break;
+				}
+			}
+			if (v != 0x1106) {
+				fprintf(stderr,
+					"pcie: VL805 firmware did not come up after %d ms (vendor=0x%04x)\n",
+					polls * 5, v);
+			}
+		}
 		/* TD-15 Stage 4 phase 2: program VL805 BAR0 to the outbound
 		 * window's PCIe base address. The bcm2711NotifyXhciReset
 		 * mailbox call resets the VL805 and reloads its firmware, but
