@@ -564,13 +564,13 @@ static int pl011_createTty0(pl011_t *uart)
 
 	err = -ENODEV;
 	/* TODO(TD-14-pl011-retry): originally 50 retries (5 s wall), bumped
-	 * to 500 (50 s) for slow Pi 4 IPC, then back DOWN to 30 (3 s) once
-	 * we made the caller TD-14-tty0-nonfatal. /dev/tty0 is now optional;
-	 * if devfs lookup is slow we'd rather give up quickly here and let
-	 * the create_dev() fallback path handle /dev/console registration
-	 * directly via portRegister. Restore to 50 after IPC slowness is
-	 * rooted out and the non-fatal hack is reverted. */
-	for (i = 0; i < 30; ++i) {
+	 * to 500 (50 s) for slow Pi 4 IPC, then 30 (3 s) once the caller
+	 * was made TD-14-tty0-nonfatal, then 5 here (~500 ms nominal but
+	 * each lookup IPC itself can stretch 1 ms to 43 s per TD-14, so the
+	 * fewer retries the better when /dev/tty0 is optional anyway).
+	 * Restore to 50 after IPC slowness is rooted out and the non-fatal
+	 * hack is reverted. */
+	for (i = 0; i < 5; ++i) {
 		err = lookup("devfs", NULL, &odev);
 		if (err >= 0) {
 			break;
