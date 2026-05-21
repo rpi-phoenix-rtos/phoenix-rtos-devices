@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <endian.h>
+#include <sys/debug.h>
 #include <sys/interrupt.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
@@ -240,21 +241,35 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 
 static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 {
+	volatile uint8_t *mailbox_page;
 	volatile uint32_t *mailbox;
 	uint32_t *msgbuf;
 	uint32_t msg;
 	uintptr_t msgaddr;
+	uintptr_t mailbox_pa_base;
+	uintptr_t mailbox_pa_offs;
 	int ret;
 
-	mailbox = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, RPI_MAILBOX_BASE_ADDRESS);
-	if (mailbox == MAP_FAILED) {
+	/* The BCM2711 mailbox MMIO sits at PA 0xfe00b880 — NOT page-aligned.
+	 * Phoenix's mmap rejects a non-page-aligned `off` argument with
+	 * MAP_FAILED (vm_pageAlloc for a contiguous device mapping refuses
+	 * to map a partial page). Round the PA down to a page boundary and
+	 * fix up the offset within the page after mmap returns. */
+	mailbox_pa_base = (uintptr_t)RPI_MAILBOX_BASE_ADDRESS & ~(uintptr_t)(_PAGE_SIZE - 1U);
+	mailbox_pa_offs = (uintptr_t)RPI_MAILBOX_BASE_ADDRESS & (uintptr_t)(_PAGE_SIZE - 1U);
+
+	mailbox_page = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, mailbox_pa_base);
+	if (mailbox_page == MAP_FAILED) {
+		debug("pcie: notifyXhciReset mailbox mmap FAILED\n");
 		return -ENOMEM;
 	}
+	mailbox = (volatile uint32_t *)(mailbox_page + mailbox_pa_offs);
 
 	msgbuf = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
 	if (msgbuf == MAP_FAILED) {
-	        munmap((void *)mailbox, _PAGE_SIZE);
-	        return -ENOMEM;
+		debug("pcie: notifyXhciReset MAP_CONTIGUOUS mmap FAILED\n");
+		munmap((void *)mailbox_page, _PAGE_SIZE);
+		return -ENOMEM;
 	}
 
 	msgbuf[0] = RPI_PROP_NOTIFY_MSG_WORDS * sizeof(uint32_t);
@@ -267,9 +282,9 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 
 	msgaddr = va2pa(msgbuf);
 	if (msgaddr == (uintptr_t)-1) {
-	        munmap(msgbuf, _PAGE_SIZE);
-	        munmap((void *)mailbox, _PAGE_SIZE);
-	        return -EFAULT;
+		munmap(msgbuf, _PAGE_SIZE);
+		munmap((void *)mailbox_page, _PAGE_SIZE);
+		return -EFAULT;
 	}
 	msg = ((uint32_t)msgaddr & ~0xfu) | RPI_MBOX_PROP_CHANNEL;
 	while ((*(mailbox + (RPI_MBOX_STATUS / sizeof(uint32_t))) & RPI_MBOX_FULL) != 0u) {
@@ -292,7 +307,7 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 	}
 
 	munmap(msgbuf, _PAGE_SIZE);
-	munmap((void *)mailbox, _PAGE_SIZE);
+	munmap((void *)mailbox_page, _PAGE_SIZE);
 
 	return ret;
 }
