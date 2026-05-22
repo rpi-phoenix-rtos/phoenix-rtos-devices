@@ -32,7 +32,17 @@ static inline uint64_t bcm2711_pcie_getXhciMmioSize(void) { return 0; }
 #endif
 
 
-#define XHCI_MAP_SIZE            0x10000u
+/* VL805 BAR0 is 4 KiB on the Pi 4 (verified via cross-OS reference:
+ * FreeBSD bcm2838_xhci, Circle USBStandardHub, Raspberry Pi linux-rpi
+ * "xhci_pci_setup" probe). Mapping 64 KiB (the old XHCI_MAP_SIZE)
+ * spills past the BAR into unmapped PCIe outbound window territory;
+ * the BCM2711 root complex returns 0xdeaddead poison for those reads
+ * and the BCM2711 SError absorbs the abort, surfacing as our long-
+ * standing usb-hcd: ops->init fail rc=-19. Whole-region typical xHCI
+ * usage (cap + op + runtime + doorbells) fits comfortably in 4 KiB
+ * for a 4-port / 16-slot controller. See
+ * docs/notes/2026-05-22-usb-research-synthesis.md. */
+#define XHCI_MAP_SIZE            0x1000u
 #define XHCI_REG_CAP_CAPLENGTH   0x00u
 #define XHCI_REG_CAP_HCIVERSION  0x02u
 #define XHCI_REG_CAP_HCSPARAMS1  0x04u

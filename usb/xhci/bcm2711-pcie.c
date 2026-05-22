@@ -115,10 +115,12 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus);
 static volatile void *bcm2711_pcie_xhciMmio = NULL;
 
 
-/* Same size as xhci.c's XHCI_MAP_SIZE. Hard-coded here to avoid coupling
- * the bcm2711 PHY init to xhci.c internals. If xhci.c grows beyond 64 KiB
- * of BAR0 usage, bump both. */
-#define BCM2711_PCIE_XHCI_MMIO_SIZE 0x10000u
+/* Same size as xhci.c's XHCI_MAP_SIZE. The VL805's BAR0 is 4 KiB on the
+ * Pi 4 (verified against cross-OS reference implementations); mapping a
+ * larger region spilled past the BAR into unmapped PCIe space and the
+ * BCM2711 root complex returned 0xdeaddead. Hard-coded here to keep
+ * bcm2711-pcie.c decoupled from xhci.c internals. */
+#define BCM2711_PCIE_XHCI_MMIO_SIZE 0x1000u
 
 
 volatile void *bcm2711_pcie_getXhciMmio(void)
