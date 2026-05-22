@@ -677,18 +677,6 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 {
 	(void)hcd;
 
-	/* On BCM2711 the bridge outbound translation can return 0xdead
-	 * poison if the bridge's internal TLB has aged out since the
-	 * last config-space access. Force a system-wide barrier so the
-	 * CPU's outstanding writes drain before the first capability
-	 * read, then issue an isb so the upcoming reads start clean.
-	 * Cheap (no Normal-memory cache flush, just a DSB) and helps
-	 * deterministically on hardware that benefits from it. */
-#if defined(__aarch64__)
-	__asm__ volatile ("dsb sy" ::: "memory");
-	__asm__ volatile ("isb" ::: "memory");
-#endif
-
 	xhci->caplength = xhci_read8(xhci, XHCI_REG_CAP_CAPLENGTH);
 	xhci->version = xhci_read16(xhci, XHCI_REG_CAP_HCIVERSION);
 	xhci->hcsparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCSPARAMS1);
