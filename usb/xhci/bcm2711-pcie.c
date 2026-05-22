@@ -1068,6 +1068,19 @@ int bcm2711_pcie_initVL805(void)
 			bcm2711SetOutboundWindow0(bcm, PCIE_BCM2711_OUTBOUND_CPU_BASE,
 				PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
 		}
+
+		/* Post-re-program settling window. The VL805 firmware reload
+		 * initiated by the mailbox notify above takes additional time
+		 * after the mailbox response returns; if xhci-side cap reads
+		 * happen too soon, the BCM2711 outbound translation hasn't
+		 * stabilized and reads return 0xdeaddead. Empirical 4-run
+		 * hardware sweep:
+		 *   0 ms wait:      rc=-110 (timeout) most runs, rc=-19 1/3
+		 *   50 ms pre-rep:  rc=-19 3/4 runs (worse — re-program too
+		 *                   late, bridge state drifts during the wait)
+		 *   50 ms post-rep: TBD — wait AFTER re-program so the bridge
+		 *                   has settled before we issue cap-space MMIO. */
+		usleep(50000);
 	}
 #endif
 
