@@ -743,6 +743,7 @@ static int xhci_waitOpBits(xhci_t *xhci, uintptr_t off, uint32_t mask, uint32_t 
 static int xhci_reset(xhci_t *xhci)
 {
 	uint32_t usbcmd;
+	uint32_t usbsts;
 	int err;
 
 	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_CNR, 0u, XHCI_CNR_TIMEOUT_MS);
@@ -751,12 +752,36 @@ static int xhci_reset(xhci_t *xhci)
 		return err;
 	}
 
+	/* xHCI spec 5.4.1: writing HCRST while HCHalted (HCH) is 0 has
+	 * UNDEFINED behaviour. On the Pi 4 the VL805 firmware-load may
+	 * leave the controller running (HCH=0); empirically writing HCRST
+	 * in that state leaves the bit set indefinitely and our wait below
+	 * times out. Match Linux's xhci_reset(): if the controller isn't
+	 * already halted, clear USBCMD.R/S and wait for HCH=1 before
+	 * proceeding. (Linux just aborts in this case with a warning; we
+	 * stop first because the boot path can't recover from a no-USB
+	 * outcome and stop-then-reset is the canonical sequence in every
+	 * other xHCI driver we surveyed — FreeBSD usb/controller/xhci.c
+	 * `xhci_halt`, NetBSD xhci.c, Circle USBControllerXHCI.) */
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	if ((usbsts & XHCI_REG_OP_USBSTS_HCH) == 0u) {
+		usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+		xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd & ~XHCI_REG_OP_USBCMD_RS);
+
+		err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH,
+			XHCI_REG_OP_USBSTS_HCH, XHCI_RUNSTOP_TIMEOUT_MS);
+		if (err < 0) {
+			fprintf(stderr, "xhci: failed to halt before reset (usbsts=0x%08x)\n", usbsts);
+			return err;
+		}
+	}
+
 	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
 	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_HCRST);
 
 	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBCMD, XHCI_REG_OP_USBCMD_HCRST, 0u, XHCI_HCRST_TIMEOUT_MS);
 	if (err < 0) {
-		fprintf(stderr, "xhci: reset timeout\n");
+		fprintf(stderr, "xhci: reset timeout (usbsts=0x%08x)\n", xhci_opRead32(xhci, XHCI_REG_OP_USBSTS));
 		return err;
 	}
 
