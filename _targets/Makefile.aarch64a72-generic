@@ -6,4 +6,9 @@
 # Copyright 2026 Phoenix Systems
 #
 
-DEFAULT_COMPONENTS := pl011-tty pcie libusbxhci usbkbd libusbdrv-usbkbd
+DEFAULT_COMPONENTS := pl011-tty libusbxhci usbkbd libusbdrv-usbkbd
+# Note: the standalone `pcie` daemon is intentionally NOT listed here.
+# Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
+# into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
+# the daemon is unused. Re-add `pcie` only if a new a72 board needs
+# the separate-daemon pattern.
