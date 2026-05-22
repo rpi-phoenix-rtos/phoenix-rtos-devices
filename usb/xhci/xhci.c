@@ -685,29 +685,50 @@ static int xhci_map(hcd_t *hcd, xhci_t **xhcip)
 
 static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 {
+	unsigned int attempt;
 	(void)hcd;
 
-	xhci->caplength = xhci_read8(xhci, XHCI_REG_CAP_CAPLENGTH);
-	xhci->version = xhci_read16(xhci, XHCI_REG_CAP_HCIVERSION);
-	xhci->hcsparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCSPARAMS1);
-	xhci->hcsparams2 = xhci_read32(xhci, XHCI_REG_CAP_HCSPARAMS2);
-	xhci->hccparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCCPARAMS1);
-	xhci->dboff = xhci_read32(xhci, XHCI_REG_CAP_DBOFF) & XHCI_REG_CAP_DBOFF__MASK;
-	xhci->rtsoff = xhci_read32(xhci, XHCI_REG_CAP_RTSOFF) & XHCI_REG_CAP_RTSOFF__MASK;
+	/* Poll cap-space up to N times with a settling delay between
+	 * attempts. The BCM2711 PCIe outbound translation can be in a
+	 * transient post-mailbox-notify state where reads return
+	 * 0xdeaddead (caplength=0xad, version=0xdead). A short delay +
+	 * re-read usually catches the bridge after it settles —
+	 * empirically the recovery window is ~50–100 ms. We try 6×100 ms
+	 * for a 600 ms total worst-case, well under any meaningful boot
+	 * deadline but more than enough to clear the transient. */
+	for (attempt = 0u; attempt < 6u; ++attempt) {
+		xhci->caplength = xhci_read8(xhci, XHCI_REG_CAP_CAPLENGTH);
+		xhci->version = xhci_read16(xhci, XHCI_REG_CAP_HCIVERSION);
+		xhci->hcsparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCSPARAMS1);
+		xhci->hcsparams2 = xhci_read32(xhci, XHCI_REG_CAP_HCSPARAMS2);
+		xhci->hccparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCCPARAMS1);
+		xhci->dboff = xhci_read32(xhci, XHCI_REG_CAP_DBOFF) & XHCI_REG_CAP_DBOFF__MASK;
+		xhci->rtsoff = xhci_read32(xhci, XHCI_REG_CAP_RTSOFF) & XHCI_REG_CAP_RTSOFF__MASK;
+
+		/* Valid xHCI cap space: caplength is at least 0x20, version is
+		 * exactly XHCI_SUPPORTED_VERSION (0x0100). The "poison" pattern
+		 * (caplength=0xad, version=0xdead) fails both checks below. */
+		if ((xhci->caplength >= 0x20u) && (xhci->caplength <= 0xffu) &&
+			(xhci->version == XHCI_SUPPORTED_VERSION)) {
+			return -ENOSYS;
+		}
+
+		/* Wait for the bridge to settle and retry. The wait grows
+		 * slightly with each attempt; on every Pi 4 boot we've seen
+		 * the recovery — when it happens at all — within the first
+		 * one or two retries. */
+		usleep(100000u);
+	}
 
 	if ((xhci->caplength < 0x20u) || (xhci->caplength > 0xffu)) {
-		fprintf(stderr, "xhci: invalid caplength 0x%02x (HCIVERSION 0x%04x)\n",
-			xhci->caplength, xhci->version);
+		fprintf(stderr, "xhci: invalid caplength 0x%02x (HCIVERSION 0x%04x) after %u retries\n",
+			xhci->caplength, xhci->version, attempt);
 		return -ENODEV;
 	}
 
-	if (xhci->version != XHCI_SUPPORTED_VERSION) {
-		fprintf(stderr, "xhci: unsupported version 0x%04x (caplength 0x%02x)\n",
-			xhci->version, xhci->caplength);
-		return -ENODEV;
-	}
-
-	return -ENOSYS;
+	fprintf(stderr, "xhci: unsupported version 0x%04x (caplength 0x%02x) after %u retries\n",
+		xhci->version, xhci->caplength, attempt);
+	return -ENODEV;
 }
 
 
