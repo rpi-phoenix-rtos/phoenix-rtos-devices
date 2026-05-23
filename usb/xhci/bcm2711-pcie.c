@@ -338,6 +338,7 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 #define BCM2711_PCIE_MEM_WIN0_LO          0x400cu
 #define BCM2711_PCIE_MEM_WIN0_HI          0x4010u
 #define BCM2711_PCIE_RC_CFG_PRIV1_ID_VAL3 0x043cu
+#define BCM2711_PCIE_RC_BAR1_CONFIG_LO    0x402cu
 #define BCM2711_PCIE_RC_BAR2_CONFIG_LO    0x4034u
 #define BCM2711_PCIE_RC_BAR2_CONFIG_HI    0x4038u
 #define BCM2711_PCIE_MISC_STATUS          0x4068u
@@ -713,6 +714,16 @@ static int pcie_cfgInitBcm2711(pcie_cfgio_t *cfgio)
 	if (bcm->linkUp && bcm->rcMode) {
 		bcm2711SetOutboundWindow0(bcm, PCIE_BCM2711_OUTBOUND_CPU_BASE,
 			PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
+		/* Disable inbound BAR1 explicitly before programming BAR2.
+		 * U-Boot's brcm_pcie_probe does this — without it a stale
+		 * BAR1 from start4.elf firmware can intercept VL805's DMA
+		 * to system memory, producing HSE on the first R/S transition.
+		 * Clearing the size-mask bits (low 5 bits) disables the BAR. */
+		{
+			uint32_t bar1 = readReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO);
+			bar1 &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
+			writeReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO, bar1);
+		}
 		bcm2711SetRcBar2(bcm, 0u, 0x100000000ull);
 		bcm2711ShapeRootBridge(bcm);
 		bcm2711ExposeDownstreamBridge(bcm);
