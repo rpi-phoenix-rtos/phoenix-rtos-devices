@@ -1202,7 +1202,11 @@ static int xhci_enterRunState(xhci_t *xhci)
 
 	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
 	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
-		fprintf(stderr, "xhci: controller error state after run\n");
+		fprintf(stderr, "xhci: controller error state after run (enterRunState USBSTS=0x%08x ERDP_LO=0x%08x ERSTBA_LO=0x%08x DCBAAP_LO=0x%08x)\n",
+			usbsts,
+			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO),
+			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO),
+			xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP));
 		return -ENODEV;
 	}
 
