@@ -156,8 +156,14 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_DCBAA_ENTRY_SIZE    sizeof(uint64_t)
 #define XHCI_TRB_SIZE            16u
 #define XHCI_CNR_TIMEOUT_MS      100u
-#define XHCI_HCRST_TIMEOUT_MS    20u
-#define XHCI_RUNSTOP_TIMEOUT_MS  20u
+/* xHCI 5.4.1 says HCRST may take an indeterminate amount of time.
+ * Linux xhci uses XHCI_RESET_SHORT_USEC (250 ms) for the normal
+ * reset path; FreeBSD xhci_halt() polls up to 500 ms. Phoenix's
+ * earlier 20 ms was too tight — empirical Pi 4 / VL805 reset
+ * times out at 20 ms (rc=-110 seen in 2026-05-22 boots). Match
+ * Linux's short reset budget. */
+#define XHCI_HCRST_TIMEOUT_MS    250u
+#define XHCI_RUNSTOP_TIMEOUT_MS  250u
 #define XHCI_TRB_CONTROL_C       (1u << 0)
 #define XHCI_TRB_CONTROL_TRB_TYPE__SHIFT 10u
 #define XHCI_TRANSFER_TRB_CONTROL_ISP (1u << 2)
