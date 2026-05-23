@@ -1365,6 +1365,13 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 		return err;
 	}
 
+	/* Drain any pending writes (cmd TRB cycle bit, event memset)
+	 * before triggering the controller via doorbell. enterRunState
+	 * already issued a DSB SY but a fresh barrier here makes the
+	 * cmd ring -> doorbell handoff explicit (cmd TRB visibility is
+	 * a precondition for the doorbell-triggered DMA read). */
+	__asm__ volatile("dsb sy" ::: "memory");
+
 	xhci_dbWrite32(xhci, 0u, 0u);
 
 	for (timeoutMs = XHCI_CMD_TIMEOUT_MS; timeoutMs > 0u; --timeoutMs) {
