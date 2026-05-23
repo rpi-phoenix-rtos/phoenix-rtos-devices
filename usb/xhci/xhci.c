@@ -696,7 +696,11 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 	 * re-read usually catches the bridge after it settles —
 	 * empirically the recovery window is ~50–100 ms. We try 6×100 ms
 	 * for a 600 ms total worst-case, well under any meaningful boot
-	 * deadline but more than enough to clear the transient. */
+	 * deadline but more than enough to clear the transient.
+	 *
+	 * Each attempt's caplength + HCIVERSION is logged so post-mortem
+	 * we can tell whether MMIO became readable mid-loop, was always
+	 * poisoned, or flipped between states. */
 	for (attempt = 0u; attempt < 6u; ++attempt) {
 		xhci->caplength = xhci_read8(xhci, XHCI_REG_CAP_CAPLENGTH);
 		xhci->version = xhci_read16(xhci, XHCI_REG_CAP_HCIVERSION);
@@ -705,6 +709,9 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 		xhci->hccparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCCPARAMS1);
 		xhci->dboff = xhci_read32(xhci, XHCI_REG_CAP_DBOFF) & XHCI_REG_CAP_DBOFF__MASK;
 		xhci->rtsoff = xhci_read32(xhci, XHCI_REG_CAP_RTSOFF) & XHCI_REG_CAP_RTSOFF__MASK;
+
+		fprintf(stderr, "xhci: capProbe[%u] caplength=0x%02x HCIVERSION=0x%04x\n",
+			attempt, xhci->caplength, xhci->version);
 
 		/* Valid xHCI cap space: caplength is at least 0x20, version is
 		 * exactly XHCI_SUPPORTED_VERSION (0x0100). The "poison" pattern
