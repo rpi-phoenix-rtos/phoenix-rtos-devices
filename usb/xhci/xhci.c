@@ -29,6 +29,7 @@
 static inline int bcm2711_pcie_initVL805(void) { return 0; }
 static inline volatile void *bcm2711_pcie_getXhciMmio(void) { return NULL; }
 static inline uint64_t bcm2711_pcie_getXhciMmioSize(void) { return 0; }
+static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #endif
 
 

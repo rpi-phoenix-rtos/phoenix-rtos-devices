@@ -115,6 +115,16 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus);
 static volatile void *bcm2711_pcie_xhciMmio = NULL;
 
 
+/* Persistent BCM2711 PCIe context. Set by bcm2711_pcie_initVL805 (the
+ * one-shot bridge bring-up at boot) and kept alive so callers can
+ * re-program the outbound window after the bridge translation gets
+ * invalidated by a downstream xHCI operation (e.g. HCRST). The
+ * underlying host-bridge config-space mapping is leaked-by-design (see
+ * the comment block at the bottom of bcm2711_pcie_initVL805), so the
+ * pointer remains valid for the lifetime of the usb daemon. */
+static pcie_bcm2711_ctx_t *bcm2711_pcie_lastCtx = NULL;
+
+
 /* Same size as xhci.c's XHCI_MAP_SIZE. The VL805's BAR0 is 4 KiB on the
  * Pi 4 (verified against cross-OS reference implementations); mapping a
  * larger region spilled past the BAR into unmapped PCIe space and the
@@ -1067,6 +1077,10 @@ int bcm2711_pcie_initVL805(void)
 		if ((bcm != NULL) && (bcm->base != MAP_FAILED) && bcm->linkUp && bcm->rcMode) {
 			bcm2711SetOutboundWindow0(bcm, PCIE_BCM2711_OUTBOUND_CPU_BASE,
 				PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
+			/* Stash the context so bcm2711_pcie_resettleOutboundWindow
+			 * can replay this same write after the controller's HCRST
+			 * has invalidated the bridge translation a second time. */
+			bcm2711_pcie_lastCtx = bcm;
 		}
 
 		/* Post-re-program settling window. Empirical hardware sweep
@@ -1111,4 +1125,33 @@ int bcm2711_pcie_initVL805(void)
 	(void)cfgio;
 
 	return ret;
+}
+
+
+/* Re-program the BCM2711 PCIe root complex's outbound window 0 with the
+ * same parameters bcm2711_pcie_initVL805 used at boot. Idempotent and
+ * cheap (a handful of MMIO writes to the host bridge). Callable any
+ * time after the one-shot bridge bring-up; intended for the xHCI driver
+ * to invoke between writing HCRST and waiting for the bit to clear,
+ * because the controller's reset sequence appears to invalidate the
+ * bridge translation the same way the firmware-load mailbox notify
+ * does. Returns EOK on success, -ENODEV if the bridge context was
+ * never set (i.e. boot-time bring-up didn't reach the IF block where
+ * lastCtx is stashed — happens on non-BCM2711 builds or when the
+ * bridge link never came up). */
+int bcm2711_pcie_resettleOutboundWindow(void)
+{
+#ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
+	pcie_bcm2711_ctx_t *bcm = bcm2711_pcie_lastCtx;
+	if ((bcm == NULL) || (bcm->base == MAP_FAILED) || !bcm->linkUp || !bcm->rcMode) {
+		return -ENODEV;
+	}
+	bcm2711SetOutboundWindow0(bcm, PCIE_BCM2711_OUTBOUND_CPU_BASE,
+		PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
+	__asm__ volatile("dsb sy" ::: "memory");
+	__asm__ volatile("isb" ::: "memory");
+	return EOK;
+#else
+	return -ENODEV;
+#endif
 }

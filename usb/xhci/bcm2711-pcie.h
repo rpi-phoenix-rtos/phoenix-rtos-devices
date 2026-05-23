@@ -74,4 +74,14 @@ int bcm2711_pcie_initVL805(void);
 volatile void *bcm2711_pcie_getXhciMmio(void);
 uint64_t bcm2711_pcie_getXhciMmioSize(void);
 
+
+/* Re-program the BCM2711 PCIe outbound window 0 with the same address
+ * mapping bcm2711_pcie_initVL805 set up at boot. Idempotent; safe to
+ * call any time after bring-up. Intended for the xHCI driver to call
+ * between writing HCRST and waiting for the bit to clear — empirically
+ * the reset can invalidate the bridge translation the same way the
+ * firmware-load mailbox notify does, leaving subsequent reads in poison
+ * state. Returns EOK on success, -ENODEV if no context was set. */
+int bcm2711_pcie_resettleOutboundWindow(void);
+
 #endif
