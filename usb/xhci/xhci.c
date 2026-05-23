@@ -696,7 +696,16 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 	 * re-read usually catches the bridge after it settles —
 	 * empirically the recovery window is ~50–100 ms. We try 6×100 ms
 	 * for a 600 ms total worst-case, well under any meaningful boot
-	 * deadline but more than enough to clear the transient. */
+	 * deadline but more than enough to clear the transient.
+	 *
+	 * If after 2 attempts (200 ms) the reads are still poisoned,
+	 * the outbound window is not coming back on its own — the
+	 * mailbox-notify path likely tore down the translation. Replay
+	 * just the outbound-window programming via
+	 * bcm2711_pcie_resettleOutboundWindow(); this is finer-grained
+	 * than re-running the whole bridge bring-up (see 7930c28
+	 * warning) and idempotent so a no-op when the bridge is
+	 * already healthy. */
 	for (attempt = 0u; attempt < 6u; ++attempt) {
 		xhci->caplength = xhci_read8(xhci, XHCI_REG_CAP_CAPLENGTH);
 		xhci->version = xhci_read16(xhci, XHCI_REG_CAP_HCIVERSION);
@@ -712,6 +721,10 @@ static int xhci_capProbe(hcd_t *hcd, xhci_t *xhci)
 		if ((xhci->caplength >= 0x20u) && (xhci->caplength <= 0xffu) &&
 			(xhci->version == XHCI_SUPPORTED_VERSION)) {
 			return -ENOSYS;
+		}
+
+		if (attempt == 1u) {
+			(void)bcm2711_pcie_resettleOutboundWindow();
 		}
 
 		/* Wait for the bridge to settle and retry. The wait grows
