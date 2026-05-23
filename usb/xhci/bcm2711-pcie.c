@@ -1102,6 +1102,16 @@ int bcm2711_pcie_initVL805(void)
 		if ((bcm != NULL) && (bcm->base != MAP_FAILED) && bcm->linkUp && bcm->rcMode) {
 			bcm2711SetOutboundWindow0(bcm, PCIE_BCM2711_OUTBOUND_CPU_BASE,
 				PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
+			/* 2026-05-24: also re-disable BAR1 and re-program BAR2.
+			 * The NOTIFY_XHCI_RESET mailbox can churn bridge-side
+			 * registers; without this re-program, inbound DMA may
+			 * fail (USBSTS.HSE on first R/S=1). */
+			{
+				uint32_t bar1 = readReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO);
+				bar1 &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
+				writeReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO, bar1);
+			}
+			bcm2711SetRcBar2(bcm, 0u, 0x100000000ull);
 			/* Stash the context so bcm2711_pcie_resettleOutboundWindow
 			 * can replay this same write after the controller's HCRST
 			 * has invalidated the bridge translation a second time. */
