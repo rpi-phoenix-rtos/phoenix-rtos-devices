@@ -1191,6 +1191,18 @@ static int xhci_enterRunState(xhci_t *xhci)
 		return -ENODEV;
 	}
 
+	/* Drain pending CPU writes to event ring / command ring / DCBAA
+	 * before the controller starts DMA-ing from them on R/S=1.
+	 * The xhci_*Write32 helpers use volatile MMIO writes (compiler
+	 * ordering only) — on AArch64 the CPU store buffer can hold the
+	 * regular-memory writes well past the MMIO write that triggers
+	 * DMA, so the controller's first read can see uninitialized or
+	 * stale data → USBSTS.HSE on the transient R/S=1.
+	 * DSB SY ensures all preceding loads and stores are observed by
+	 * all observers (including the PCIe DMA agent) before the next
+	 * memory access. */
+	__asm__ volatile("dsb sy" ::: "memory");
+
 	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
 	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
 
