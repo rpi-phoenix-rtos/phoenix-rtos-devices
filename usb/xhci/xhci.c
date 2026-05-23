@@ -2099,12 +2099,20 @@ static int xhci_init(hcd_t *hcd)
 					}
 					if (err == 0) {
 						err = xhci_programCommandSpace(xhci);
+						/* xHCI 1.2 §4.5: software MUST have programmed
+						 * Max Slots, DCBAAP, Command Ring, AND Event
+						 * Ring 0 (ERSTBA) before setting R/S=1. Toggling
+						 * R/S without a valid event ring leaves the
+						 * controller's event handling undefined; on VL805
+						 * we see USBSTS.HCE/HSE set on transition.
+						 * Allocate + program the event ring FIRST, then
+						 * run the R/S selftest. */
 						if (err == 0) {
-							err = xhci_runStateSelftest(xhci);
+							err = xhci_allocEventRing(xhci);
 							if (err == 0) {
-								err = xhci_allocEventRing(xhci);
+								err = xhci_programEventRing(xhci);
 								if (err == 0) {
-									err = xhci_programEventRing(xhci);
+									err = xhci_runStateSelftest(xhci);
 									if (err == 0) {
 										err = xhci_cmdNoopSelftest(xhci);
 										if (err == 0) {
