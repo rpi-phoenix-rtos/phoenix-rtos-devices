@@ -1123,6 +1123,7 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 }
 
 
+__attribute__((unused))
 static int xhci_runStateSelftest(xhci_t *xhci)
 {
 	uint32_t usbcmd;
@@ -2115,15 +2116,23 @@ static int xhci_init(hcd_t *hcd)
 							err = xhci_allocEventRing(xhci);
 							if (err == 0) {
 								err = xhci_programEventRing(xhci);
+								/* xhci_runStateSelftest (toggle R/S then back
+								 * to verify the transition) was a Phoenix
+								 * addition not done by Linux/FreeBSD/Circle.
+								 * On VL805 the controller spends real time
+								 * processing the brief R/S=1 (port scan,
+								 * device discovery) and the subsequent
+								 * R/S=0 halt-transition can't meet our 250ms
+								 * timeout. Skip the selftest; cmdNoopSelftest
+								 * already enters the run state via cmdExec,
+								 * which is the canonical "controller alive"
+								 * check. */
 								if (err == 0) {
-									err = xhci_runStateSelftest(xhci);
+									err = xhci_cmdNoopSelftest(xhci);
 									if (err == 0) {
-										err = xhci_cmdNoopSelftest(xhci);
+										err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
 										if (err == 0) {
-											err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
-											if (err == 0) {
-												err = xhci_allocSlotSpace(xhci);
-											}
+											err = xhci_allocSlotSpace(xhci);
 										}
 									}
 								}
