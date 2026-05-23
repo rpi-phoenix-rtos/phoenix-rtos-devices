@@ -359,6 +359,12 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 #define BCM2711_PCIE_MISC_CTRL_SCB_ACCESS_EN   0x1000u
 #define BCM2711_PCIE_MISC_CTRL_CFG_READ_UR_MODE 0x2000u
 #define BCM2711_PCIE_MISC_CTRL_MAX_BURST_MASK  0x300000u
+/* From Linux pcie-brcmstb.c — required for BCM2711 inbound DMA. */
+#define BCM2711_PCIE_MISC_CTRL_RCB_MPS_MODE    0x400u    /* bit 10 */
+#define BCM2711_PCIE_MISC_CTRL_RCB_64B_MODE    0x80u     /* bit 7  */
+#define BCM2711_PCIE_MISC_CTRL_SCB0_SIZE_MASK  0xf8000000u
+/* log2(4 GiB) - 15 = 32 - 15 = 17, placed in bits 31:27 = 0x88000000. */
+#define BCM2711_PCIE_MISC_CTRL_SCB0_SIZE_4G    (17u << 27)
 
 #define BCM2711_PCIE_HARD_DEBUG_SERDES_IDDQ_MASK 0x08000000u
 
@@ -480,7 +486,15 @@ static void bcm2711PrepareHostBridge(pcie_bcm2711_ctx_t *ctx)
 	misc = readReg(ctx->base, BCM2711_PCIE_MISC_CTRL);
 	misc |= BCM2711_PCIE_MISC_CTRL_SCB_ACCESS_EN;
 	misc |= BCM2711_PCIE_MISC_CTRL_CFG_READ_UR_MODE;
-	misc &= ~BCM2711_PCIE_MISC_CTRL_MAX_BURST_MASK;
+	misc &= ~BCM2711_PCIE_MISC_CTRL_MAX_BURST_MASK; /* 0 = 128-byte burst per Linux for BCM2711 */
+	/* Linux brcm_pcie_setup also sets these MISC_CTRL bits for BCM2711;
+	 * without them the inbound BAR2 window doesn't reliably serve VL805
+	 * DMA reads (symptom: USBSTS.HSE on first xhci R/S=1 transition,
+	 * USBSTS=0x15 = HCH|HSE|PCD). */
+	misc |= BCM2711_PCIE_MISC_CTRL_RCB_MPS_MODE;
+	misc |= BCM2711_PCIE_MISC_CTRL_RCB_64B_MODE;
+	misc &= ~BCM2711_PCIE_MISC_CTRL_SCB0_SIZE_MASK;
+	misc |= BCM2711_PCIE_MISC_CTRL_SCB0_SIZE_4G;
 	writeReg(ctx->base, BCM2711_PCIE_MISC_CTRL, misc);
 }
 
