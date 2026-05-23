@@ -2048,7 +2048,18 @@ static int xhci_init(hcd_t *hcd)
 	 * the canonical Phoenix-RTOS pattern (imx6ull, imxrt106x/117x, ia32)
 	 * where the USB process owns both bus init and HCD init eliminates
 	 * the cross-process race.
-	 */
+	 *
+	 * NB: a previous Phase-D experiment (commit 011c27a... reverted)
+	 * tried wrapping this in a 3× outer retry that re-invoked
+	 * bcm2711_pcie_initVL805 on cap-probe poison. Result was 4/4
+	 * rc=-19 — re-running the bridge bring-up DESTABILISES the bridge
+	 * (the host-bridge config-space mapping is leaked on purpose by
+	 * design, and re-running pcie_cfgInitBcm2711 either takes a
+	 * second mmap onto the already-mapped region or churns the
+	 * outbound translation in a way that's worse than not retrying).
+	 * Keep the bridge bring-up to a single attempt; recovery has to
+	 * be at finer granularity (e.g. just re-program the outbound
+	 * window, not the whole bridge). */
 	err = bcm2711_pcie_initVL805();
 	if (err != 0) {
 		return err;
