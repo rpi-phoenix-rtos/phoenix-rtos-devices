@@ -2152,7 +2152,10 @@ static int xhci_programEventRing(xhci_t *xhci)
 	 * "armed" and for the controller's internal R/S=1 state machine to
 	 * succeed. Set IMAN.IE; clear IP (write-1-to-clear) at the same time
 	 * so any stale pending bit doesn't immediately latch IRQ. */
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMOD, 0u);
+	/* IMOD = 4000 = ~1 ms moderation interval (250 ns ticks).
+	 * Matches Linux's xhci_run_finished default. Some controllers
+	 * dislike IMOD=0 (no moderation) — internal interrupt storm. */
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMOD, 4000u);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMAN, XHCI_REG_RT_IR_IMAN_IE | XHCI_REG_RT_IR_IMAN_IP);
 
 	xhci->erstsz = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTSZ);
