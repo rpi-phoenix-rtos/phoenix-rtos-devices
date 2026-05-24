@@ -1415,6 +1415,15 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 		}
 
 		usleep(1000);
+
+		/* (2026-05-24) periodic doorbell re-ring. The first doorbell
+		 * after R/S=1 may race the controller's RUN-state transition
+		 * and get dropped. Re-ringing every 10 ms is cheap and
+		 * spec-allowed (doorbell writes are idempotent). */
+		if ((timeoutMs % 10u) == 0u) {
+			__asm__ volatile("dsb sy" ::: "memory");
+			xhci_dbWrite32(xhci, 0u, 0u);
+		}
 	}
 
 	if (timeoutMs == 0u) {
