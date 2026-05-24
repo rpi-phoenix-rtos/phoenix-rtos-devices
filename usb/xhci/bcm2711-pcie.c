@@ -1178,11 +1178,20 @@ int bcm2711_pcie_resettleOutboundWindow(void)
 {
 #ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
 	pcie_bcm2711_ctx_t *bcm = bcm2711_pcie_lastCtx;
+	uint32_t bar1;
 	if ((bcm == NULL) || (bcm->base == MAP_FAILED) || !bcm->linkUp || !bcm->rcMode) {
 		return -ENODEV;
 	}
 	bcm2711SetOutboundWindow0(bcm, PCIE_BCM2711_OUTBOUND_CPU_BASE,
 		PCIE_BCM2711_OUTBOUND_PCIE_BASE, PCIE_BCM2711_OUTBOUND_SIZE);
+	/* Inbound DMA window can also be churned by intermediate bridge-
+	 * affecting events (xhci HCRST, mailbox notify). Re-disable BAR1
+	 * and re-program BAR2 to 4 GiB to ensure VL805 DMA reads still
+	 * reach system memory after this call returns. */
+	bar1 = readReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO);
+	bar1 &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
+	writeReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO, bar1);
+	bcm2711SetRcBar2(bcm, 0u, 0x100000000ull);
 	__asm__ volatile("dsb sy" ::: "memory");
 	__asm__ volatile("isb" ::: "memory");
 	return EOK;

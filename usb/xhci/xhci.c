@@ -826,6 +826,13 @@ static int xhci_reset(xhci_t *xhci)
 		return err;
 	}
 
+	/* HCRST appears to invalidate the BCM2711 bridge translation in
+	 * the same way the firmware-load mailbox does (per the original
+	 * resettleOutboundWindow comment). Now that resettle also
+	 * re-programs RC_BAR2 inbound, call it here so the bridge state
+	 * is intact before subsequent DMA-trigger writes (R/S=1). */
+	(void)bcm2711_pcie_resettleOutboundWindow();
+
 	return EOK;
 }
 
