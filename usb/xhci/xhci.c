@@ -829,12 +829,12 @@ static int xhci_reset(xhci_t *xhci)
 		return err;
 	}
 
-	/* HCRST appears to invalidate the BCM2711 bridge translation in
-	 * the same way the firmware-load mailbox does (per the original
-	 * resettleOutboundWindow comment). Now that resettle also
-	 * re-programs RC_BAR2 inbound, call it here so the bridge state
-	 * is intact before subsequent DMA-trigger writes (R/S=1). */
-	(void)bcm2711_pcie_resettleOutboundWindow();
+	/* (2026-05-24) Removed the post-HCRST bcm2711_pcie_resettleOutboundWindow
+	 * call. Empirically the multiple bridge re-programs (initVL805 once
+	 * after mailbox + here after HCRST + once more before R/S=1) gave no
+	 * deterministic improvement and may have been churning bridge state.
+	 * The post-mailbox re-program in bcm2711_pcie_initVL805 is the only
+	 * one kept. */
 
 	return EOK;
 }
@@ -1213,12 +1213,10 @@ static int xhci_enterRunState(xhci_t *xhci)
 	 * memory access. */
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	/* Last-line defense: re-apply the BCM2711 bridge inbound +
-	 * outbound window programming immediately before triggering DMA.
-	 * Anything between the initial bring-up and this point (HCRST,
-	 * mailbox notify, controller MMIO writes during init) can churn
-	 * bridge-side registers. This is a no-op on non-BCM2711 builds. */
-	(void)bcm2711_pcie_resettleOutboundWindow();
+	/* (2026-05-24) Removed the pre-R/S=1 bcm2711_pcie_resettleOutboundWindow
+	 * call. Multiple bridge re-programs across the init flow didn't make
+	 * USBSTS.HSE on R/S=1 any more deterministic; trim back to a single
+	 * post-mailbox re-program. */
 
 	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
 	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
