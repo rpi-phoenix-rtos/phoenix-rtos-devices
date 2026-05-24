@@ -1210,6 +1210,13 @@ static int xhci_enterRunState(xhci_t *xhci)
 	 * memory access. */
 	__asm__ volatile("dsb sy" ::: "memory");
 
+	/* Last-line defense: re-apply the BCM2711 bridge inbound +
+	 * outbound window programming immediately before triggering DMA.
+	 * Anything between the initial bring-up and this point (HCRST,
+	 * mailbox notify, controller MMIO writes during init) can churn
+	 * bridge-side registers. This is a no-op on non-BCM2711 builds. */
+	(void)bcm2711_pcie_resettleOutboundWindow();
+
 	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
 	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
 
