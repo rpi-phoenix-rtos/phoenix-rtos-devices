@@ -858,14 +858,10 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 				fprintf(stderr, "pcie: VL805 cmd readback %04x did not stick (wanted %04x)\n", rb, want);
 			}
 		}
-		/* 2026-05-24 experiment: skip the firmware notify-xhci-reset
-		 * mailbox call. start4.elf already does an XHCI reset on cold
-		 * boot (visible as "XHCI-STOP" in the firmware UART log near
-		 * t=2.75 s), and per firmware#1617 re-issuing the notify can
-		 * leave bridge/VL805 state stale. The stale state is a strong
-		 * candidate for the intermittent USBSTS.HSE on R/S=1 we observed
-		 * across the 2026-05-23 -> 24 session. Try without it. */
-		(void)bcm2711NotifyXhciReset; /* keep symbol referenced */
+		int err = bcm2711NotifyXhciReset(bus, dev, fun);
+		if (err < 0) {
+			fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
+		}
 		/* TD-USB: VL805 firmware load is async after the mailbox reset
 		 * call returns. Without an explicit wait, the next config-space
 		 * writes and (especially) MMIO reads to BAR0 race the VL805
