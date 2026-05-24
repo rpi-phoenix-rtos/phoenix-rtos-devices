@@ -1213,31 +1213,51 @@ static int xhci_enterRunState(xhci_t *xhci)
 	 * memory access. */
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	/* (2026-05-24) Removed the pre-R/S=1 bcm2711_pcie_resettleOutboundWindow
-	 * call. Multiple bridge re-programs across the init flow didn't make
-	 * USBSTS.HSE on R/S=1 any more deterministic; trim back to a single
-	 * post-mailbox re-program. */
+	/* HSE-on-R/S=1 soft retry (2026-05-24): on bridge state where the
+	 * controller's first DMA fetch fails (USBSTS.HSE = 1, controller
+	 * self-halts), clear HSE (write-1-to-clear), drop R/S, wait for
+	 * HCH=1, and try R/S=1 again. Up to 3 attempts. If 2nd or 3rd
+	 * attempt succeeds we recover from the intermittent HSE without
+	 * the entire xhci_init re-running. Per xHCI 1.2 §5.4.2, HSE is
+	 * RW1C in USBSTS. */
+	{
+		unsigned attempt;
+		for (attempt = 0u; attempt < 3u; ++attempt) {
+			usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+			xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
 
-	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
-	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
+			err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, 0u, XHCI_RUNSTOP_TIMEOUT_MS);
+			if (err < 0) {
+				fprintf(stderr, "xhci: run transition timeout (attempt %u)\n", attempt);
+				return err;
+			}
 
-	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, 0u, XHCI_RUNSTOP_TIMEOUT_MS);
-	if (err < 0) {
-		fprintf(stderr, "xhci: run transition timeout\n");
-		return err;
-	}
+			usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+			if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) == 0u) {
+				if (attempt > 0u) {
+					fprintf(stderr, "xhci: enterRunState recovered on attempt %u\n", attempt);
+				}
+				return EOK;
+			}
 
-	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
-		fprintf(stderr, "xhci: controller error state after run (enterRunState USBSTS=0x%08x ERDP_LO=0x%08x ERSTBA_LO=0x%08x DCBAAP_LO=0x%08x)\n",
+			fprintf(stderr, "xhci: enterRunState HSE attempt %u (USBSTS=0x%08x)\n", attempt, usbsts);
+
+			/* Clear HSE (W1C), drop R/S, wait for halt, retry. */
+			xhci_opWrite32(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE);
+			usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+			xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd & ~XHCI_REG_OP_USBCMD_RS);
+			(void)xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, XHCI_REG_OP_USBSTS_HCH, XHCI_RUNSTOP_TIMEOUT_MS);
+
+			__asm__ volatile("dsb sy" ::: "memory");
+		}
+
+		fprintf(stderr, "xhci: enterRunState gave up after 3 HSE attempts (USBSTS=0x%08x ERDP_LO=0x%08x ERSTBA_LO=0x%08x DCBAAP_LO=0x%08x)\n",
 			usbsts,
 			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO),
 			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO),
 			xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP));
-		return -ENODEV;
 	}
-
-	return EOK;
+	return -ENODEV;
 }
 
 
