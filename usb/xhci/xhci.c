@@ -1427,13 +1427,15 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	}
 
 	if (timeoutMs == 0u) {
-		fprintf(stderr, "xhci: command completion timeout (USBSTS=0x%08x CRCR_LO=0x%08x event[0]=ctrl=0x%08x parm_lo=0x%08x cmd_phys=0x%08llx cmd_ctrl=0x%08x)\n",
+		fprintf(stderr, "xhci: command completion timeout (USBSTS=0x%08x CRCR_LO=0x%08x event[0]=ctrl=0x%08x parm_lo=0x%08x cmd_phys=0x%08llx cmd_ctrl=0x%08x dboff=0x%08x USBCMD=0x%08x)\n",
 			xhci_opRead32(xhci, XHCI_REG_OP_USBSTS),
 			xhci_opRead32(xhci, XHCI_REG_OP_CRCR),
 			event->control,
 			(uint32_t)event->parameter,
 			(unsigned long long)cmdPhys,
-			cmd->control);
+			cmd->control,
+			xhci->dboff,
+			xhci_opRead32(xhci, XHCI_REG_OP_USBCMD));
 		(void)xhci_enterHaltedState(xhci);
 		memset(cmd, 0, sizeof(*cmd));
 		return -ETIMEDOUT;
