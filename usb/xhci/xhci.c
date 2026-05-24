@@ -1408,6 +1408,27 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	 * a precondition for the doorbell-triggered DMA read). */
 	__asm__ volatile("dsb sy" ::: "memory");
 
+	/* Re-publish CRCR pointer right before doorbell. Spec § 5.4.5
+	 * allows CRCR writes only when the Command Ring is Stopped
+	 * (CRR=0); we just verified controller transitioned to RUN and
+	 * the cmd ring hasn't started yet (CRR=0 throughout init).
+	 *
+	 * Why: previous diagnostics showed CRR=0 + event[0]=0 + USBSTS
+	 * clean after R/S=1 + doorbell, suggesting the controller may
+	 * have lost the cmd-ring pointer between programCommandSpace
+	 * (when we wrote CRCR initially) and this point. Bridge-side
+	 * MMIO write churn during the intervening init steps is a
+	 * plausible cause. Re-publishing is idempotent if the pointer
+	 * is still valid. */
+	{
+		uint64_t cmdRingPhys = xhci->cmdRingPhys;
+		uint32_t crcrLo = (uint32_t)(cmdRingPhys & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK) | XHCI_REG_OP_CRCR_RCS;
+		uint32_t crcrHi = (uint32_t)(cmdRingPhys >> 32);
+		xhci_opWrite32(xhci, XHCI_REG_OP_CRCR_HI, crcrHi);
+		xhci_opWrite32(xhci, XHCI_REG_OP_CRCR, crcrLo);
+		(void)xhci_opRead32(xhci, XHCI_REG_OP_USBSTS); /* flush */
+	}
+
 	xhci_dbWrite32(xhci, 0u, 0u);
 	/* Flush the posted doorbell write: PCIe spec allows MMIO writes
 	 * to be posted (queued in the bridge's write buffer). A subsequent
