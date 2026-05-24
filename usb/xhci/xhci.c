@@ -1410,31 +1410,60 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 
 	xhci_dbWrite32(xhci, 0u, 0u);
 
-	for (timeoutMs = XHCI_CMD_TIMEOUT_MS; timeoutMs > 0u; --timeoutMs) {
-		if ((event->control & XHCI_TRB_CONTROL_C) == (xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
-			break;
-		}
+	/* Walk the event ring rather than fixating on event[0]. The
+	 * controller may emit port-status-change events (type 34) or
+	 * other events BEFORE our cmd completion event (type 33). If we
+	 * only look at slot 0 we'd see the port event's cycle-bit flip,
+	 * treat that as "an event arrived", and then fail validation
+	 * because type or parameter doesn't match. Walk forward,
+	 * skipping events that aren't the cmd completion we're waiting
+	 * for, until we find ours or time out. */
+	{
+		unsigned int eventIdx = 0u;
+		int found = 0;
+		xhci_trb_t *cur;
 
-		usleep(1000);
-
-		/* (2026-05-24) periodic doorbell re-ring. The first doorbell
-		 * after R/S=1 may race the controller's RUN-state transition
-		 * and get dropped. Re-ringing every 10 ms is cheap and
-		 * spec-allowed (doorbell writes are idempotent). */
-		if ((timeoutMs % 10u) == 0u) {
-			__asm__ volatile("dsb sy" ::: "memory");
-			xhci_dbWrite32(xhci, 0u, 0u);
-
-			/* If HSE fires during cmd processing the controller
-			 * self-halts and stops fetching from the cmd ring. We
-			 * could wait the full 1 s for nothing — bail early so
-			 * the caller can decide on recovery. */
-			{
-				uint32_t sts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-				if ((sts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
-					fprintf(stderr, "xhci: HSE during cmd wait (timeoutMs=%u USBSTS=0x%08x)\n",
-						timeoutMs, sts);
+		for (timeoutMs = XHCI_CMD_TIMEOUT_MS; timeoutMs > 0u; --timeoutMs) {
+			while (eventIdx < xhci->eventRingTrbs) {
+				cur = &((xhci_trb_t *)xhci->eventRing)[eventIdx];
+				if ((cur->control & XHCI_TRB_CONTROL_C) !=
+					(xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
 					break;
+				}
+
+				type = (cur->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+				if ((type == XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) && (cur->parameter == cmdPhys)) {
+					event = cur;
+					found = 1;
+					break;
+				}
+
+				/* Not our event — log and skip. */
+				fprintf(stderr, "xhci: skipping non-cmd event ring[%u] type=%u parm=0x%08x\n",
+					eventIdx, type, (uint32_t)cur->parameter);
+				eventIdx++;
+			}
+
+			if (found != 0) {
+				break;
+			}
+
+			usleep(1000);
+
+			/* (2026-05-24) periodic doorbell re-ring. */
+			if ((timeoutMs % 10u) == 0u) {
+				__asm__ volatile("dsb sy" ::: "memory");
+				xhci_dbWrite32(xhci, 0u, 0u);
+
+				/* If HSE fires during cmd processing the controller
+				 * self-halts and stops fetching from the cmd ring. */
+				{
+					uint32_t sts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+					if ((sts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+						fprintf(stderr, "xhci: HSE during cmd wait (timeoutMs=%u USBSTS=0x%08x)\n",
+							timeoutMs, sts);
+						break;
+					}
 				}
 			}
 		}
