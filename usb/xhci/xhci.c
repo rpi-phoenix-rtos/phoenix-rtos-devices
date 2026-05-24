@@ -1409,6 +1409,14 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	xhci_dbWrite32(xhci, 0u, 0u);
+	/* Flush the posted doorbell write: PCIe spec allows MMIO writes
+	 * to be posted (queued in the bridge's write buffer). A subsequent
+	 * MMIO read to the SAME device cannot bypass an earlier posted
+	 * write, so reading USBSTS forces the doorbell write to complete
+	 * its journey to the controller. Without this the doorbell may
+	 * sit in the bridge buffer for some indeterminate time, during
+	 * which the controller doesn't fetch from the cmd ring. */
+	(void)xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
 
 	/* Walk the event ring rather than fixating on event[0]. The
 	 * controller may emit port-status-change events (type 34) or
