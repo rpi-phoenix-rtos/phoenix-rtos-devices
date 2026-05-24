@@ -1222,7 +1222,7 @@ static int xhci_enterRunState(xhci_t *xhci)
 	 * RW1C in USBSTS. */
 	{
 		unsigned attempt;
-		for (attempt = 0u; attempt < 3u; ++attempt) {
+		for (attempt = 0u; attempt < 10u; ++attempt) {
 			usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
 			xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
 
@@ -1251,7 +1251,7 @@ static int xhci_enterRunState(xhci_t *xhci)
 			__asm__ volatile("dsb sy" ::: "memory");
 		}
 
-		fprintf(stderr, "xhci: enterRunState gave up after 3 HSE attempts (USBSTS=0x%08x ERDP_LO=0x%08x ERSTBA_LO=0x%08x DCBAAP_LO=0x%08x)\n",
+		fprintf(stderr, "xhci: enterRunState gave up after 10 HSE attempts (USBSTS=0x%08x ERDP_LO=0x%08x ERSTBA_LO=0x%08x DCBAAP_LO=0x%08x)\n",
 			usbsts,
 			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO),
 			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO),
