@@ -1418,58 +1418,52 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	 * because type or parameter doesn't match. Walk forward,
 	 * skipping events that aren't the cmd completion we're waiting
 	 * for, until we find ours or time out. */
-	{
-		unsigned int eventIdx = 0u;
-		int found = 0;
-		xhci_trb_t *cur;
+	unsigned int eventIdx = 0u;
+	int found = 0;
+	xhci_trb_t *cur;
 
-		for (timeoutMs = XHCI_CMD_TIMEOUT_MS; timeoutMs > 0u; --timeoutMs) {
-			while (eventIdx < xhci->eventRingTrbs) {
-				cur = &((xhci_trb_t *)xhci->eventRing)[eventIdx];
-				if ((cur->control & XHCI_TRB_CONTROL_C) !=
-					(xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
-					break;
-				}
-
-				type = (cur->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
-				if ((type == XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) && (cur->parameter == cmdPhys)) {
-					event = cur;
-					found = 1;
-					break;
-				}
-
-				/* Not our event — log and skip. */
-				fprintf(stderr, "xhci: skipping non-cmd event ring[%u] type=%u parm=0x%08x\n",
-					eventIdx, type, (uint32_t)cur->parameter);
-				eventIdx++;
-			}
-
-			if (found != 0) {
+	for (timeoutMs = XHCI_CMD_TIMEOUT_MS; timeoutMs > 0u; --timeoutMs) {
+		while (eventIdx < xhci->eventRingTrbs) {
+			cur = &((xhci_trb_t *)xhci->eventRing)[eventIdx];
+			if ((cur->control & XHCI_TRB_CONTROL_C) !=
+				(xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
 				break;
 			}
 
-			usleep(1000);
+			type = (cur->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+			if ((type == XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) && (cur->parameter == cmdPhys)) {
+				event = cur;
+				found = 1;
+				break;
+			}
 
-			/* (2026-05-24) periodic doorbell re-ring. */
-			if ((timeoutMs % 10u) == 0u) {
-				__asm__ volatile("dsb sy" ::: "memory");
-				xhci_dbWrite32(xhci, 0u, 0u);
+			fprintf(stderr, "xhci: skipping non-cmd event ring[%u] type=%u parm=0x%08x\n",
+				eventIdx, type, (uint32_t)cur->parameter);
+			eventIdx++;
+		}
 
-				/* If HSE fires during cmd processing the controller
-				 * self-halts and stops fetching from the cmd ring. */
-				{
-					uint32_t sts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-					if ((sts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
-						fprintf(stderr, "xhci: HSE during cmd wait (timeoutMs=%u USBSTS=0x%08x)\n",
-							timeoutMs, sts);
-						break;
-					}
+		if (found != 0) {
+			break;
+		}
+
+		usleep(1000);
+
+		if ((timeoutMs % 10u) == 0u) {
+			__asm__ volatile("dsb sy" ::: "memory");
+			xhci_dbWrite32(xhci, 0u, 0u);
+
+			{
+				uint32_t sts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+				if ((sts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+					fprintf(stderr, "xhci: HSE during cmd wait (timeoutMs=%u USBSTS=0x%08x)\n",
+						timeoutMs, sts);
+					break;
 				}
 			}
 		}
 	}
 
-	if (timeoutMs == 0u) {
+	if (found == 0) {
 		fprintf(stderr, "xhci: command completion timeout (USBSTS=0x%08x CRCR_LO=0x%08x event[0]=ctrl=0x%08x parm_lo=0x%08x cmd_phys=0x%08llx cmd_ctrl=0x%08x dboff=0x%08x USBCMD=0x%08x)\n",
 			xhci_opRead32(xhci, XHCI_REG_OP_USBSTS),
 			xhci_opRead32(xhci, XHCI_REG_OP_CRCR),
