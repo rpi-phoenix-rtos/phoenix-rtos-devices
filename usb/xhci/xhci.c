@@ -1423,6 +1423,19 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 		if ((timeoutMs % 10u) == 0u) {
 			__asm__ volatile("dsb sy" ::: "memory");
 			xhci_dbWrite32(xhci, 0u, 0u);
+
+			/* If HSE fires during cmd processing the controller
+			 * self-halts and stops fetching from the cmd ring. We
+			 * could wait the full 1 s for nothing — bail early so
+			 * the caller can decide on recovery. */
+			{
+				uint32_t sts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+				if ((sts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
+					fprintf(stderr, "xhci: HSE during cmd wait (timeoutMs=%u USBSTS=0x%08x)\n",
+						timeoutMs, sts);
+					break;
+				}
+			}
 		}
 	}
 
