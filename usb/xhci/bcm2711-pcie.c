@@ -481,7 +481,13 @@ static void bcm2711PrepareHostBridge(pcie_bcm2711_ctx_t *ctx)
 
 	bcm2711BridgeSwInitSet(ctx, 1u);
 	bcm2711PerstSet(ctx, 1u);
-	usleep(200);
+	/* PCIe CEM spec 2.0 §2.6.2: PERST# MUST be asserted for at least
+	 * 100 ms with stable power before deassert. Phoenix's prior 200 us
+	 * was orders of magnitude short of spec — bridge / VL805 internal
+	 * state from start4.elf wasn't fully cleared, leaving the inbound
+	 * DMA path in an intermittent broken state. Linux brcm_pcie holds
+	 * PERST for the full 100 ms before deassert in start_link. */
+	usleep(100000);
 
 	bcm2711BridgeSwInitSet(ctx, 0u);
 	writeRegMsk(ctx->base, BCM2711_PCIE_HARD_DEBUG,
