@@ -829,12 +829,13 @@ static int xhci_reset(xhci_t *xhci)
 		return err;
 	}
 
-	/* (2026-05-24) Removed the post-HCRST bcm2711_pcie_resettleOutboundWindow
-	 * call. Empirically the multiple bridge re-programs (initVL805 once
-	 * after mailbox + here after HCRST + once more before R/S=1) gave no
-	 * deterministic improvement and may have been churning bridge state.
-	 * The post-mailbox re-program in bcm2711_pcie_initVL805 is the only
-	 * one kept. */
+	/* 100 ms settling window after HCRST. Empirically the BCM2711
+	 * bridge and VL805 internal state can be in a transient mode
+	 * even after CNR clears: ERSTBA / DCBAAP writes that immediately
+	 * follow sometimes don't reach the controller, manifesting as
+	 * HSE later when the controller tries to DMA. Linux's xhci-pci
+	 * has a similar post-reset delay (xhci_handshake + udelay). */
+	usleep(100000);
 
 	return EOK;
 }
