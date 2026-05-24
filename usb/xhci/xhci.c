@@ -81,6 +81,7 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_REG_OP_PORT_PORTSC  0x00u
 #define XHCI_REG_RT_IR0          0x20u
 #define XHCI_REG_RT_IR_IMAN      0x00u
+#define XHCI_REG_RT_IR_IMOD      0x04u
 #define XHCI_REG_RT_IR_ERSTSZ    0x08u
 #define XHCI_REG_RT_IR_ERSTBA_LO 0x10u
 #define XHCI_REG_RT_IR_ERSTBA_HI 0x14u
@@ -121,6 +122,8 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_REG_RT_IR_ERSTSZ__MASK 0xffffu
 #define XHCI_REG_RT_IR_ERSTBA_LO__MASK 0xffffffc0u
 #define XHCI_REG_RT_IR_ERDP_LO_EHB (1u << 3)
+#define XHCI_REG_RT_IR_IMAN_IP    (1u << 0)
+#define XHCI_REG_RT_IR_IMAN_IE    (1u << 1)
 #define XHCI_REG_RT_IR_ERDP_LO__MASK 0xfffffff0u
 #define XHCI_DCBAA_ALIGN         0x1000u
 #define XHCI_DCBAA_SIZE          0x1000u
@@ -2074,6 +2077,17 @@ static int xhci_programEventRing(xhci_t *xhci)
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_LO, erstbaLo);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, erdpHi);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO, erdpLo);
+
+	/* Enable Interrupter 0 (IE=1). Phoenix polls the event ring rather
+	 * than relying on the IRQ, so the IE bit shouldn't be strictly
+	 * required for event delivery. However Linux's xhci_run_finished
+	 * enables IMAN.IE before USBCMD.RUN per xHCI 4.2/5.5.2 — some
+	 * controllers may require this for the interrupter to be considered
+	 * "armed" and for the controller's internal R/S=1 state machine to
+	 * succeed. Set IMAN.IE; clear IP (write-1-to-clear) at the same time
+	 * so any stale pending bit doesn't immediately latch IRQ. */
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMOD, 0u);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMAN, XHCI_REG_RT_IR_IMAN_IE | XHCI_REG_RT_IR_IMAN_IP);
 
 	xhci->erstsz = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTSZ);
 	xhci->erstbaLo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO);
