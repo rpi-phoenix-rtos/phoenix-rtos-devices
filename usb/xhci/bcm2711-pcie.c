@@ -546,10 +546,19 @@ static void bcm2711PrepareLinkState(pcie_bcm2711_ctx_t *ctx)
 
 	bcm2711PerstSet(ctx, 0u);
 
-	/* Poll for link up rather than waiting a fixed 100 ms. On a healthy
-	 * Pi 4 the link typically comes up within 5–30 ms after PERST
-	 * deassert; the 100 ms ceiling matches Linux's brcmstb-pcie driver
-	 * worst-case. Save the rest. */
+	/* PCIe CEM spec 2.0 §2.2 / PCIe r5.0 §6.6.1: wait 100 ms after
+	 * PERST# deassertion before initiating configuration cycles.
+	 * The downstream device needs this window to come out of reset
+	 * cleanly. Linux msleep(100) here. Without this Phoenix's earlier
+	 * config-space accesses race the device's init and can leave
+	 * VL805 in a partial state that surfaces later as inbound DMA
+	 * failures (USBSTS.HSE on R/S=1 or cmd ring processing). */
+	usleep(100000);
+
+	/* Poll for link up; on a healthy Pi 4 the link comes up within
+	 * 5–30 ms after PERST# deassert (we've already waited 100 ms).
+	 * The 100 ms ceiling here matches Linux's brcmstb-pcie driver
+	 * worst-case. */
 	for (polls = 0; polls < 50; polls++) {
 		usleep(2000);
 		if (bcm2711LinkUp(ctx)) {
