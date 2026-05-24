@@ -359,6 +359,13 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 #define BCM2711_PCIE_MISC_CTRL_SCB_ACCESS_EN   0x1000u
 #define BCM2711_PCIE_MISC_CTRL_CFG_READ_UR_MODE 0x2000u
 #define BCM2711_PCIE_MISC_CTRL_MAX_BURST_MASK  0x300000u
+/* Vendor-specific register at config offset 0x0188 controls the PCIe-to-SCB
+ * endian mode for the inbound BAR2 window. Bits 2:3 = ENDIAN_MODE_BAR2,
+ * with 0x0 = little-endian (matches ARM64 LE). Without writing this, the
+ * bridge can byte-swap inbound DMA data → controller sees garbage TRBs →
+ * USBSTS.HSE on the first R/S=1 fetch. Linux sets this in brcm_pcie_setup. */
+#define BCM2711_PCIE_RC_CFG_VENDOR_VSR1        0x0188u
+#define BCM2711_PCIE_RC_CFG_VSR1_ENDIAN_BAR2   0xcu     /* bits 2:3 */
 /* From Linux pcie-brcmstb.c — required for BCM2711 inbound DMA. */
 #define BCM2711_PCIE_MISC_CTRL_RCB_MPS_MODE    0x400u    /* bit 10 */
 #define BCM2711_PCIE_MISC_CTRL_RCB_64B_MODE    0x80u     /* bit 7  */
@@ -496,6 +503,17 @@ static void bcm2711PrepareHostBridge(pcie_bcm2711_ctx_t *ctx)
 	misc &= ~BCM2711_PCIE_MISC_CTRL_SCB0_SIZE_MASK;
 	misc |= BCM2711_PCIE_MISC_CTRL_SCB0_SIZE_4G;
 	writeReg(ctx->base, BCM2711_PCIE_MISC_CTRL, misc);
+
+	/* Force the bridge's PCIe-to-SCB inbound endian-mode for BAR2
+	 * to little-endian (matches ARM64 LE memory layout). Without this
+	 * the bridge's default mode can byte-swap inbound DMA data,
+	 * making the controller's reads of cmd ring / event ring /
+	 * DCBAA see garbage TRBs and set USBSTS.HSE on R/S=1. */
+	{
+		uint32_t vsr1 = readReg(ctx->base, BCM2711_PCIE_RC_CFG_VENDOR_VSR1);
+		vsr1 &= ~BCM2711_PCIE_RC_CFG_VSR1_ENDIAN_BAR2;
+		writeReg(ctx->base, BCM2711_PCIE_RC_CFG_VENDOR_VSR1, vsr1);
+	}
 }
 
 
