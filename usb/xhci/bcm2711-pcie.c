@@ -1190,11 +1190,16 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		uint16_t want = cmd | PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE;
 		if (want != cmd) {
 			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
-			uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
-			if ((rb & (PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE)) !=
-				(PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE)) {
-				fprintf(stderr, "pcie: cmd readback %04x (wanted %04x)\n", rb, want);
-			}
+		}
+		uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
+		{
+			char dbgbuf[96];
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"pcie: %02x:%02x.%u final CMD=0x%04x (MEM=%u MASTER=%u)\n",
+				bus, dev, fun, rb,
+				(unsigned)(!!(rb & PCI_CMD_MEM_ENABLE)),
+				(unsigned)(!!(rb & PCI_CMD_MASTER_ENABLE)));
+			debug(dbgbuf);
 		}
 	}
 

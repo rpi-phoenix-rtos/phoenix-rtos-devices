@@ -1443,7 +1443,20 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	cmdPhys = xhci->cmdRingPhys;
 
 	event = (xhci_trb_t *)xhci->eventRing;
-	memset(event, 0, sizeof(*event));
+	/* USB-FIX-14 instrumentation: paint a magic pattern on the first
+	 * 4 event TRBs. After timeout we'll see if the pattern survived
+	 * (controller never wrote -> inbound DMA write broken) or got
+	 * overwritten (controller did write -> our polling missed it). */
+	{
+		xhci_trb_t *evring = (xhci_trb_t *)xhci->eventRing;
+		int k;
+		for (k = 0; k < 4; ++k) {
+			evring[k].parameter = 0xCAFEBABE00000000ull | (uint64_t)k;
+			evring[k].status = 0xDEADBEEFu;
+			evring[k].control = 0xFFFF0000u;
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+	}
 
 	err = xhci_enterRunState(xhci);
 	if (err < 0) {
