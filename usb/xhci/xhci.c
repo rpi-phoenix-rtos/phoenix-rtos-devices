@@ -837,6 +837,22 @@ static int xhci_reset(xhci_t *xhci)
 	 * has a similar post-reset delay (xhci_handshake + udelay). */
 	usleep(100000);
 
+	/* USB-FIX-3 (2026-05-26): HCRST may churn BCM2711 bridge state
+	 * analogous to the mailbox-notify path. Re-program the outbound
+	 * window AND inbound BAR1/BAR2 here so the subsequent
+	 * DCBAAP/CRCR/ERSTBA writes from xhci_programCommandSpace +
+	 * xhci_programEventRing land on a stable bridge translation
+	 * and any inbound DMA the controller issues at R/S=1 still
+	 * reaches DRAM. The CRCR re-publish before each doorbell that
+	 * exists today is a symptom-workaround for the same class of
+	 * bug; if FIX-3 holds we can drop that hack. */
+	{
+		int re = bcm2711_pcie_resettleOutboundWindow();
+		if (re != EOK && re != -ENODEV) {
+			fprintf(stderr, "xhci: bridge re-settle after HCRST returned %d\n", re);
+		}
+	}
+
 	return EOK;
 }
 
