@@ -577,15 +577,42 @@ static void bcm2711PrepareLinkState(pcie_bcm2711_ctx_t *ctx)
 
 static uint32_t bcm2711EncodeBar2Size(uint64_t size)
 {
-	unsigned shift = 20;
+	/* BCM2711 PCIe RC_BAR2 size field encoding (per Linux
+	 * pcie-brcmstb.c::brcm_pcie_get_dma_ranges_property):
+	 *
+	 *   field = log2(size_bytes) - 15
+	 *
+	 * Valid range: 64 KB (field=1) through 4 GB (field=17). The
+	 * field is 5 bits wide so the max representable value is 31
+	 * (= 2^46 = 64 TB, plenty of headroom).
+	 *
+	 * USB-FIX-12 (2026-05-26): the previous implementation started
+	 * `shift = 20` and counted right-shifts; for 4 GB input
+	 * (size = 2^32) the loop ran 32 times producing shift=52 and
+	 * return value 37. With BCM2711_PCIE_RC_BAR2_SIZE_MASK = 0x1F
+	 * (5 bits), 37 silently truncated to 5 -- which the bridge
+	 * interprets as a 1 MB window. The VL805 cmd-ring DMA target
+	 * (cmd_phys = 0x33060000 = 854 MB) fell OUTSIDE the actual
+	 * 1 MB window, so VL805's inbound TLP had no valid PCIe-side
+	 * destination, the bridge dropped it, the controller saw a
+	 * completion timeout, and USBSTS.HSE went high. This was the
+	 * root cause of the rc=-110 wedge that survived every other
+	 * hypothesis test today. */
+	unsigned shift;
 	uint64_t value = size;
 
-	while ((value > 1u) && ((value & 1u) == 0u)) {
+	if (size == 0u) {
+		return 0u;
+	}
+
+	/* Find log2(size). */
+	shift = 0u;
+	while ((value & 1u) == 0u) {
 		value >>= 1;
 		shift++;
 	}
 
-	if ((size == 0u) || (value != 1u) || (shift < 15u)) {
+	if (value != 1u || shift < 15u || shift > 46u) {
 		return 0u;
 	}
 
@@ -627,10 +654,34 @@ static void bcm2711SetRcBar2(pcie_bcm2711_ctx_t *ctx, uint64_t pcieAddr, uint64_
 
 	value &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
 	value |= bcm2711EncodeBar2Size(size) & BCM2711_PCIE_RC_BAR2_SIZE_MASK;
-	value &= ~0xfffffff0u;
-	value |= LOWER_32_BITS(pcieAddr) & 0xfffffff0u;
+	/* USB-FIX-12b (2026-05-26): address portion is bits 12:31 (PCIe
+	 * addresses are 4 KB aligned, and the register layout reserves
+	 * bits 5:11 as 0). The previous mask 0xfffffff0u clears bits
+	 * 4:31, which overlapped with bit 4 of the size field and
+	 * silently clobbered bit 4 every time the address portion was
+	 * written. Concretely: with size_field = 17 (= 0b10001 for
+	 * 4 GiB), the subsequent address-write cleared bit 4 leaving 1
+	 * = 1 MiB encoding. Use the proper bits-12:31 mask. */
+	value &= ~0xfffff000u;
+	value |= LOWER_32_BITS(pcieAddr) & 0xfffff000u;
 	writeReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_LO, value);
 	writeReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_HI, UPPER_32_BITS(pcieAddr));
+
+	/* USB-FIX-11 (2026-05-26): read RC_BAR2 back and report via
+	 * debug() so we can confirm the inbound DMA window is actually
+	 * programmed. If the readback doesn't match what we wrote, the
+	 * bridge isn't accepting the configuration and VL805's inbound
+	 * DMA reads fail at the bridge level. */
+	{
+		uint32_t lo_rb = readReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_LO);
+		uint32_t hi_rb = readReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_HI);
+		char dbgbuf[128];
+		snprintf(dbgbuf, sizeof(dbgbuf),
+			"pcie: RC_BAR2 readback LO=0x%08x HI=0x%08x (size_field=0x%x)\n",
+			lo_rb, hi_rb,
+			(unsigned)(lo_rb & BCM2711_PCIE_RC_BAR2_SIZE_MASK));
+		debug(dbgbuf);
+	}
 }
 
 
@@ -697,6 +748,29 @@ static void bcm2711ExposeDownstreamBridge(pcie_bcm2711_ctx_t *ctx)
 					"  RC DCTL post-fix=0x%08x (NoSnoop+sticky cleared)\n",
 					devctl_post);
 				debug(dbgbuf);
+			}
+
+			/* USB-FIX-11: read Link Control (PCIe Cap offset 0x10),
+			 * print current ASPM state, then disable ASPM (bits[1:0]
+			 * = 00). If VL805's link is in L1 when we issue R/S=1,
+			 * coming out of L1 takes time and the first DMA can
+			 * timeout. Linux disables ASPM on VL805 via PCI quirk. */
+			{
+				uint32_t lnkcap = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x0C);
+				uint32_t lnkctl = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x10);
+				snprintf(dbgbuf, sizeof(dbgbuf),
+					"  RC LNKCAP=0x%08x LNKCTL=0x%08x (ASPM=%u)\n",
+					lnkcap, lnkctl, (unsigned)(lnkctl & 0x3u));
+				debug(dbgbuf);
+				bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + 0x10,
+					(uint16_t)((lnkctl & 0xFFFFu) & ~0x0003u));
+				{
+					uint32_t lnkctl_post = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x10);
+					snprintf(dbgbuf, sizeof(dbgbuf),
+						"  RC LNKCTL post-fix=0x%08x (ASPM disabled)\n",
+						lnkctl_post);
+					debug(dbgbuf);
+				}
 			}
 		}
 	}
@@ -977,6 +1051,24 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 				snprintf(dbgbuf, sizeof(dbgbuf),
 					"  VL805 DCTL post-fix=0x%08x\n", devctl_post);
 				debug(dbgbuf);
+			}
+
+			/* USB-FIX-11: VL805 ASPM disable via Link Control. */
+			{
+				uint32_t lnkcap = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x0C);
+				uint32_t lnkctl = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x10);
+				snprintf(dbgbuf, sizeof(dbgbuf),
+					"  VL805 LNKCAP=0x%08x LNKCTL=0x%08x (ASPM=%u)\n",
+					lnkcap, lnkctl, (unsigned)(lnkctl & 0x3u));
+				debug(dbgbuf);
+				cfgio->write32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x10,
+					(lnkctl & 0xFFFFu) & ~0x0003u);
+				{
+					uint32_t lnkctl_post = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x10);
+					snprintf(dbgbuf, sizeof(dbgbuf),
+						"  VL805 LNKCTL post-fix=0x%08x\n", lnkctl_post);
+					debug(dbgbuf);
+				}
 			}
 		}
 
