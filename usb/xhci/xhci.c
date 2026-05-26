@@ -1239,6 +1239,25 @@ static int xhci_enterRunState(xhci_t *xhci)
 		return -ENODEV;
 	}
 
+	/* USB-FIX-19 (2026-05-27): re-settle the BCM2711 inbound DMA window
+	 * (RC_BAR2 / UBUS_BAR2) one more time RIGHT BEFORE R/S=1. FIX-3
+	 * re-settles after HCRST, but between HCRST and here usb-hcd does
+	 * the scratchpad + event-ring DMA mmaps; in usb-hcd's process
+	 * (which also holds the bridge MMIO mapping) those mmaps re-churn
+	 * the bridge inbound translation (the TD-USB-pmap interaction),
+	 * leaving inbound DMA WRITES dead at R/S=1 — the controller runs
+	 * commands (CRR=1, inbound reads work) but posts ZERO events.
+	 * Diagnosis: the lwip-port 'X' bring-up, which does NOT hold the
+	 * bridge mapping, posts events fine with an identical register
+	 * setup; usb-hcd does not. Re-asserting RC_BAR2 here is idempotent
+	 * and restores the inbound write path after the last mmap. */
+	{
+		int re = bcm2711_pcie_resettleOutboundWindow();
+		if (re != EOK && re != -ENODEV) {
+			fprintf(stderr, "xhci: bridge re-settle before R/S returned %d\n", re);
+		}
+	}
+
 	/* Drain pending CPU writes to event ring / command ring / DCBAA
 	 * before the controller starts DMA-ing from them on R/S=1.
 	 * The xhci_*Write32 helpers use volatile MMIO writes (compiler
