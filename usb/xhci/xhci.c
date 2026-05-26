@@ -1547,15 +1547,38 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 		uint32_t usbsts2 = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
 		uint32_t crcr_lo = xhci_opRead32(xhci, XHCI_REG_OP_CRCR);
 		uint32_t usbcmd2 = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+		uint32_t erstba_lo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO);
+		uint32_t erstba_hi = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_HI);
+		uint32_t erdp_lo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO);
+		uint32_t erdp_hi = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_HI);
+		xhci_trb_t *evring = (xhci_trb_t *)xhci->eventRing;
 		snprintf(dbgbuf, sizeof(dbgbuf),
 			"xhci_cmdExec TIMEOUT USBSTS=0x%08x USBCMD=0x%08x CRCR=0x%08x\n",
 			usbsts2, usbcmd2, crcr_lo);
 		debug(dbgbuf);
 		snprintf(dbgbuf, sizeof(dbgbuf),
-			"  cmd_phys=0x%08llx cmd_ctrl=0x%08x event_ctrl=0x%08x event_parm=0x%08x\n",
+			"  cmd_phys=0x%08llx cmd_ctrl=0x%08x cycleState=%u\n",
 			(unsigned long long)cmdPhys, cmd->control,
-			event->control, (uint32_t)event->parameter);
+			(unsigned)xhci->eventCycleState);
 		debug(dbgbuf);
+		snprintf(dbgbuf, sizeof(dbgbuf),
+			"  ERSTBA=%08x%08x ERDP=%08x%08x evRingPhys=0x%08llx\n",
+			erstba_hi, erstba_lo, erdp_hi, erdp_lo,
+			(unsigned long long)xhci->eventRingPhys);
+		debug(dbgbuf);
+		snprintf(dbgbuf, sizeof(dbgbuf),
+			"  ev[0] parm=0x%08x st=0x%08x ctrl=0x%08x\n",
+			(uint32_t)evring[0].parameter, evring[0].status, evring[0].control);
+		debug(dbgbuf);
+		snprintf(dbgbuf, sizeof(dbgbuf),
+			"  ev[1] parm=0x%08x st=0x%08x ctrl=0x%08x\n",
+			(uint32_t)evring[1].parameter, evring[1].status, evring[1].control);
+		debug(dbgbuf);
+		snprintf(dbgbuf, sizeof(dbgbuf),
+			"  ev[2] parm=0x%08x st=0x%08x ctrl=0x%08x\n",
+			(uint32_t)evring[2].parameter, evring[2].status, evring[2].control);
+		debug(dbgbuf);
+		(void)event;
 		(void)xhci_enterHaltedState(xhci);
 		memset(cmd, 0, sizeof(*cmd));
 		return -ETIMEDOUT;
