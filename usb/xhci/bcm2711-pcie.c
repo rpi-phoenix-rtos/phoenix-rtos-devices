@@ -677,12 +677,27 @@ static void bcm2711ExposeDownstreamBridge(pcie_bcm2711_ctx_t *ctx)
 				"pcie: RC PCIe Cap @0xAC DCAP=0x%08x DCTL=0x%08x\n",
 				devcap, devctl);
 			debug(dbgbuf);
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"  RC MPS_supported=%u MPS_set=%u MRRS_set=%u\n",
-				(unsigned)(devcap & 0x7u),
-				(unsigned)((devctl >> 5) & 0x7u),
-				(unsigned)((devctl >> 12) & 0x7u));
-			debug(dbgbuf);
+
+			/* USB-FIX-9 (2026-05-26): clear NO_SNOOP_EN (bit 11) in
+			 * RC's DCTL. BCM2711 PCIe is not cache-coherent by
+			 * default; NoSnoop TLPs bypass CPU caches, so an
+			 * inbound DMA fetch can read stale DRAM if the most
+			 * recent CPU write is still in a dirty cache line. */
+			bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + 0x08,
+				(uint16_t)((devctl & 0xFFFFu) & ~0x0800u));
+
+			/* USB-FIX-10: clear RC Device Status sticky bits
+			 * (bits 0..4: CED, NFED, FED, URD, AUX_PWR_DET). They
+			 * are RW1C; write the mask to clear. */
+			bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + 0x0A, 0x001Fu);
+
+			{
+				uint32_t devctl_post = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x08);
+				snprintf(dbgbuf, sizeof(dbgbuf),
+					"  RC DCTL post-fix=0x%08x (NoSnoop+sticky cleared)\n",
+					devctl_post);
+				debug(dbgbuf);
+			}
 		}
 	}
 
@@ -939,13 +954,7 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 
 		/* USB-FIX-8 (2026-05-26): read VL805's PCIe Capability MPS/MRRS
 		 * fields. VL805 PCIe Cap is at config offset 0xC4 per the boot-time
-		 * "pcie: CAP id 0x10 address 0xc4" print. DCAP @ cap+0x04 has
-		 * MaxPayloadSize_Supported (bits[2:0]); DCTL @ cap+0x08 has
-		 * MaxPayloadSize (bits[7:5]) and MaxReadRequestSize (bits[14:12]).
-		 * Encoding: 000=128B, 001=256B, 010=512B, ...
-		 * If MPS isn't negotiated between VL805 and BCM2711 RC, every TLP
-		 * larger than the smaller-side limit fails. Linux's PCI core
-		 * does this via pcie_set_mps(). Phoenix does not. */
+		 * "pcie: CAP id 0x10 address 0xc4" print. */
 		{
 			uint32_t devcap = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x04);
 			uint32_t devctl = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08);
@@ -954,12 +963,21 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 				"pcie: VL805 PCIe Cap @0xC4 DCAP=0x%08x DCTL=0x%08x\n",
 				devcap, devctl);
 			debug(dbgbuf);
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"  VL805 MPS_supported=%u MPS_set=%u MRRS_set=%u\n",
-				(unsigned)(devcap & 0x7u),
-				(unsigned)((devctl >> 5) & 0x7u),
-				(unsigned)((devctl >> 12) & 0x7u));
-			debug(dbgbuf);
+
+			/* USB-FIX-9: clear NO_SNOOP_EN in VL805 DCTL (bit 11). */
+			uint32_t devctl_new = (devctl & 0xFFFFu) & ~0x0800u;
+			cfgio->write32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08, devctl_new);
+
+			/* USB-FIX-10: clear Device Status sticky bits (RW1C). */
+			cfgio->write32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08,
+				devctl_new | (0x001Fu << 16));
+
+			{
+				uint32_t devctl_post = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08);
+				snprintf(dbgbuf, sizeof(dbgbuf),
+					"  VL805 DCTL post-fix=0x%08x\n", devctl_post);
+				debug(dbgbuf);
+			}
 		}
 
 		int err = 0;
