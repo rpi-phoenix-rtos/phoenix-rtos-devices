@@ -220,7 +220,7 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS (1u << 0)
 #define XHCI_EP_CTX_MAX_ESIT_PAYLOAD__SHIFT 16u
 #define XHCI_INPUT_CTRL_CTX_ADD_A0_A1 0x3u
-#define XHCI_CMD_TIMEOUT_MS      100u
+#define XHCI_CMD_TIMEOUT_MS      1000u  /* xHCI commands (enable-slot, address-device) can need ~hundreds of ms; 100 was too aggressive. Note: the current usb-hcd cmd-completion gap is NOT timing (a 30 s test still saw zero events) — it's a process-context inbound-write issue. */
 #define XHCI_PORT_RESET_TIMEOUT_MS 100u
 #define XHCI_PORT_POWER_GOOD_DELAY_US 20000u
 
@@ -2298,19 +2298,15 @@ static int xhci_programEventRing(xhci_t *xhci)
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_HI, erstbaHi);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_LO, erstbaLo);
 
-	/* Enable Interrupter 0 (IE=1). Phoenix polls the event ring rather
-	 * than relying on the IRQ, so the IE bit shouldn't be strictly
-	 * required for event delivery. However Linux's xhci_run_finished
-	 * enables IMAN.IE before USBCMD.RUN per xHCI 4.2/5.5.2 — some
-	 * controllers may require this for the interrupter to be considered
-	 * "armed" and for the controller's internal R/S=1 state machine to
-	 * succeed. Set IMAN.IE; clear IP (write-1-to-clear) at the same time
-	 * so any stale pending bit doesn't immediately latch IRQ. */
-	/* IMOD = 4000 = ~1 ms moderation interval (250 ns ticks).
-	 * Matches Linux's xhci_run_finished default. Some controllers
-	 * dislike IMOD=0 (no moderation) — internal interrupt storm. */
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMOD, 4000u);
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMAN, XHCI_REG_RT_IR_IMAN_IE | XHCI_REG_RT_IR_IMAN_IP);
+	/* NOTE: deliberately NOT setting IMAN.IE / IMOD here. The working
+	 * lwip-port 'X' bring-up leaves both at their post-HCRST default
+	 * (IE=0, IMOD=0) and the controller posts Command Completion and
+	 * Port Status events to the ring fine — confirming (with iPXE,
+	 * which polls without interrupts) that IE is NOT required for the
+	 * controller to DMA events to memory; IE only gates the IRQ line.
+	 * usb-hcd polls the event ring, so leaving the interrupter masked
+	 * matches the known-good path. (Comparison test for the usb-hcd
+	 * "CRR=1 but zero events land" gap vs the working 'X' path.) */
 
 	xhci->erstsz = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTSZ);
 	xhci->erstbaLo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO);
