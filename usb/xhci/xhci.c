@@ -1591,6 +1591,35 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 			"  ev[2] parm=0x%08x st=0x%08x ctrl=0x%08x\n",
 			(uint32_t)evring[2].parameter, evring[2].status, evring[2].control);
 		debug(dbgbuf);
+		/* Comparison probe vs the working lwip 'X' path: dump the
+		 * scratchpad pointer actually sitting in DCBAA[0], ERSTSZ,
+		 * and scan the WHOLE event ring for any event TRB the
+		 * controller may have posted past ev[2] (lwip 'X' saw the
+		 * completion at idx 1, after a port-status event at idx 0). */
+		{
+			volatile uint64_t *dcbaa = (volatile uint64_t *)xhci->dcbaa;
+			uint32_t erstsz_rb = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTSZ);
+			unsigned scan;
+			int firstEvt = -1, firstType = 0;
+			for (scan = 0u; scan < xhci->eventRingTrbs; ++scan) {
+				uint32_t ty = (evring[scan].control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+				if (ty >= 1u && ty <= 39u) {
+					firstEvt = (int)scan;
+					firstType = (int)ty;
+					break;
+				}
+			}
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"  DCBAA[0]=0x%08x%08x scratchpadPhys=0x%08llx ERSTSZ=%u trbs=%u\n",
+				(uint32_t)(dcbaa[0] >> 32), (uint32_t)dcbaa[0],
+				(unsigned long long)xhci->scratchpadArrayPhys,
+				(unsigned)erstsz_rb, (unsigned)xhci->eventRingTrbs);
+			debug(dbgbuf);
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"  ring-scan: first event @idx %d type=%d (any event => writes land)\n",
+				firstEvt, firstType);
+			debug(dbgbuf);
+		}
 		(void)event;
 		(void)xhci_enterHaltedState(xhci);
 		memset(cmd, 0, sizeof(*cmd));
@@ -2257,11 +2286,17 @@ static int xhci_programEventRing(xhci_t *xhci)
 		return -ENODEV;
 	}
 
+	/* Order matters: ERSTSZ, then ERDP, then ERSTBA LAST. Writing
+	 * ERSTBA is what makes the xHC (re)read the ERST and latch its
+	 * internal event-ring enqueue/dequeue (xHCI 1.2 §4.9.4 / §5.5.2.3).
+	 * The working lwip-port bring-up ('X' diag) uses exactly this
+	 * order; usb-hcd previously wrote ERSTBA before ERDP, leaving the
+	 * controller to load the ERST with a not-yet-initialised ERDP. */
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTSZ, XHCI_ERST_ENTRY_COUNT & XHCI_REG_RT_IR_ERSTSZ__MASK);
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_HI, erstbaHi);
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_LO, erstbaLo);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, erdpHi);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO, erdpLo);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_HI, erstbaHi);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_LO, erstbaLo);
 
 	/* Enable Interrupter 0 (IE=1). Phoenix polls the event ring rather
 	 * than relying on the IRQ, so the IE bit shouldn't be strictly
