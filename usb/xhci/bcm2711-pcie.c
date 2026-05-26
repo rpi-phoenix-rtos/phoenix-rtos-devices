@@ -857,25 +857,67 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 	if ((bus == XHCI_BCM2711_PCIE_BUS) && (dev == XHCI_BCM2711_PCIE_SLOT) &&
 		(fun == XHCI_BCM2711_PCIE_FUNC) && ((class24 >> 8) == XHCI_BCM2711_PCI_CLASS_CODE)) {
 		/*
-		 * Enable Memory Space and Bus Master BEFORE the firmware mailbox
-		 * notify and BAR programming. Empirically, enabling BME *after*
-		 * the firmware reset leaves VL805 in a state where capability
-		 * reads return 0xdead (no completion) even though the BAR is
-		 * programmed and the cmd register read-back shows 0x0006.
+		 * USB-FIX-1 (2026-05-26): split PCI_COMMAND write into two
+		 * stages around the firmware mailbox notify.
+		 *
+		 * Background: the previous form enabled both MEM_ENABLE
+		 * (outbound CPU->VL805) and BUS_MASTER (inbound VL805->DRAM
+		 * DMA) BEFORE the mailbox notify. That ordering disagrees
+		 * with every reference (Linux pci-quirks.c::quirk_usb_early_handoff,
+		 * Circle's bcmpciehostbridge.cpp::EnableDevice, NetBSD bwfm):
+		 * they all enable MEM only pre-notify and defer BUS_MASTER
+		 * until after BAR0 program + post-notify settle.
+		 *
+		 * Why the divergence matters: the mailbox handler
+		 * (RPI_FIRMWARE_NOTIFY_XHCI_RESET) churns bridge-side
+		 * registers. If BUS_MASTER is on during that churn, VL805
+		 * can issue inbound DMA reads that complete against stale
+		 * translations, leaving its internal DMA TLB inconsistent.
+		 * The classic symptom is HSE on the first R/S=1 (mode B in
+		 * our 10-cycle experiment) or "can't setup: -110"
+		 * (raspberrypi/firmware#1617 — same error code).
+		 *
+		 * The original justification for setting BUS_MASTER first
+		 * (BME-after-mailbox -> 0xdead capability reads) was a
+		 * misdiagnosis: 0xdead came from the bridge-translation
+		 * invalidation bug, not from BUS_MASTER ordering. That bug
+		 * is fixed separately via the dev-0-only PCIe scan +
+		 * keep-alive mmap.
+		 *
+		 * Stage 1 (here): MEM_ENABLE only; explicitly clear
+		 * BUS_MASTER so any stale value can't bias the mailbox.
 		 */
 		{
 			uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
-			uint16_t want = cmd | PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE;
+			uint16_t want = (cmd | PCI_CMD_MEM_ENABLE) & ~(uint16_t)PCI_CMD_MASTER_ENABLE;
 			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
 			uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
-			if ((rb & (PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE)) !=
-				(PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE)) {
-				fprintf(stderr, "pcie: VL805 cmd readback %04x did not stick (wanted %04x)\n", rb, want);
+			if ((rb & PCI_CMD_MEM_ENABLE) == 0) {
+				fprintf(stderr, "pcie: VL805 MEM_ENABLE did not stick (cmd=%04x)\n", rb);
 			}
+			printf("pcie: VL805 pre-mailbox CMD=0x%04x (MEM only, MASTER deferred)\n", rb);
 		}
-		int err = bcm2711NotifyXhciReset(bus, dev, fun);
-		if (err < 0) {
-			fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
+
+		/*
+		 * USB-FIX-2 (2026-05-26): check VL805 firmware version
+		 * (PCI config offset 0x50). If non-zero, the EEPROM has
+		 * already loaded firmware -- skip the mailbox to avoid
+		 * raspberrypi/firmware#1617 (repeated XHCI_RESET ->
+		 * "can't setup: -110"). Linux's rpi_firmware_init_vl805()
+		 * does this exact check.
+		 */
+		uint32_t fw_ver_pre = cfgio->read32(cfgio->ctx, bus, dev, fun, 0x50);
+		int skip_mailbox = (fw_ver_pre != 0u);
+		printf("pcie: VL805 firmware version @0x50 pre-notify = 0x%08x  %s\n",
+			fw_ver_pre,
+			skip_mailbox ? "(already loaded, skipping mailbox)" : "(zero, will notify)");
+
+		int err = 0;
+		if (!skip_mailbox) {
+			err = bcm2711NotifyXhciReset(bus, dev, fun);
+			if (err < 0) {
+				fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
+			}
 		}
 		/* TD-USB: VL805 firmware load is async after the mailbox reset
 		 * call returns. Without an explicit wait, the next config-space
