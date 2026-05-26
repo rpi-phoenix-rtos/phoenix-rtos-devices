@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/debug.h>
 #include <sys/mman.h>
 #include <sys/minmax.h>
 #include <sys/threads.h>
@@ -783,10 +784,22 @@ static int xhci_reset(xhci_t *xhci)
 	uint32_t usbcmd;
 	uint32_t usbsts;
 	int err;
+	char dbgbuf[96];
+
+	/* USB-DBG (2026-05-26): announce entry state to UART via
+	 * debug() so we can see where the wedge originates. printf
+	 * goes through stdio buffering that may not flush before the
+	 * process exits on init failure. */
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+	snprintf(dbgbuf, sizeof(dbgbuf),
+		"xhci_reset: enter USBSTS=0x%08x USBCMD=0x%08x\n",
+		usbsts, usbcmd);
+	debug(dbgbuf);
 
 	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_CNR, 0u, XHCI_CNR_TIMEOUT_MS);
 	if (err < 0) {
-		fprintf(stderr, "xhci: controller not ready before reset\n");
+		debug("xhci_reset: CNR did not clear before reset\n");
 		return err;
 	}
 
@@ -819,15 +832,23 @@ static int xhci_reset(xhci_t *xhci)
 
 	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBCMD, XHCI_REG_OP_USBCMD_HCRST, 0u, XHCI_HCRST_TIMEOUT_MS);
 	if (err < 0) {
-		fprintf(stderr, "xhci: reset timeout (usbsts=0x%08x)\n", xhci_opRead32(xhci, XHCI_REG_OP_USBSTS));
+		usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+		snprintf(dbgbuf, sizeof(dbgbuf),
+			"xhci_reset: HCRST timeout USBSTS=0x%08x\n", usbsts);
+		debug(dbgbuf);
 		return err;
 	}
 
 	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_CNR, 0u, XHCI_CNR_TIMEOUT_MS);
 	if (err < 0) {
-		fprintf(stderr, "xhci: controller not ready after reset\n");
+		debug("xhci_reset: CNR did not clear after reset\n");
 		return err;
 	}
+
+	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+	snprintf(dbgbuf, sizeof(dbgbuf),
+		"xhci_reset: post-HCRST USBSTS=0x%08x\n", usbsts);
+	debug(dbgbuf);
 
 	/* 100 ms settling window after HCRST. Empirically the BCM2711
 	 * bridge and VL805 internal state can be in a transient mode
@@ -1252,12 +1273,20 @@ static int xhci_enterRunState(xhci_t *xhci)
 			usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
 			if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) == 0u) {
 				if (attempt > 0u) {
-					fprintf(stderr, "xhci: enterRunState recovered on attempt %u\n", attempt);
+					char dbgbuf[64];
+					snprintf(dbgbuf, sizeof(dbgbuf),
+						"xhci: enterRun recovered on attempt %u\n", attempt);
+					debug(dbgbuf);
 				}
 				return EOK;
 			}
 
-			fprintf(stderr, "xhci: enterRunState HSE attempt %u (USBSTS=0x%08x)\n", attempt, usbsts);
+			{
+				char dbgbuf[96];
+				snprintf(dbgbuf, sizeof(dbgbuf),
+					"xhci: enterRun HSE attempt %u USBSTS=0x%08x\n", attempt, usbsts);
+				debug(dbgbuf);
+			}
 
 			/* Clear HSE (W1C), drop R/S, wait for halt, retry. */
 			xhci_opWrite32(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE);
@@ -1268,11 +1297,16 @@ static int xhci_enterRunState(xhci_t *xhci)
 			__asm__ volatile("dsb sy" ::: "memory");
 		}
 
-		fprintf(stderr, "xhci: enterRunState gave up after 10 HSE attempts (USBSTS=0x%08x ERDP_LO=0x%08x ERSTBA_LO=0x%08x DCBAAP_LO=0x%08x)\n",
-			usbsts,
-			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO),
-			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO),
-			xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP));
+		{
+			char dbgbuf[160];
+			uint32_t erdp = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO);
+			uint32_t erstba = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO);
+			uint32_t dcbaap = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP);
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"xhci: enterRun GAVE UP USBSTS=0x%08x ERDP=0x%08x ERSTBA=0x%08x DCBAAP=0x%08x\n",
+				usbsts, erdp, erstba, dcbaap);
+			debug(dbgbuf);
+		}
 	}
 	return -ENODEV;
 }
@@ -1509,15 +1543,19 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	}
 
 	if (found == 0) {
-		fprintf(stderr, "xhci: command completion timeout (USBSTS=0x%08x CRCR_LO=0x%08x event[0]=ctrl=0x%08x parm_lo=0x%08x cmd_phys=0x%08llx cmd_ctrl=0x%08x dboff=0x%08x USBCMD=0x%08x)\n",
-			xhci_opRead32(xhci, XHCI_REG_OP_USBSTS),
-			xhci_opRead32(xhci, XHCI_REG_OP_CRCR),
-			event->control,
-			(uint32_t)event->parameter,
-			(unsigned long long)cmdPhys,
-			cmd->control,
-			xhci->dboff,
-			xhci_opRead32(xhci, XHCI_REG_OP_USBCMD));
+		char dbgbuf[200];
+		uint32_t usbsts2 = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+		uint32_t crcr_lo = xhci_opRead32(xhci, XHCI_REG_OP_CRCR);
+		uint32_t usbcmd2 = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+		snprintf(dbgbuf, sizeof(dbgbuf),
+			"xhci_cmdExec TIMEOUT USBSTS=0x%08x USBCMD=0x%08x CRCR=0x%08x\n",
+			usbsts2, usbcmd2, crcr_lo);
+		debug(dbgbuf);
+		snprintf(dbgbuf, sizeof(dbgbuf),
+			"  cmd_phys=0x%08llx cmd_ctrl=0x%08x event_ctrl=0x%08x event_parm=0x%08x\n",
+			(unsigned long long)cmdPhys, cmd->control,
+			event->control, (uint32_t)event->parameter);
+		debug(dbgbuf);
 		(void)xhci_enterHaltedState(xhci);
 		memset(cmd, 0, sizeof(*cmd));
 		return -ETIMEDOUT;
