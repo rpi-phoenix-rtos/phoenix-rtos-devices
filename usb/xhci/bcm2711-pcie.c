@@ -340,7 +340,23 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 #define BCM2711_PCIE_RC_CFG_PRIV1_ID_VAL3 0x043cu
 #define BCM2711_PCIE_RC_BAR1_CONFIG_LO    0x402cu
 #define BCM2711_PCIE_RC_BAR2_CONFIG_LO    0x4034u
+/* USB-FIX-16 (2026-05-26): RC_BAR3 is the PCIe -> SCB peripheral
+ * window. Pi 4 firmware sometimes leaves it with a non-zero default
+ * SIZE mapping that shadows the BAR2 path; inbound TLPs from PCIe
+ * devices get silently routed to the SCB aperture instead of DRAM.
+ * Linux's pcie-brcmstb.c::brcm_pcie_setup() always clears the SIZE
+ * field unconditionally. */
+#define BCM2711_PCIE_RC_BAR3_CONFIG_LO    0x403cu
 #define BCM2711_PCIE_RC_BAR2_CONFIG_HI    0x4038u
+/* PCIE_MISC_UBUS_BAR2_CONFIG_REMAP: CPU-side enable for inbound BAR2
+ * window. On BCM2711 reset, bit 0 (ACCESS_ENABLE) is 0, gating all
+ * inbound DMA from PCIe devices at the UBUS interconnect. Linux's
+ * pcie-brcmstb.c::brcm_pcie_setup() sets it; without it, VL805's
+ * DMA reads/writes silently disappear at the bridge -- exactly the
+ * symptom we've been chasing all day. */
+#define BCM2711_PCIE_UBUS_BAR2_REMAP_LO   0x40b4u
+#define BCM2711_PCIE_UBUS_BAR2_REMAP_HI   0x40b8u
+#define BCM2711_PCIE_UBUS_BAR2_ACCESS_EN  0x1u
 #define BCM2711_PCIE_MISC_STATUS          0x4068u
 #define BCM2711_PCIE_MISC_REVISION        0x406cu
 #define BCM2711_PCIE_MEM_WIN0_BASE_LIMIT  0x4070u
@@ -667,6 +683,21 @@ static void bcm2711SetRcBar2(pcie_bcm2711_ctx_t *ctx, uint64_t pcieAddr, uint64_
 	writeReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_LO, value);
 	writeReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_HI, UPPER_32_BITS(pcieAddr));
 
+	/* USB-FIX-15 (2026-05-26): enable UBUS-side BAR2 access. Without
+	 * this bit set, the BCM2711 UBUS interconnect drops every inbound
+	 * DMA TLP from PCIe devices targeting the BAR2 window -- even
+	 * though RC_BAR2_CONFIG_LO/HI advertise a correctly sized window
+	 * on the PCIe side. Linux's brcm_pcie_setup() always sets this
+	 * after programming the PCIe-side decoder. On BCM2711 (unlike
+	 * BCM2712) the REMAP register has no address-base field -- it is
+	 * a pure enable, and the inbound PCIe address goes to the same
+	 * CPU PA via the SCB. */
+	{
+		uint32_t remap = readReg(ctx->base, BCM2711_PCIE_UBUS_BAR2_REMAP_LO);
+		remap |= BCM2711_PCIE_UBUS_BAR2_ACCESS_EN;
+		writeReg(ctx->base, BCM2711_PCIE_UBUS_BAR2_REMAP_LO, remap);
+	}
+
 	/* USB-FIX-11 (2026-05-26): read RC_BAR2 back and report via
 	 * debug() so we can confirm the inbound DMA window is actually
 	 * programmed. If the readback doesn't match what we wrote, the
@@ -675,11 +706,14 @@ static void bcm2711SetRcBar2(pcie_bcm2711_ctx_t *ctx, uint64_t pcieAddr, uint64_
 	{
 		uint32_t lo_rb = readReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_LO);
 		uint32_t hi_rb = readReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_HI);
-		char dbgbuf[128];
+		uint32_t remap_lo = readReg(ctx->base, BCM2711_PCIE_UBUS_BAR2_REMAP_LO);
+		char dbgbuf[160];
 		snprintf(dbgbuf, sizeof(dbgbuf),
-			"pcie: RC_BAR2 readback LO=0x%08x HI=0x%08x (size_field=0x%x)\n",
+			"pcie: RC_BAR2 LO=0x%08x HI=0x%08x sz=0x%x  UBUS_REMAP=0x%08x (EN=%u)\n",
 			lo_rb, hi_rb,
-			(unsigned)(lo_rb & BCM2711_PCIE_RC_BAR2_SIZE_MASK));
+			(unsigned)(lo_rb & BCM2711_PCIE_RC_BAR2_SIZE_MASK),
+			remap_lo,
+			(unsigned)(remap_lo & BCM2711_PCIE_UBUS_BAR2_ACCESS_EN));
 		debug(dbgbuf);
 	}
 }
@@ -876,6 +910,13 @@ static int pcie_cfgInitBcm2711(pcie_cfgio_t *cfgio)
 			uint32_t bar1 = readReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO);
 			bar1 &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
 			writeReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO, bar1);
+			/* USB-FIX-16: also disable BAR3 (PCIe->SCB peripheral
+			 * shadow). See header comment for rationale. */
+			{
+				uint32_t bar3 = readReg(bcm->base, BCM2711_PCIE_RC_BAR3_CONFIG_LO);
+				bar3 &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
+				writeReg(bcm->base, BCM2711_PCIE_RC_BAR3_CONFIG_LO, bar3);
+			}
 		}
 		bcm2711SetRcBar2(bcm, 0u, 0x100000000ull);
 		bcm2711ShapeRootBridge(bcm);
@@ -1431,6 +1472,12 @@ int bcm2711_pcie_resettleOutboundWindow(void)
 	bar1 = readReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO);
 	bar1 &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
 	writeReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO, bar1);
+	/* USB-FIX-16: also disable BAR3. */
+	{
+		uint32_t bar3 = readReg(bcm->base, BCM2711_PCIE_RC_BAR3_CONFIG_LO);
+		bar3 &= ~BCM2711_PCIE_RC_BAR2_SIZE_MASK;
+		writeReg(bcm->base, BCM2711_PCIE_RC_BAR3_CONFIG_LO, bar3);
+	}
 	bcm2711SetRcBar2(bcm, 0u, 0x100000000ull);
 	__asm__ volatile("dsb sy" ::: "memory");
 	__asm__ volatile("isb" ::: "memory");
