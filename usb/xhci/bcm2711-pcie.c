@@ -892,10 +892,13 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			uint16_t want = (cmd | PCI_CMD_MEM_ENABLE) & ~(uint16_t)PCI_CMD_MASTER_ENABLE;
 			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
 			uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
+			char dbgbuf[80];
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"pcie: VL805 pre-mailbox CMD=0x%04x (MEM only, MASTER deferred)\n", rb);
+			debug(dbgbuf);
 			if ((rb & PCI_CMD_MEM_ENABLE) == 0) {
-				fprintf(stderr, "pcie: VL805 MEM_ENABLE did not stick (cmd=%04x)\n", rb);
+				debug("pcie: VL805 MEM_ENABLE did not stick\n");
 			}
-			printf("pcie: VL805 pre-mailbox CMD=0x%04x (MEM only, MASTER deferred)\n", rb);
 		}
 
 		/*
@@ -908,9 +911,14 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		 */
 		uint32_t fw_ver_pre = cfgio->read32(cfgio->ctx, bus, dev, fun, 0x50);
 		int skip_mailbox = (fw_ver_pre != 0u);
-		printf("pcie: VL805 firmware version @0x50 pre-notify = 0x%08x  %s\n",
-			fw_ver_pre,
-			skip_mailbox ? "(already loaded, skipping mailbox)" : "(zero, will notify)");
+		{
+			char dbgbuf[96];
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"pcie: VL805 fw_ver @0x50 = 0x%08x  %s\n",
+				fw_ver_pre,
+				skip_mailbox ? "(loaded, skip mailbox)" : "(zero, will notify)");
+			debug(dbgbuf);
+		}
 
 		int err = 0;
 		if (!skip_mailbox) {
