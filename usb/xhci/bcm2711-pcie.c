@@ -667,6 +667,23 @@ static void bcm2711ExposeDownstreamBridge(pcie_bcm2711_ctx_t *ctx)
 		rootControl = bcm2711RootRead16(ctx, BCM2711_PCIE_CAP_REGS + PCI_EXP_RTCTL);
 		rootControl |= PCI_EXP_RTCTL_CRSSVE;
 		bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + PCI_EXP_RTCTL, rootControl);
+
+		/* USB-FIX-8 instrumentation: print RC PCIe Cap MPS/MRRS. */
+		{
+			uint32_t devcap = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x04);
+			uint32_t devctl = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x08);
+			char dbgbuf[128];
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"pcie: RC PCIe Cap @0xAC DCAP=0x%08x DCTL=0x%08x\n",
+				devcap, devctl);
+			debug(dbgbuf);
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"  RC MPS_supported=%u MPS_set=%u MRRS_set=%u\n",
+				(unsigned)(devcap & 0x7u),
+				(unsigned)((devctl >> 5) & 0x7u),
+				(unsigned)((devctl >> 12) & 0x7u));
+			debug(dbgbuf);
+		}
 	}
 
 	command |= PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE |
@@ -917,6 +934,31 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 				"pcie: VL805 fw_ver @0x50 = 0x%08x  %s\n",
 				fw_ver_pre,
 				skip_mailbox ? "(loaded, skip mailbox)" : "(zero, will notify)");
+			debug(dbgbuf);
+		}
+
+		/* USB-FIX-8 (2026-05-26): read VL805's PCIe Capability MPS/MRRS
+		 * fields. VL805 PCIe Cap is at config offset 0xC4 per the boot-time
+		 * "pcie: CAP id 0x10 address 0xc4" print. DCAP @ cap+0x04 has
+		 * MaxPayloadSize_Supported (bits[2:0]); DCTL @ cap+0x08 has
+		 * MaxPayloadSize (bits[7:5]) and MaxReadRequestSize (bits[14:12]).
+		 * Encoding: 000=128B, 001=256B, 010=512B, ...
+		 * If MPS isn't negotiated between VL805 and BCM2711 RC, every TLP
+		 * larger than the smaller-side limit fails. Linux's PCI core
+		 * does this via pcie_set_mps(). Phoenix does not. */
+		{
+			uint32_t devcap = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x04);
+			uint32_t devctl = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08);
+			char dbgbuf[128];
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"pcie: VL805 PCIe Cap @0xC4 DCAP=0x%08x DCTL=0x%08x\n",
+				devcap, devctl);
+			debug(dbgbuf);
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"  VL805 MPS_supported=%u MPS_set=%u MRRS_set=%u\n",
+				(unsigned)(devcap & 0x7u),
+				(unsigned)((devctl >> 5) & 0x7u),
+				(unsigned)((devctl >> 12) & 0x7u));
 			debug(dbgbuf);
 		}
 
