@@ -1233,10 +1233,18 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			 * the dev-0-only sweep there. Pre-creating the mapping
 			 * here is still useful because it avoids a redundant
 			 * MAP_DEVICE mmap inside xhci_init. */
+			/* Map the VL805 MMIO with MAP_UNCACHED in addition to
+			 * MAP_DEVICE so the page uses Device-nGnRnE (strongly ordered,
+			 * MAIR_IDX_S_ORDERED) rather than Device-nGnRE. nGnRnE is the
+			 * correct, strongest ordering for PCIe device registers and
+			 * matches the known-good lwip-port 'X' mapping of the same BAR.
+			 * (Tested as a candidate for the usb-hcd "event writes never
+			 * land" gap; it is NOT the fix, but the alignment is kept as a
+			 * correctness improvement.) */
 			volatile uint8_t *xhci_mmio = mmap(NULL,
 				bcm2711_pcie_getXhciMmioSize(),
 				PROT_READ | PROT_WRITE,
-				MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS,
+				MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
 				-1, PCIE_BCM2711_OUTBOUND_CPU_BASE);
 			if (xhci_mmio == MAP_FAILED) {
 				fprintf(stderr, "pcie: xhci mmio mmap failed in scan callback\n");

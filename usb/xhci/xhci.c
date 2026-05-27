@@ -681,7 +681,9 @@ static int xhci_map(hcd_t *hcd, xhci_t **xhcip)
 		xhci->mapSz = bcm2711_pcie_getXhciMmioSize();
 	}
 	else {
-		xhci->mmio = mmap(NULL, xhci->mapSz, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, hcd->info->hcdaddr - offs);
+		/* MAP_UNCACHED (Device-nGnRnE, no early write-ack) matches the
+		 * working lwip 'X' mapping; see USB-FIX-22 in bcm2711-pcie.c. */
+		xhci->mmio = mmap(NULL, xhci->mapSz, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, hcd->info->hcdaddr - offs);
 		if (xhci->mmio == MAP_FAILED) {
 			xhci_destroy(xhci);
 			return -ENOMEM;
