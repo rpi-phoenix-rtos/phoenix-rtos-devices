@@ -92,6 +92,8 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_SUPPORTED_VERSION   0x0100u
 #define XHCI_REG_OP_USBCMD_RS    (1u << 0)
 #define XHCI_REG_OP_USBCMD_HCRST (1u << 1)
+#define XHCI_REG_OP_USBCMD_INTE  (1u << 2)
+#define XHCI_REG_OP_USBCMD_HSEE  (1u << 3)
 #define XHCI_REG_OP_USBSTS_HCH   (1u << 0)
 #define XHCI_REG_OP_USBSTS_HSE   (1u << 2)
 #define XHCI_REG_OP_USBSTS_CNR   (1u << 11)
@@ -1281,7 +1283,13 @@ static int xhci_enterRunState(xhci_t *xhci)
 		unsigned attempt;
 		for (attempt = 0u; attempt < 10u; ++attempt) {
 			usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
-			xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
+			/* Set R/S together with INTE and HSEE in a single USBCMD write,
+			 * matching Linux xhci_run(). INTE/HSEE gate only the interrupt
+			 * line (usb-hcd polls the event ring), so this is not required
+			 * for correctness, but it keeps the run sequence aligned with
+			 * the reference stacks. */
+			xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD,
+				usbcmd | XHCI_REG_OP_USBCMD_RS | XHCI_REG_OP_USBCMD_INTE | XHCI_REG_OP_USBCMD_HSEE);
 
 			err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, 0u, XHCI_RUNSTOP_TIMEOUT_MS);
 			if (err < 0) {
