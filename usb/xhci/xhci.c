@@ -2427,20 +2427,31 @@ static int xhci_init(hcd_t *hcd)
 	}
 
 	/* Pi 4 BRIDGE-ONLY split (2026-05-28): when this process exists
-	 * solely to do the one-shot BCM2711 PCIe bridge bring-up, exit
-	 * cleanly here. The actual controller bring-up runs in a later
-	 * process (currently lwip-port-embedded with USB_HCD_PCIE_DRIVE_ONLY).
+	 * solely to do the one-shot BCM2711 PCIe bridge bring-up, PARK
+	 * here instead of exiting. The actual controller bring-up runs in
+	 * a later process (currently lwip-port-embedded).
 	 *
-	 * Empirically the VL805 retains an internal CRCR latch across HCRST:
-	 * if THIS process programs CRCR and exits, the next process's HCRST
-	 * + fresh CRCR write does not actually replace the stored pointer,
-	 * and the next process sees command-completion events with parm =
-	 * THIS process's cmd-ring PA. Avoid that by never touching the
-	 * controller in the bridge-only boot daemon. */
+	 * Why park instead of exit: bcm2711_pcie_initVL805 leaks the bridge
+	 * config-register mapping intentionally because munmap-on-process-
+	 * teardown invalidates the bridge outbound translation
+	 * (see "INTENTIONALLY DO NOT DESTROY" in bcm2711-pcie.c). _exit()
+	 * forcibly unmaps everything the process owns — including that
+	 * leaked mapping — and the bridge translation gets churned for the
+	 * next process. Empirically this manifests as flaky MMIO reads
+	 * (USBSTS returning 0) in the next process to touch the
+	 * controller. Parking holds the mapping alive forever and keeps
+	 * the bridge translation stable.
+	 *
+	 * Additionally, the VL805 retains an internal CRCR latch across
+	 * HCRST. Never touching the controller in the boot-time daemon
+	 * means the next process's HCRST + fresh CRCR write actually
+	 * replaces the stored pointer. */
 	if (getenv("BCM2711_USB_BRIDGE_ONLY") != NULL) {
-		debug("xhci: bridge-only mode — bridge is up, exiting cleanly\n");
+		debug("xhci: bridge-only mode — bridge is up, parking to preserve outbound mapping\n");
 		fflush(NULL);
-		_exit(0);
+		for (;;) {
+			sleep(3600);
+		}
 	}
 
 	err = xhci_map(hcd, &xhci);
