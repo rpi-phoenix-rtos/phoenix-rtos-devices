@@ -2455,46 +2455,51 @@ static int xhci_init(hcd_t *hcd)
 		if (err == 0) {
 			err = xhci_validateRuntime(xhci);
 			if (err == 0) {
+				/* ALLOCATE EVERYTHING FIRST (2026-05-28 experiment):
+				 * the 'X' diag rig allocates dcbaa + cmdRing + evtRing
+				 * + erst + scratchpadArray + scratchpadBufs ALL in a
+				 * single pre-MMIO batch before any controller register
+				 * writes. xhci_init previously interleaved allocations
+				 * with MMIO writes (allocCommandSpace, programCommand,
+				 * allocEventRing, programEventRing). Restructure to
+				 * mirror the rig's allocate-then-program pattern in
+				 * case the kernel allocator's behavior with MAP_CONTIGUOUS
+				 * depends on intervening MMIO writes (which would
+				 * affect bridge-side state on BCM2711). */
 				err = xhci_allocCommandSpace(xhci);
 				if (err == 0) {
 					err = xhci_initCommandRing(xhci);
+				}
+				if (err == 0) {
+					err = xhci_allocScratchpads(xhci);
+				}
+				if (err == 0) {
+					err = xhci_allocEventRing(xhci);
+				}
+				if (err == 0) {
+					/* Now do all the MMIO programming, no allocations
+					 * in between. */
+					err = xhci_programCommandSpace(xhci);
 					if (err == 0) {
-						err = xhci_allocScratchpads(xhci);
+						err = xhci_programEventRing(xhci);
 					}
 					if (err == 0) {
-						err = xhci_programCommandSpace(xhci);
-						/* xHCI 1.2 §4.5: software MUST have programmed
-						 * Max Slots, DCBAAP, Command Ring, AND Event
-						 * Ring 0 (ERSTBA) before setting R/S=1. Toggling
-						 * R/S without a valid event ring leaves the
-						 * controller's event handling undefined; on VL805
-						 * we see USBSTS.HCE/HSE set on transition.
-						 * Allocate + program the event ring FIRST, then
-						 * run the R/S selftest. */
+						/* xhci_runStateSelftest (toggle R/S then back
+						 * to verify the transition) was a Phoenix
+						 * addition not done by Linux/FreeBSD/Circle.
+						 * On VL805 the controller spends real time
+						 * processing the brief R/S=1 (port scan,
+						 * device discovery) and the subsequent
+						 * R/S=0 halt-transition can't meet our 250ms
+						 * timeout. Skip the selftest; cmdNoopSelftest
+						 * already enters the run state via cmdExec,
+						 * which is the canonical "controller alive"
+						 * check. */
+						err = xhci_cmdNoopSelftest(xhci);
 						if (err == 0) {
-							err = xhci_allocEventRing(xhci);
+							err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
 							if (err == 0) {
-								err = xhci_programEventRing(xhci);
-								/* xhci_runStateSelftest (toggle R/S then back
-								 * to verify the transition) was a Phoenix
-								 * addition not done by Linux/FreeBSD/Circle.
-								 * On VL805 the controller spends real time
-								 * processing the brief R/S=1 (port scan,
-								 * device discovery) and the subsequent
-								 * R/S=0 halt-transition can't meet our 250ms
-								 * timeout. Skip the selftest; cmdNoopSelftest
-								 * already enters the run state via cmdExec,
-								 * which is the canonical "controller alive"
-								 * check. */
-								if (err == 0) {
-									err = xhci_cmdNoopSelftest(xhci);
-									if (err == 0) {
-										err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
-										if (err == 0) {
-											err = xhci_allocSlotSpace(xhci);
-										}
-									}
-								}
+								err = xhci_allocSlotSpace(xhci);
 							}
 						}
 					}
