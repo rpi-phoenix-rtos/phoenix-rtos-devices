@@ -1398,6 +1398,43 @@ int bcm2711_pcie_initVL805(void)
 	int ret = 0;
 
 #ifdef PCI_EXPRESS_BCM2711_INDEXED_CFG
+	/* Pi 4 PoC drive-only path (2026-05-28): when this process is hosting
+	 * the USB host stack inside lwip-port (which sets USB_HCD_PCIE_DRIVE_ONLY
+	 * before calling usb_init), an earlier boot-time `usb` daemon instance
+	 * already performed the one-shot BCM2711 PCIe bridge bring-up — that
+	 * state persists in bridge HW after the boot-time process exits. Skip
+	 * the bring-up here so this drive-only instance never PERSTs the bridge
+	 * or does the in-process bridge config that empirically (on BCM2711)
+	 * leaves THIS process's subsequent xHCI inbound DMA writes silently
+	 * lost. bcm2711_pcie_getXhciMmio() stays NULL on this path, so xhci_map
+	 * falls back to a fresh MAP_PHYSMEM mapping of the controller MMIO —
+	 * exactly the known-good drive-only path the diag-udp 'X' rig uses.
+	 * The probe mapping is intentionally held (not unmapped) on the skip
+	 * path: holding the bridge mapping is harmless and avoids the
+	 * munmap-invalidates-translation hazard noted at the bottom of this
+	 * function. */
+	if (getenv("USB_HCD_PCIE_DRIVE_ONLY") != NULL) {
+		volatile uint8_t *probe = mmap(NULL, PCIE_BCM2711_HOST_SIZE,
+			PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS,
+			-1, PCIE_BCM2711_HOST_BASE);
+		if (probe != MAP_FAILED) {
+			uint32_t linkmask = BCM2711_PCIE_MISC_STATUS_PCIE_DL_ACTIVE_MASK |
+				BCM2711_PCIE_MISC_STATUS_PCIE_PHYLINKUP_MASK;
+			int i;
+			for (i = 0; i < 1000; i++) { /* wait up to ~10 s for the initializer */
+				uint32_t st = *(volatile uint32_t *)(probe + BCM2711_PCIE_MISC_STATUS);
+				if ((st & linkmask) == linkmask) {
+					break;
+				}
+				usleep(10000);
+			}
+			debug("xhci-pcie: drive-only instance; bridge bring-up skipped (waited for link)\n");
+			/* probe mapping intentionally held (leaked) — see comment above */
+			return EOK;
+		}
+		/* Probe map failed; fall through to full init so a lone instance
+		 * still has a chance to come up. */
+	}
 	ret = pcie_cfgInitBcm2711(&cfgio);
 #else
 	/* Non-BCM2711 boards reach this function only if their xhci PHY
