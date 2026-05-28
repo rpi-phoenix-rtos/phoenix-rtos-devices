@@ -1420,19 +1420,39 @@ int bcm2711_pcie_initVL805(void)
 		if (probe != MAP_FAILED) {
 			uint32_t linkmask = BCM2711_PCIE_MISC_STATUS_PCIE_DL_ACTIVE_MASK |
 				BCM2711_PCIE_MISC_STATUS_PCIE_PHYLINKUP_MASK;
+			uint32_t st = 0u;
 			int i;
 			for (i = 0; i < 1000; i++) { /* wait up to ~10 s for the initializer */
-				uint32_t st = *(volatile uint32_t *)(probe + BCM2711_PCIE_MISC_STATUS);
+				st = *(volatile uint32_t *)(probe + BCM2711_PCIE_MISC_STATUS);
 				if ((st & linkmask) == linkmask) {
 					break;
 				}
 				usleep(10000);
 			}
-			debug("xhci-pcie: drive-only instance; bridge bring-up skipped (waited for link)\n");
-			/* probe mapping intentionally held (leaked) — see comment above.
-			 * TESTED 2026-05-28: skipping this probe mmap entirely did NOT
-			 * improve the 0% PoC pass rate (5-trial bench, no-bridge-map). */
-			return EOK;
+			if ((st & linkmask) == linkmask) {
+				char dbgbuf[128];
+				snprintf(dbgbuf, sizeof(dbgbuf),
+					"xhci-pcie: drive-only; link UP (MISC_STATUS=0x%08x) after %d iters\n",
+					(unsigned)st, i);
+				debug(dbgbuf);
+				/* probe mapping intentionally held (leaked) — see comment
+				 * above. */
+				return EOK;
+			}
+			/* Link didn't come up within 10 s. Known Pi 4 silicon
+			 * variability per Linux issue #5060 / rpi forums #380969:
+			 * some VL805 instances fail PCIe link bring-up unless an
+			 * RC delay between 3.3V and nPONRST is in place. This is
+			 * hardware-level — software can only report and bail. */
+			{
+				char dbgbuf[128];
+				snprintf(dbgbuf, sizeof(dbgbuf),
+					"xhci-pcie: drive-only LINK DOWN after 10s (MISC_STATUS=0x%08x); aborting\n",
+					(unsigned)st);
+				debug(dbgbuf);
+			}
+			munmap((void *)probe, PCIE_BCM2711_HOST_SIZE);
+			return -ENODEV;
 		}
 		/* Probe map failed; fall through to full init so a lone instance
 		 * still has a chance to come up. */
