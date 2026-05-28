@@ -2420,6 +2420,23 @@ static int xhci_init(hcd_t *hcd)
 		return err;
 	}
 
+	/* Pi 4 BRIDGE-ONLY split (2026-05-28): when this process exists
+	 * solely to do the one-shot BCM2711 PCIe bridge bring-up, exit
+	 * cleanly here. The actual controller bring-up runs in a later
+	 * process (currently lwip-port-embedded with USB_HCD_PCIE_DRIVE_ONLY).
+	 *
+	 * Empirically the VL805 retains an internal CRCR latch across HCRST:
+	 * if THIS process programs CRCR and exits, the next process's HCRST
+	 * + fresh CRCR write does not actually replace the stored pointer,
+	 * and the next process sees command-completion events with parm =
+	 * THIS process's cmd-ring PA. Avoid that by never touching the
+	 * controller in the bridge-only boot daemon. */
+	if (getenv("BCM2711_USB_BRIDGE_ONLY") != NULL) {
+		debug("xhci: bridge-only mode — bridge is up, exiting cleanly\n");
+		fflush(NULL);
+		_exit(0);
+	}
+
 	err = xhci_map(hcd, &xhci);
 	if (err < 0) {
 		return err;
