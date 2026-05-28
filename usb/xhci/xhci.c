@@ -1666,36 +1666,15 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 			debug(dbgbuf);
 		}
 
-		/* DECISIVE read-cache-vs-no-write test: map a FRESH
-		 * MAP_PHYSMEM|MAP_UNCACHED view of the event ring's physical
-		 * page and re-read ev[0..1]. If this fresh (guaranteed-
-		 * uncached) view shows a real event while our normal mapping
-		 * still reads 0xdeadbeef, then the controller DID DMA-write
-		 * and our event-ring mapping is effectively CACHED (MAP_UNCACHED
-		 * defeated by a cacheable alias) — a CPU read-side stale-cache
-		 * bug, not a dead inbound-write path. If both read 0xdeadbeef,
-		 * the device genuinely never wrote. This is the fork the whole
-		 * investigation hinges on. */
-		{
-			addr_t evpa = (addr_t)xhci->eventRingPhys;
-			addr_t evpage = evpa & ~((addr_t)_PAGE_SIZE - 1U);
-			size_t evoff = (size_t)(evpa - evpage);
-			volatile uint32_t *fresh = (volatile uint32_t *)mmap(NULL, _PAGE_SIZE,
-				PROT_READ | PROT_WRITE,
-				MAP_PHYSMEM | MAP_UNCACHED | MAP_ANONYMOUS, -1, (off_t)evpage);
-			if (fresh != MAP_FAILED) {
-				volatile uint32_t *fe = (volatile uint32_t *)((volatile uint8_t *)fresh + evoff);
-				snprintf(dbgbuf, sizeof(dbgbuf),
-					"  FRESH-uncached ev[0..1]: %08x %08x %08x | %08x %08x %08x  (vs normal ev[0] st=%08x)\n",
-					fe[0], fe[1], fe[2], fe[4], fe[5], fe[6],
-					((xhci_trb_t *)xhci->eventRing)[0].status);
-				debug(dbgbuf);
-				munmap((void *)fresh, _PAGE_SIZE);
-			}
-			else {
-				debug("  FRESH-uncached remap FAILED\n");
-			}
-		}
+		/* (Removed 2026-05-28) The FRESH-uncached re-read of the event
+		 * ring used to be here to disambiguate "controller wrote but
+		 * cache aliasing hides the write" vs "controller never wrote".
+		 * Hypothesis was conclusively DISPROVED across many trials:
+		 * FRESH MAP_PHYSMEM|MAP_UNCACHED and the normal MAP_UNCACHED
+		 * always agree, so cache aliasing is not the failure mechanism.
+		 * Removed per CLAUDE.md "remove diagnostic-only code whose
+		 * hypothesis was disproved" guidance. See memory
+		 * usb-dma-write-loss for the full investigation. */
 		(void)event;
 		(void)xhci_enterHaltedState(xhci);
 		memset(cmd, 0, sizeof(*cmd));
