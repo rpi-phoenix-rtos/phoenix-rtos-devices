@@ -1429,7 +1429,9 @@ int bcm2711_pcie_initVL805(void)
 				usleep(10000);
 			}
 			debug("xhci-pcie: drive-only instance; bridge bring-up skipped (waited for link)\n");
-			/* probe mapping intentionally held (leaked) — see comment above */
+			/* probe mapping intentionally held (leaked) — see comment above.
+			 * TESTED 2026-05-28: skipping this probe mmap entirely did NOT
+			 * improve the 0% PoC pass rate (5-trial bench, no-bridge-map). */
 			return EOK;
 		}
 		/* Probe map failed; fall through to full init so a lone instance
