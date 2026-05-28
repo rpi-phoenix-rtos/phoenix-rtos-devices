@@ -1147,11 +1147,21 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 	config &= ~XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK;
 	config |= xhci->nslots & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK;
 
-	xhci_opWrite32(xhci, XHCI_REG_OP_DCBAAP_HI, dcbaapHi);
-	xhci_opWrite32(xhci, XHCI_REG_OP_DCBAAP, dcbaapLo);
-	xhci_opWrite32(xhci, XHCI_REG_OP_CRCR_HI, crcrHi);
-	xhci_opWrite32(xhci, XHCI_REG_OP_CRCR, crcrLo);
+	/* 2026-05-28: match the 'X' diag rig's register-write order
+	 * exactly (port/diag-udp.c):
+	 *   1) CONFIG.MaxSlotsEn  — set BEFORE pointers, not after
+	 *   2) DCBAAP_LO          — LO first (LO commits the 64-bit write)
+	 *   3) DCBAAP_HI
+	 *   4) CRCR_LO            — same LO-first ordering
+	 *   5) CRCR_HI
+	 * The rig has known-good behavior; xhci_init had a different order
+	 * (HI first, CONFIG last) which xHCI spec says shouldn't matter but
+	 * VL805 firmware quirks may not match the spec. */
 	xhci_opWrite32(xhci, XHCI_REG_OP_CONFIG, config);
+	xhci_opWrite32(xhci, XHCI_REG_OP_DCBAAP, dcbaapLo);
+	xhci_opWrite32(xhci, XHCI_REG_OP_DCBAAP_HI, dcbaapHi);
+	xhci_opWrite32(xhci, XHCI_REG_OP_CRCR, crcrLo);
+	xhci_opWrite32(xhci, XHCI_REG_OP_CRCR_HI, crcrHi);
 
 	xhci->dcbaapLo = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP);
 	xhci->dcbaapHi = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP_HI);
