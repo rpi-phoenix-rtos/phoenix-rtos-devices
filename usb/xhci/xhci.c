@@ -870,7 +870,13 @@ static int xhci_reset(xhci_t *xhci)
 	 * and any inbound DMA the controller issues at R/S=1 still
 	 * reaches DRAM. The CRCR re-publish before each doorbell that
 	 * exists today is a symptom-workaround for the same class of
-	 * bug; if FIX-3 holds we can drop that hack. */
+	 * bug; if FIX-3 holds we can drop that hack.
+	 *
+	 * NOTE 2026-05-28: tested skipping this call to match the known-
+	 * good 'X' diag rig (which doesn't touch the bridge after HCRST).
+	 * It did NOT change the outcome — the PoC still failed with zero
+	 * events landing. Keep FIX-3 active; the rig-vs-PoC divergence
+	 * must be elsewhere in the controller-side sequence. */
 	{
 		int re = bcm2711_pcie_resettleOutboundWindow();
 		if (re != EOK && re != -ENODEV) {
