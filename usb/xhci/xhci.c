@@ -1290,6 +1290,13 @@ static int xhci_enterRunState(xhci_t *xhci)
 	 * memory access. */
 	__asm__ volatile("dsb sy" ::: "memory");
 
+	/* Pre-R/S settle: the working lwip-port 'X' rig sleeps 10 ms after
+	 * the DSB and before the first R/S=1 (diag-udp.c:1644-1645), giving
+	 * the controller time to settle after the burst of ring-pointer
+	 * register writes. The PoC previously went straight to R/S. Matched
+	 * here to eliminate it as a rig-vs-PoC variable. */
+	usleep(10000);
+
 	/* HSE-on-R/S=1 soft retry (2026-05-24): on bridge state where the
 	 * controller's first DMA fetch fails (USBSTS.HSE = 1, controller
 	 * self-halts), clear HSE (write-1-to-clear), drop R/S, wait for
@@ -2341,17 +2348,20 @@ static int xhci_programEventRing(xhci_t *xhci)
 		return -ENODEV;
 	}
 
-	/* Order matters: ERSTSZ, then ERDP, then ERSTBA LAST. Writing
+	/* Order matters: ERSTSZ first, then ERDP, then ERSTBA LAST. Writing
 	 * ERSTBA is what makes the xHC (re)read the ERST and latch its
 	 * internal event-ring enqueue/dequeue (xHCI 1.2 §4.9.4 / §5.5.2.3).
-	 * The working lwip-port bring-up ('X' diag) uses exactly this
-	 * order; usb-hcd previously wrote ERSTBA before ERDP, leaving the
-	 * controller to load the ERST with a not-yet-initialised ERDP. */
+	 * Within each 64-bit register pair, write LO then HI to byte-match
+	 * the working lwip-port bring-up ('X' diag, diag-udp.c:1631-1635),
+	 * which uses ERSTSZ, ERDP_LO, ERDP_HI, ERSTBA_LO, ERSTBA_HI. (For
+	 * the low-memory rings the HI halves are 0, so the half-order should
+	 * be inert — but we keep it byte-identical to the known-good rig to
+	 * eliminate it as a variable; see the rig-vs-PoC bring-up diff.) */
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTSZ, XHCI_ERST_ENTRY_COUNT & XHCI_REG_RT_IR_ERSTSZ__MASK);
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, erdpHi);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO, erdpLo);
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_HI, erstbaHi);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, erdpHi);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_LO, erstbaLo);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_HI, erstbaHi);
 
 	/* NOTE: deliberately NOT setting IMAN.IE / IMOD here. The working
 	 * lwip-port 'X' bring-up leaves both at their post-HCRST default
