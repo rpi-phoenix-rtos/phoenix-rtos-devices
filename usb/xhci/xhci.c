@@ -1508,20 +1508,15 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	cmdPhys = xhci->cmdRingPhys;
 
 	event = (xhci_trb_t *)xhci->eventRing;
-	/* USB-FIX-14 instrumentation: paint a magic pattern on the first
-	 * 4 event TRBs. After timeout we'll see if the pattern survived
-	 * (controller never wrote -> inbound DMA write broken) or got
-	 * overwritten (controller did write -> our polling missed it). */
-	{
-		xhci_trb_t *evring = (xhci_trb_t *)xhci->eventRing;
-		int k;
-		for (k = 0; k < 4; ++k) {
-			evring[k].parameter = 0xCAFEBABE00000000ull | (uint64_t)k;
-			evring[k].status = 0xDEADBEEFu;
-			evring[k].control = 0xFFFF0000u;
-		}
-		__asm__ volatile("dsb sy" ::: "memory");
-	}
+	/* (2026-05-30) Stage 2a: removed the idx 0-3 "sentinel paint". It
+	 * overwrote any event TRB the controller had ALREADY posted at idx 0
+	 * (e.g. an autonomous Port-Status Change generated at R/S=1) with a
+	 * cycle-bit-0 pattern, which forced the cycle-bit walk below to break
+	 * at idx 0 and never reach the real Command Completion further in.
+	 * Stage 1 proved the completion DMA-lands (type-33, cc=SUCCESS, at
+	 * idx 1 behind a port event); the paint was the sole thing hiding it.
+	 * Detection now relies purely on the event TRB cycle bit (xHCI 4.9.4),
+	 * the spec-correct mechanism. */
 
 	err = xhci_enterRunState(xhci);
 	if (err < 0) {
