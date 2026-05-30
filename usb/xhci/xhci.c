@@ -412,6 +412,7 @@ typedef struct {
 	uint64_t ep0RingPhys;
 	uint32_t cmdRingCount;
 	uint32_t cmdCycleState;
+	uint32_t cmdEnqueue;      /* persistent command-ring producer index (xhci_cmdExec) */
 	uint32_t ep0RingCount;
 	uint32_t ep0CycleState;   /* producer cycle state for the ep0 transfer ring */
 	uint32_t ep0Enqueue;      /* persistent ep0 producer index (xhci_ep0Push) */
@@ -428,6 +429,7 @@ typedef struct {
 	uint64_t erdp;
 	struct xhci_pipePriv *interruptPriv;
 	uint8_t slotAddressed;    /* the single tracked slot has had Address Device issued */
+	uint8_t crcrPublished;    /* CRCR re-published once before the first command */
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
@@ -1027,6 +1029,7 @@ static int xhci_initCommandRing(xhci_t *xhci)
 
 	xhci->cmdRingTrbs = (xhci_trb_t *)xhci->cmdRing;
 	xhci->cmdCycleState = 1u;
+	xhci->cmdEnqueue = 0u;
 
 	link = &xhci->cmdRingTrbs[xhci->cmdRingCount - 1u];
 	link->parameter = xhci->cmdRingPhys;
@@ -1577,12 +1580,29 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	uint32_t completion;
 	int err;
 
-	cmd = &xhci->cmdRingTrbs[0];
+	/* Persistent command-ring producer. The controller's internal command
+	 * dequeue advances past each consumed command and is NOT rewound by a
+	 * CRCR rewrite once the ring is running (the VL805 ignores it — see the
+	 * one-shot republish below), so each command must be enqueued at the
+	 * running producer position with the running cycle bit. Writing every
+	 * command at index 0 (the prior behaviour) was only seen for the first
+	 * command after init; the second hung (cmd-completion never landed).
+	 * Wrap + toggle the cycle at the trailing Link TRB. */
+	if (xhci->cmdEnqueue >= (xhci->cmdRingCount - 1u)) {
+		xhci_trb_t *link = &xhci->cmdRingTrbs[xhci->cmdRingCount - 1u];
+		link->control = (link->control & ~XHCI_TRB_CONTROL_C) |
+			(xhci->cmdCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
+		xhci->cmdEnqueue = 0u;
+		xhci->cmdCycleState ^= 1u;
+	}
+
+	cmd = &xhci->cmdRingTrbs[xhci->cmdEnqueue];
 	memset(cmd, 0, sizeof(*cmd));
 	cmd->parameter = parameter;
 	cmd->status = status;
 	cmd->control = (control & ~XHCI_TRB_CONTROL_C) | (xhci->cmdCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
-	cmdPhys = xhci->cmdRingPhys;
+	cmdPhys = xhci->cmdRingPhys + ((uint64_t)xhci->cmdEnqueue * (uint64_t)XHCI_TRB_SIZE);
+	xhci->cmdEnqueue++;
 
 	/* Completions are consumed via xhci_eventAwait() below (shared
 	 * persistent dequeue, cycle-bit detection). The old idx 0-3 "sentinel
@@ -1602,25 +1622,28 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	 * a precondition for the doorbell-triggered DMA read). */
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	/* Re-publish CRCR pointer right before doorbell. Spec § 5.4.5
-	 * allows CRCR writes only when the Command Ring is Stopped
-	 * (CRR=0); we just verified controller transitioned to RUN and
-	 * the cmd ring hasn't started yet (CRR=0 throughout init).
+	/* Re-publish CRCR pointer ONCE, right before the first command's
+	 * doorbell. Spec § 5.4.5 allows CRCR writes only when the Command Ring
+	 * is Stopped (CRR=0), which holds before the first command. Earlier
+	 * diagnostics showed the controller losing the cmd-ring pointer between
+	 * programCommandSpace and the first doorbell (bridge-side MMIO churn
+	 * during init), so re-establishing the base pointer here lets the first
+	 * command run.
 	 *
-	 * Why: previous diagnostics showed CRR=0 + event[0]=0 + USBSTS
-	 * clean after R/S=1 + doorbell, suggesting the controller may
-	 * have lost the cmd-ring pointer between programCommandSpace
-	 * (when we wrote CRCR initially) and this point. Bridge-side
-	 * MMIO write churn during the intervening init steps is a
-	 * plausible cause. Re-publishing is idempotent if the pointer
-	 * is still valid. */
-	{
+	 * It MUST be one-shot: once the ring is running the command producer is
+	 * persistent (xhci->cmdEnqueue), so a later CRCR=base rewrite would —
+	 * if honoured — rewind the controller's dequeue to index 0 and desync it
+	 * from the producer mid-stream. (Empirically the VL805 ignores the
+	 * rewrite once running anyway — that was bug #3 — but relying on that
+	 * would be fragile.) */
+	if (xhci->crcrPublished == 0u) {
 		uint64_t cmdRingPhys = xhci->cmdRingPhys;
 		uint32_t crcrLo = (uint32_t)(cmdRingPhys & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK) | XHCI_REG_OP_CRCR_RCS;
 		uint32_t crcrHi = (uint32_t)(cmdRingPhys >> 32);
 		xhci_opWrite32(xhci, XHCI_REG_OP_CRCR_HI, crcrHi);
 		xhci_opWrite32(xhci, XHCI_REG_OP_CRCR, crcrLo);
 		(void)xhci_opRead32(xhci, XHCI_REG_OP_USBSTS); /* flush */
+		xhci->crcrPublished = 1u;
 	}
 
 	xhci_dbWrite32(xhci, 0u, 0u);
@@ -2473,6 +2496,7 @@ static int xhci_init(hcd_t *hcd)
 		xhci->cmdRingPhys = h.cmdRingPhys;
 		xhci->cmdRingCount = h.cmdRingCount;
 		xhci->cmdCycleState = h.cmdCycleState;
+		xhci->cmdEnqueue = 0u;                     /* command producer starts at segment base */
 		xhci->eventRing = h.eventRing;
 		xhci->eventRingPhys = h.eventRingPhys;
 		xhci->eventRingTrbs = h.eventRingTrbs;
