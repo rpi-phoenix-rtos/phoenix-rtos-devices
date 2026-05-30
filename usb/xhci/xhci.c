@@ -350,6 +350,12 @@ typedef struct {
 } __attribute__((packed)) xhci_erst_entry_t;
 
 
+/* Depth of the cross-consumer event stash (see xhci_eventAwait). Bounds the
+ * number of in-flight events that belong to the other consumer; enumeration is
+ * sequential so only a handful are ever live at once. */
+#define XHCI_EVENT_STASH_MAX 16u
+
+
 typedef struct {
 	void *mmio;
 	size_t mapSz;
@@ -419,6 +425,11 @@ typedef struct {
 	uint32_t eventRingTrbs;
 	uint32_t eventCycleState; /* consumer cycle state (CCS) for the shared event-ring dequeue */
 	uint32_t eventDeq;        /* shared event-ring dequeue index (xhci_eventAwait) */
+	handle_t eventLock;       /* serialises shared event-ring consumption between the
+	                             enumeration path (cmd/ep0) and the roothub status thread */
+	xhci_trb_t eventStash[XHCI_EVENT_STASH_MAX]; /* events consumed for the *other* consumer,
+	                             parked here so a dispatch pass never discards them */
+	uint32_t eventStashCount;
 	uint8_t slotId;
 	uint32_t erstsz;
 	uint32_t erstbaLo;
@@ -610,19 +621,19 @@ static void xhci_destroy(xhci_t *xhci)
 }
 
 
+static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out);
+
+
 static void xhci_roothubStatusThread(void *arg)
 {
 	hcd_t *hcd = (hcd_t *)arg;
 	xhci_t *xhci = (xhci_t *)hcd->priv;
 	usb_dev_t *hub;
 	xhci_pipePriv_t *priv;
-	xhci_trb_t *event;
+	xhci_trb_t ev;
 	usb_transfer_t *t;
 	uint32_t status;
-	uint32_t type;
 	uint32_t completion;
-	uint32_t endpointId;
-	uint32_t slotId;
 	uint32_t residual;
 	unsigned sleepUs;
 	int ret;
@@ -641,21 +652,18 @@ static void xhci_roothubStatusThread(void *arg)
 		priv = xhci->interruptPriv;
 		if ((priv != NULL) && (priv->pendingTransfer != NULL)) {
 			sleepUs = 1000u;
-			event = (xhci_trb_t *)xhci->eventRing;
-			if ((event->control & XHCI_TRB_CONTROL_C) == (xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
+			/* Single non-blocking poll of the shared event ring (locked,
+			 * stash-aware) for this interrupt endpoint's completion. The
+			 * dispatcher owns the dequeue/ERDP/cycle and the controller keeps
+			 * running (keepRunning) — so no ERDP-reset or R/S=0 here. */
+			if (xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, priv->pendingTrbPhys,
+					priv->endpointId, 1u, &ev) == EOK) {
 				t = priv->pendingTransfer;
-				type = (event->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
-				completion = (event->status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
+				completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
 					XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
-				endpointId = (event->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >>
-					XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
-				slotId = (event->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >>
-					XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
-				residual = event->status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
+				residual = ev.status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
 
-				if ((type == XHCI_TRB_TYPE_EVENT_TRANSFER) && (event->parameter == priv->pendingTrbPhys) &&
-					(endpointId == priv->endpointId) && (slotId == xhci->slotId) &&
-					(residual <= t->size) &&
+				if ((residual <= t->size) &&
 					((completion == XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
 					(completion == XHCI_TRB_COMPLETION_CODE_SHORT_PACKET))) {
 					ret = (int)(t->size - residual);
@@ -663,12 +671,6 @@ static void xhci_roothubStatusThread(void *arg)
 				else {
 					ret = -ENODEV;
 				}
-
-				memset(event, 0, sizeof(*event));
-				xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, (uint32_t)(xhci->eventRingPhys >> 32));
-				xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO,
-					(uint32_t)(xhci->eventRingPhys & XHCI_REG_RT_IR_ERDP_LO__MASK) | XHCI_REG_RT_IR_ERDP_LO_EHB);
-				(void)xhci_enterHaltedState(xhci);
 
 				priv->pendingTransfer = NULL;
 				usb_transferFinished(t, ret);
@@ -688,6 +690,14 @@ static int xhci_map(hcd_t *hcd, xhci_t **xhcip)
 
 	xhci = calloc(1, sizeof(*xhci));
 	if (xhci == NULL) {
+		return -ENOMEM;
+	}
+
+	/* Serialises the shared event-ring dispatcher (xhci_eventAwait) between the
+	 * enumeration path and the roothub status thread. Created before any command
+	 * is issued (the rig handoff's EnableSlot is the first event consumer). */
+	if (mutexCreate(&xhci->eventLock) != 0) {
+		free(xhci);
 		return -ENOMEM;
 	}
 
@@ -1505,64 +1515,109 @@ static int xhci_cmdNoopSelftest(xhci_t *xhci)
 }
 
 
-/* Shared event-ring consumer. Walks forward from the persistent dequeue
- * (xhci->eventDeq / eventCycleState=consumer cycle), consuming events in
- * order: it advances the dequeue, writes ERDP (with EHB), and flips the
- * consumer cycle on wrap for EVERY event whose cycle bit matches. It
- * returns (copying into *out) the first event whose TRB type == wantType
- * and parameter == wantParam — the completing command's cmd-ring TRB PA
- * (type-33) or a transfer's event-data TRB PA (type-32); other events
- * (port-status, completions for already-finished work) are consumed and
- * skipped. Returns -ETIMEDOUT if no matching event lands within
- * timeoutMs.
+/* Does event `ev` satisfy a waiter looking for (wantType, wantParam, wantEp)?
+ * Command/port-status events match by parameter (the cmd-ring TRB PA). Transfer
+ * events match by (slot, endpoint): a control transfer reports completion on
+ * whichever stage TRB carries it — SUCCESS on the IOC'd Status TRB, an ERROR on
+ * the failing Setup/Data TRB — so matching the exact Status-TRB PA would MISS
+ * error completions. Slot+ep catches any completion for the addressed pipe and
+ * surfaces its code; it is also the routing key multi-slot/HID needs. */
+static int xhci_eventMatch(xhci_t *xhci, const xhci_trb_t *ev, uint32_t wantType, uint64_t wantParam, uint32_t wantEp)
+{
+	uint32_t type = (ev->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+
+	if (type != wantType) {
+		return 0;
+	}
+	if (wantType == XHCI_TRB_TYPE_EVENT_TRANSFER) {
+		uint32_t evSlot = (ev->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >>
+			XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
+		uint32_t evEp = (ev->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >>
+			XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
+		(void)wantParam;
+		return ((evSlot == xhci->slotId) && (evEp == wantEp)) ? 1 : 0;
+	}
+	return (ev->parameter == wantParam) ? 1 : 0;
+}
+
+
+/* Is `ev` a completion that some waiter will be looking for (so it must be
+ * parked in the stash rather than discarded)? Command + transfer completions
+ * belong to a synchronous waiter; port-status changes are level state polled
+ * elsewhere and can be safely dropped from the dequeue. */
+static int xhci_eventStashable(const xhci_trb_t *ev)
+{
+	uint32_t type = (ev->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+
+	return ((type == XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) || (type == XHCI_TRB_TYPE_EVENT_TRANSFER)) ? 1 : 0;
+}
+
+
+/* Shared event-ring dispatcher. Two threads consume this single ring: the
+ * synchronous enumeration path (xhci_cmdExec / ep0 control transfers) and the
+ * roothub status thread (interrupt-IN completions, once an interrupt pipe
+ * exists). They must NOT each walk the ring independently — that races the
+ * shared dequeue/ERDP and lets one thread discard the other's completion.
  *
- * This is the SINGLE point of event-ring consumption for the synchronous
- * command + control-transfer paths, replacing the old per-call "look at
- * event[0]" logic that lost completions landing behind other events and
- * re-matched stale completions (no shared dequeue). It is safe while the
- * caller is the only consumer — true during sequential enumeration, when
- * no interrupt-IN pipe exists yet (xhci->interruptPriv == NULL). Once an
- * interrupt endpoint is configured, the roothub thread also consumes
- * events and must be routed through this same dequeue under a lock (TODO,
- * Stage 4 / HID). */
-static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, unsigned timeoutMs, xhci_trb_t *out)
+ * Instead every consumer calls here under xhci->eventLock. A pass first checks
+ * the stash (events previously pulled off the ring for *this* waiter by the
+ * other consumer), then walks the hardware ring from the shared dequeue: each
+ * event is either returned to this caller (match), parked in the stash for the
+ * other consumer (non-matching completion), or dropped (port-status). Every
+ * consumed event advances the dequeue, writes ERDP (with EHB), and flips the
+ * consumer cycle on wrap — exactly once, by whichever thread holds the lock.
+ *
+ * Match key: (wantType, wantParam, wantEp) — see xhci_eventMatch. Returns EOK
+ * with *out filled, or -ETIMEDOUT if no matching event lands within timeoutMs.
+ * timeoutMs==1 makes this a single non-blocking poll pass (used by the roothub
+ * thread, which has its own poll loop). */
+static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out)
 {
 	xhci_trb_t *ring = (xhci_trb_t *)xhci->eventRing;
 	unsigned t;
+	uint32_t i;
 
 	for (t = timeoutMs; t > 0u; --t) {
+		mutexLock(xhci->eventLock);
+
+		/* The other consumer may already have pulled our event off the ring. */
+		for (i = 0u; i < xhci->eventStashCount; ++i) {
+			if (xhci_eventMatch(xhci, &xhci->eventStash[i], wantType, wantParam, wantEp) != 0) {
+				uint32_t j;
+				if (out != NULL) {
+					*out = xhci->eventStash[i];
+				}
+				for (j = i + 1u; j < xhci->eventStashCount; ++j) {
+					xhci->eventStash[j - 1u] = xhci->eventStash[j];
+				}
+				xhci->eventStashCount--;
+				mutexUnlock(xhci->eventLock);
+				return EOK;
+			}
+		}
+
 		for (;;) {
 			xhci_trb_t *cur = &ring[xhci->eventDeq];
 			uint32_t ctrl = cur->control;
 			uint32_t cbit = ((ctrl & XHCI_TRB_CONTROL_C) != 0u) ? 1u : 0u;
-			uint32_t type;
 			int matched;
 
 			if (cbit != ((xhci->eventCycleState != 0u) ? 1u : 0u)) {
 				break; /* dequeue caught up to the producer */
 			}
 
-			type = (ctrl >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
-			if (type != wantType) {
-				matched = 0;
-			}
-			else if (wantType == XHCI_TRB_TYPE_EVENT_TRANSFER) {
-				/* A control transfer reports completion on whichever stage TRB
-				 * carries it: SUCCESS lands on the IOC'd Status TRB, but an
-				 * ERROR lands on the failing Setup/Data TRB. Matching the exact
-				 * Status-TRB PA therefore MISSES error completions (they time
-				 * out instead of reporting). Match by slot + ep0 so any
-				 * completion for this control transfer is caught and its code
-				 * surfaced. */
-				uint32_t evSlot = (ctrl & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >>
-					XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
-				uint32_t evEp = (ctrl & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >>
-					XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
-				matched = ((evSlot == xhci->slotId) && (evEp == 1u)) ? 1 : 0;
-				(void)wantParam;
-			}
-			else {
-				matched = (cur->parameter == wantParam) ? 1 : 0;
+			matched = xhci_eventMatch(xhci, cur, wantType, wantParam, wantEp);
+			if ((matched == 0) && (xhci_eventStashable(cur) != 0)) {
+				if (xhci->eventStashCount < XHCI_EVENT_STASH_MAX) {
+					/* completion for the other consumer — park, don't discard */
+					xhci->eventStash[xhci->eventStashCount++] = *cur;
+				}
+				else {
+					/* Unreachable in normal operation (the cross-consumer window
+					 * is ~1-2 ms); if it prints, a waiter has stopped draining and
+					 * its completions are accumulating — a real bug, not noise. */
+					debug("xhci: event stash full, dropping a completion\n");
+				}
 			}
 			if ((matched != 0) && (out != NULL)) {
 				*out = *cur;
@@ -1582,10 +1637,13 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 			}
 
 			if (matched != 0) {
+				mutexUnlock(xhci->eventLock);
 				return EOK;
 			}
-			/* non-matching event consumed; keep draining the ring */
+			/* non-matching event consumed (stashed or dropped); keep draining */
 		}
+
+		mutexUnlock(xhci->eventLock);
 		usleep(1000);
 	}
 
@@ -1680,7 +1738,7 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	/* Consume the event ring via the shared dequeue until our command
 	 * completion (type-33, parameter == cmdPhys) lands, draining any
 	 * port-status or stale events queued ahead of it. */
-	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_CMD_COMPLETION, cmdPhys, XHCI_CMD_TIMEOUT_MS, &ev);
+	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_CMD_COMPLETION, cmdPhys, 0u, XHCI_CMD_TIMEOUT_MS, &ev);
 
 	if (err < 0) {
 		char dbgbuf[160];
@@ -2234,7 +2292,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 
 	/* Consume the transfer event (type-32) for this slot's ep0 via the shared
 	 * dequeue, draining any events ahead of it. */
-	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, XHCI_CMD_TIMEOUT_MS, &ev);
+	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
 	if (err < 0) {
 		fprintf(stderr, "xhci: transfer completion timeout\n");
 		(void)xhci_enterHaltedState(xhci);
@@ -2319,7 +2377,7 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 
 	/* Consume the transfer event (type-32, parameter == the status-stage
 	 * TRB PA) via the shared dequeue, draining any events ahead of it. */
-	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, XHCI_CMD_TIMEOUT_MS, &ev);
+	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
 	if (err < 0) {
 		fprintf(stderr, "xhci: transfer completion timeout\n");
 		(void)xhci_enterHaltedState(xhci);
