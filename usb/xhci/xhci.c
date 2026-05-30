@@ -413,7 +413,8 @@ typedef struct {
 	uint32_t cmdRingCount;
 	uint32_t cmdCycleState;
 	uint32_t ep0RingCount;
-	uint32_t ep0CycleState;
+	uint32_t ep0CycleState;   /* producer cycle state for the ep0 transfer ring */
+	uint32_t ep0Enqueue;      /* persistent ep0 producer index (xhci_ep0Push) */
 	uint32_t eventRingTrbs;
 	uint32_t eventCycleState; /* consumer cycle state (CCS) for the shared event-ring dequeue */
 	uint32_t eventDeq;        /* shared event-ring dequeue index (xhci_eventAwait) */
@@ -426,6 +427,7 @@ typedef struct {
 	uint64_t erstba;
 	uint64_t erdp;
 	struct xhci_pipePriv *interruptPriv;
+	uint8_t slotAddressed;    /* the single tracked slot has had Address Device issued */
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
@@ -1817,6 +1819,7 @@ static int xhci_initEp0Ring(xhci_t *xhci)
 
 	memset(xhci->ep0Ring, 0, xhci->ep0RingSize);
 	xhci->ep0CycleState = 1u;
+	xhci->ep0Enqueue = 0u;
 
 	ring = (xhci_trb_t *)xhci->ep0Ring;
 	link = &ring[xhci->ep0RingCount - 1u];
@@ -2084,9 +2087,56 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 }
 
 
+/* Reserve `count` contiguous TRBs ahead of the trailing Link TRB so a single
+ * control transfer's stages never straddle the ring wrap. If they would,
+ * publish the Link TRB now (with the running producer cycle) and wrap the
+ * producer to the segment base, toggling the producer cycle. */
+static void xhci_ep0Reserve(xhci_t *xhci, uint32_t count)
+{
+	xhci_trb_t *ring = (xhci_trb_t *)xhci->ep0Ring;
+	xhci_trb_t *link;
+
+	if ((xhci->ep0Enqueue + count) <= (xhci->ep0RingCount - 1u)) {
+		return;
+	}
+
+	link = &ring[xhci->ep0RingCount - 1u];
+	link->control = (link->control & ~XHCI_TRB_CONTROL_C) |
+		(xhci->ep0CycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
+	xhci->ep0Enqueue = 0u;
+	xhci->ep0CycleState ^= 1u;
+}
+
+
+/* Enqueue one TRB at the current ep0 producer position with the running
+ * producer cycle bit and return its physical address (for event matching).
+ *
+ * The controller's internal ep0 dequeue pointer is rewound to the ring base
+ * only by Address Device (which reloads the EP0 context trDequeuePtr). Between
+ * transfers it advances past each consumed TRB and parks there, so the driver
+ * must enqueue at the SAME running position rather than rewriting index 0 each
+ * time — otherwise the controller, parked past the previous transfer, never
+ * sees the new work. Callers reserve room via xhci_ep0Reserve so a transfer
+ * cannot straddle the trailing Link TRB; this advances only within the
+ * segment. */
+static uint64_t xhci_ep0Push(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control)
+{
+	xhci_trb_t *ring = (xhci_trb_t *)xhci->ep0Ring;
+	uint32_t idx = xhci->ep0Enqueue;
+	uint64_t trbPhys = xhci->ep0RingPhys + ((uint64_t)idx * (uint64_t)XHCI_TRB_SIZE);
+
+	ring[idx].parameter = parameter;
+	ring[idx].status = status;
+	ring[idx].control = (control & ~XHCI_TRB_CONTROL_C) |
+		(xhci->ep0CycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
+
+	xhci->ep0Enqueue = idx + 1u;
+	return trbPhys;
+}
+
+
 static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 {
-	xhci_trb_t *ring;
 	xhci_trb_t ev;
 	uint64_t statusTrbPhys;
 	uint32_t completion;
@@ -2099,41 +2149,28 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 		return -EINVAL;
 	}
 
-	ring = (xhci_trb_t *)xhci->ep0Ring;
-	memset(ring, 0, xhci->ep0RingSize);
+	/* Setup + Data(IN) + Status(OUT) at the persistent producer position. */
+	xhci_ep0Reserve(xhci, 3u);
 
-	ring[0].parameter =
+	(void)xhci_ep0Push(xhci,
 		(uint64_t)t->setup->bmRequestType |
-		((uint64_t)t->setup->bRequest << 8) |
-		((uint64_t)t->setup->wValue << 16) |
-		((uint64_t)t->setup->wIndex << 32) |
-		((uint64_t)t->setup->wLength << 48);
-	ring[0].status = sizeof(usb_setup_packet_t);
-	ring[0].control = XHCI_TRB_CONTROL_C |
+			((uint64_t)t->setup->bRequest << 8) |
+			((uint64_t)t->setup->wValue << 16) |
+			((uint64_t)t->setup->wIndex << 32) |
+			((uint64_t)t->setup->wLength << 48),
+		sizeof(usb_setup_packet_t),
 		(XHCI_TRB_TYPE_SETUP_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
-		(XHCI_TRANSFER_TRB_CONTROL_TRT_IN << XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT) |
-		XHCI_TRANSFER_TRB_CONTROL_IDT;
+			(XHCI_TRANSFER_TRB_CONTROL_TRT_IN << XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT) |
+			XHCI_TRANSFER_TRB_CONTROL_IDT);
 
-	ring[1].parameter = va2pa(t->buffer);
-	ring[1].status = (uint32_t)t->size;
-	ring[1].control = XHCI_TRB_CONTROL_C |
+	(void)xhci_ep0Push(xhci, va2pa(t->buffer), (uint32_t)t->size,
 		(XHCI_TRB_TYPE_DATA_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
-		XHCI_TRANSFER_TRB_CONTROL_DIR_IN |
-		XHCI_TRANSFER_TRB_CONTROL_ISP;
+			XHCI_TRANSFER_TRB_CONTROL_DIR_IN |
+			XHCI_TRANSFER_TRB_CONTROL_ISP);
 
-	ring[2].parameter = 0u;
-	ring[2].status = 0u;
-	ring[2].control = XHCI_TRB_CONTROL_C |
+	statusTrbPhys = xhci_ep0Push(xhci, 0u, 0u,
 		(XHCI_TRB_TYPE_STATUS_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
-		XHCI_TRANSFER_TRB_CONTROL_IOC;
-
-	ring[xhci->ep0RingCount - 1u].parameter = xhci->ep0RingPhys;
-	ring[xhci->ep0RingCount - 1u].status = 0u;
-	ring[xhci->ep0RingCount - 1u].control = XHCI_TRB_CONTROL_C |
-		XHCI_LINK_TRB_CONTROL_TC |
-		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
-
-	statusTrbPhys = xhci->ep0RingPhys + (2u * XHCI_TRB_SIZE);
+			XHCI_TRANSFER_TRB_CONTROL_IOC);
 
 	err = xhci_enterRunState(xhci);
 	if (err < 0) {
@@ -2184,7 +2221,6 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 
 static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 {
-	xhci_trb_t *ring;
 	xhci_trb_t ev;
 	uint64_t statusTrbPhys;
 	uint32_t completion;
@@ -2196,35 +2232,24 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 		return -EINVAL;
 	}
 
-	ring = (xhci_trb_t *)xhci->ep0Ring;
-	memset(ring, 0, xhci->ep0RingSize);
+	/* Setup + Status(IN), no Data stage, at the persistent producer position. */
+	xhci_ep0Reserve(xhci, 2u);
 
-	ring[0].parameter =
+	(void)xhci_ep0Push(xhci,
 		(uint64_t)t->setup->bmRequestType |
-		((uint64_t)t->setup->bRequest << 8) |
-		((uint64_t)t->setup->wValue << 16) |
-		((uint64_t)t->setup->wIndex << 32) |
-		((uint64_t)t->setup->wLength << 48);
-	ring[0].status = sizeof(usb_setup_packet_t);
-	ring[0].control = XHCI_TRB_CONTROL_C |
+			((uint64_t)t->setup->bRequest << 8) |
+			((uint64_t)t->setup->wValue << 16) |
+			((uint64_t)t->setup->wIndex << 32) |
+			((uint64_t)t->setup->wLength << 48),
+		sizeof(usb_setup_packet_t),
 		(XHCI_TRB_TYPE_SETUP_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
-		(XHCI_TRANSFER_TRB_CONTROL_TRT_NONE << XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT) |
-		XHCI_TRANSFER_TRB_CONTROL_IDT;
+			(XHCI_TRANSFER_TRB_CONTROL_TRT_NONE << XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT) |
+			XHCI_TRANSFER_TRB_CONTROL_IDT);
 
-	ring[1].parameter = 0u;
-	ring[1].status = 0u;
-	ring[1].control = XHCI_TRB_CONTROL_C |
+	statusTrbPhys = xhci_ep0Push(xhci, 0u, 0u,
 		(XHCI_TRB_TYPE_STATUS_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
-		XHCI_TRANSFER_TRB_CONTROL_DIR_IN |
-		XHCI_TRANSFER_TRB_CONTROL_IOC;
-
-	ring[xhci->ep0RingCount - 1u].parameter = xhci->ep0RingPhys;
-	ring[xhci->ep0RingCount - 1u].status = 0u;
-	ring[xhci->ep0RingCount - 1u].control = XHCI_TRB_CONTROL_C |
-		XHCI_LINK_TRB_CONTROL_TC |
-		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
-
-	statusTrbPhys = xhci->ep0RingPhys + XHCI_TRB_SIZE;
+			XHCI_TRANSFER_TRB_CONTROL_DIR_IN |
+			XHCI_TRANSFER_TRB_CONTROL_IOC);
 
 	err = xhci_enterRunState(xhci);
 	if (err < 0) {
@@ -2881,14 +2906,35 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 	}
 
 	if ((pipe->dev->address == 0) && (xhci != NULL)) {
-		err = xhci_initEp0Ring(xhci);
-		if (err < 0) {
-			return err;
-		}
+		/* First contact with a freshly-connected device. xHCI requires the
+		 * slot to be addressed before ANY ep0 transfer, so set up the ep0
+		 * ring, program the slot/ep0 input context, and issue Address Device
+		 * once. We use the non-BSR form (assign the USB address = slotId
+		 * immediately): the framework still believes the device sits at the
+		 * default address and issues SET_ADDRESS next, which we acknowledge
+		 * without re-issuing the command — a second Address Device would
+		 * reload trDequeuePtr and rewind the now-persistent ep0 ring
+		 * mid-enumeration. The maxPacketSize0 fix-up the spec permits between
+		 * the first descriptor read and SET_ADDRESS is a no-op for high- and
+		 * super-speed (fixed 64/512) and is a TODO for low/full-speed devices
+		 * once those are reachable behind a hub. */
+		if (xhci->slotAddressed == 0u) {
+			err = xhci_initEp0Ring(xhci);
+			if (err < 0) {
+				return err;
+			}
 
-		err = xhci_prepareAddressContext(xhci, pipe->dev);
-		if (err < 0) {
-			return err;
+			err = xhci_prepareAddressContext(xhci, pipe->dev);
+			if (err < 0) {
+				return err;
+			}
+
+			err = xhci_cmdAddressDevice(xhci, 1);
+			if (err < 0) {
+				return err;
+			}
+
+			xhci->slotAddressed = 1u;
 		}
 
 		if ((setup != NULL) && (setup->bRequest == REQ_SET_ADDRESS)) {
@@ -2898,14 +2944,25 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 				return -ENOSYS;
 			}
 
-			err = xhci_cmdAddressDevice(xhci, 1);
+			usb_transferFinished(t, 0);
+			return 0;
+		}
+
+		/* Default-address device-descriptor read (the framework's first probe,
+		 * before SET_ADDRESS). The slot is addressed above, so route by request
+		 * rather than by dev->address (still 0 at this point). */
+		if ((setup != NULL) && (setup->bRequest == REQ_GET_DESCRIPTOR) &&
+			(t->type == usb_transfer_control) && (t->direction == usb_dir_in)) {
+			err = xhci_ep0ControlRead(xhci, t);
 			if (err < 0) {
 				return err;
 			}
 
-			usb_transferFinished(t, 0);
+			usb_transferFinished(t, err);
 			return 0;
 		}
+
+		return -ENOSYS;
 	}
 
 	if ((xhci != NULL) && (setup != NULL) &&
@@ -2917,11 +2974,6 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_DEV2HOST) &&
 		(EXTRACT_REQ_TYPE(setup->bmRequestType) == REQUEST_TYPE_STANDARD) &&
 		((setup->bmRequestType & 0x1f) == REQUEST_RECIPIENT_DEVICE)) {
-		err = xhci_initEp0Ring(xhci);
-		if (err < 0) {
-			return err;
-		}
-
 		err = xhci_ep0ControlRead(xhci, t);
 		if (err < 0) {
 			return err;
@@ -2945,11 +2997,6 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 			((EXTRACT_REQ_TYPE(setup->bmRequestType) == REQUEST_TYPE_CLASS) &&
 			((setup->bmRequestType & 0x1f) == REQUEST_RECIPIENT_INTERFACE) &&
 			((setup->bRequest == CLASS_REQ_SET_PROTOCOL) || (setup->bRequest == CLASS_REQ_SET_IDLE)))))) {
-		err = xhci_initEp0Ring(xhci);
-		if (err < 0) {
-			return err;
-		}
-
 		err = xhci_ep0ControlWriteNoData(xhci, t);
 		if (err < 0) {
 			return err;
