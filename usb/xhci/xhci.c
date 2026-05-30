@@ -2069,9 +2069,16 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 		return 0;
 	}
 
+	/* Require an ADDRESSED device on a root-port hub, but do NOT require
+	 * dev->address == slotId: the framework's USB address is its own bookkeeping
+	 * (the external hub is address 2 — the root hub took 1) and need not equal
+	 * the xHCI slot id. xHCI routes by slot via the doorbell (slotId below), not
+	 * by the framework address — same rationale as the SET_ADDRESS handler in
+	 * xhci_transferEnqueue. Requiring ==slotId here rejected the hub's
+	 * status-change interrupt pipe with -EINVAL, failing hub_conf. */
 	if ((pipe->type != usb_transfer_interrupt) || (pipe->dir != usb_dir_in) ||
 		(pipe->dev->hub == NULL) || (pipe->dev->hub->hub != NULL) ||
-		(pipe->dev->address != (int)xhci->slotId)) {
+		(pipe->dev->address == 0)) {
 		return -EINVAL;
 	}
 
@@ -2146,7 +2153,6 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 {
 	xhci_pipePriv_t *priv;
 	xhci_trb_t *ring;
-	xhci_trb_t *event;
 	xhci_trb_t *link;
 	int err;
 
@@ -2179,12 +2185,13 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 		XHCI_LINK_TRB_CONTROL_TC |
 		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
 
-	event = (xhci_trb_t *)xhci->eventRing;
-	memset(event, 0, sizeof(*event));
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, (uint32_t)(xhci->eventRingPhys >> 32));
-	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO,
-		(uint32_t)(xhci->eventRingPhys & XHCI_REG_RT_IR_ERDP_LO__MASK) | XHCI_REG_RT_IR_ERDP_LO_EHB);
-
+	/* Do NOT touch the event ring / ERDP here: the shared dispatcher
+	 * (xhci_eventAwait, consumed by the roothub status thread) owns the event
+	 * dequeue and ERDP. The old code zeroed event-ring slot 0 and reset ERDP to
+	 * the ring base on every interrupt submit, desyncing the persistent dequeue
+	 * and corrupting in-flight control completions on the shared ep. This submit
+	 * only queues the Normal TRB on the interrupt ring and rings the doorbell;
+	 * the roothub thread reaps the completion via the dispatcher. */
 	err = xhci_enterRunState(xhci);
 	if (err < 0) {
 		return err;
