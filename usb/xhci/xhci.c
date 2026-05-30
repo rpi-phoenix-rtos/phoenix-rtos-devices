@@ -365,6 +365,13 @@ typedef struct {
 	uint32_t nintrs;
 	uint32_t nslots;
 	uint32_t nports;
+	/* Per-port (bit = port number) "connect announced" latch. A device
+	 * already attached before this controller's bring-up shows CCS=1 with
+	 * no fresh CSC change bit, so the change-bit-driven hub poll never
+	 * enumerates it. We synthesize a one-shot C_CONNECTION for such ports;
+	 * this latch records the ack (ClearPortFeature C_CONNECTION) so we stop
+	 * re-synthesizing, and is cleared on disconnect to allow re-announce. */
+	uint32_t portConnAnnounced;
 	uint32_t erstMax;
 	uint32_t ist;
 	uint32_t nscratchpad;
@@ -2777,6 +2784,14 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 		status->wPortChange |= USB_PORT_STAT_C_CONNECTION;
 	}
 
+	/* Synthesize a connect change for a device attached before this
+	 * controller's bring-up (CCS=1 with no fresh CSC) so the hub driver
+	 * enumerates it; latched off by ClearPortFeature(C_CONNECTION). */
+	if (((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) &&
+		((xhci->portConnAnnounced & (1u << (unsigned)port)) == 0u)) {
+		status->wPortChange |= USB_PORT_STAT_C_CONNECTION;
+	}
+
 	if ((portsc & XHCI_REG_OP_PORT_PORTSC_PEC) != 0u) {
 		status->wPortChange |= USB_PORT_STAT_C_ENABLE;
 	}
@@ -2852,6 +2867,10 @@ static int xhci_clearPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 
 	switch (wValue) {
 		case USB_PORT_FEAT_C_CONNECTION:
+			/* Hub driver acked the connect — latch it so getHubStatus /
+			 * getPortStatus stop synthesizing C_CONNECTION for a device
+			 * that was already attached before bring-up. */
+			xhci->portConnAnnounced |= (1u << (unsigned)port);
 			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_CSC);
 			break;
 
@@ -3074,9 +3093,20 @@ static uint32_t xhci_getHubStatus(usb_dev_t *hub)
 	int i;
 
 	for (i = 0; i < hub->nports; ++i) {
+		uint32_t bit = 1u << (i + 1);
 		portsc = xhci_portRead32(xhci, i + 1, XHCI_REG_OP_PORT_PORTSC);
-		if ((portsc & XHCI_REG_OP_PORT_PORTSC_RW1C) != 0u) {
-			status |= 1u << (i + 1);
+		if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) == 0u) {
+			/* Disconnected: drop the latch so a future re-attach
+			 * re-announces. */
+			xhci->portConnAnnounced &= ~bit;
+		}
+		/* Report a port to the hub driver on a real RW1C change OR when a
+		 * device is attached (CCS=1) that we have not yet announced — the
+		 * latter covers a device already attached before bring-up (no
+		 * fresh CSC), which the change-bit-only logic otherwise ignored. */
+		if (((portsc & XHCI_REG_OP_PORT_PORTSC_RW1C) != 0u) ||
+			(((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) && ((xhci->portConnAnnounced & bit) == 0u))) {
+			status |= bit;
 		}
 	}
 
