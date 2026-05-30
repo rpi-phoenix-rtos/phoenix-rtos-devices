@@ -25,6 +25,19 @@
 
 #if defined(__TARGET_AARCH64A72) && defined(PCI_EXPRESS_BCM2711_INDEXED_CFG)
 #include "bcm2711-pcie.h"
+/* Stage-1 rig-bring-up handoff (lwip-port 'X' rig). The contract header
+ * lives in phoenix-rtos-lwip/port/usb-embed; the xhci Makefile adds that
+ * directory to the include path for this BCM2711 build.
+ *
+ * libusbxhci.a is linked into TWO binaries: the merged Pi 4 'lwip'
+ * process (which also links diag-udp.o, so the symbol resolves) and the
+ * standalone 'usb' daemon (which does NOT — diag-udp.o lives only in the
+ * lwip port). Declaring the reference WEAK lets the standalone 'usb'
+ * link with the symbol resolving to NULL; the rig path is additionally
+ * gated on the XHCI_USE_RIG_BRINGUP env var (never set for that daemon)
+ * and on the symbol address being non-NULL before it is ever called. */
+#include "xhci-rig-handoff.h"
+extern int diag_xhci_rigBringupHandoff(xhci_rig_handoff_t *out) __attribute__((weak));
 #else
 /* Other boards' xhci PHYs don't need BCM2711 bring-up; provide stubs. */
 static inline int bcm2711_pcie_initVL805(void) { return 0; }
@@ -2453,14 +2466,101 @@ static int xhci_init(hcd_t *hcd)
 		}
 	}
 
-	err = xhci_map(hcd, &xhci);
-	if (err < 0) {
-		return err;
+	/* Stage-1 "build USB on the rig's proven bring-up" (gated on
+	 * XHCI_USE_RIG_BRINGUP; default path below is unchanged). The lwip
+	 * 'X' diag rig brings the VL805 to a verified-RUNNING state (HCRST ->
+	 * rings -> R/S=1 -> No-Op completion landed) from this same worker
+	 * context, where xhci_init's own helpers fail at the first command
+	 * completion. Adopt the rig's live MMIO + DMA handles into our
+	 * xhci_t, then resume the framework at EnableSlot. Decisive test:
+	 * does the framework command/event path work on a rig-brought-up
+	 * controller? See docs/notes/2026-05-30-usb-rig-bringup-build-plan.md. */
+#if defined(__TARGET_AARCH64A72) && defined(PCI_EXPRESS_BCM2711_INDEXED_CFG)
+	if ((getenv("XHCI_USE_RIG_BRINGUP") != NULL) && (&diag_xhci_rigBringupHandoff != NULL)) {
+		xhci_rig_handoff_t h;
+		uint32_t hccparams1;
+
+		if (diag_xhci_rigBringupHandoff(&h) != 0) {
+			debug("xhci: rig handoff FAILED (controller not RUNNING after retries)\n");
+			fflush(NULL);
+			return -ENODEV;
+		}
+
+		/* Allocate + register the xhci_t exactly as xhci_map does, but
+		 * WITHOUT mapping MMIO — the rig already mapped BAR0 and owns the
+		 * window. We adopt its VA below. */
+		xhci = calloc(1, sizeof(*xhci));
+		if (xhci == NULL) {
+			return -ENOMEM;
+		}
+		hcd->priv = xhci;
+		hcd->base = (volatile uint32_t *)h.mmio;
+
+		xhci->mmio = h.mmio;
+		xhci->mapSz = h.mmioSize;
+		xhci->caplength = h.caplength;
+		xhci->rtsoff = h.rtsoff;
+		xhci->dboff = h.dboff;
+		xhci->nslots = h.nslots;
+		xhci->nports = h.nports;
+		xhci->ac64 = h.ac64;
+
+		/* capProbe-derived fields the rig path skips but the post-handoff
+		 * framework helpers still read. contextSize sizes the device /
+		 * input contexts in allocSlotSpace; the handoff does not carry
+		 * CSZ, so re-derive it from HCCPARAMS1 (bit 2). VL805 is 32-byte.
+		 * dcbaaSize bounds the slot-id check in allocSlotSpace; the rig's
+		 * DCBAA is one page, matching XHCI_DCBAA_SIZE. */
+		hccparams1 = xhci_read32(xhci, XHCI_REG_CAP_HCCPARAMS1);
+		xhci->hccparams1 = hccparams1;
+		xhci->contextSize = ((hccparams1 & XHCI_REG_CAP_HCCPARAMS1_CSZ) != 0u) ? 64u : 32u;
+		xhci->dcbaaSize = XHCI_DCBAA_SIZE;
+
+		xhci->dcbaa = h.dcbaa;
+		xhci->dcbaaPhys = h.dcbaaPhys;
+		xhci->cmdRing = h.cmdRing;
+		xhci->cmdRingTrbs = (xhci_trb_t *)h.cmdRing;
+		xhci->cmdRingPhys = h.cmdRingPhys;
+		xhci->cmdRingCount = h.cmdRingCount;
+		xhci->cmdCycleState = h.cmdCycleState;
+		xhci->eventRing = h.eventRing;
+		xhci->eventRingPhys = h.eventRingPhys;
+		xhci->eventRingTrbs = h.eventRingTrbs;
+		xhci->eventCycleState = h.eventCycleState;
+		xhci->erst = h.erst;
+		xhci->erstPhys = h.erstPhys;
+		xhci->scratchpadArray = h.scratchpadArray;
+		xhci->scratchpadArrayPhys = h.scratchpadArrayPhys;
+		xhci->nscratchpad = h.nscratchpad;
+		/* devCtx / inputCtx / ep0Ring stay NULL — allocSlotSpace allocs
+		 * them. The controller is left RUNNING (the rig does not halt). */
+
+		debug("xhci: rig handoff OK, attempting framework EnableSlot\n");
+		fflush(NULL);
+
+		err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
+		{
+			char dbg[96];
+			snprintf(dbg, sizeof(dbg), "xhci: rig EnableSlot err=%d slotId=%u\n",
+				err, (unsigned)xhci->slotId);
+			debug(dbg);
+			fflush(NULL);
+		}
+		if (err == 0) {
+			err = xhci_allocSlotSpace(xhci);
+		}
 	}
+	else
+#endif
+	{
+		err = xhci_map(hcd, &xhci);
+		if (err < 0) {
+			return err;
+		}
 
-	err = xhci_capProbe(hcd, xhci);
+		err = xhci_capProbe(hcd, xhci);
 
-	if (err == -ENOSYS) {
+		if (err == -ENOSYS) {
 		err = xhci_reset(xhci);
 		if (err == 0) {
 			err = xhci_validateRuntime(xhci);
@@ -2516,6 +2616,7 @@ static int xhci_init(hcd_t *hcd)
 				}
 			}
 		}
+	}
 	}
 
 	if (err != 0) {
