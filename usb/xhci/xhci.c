@@ -430,6 +430,7 @@ typedef struct {
 	struct xhci_pipePriv *interruptPriv;
 	uint8_t slotAddressed;    /* the single tracked slot has had Address Device issued */
 	uint8_t crcrPublished;    /* CRCR re-published once before the first command */
+	uint8_t keepRunning;      /* run the controller continuously (rig-handoff path) — never R/S=0 between ops */
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
@@ -1542,7 +1543,27 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 			}
 
 			type = (ctrl >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
-			matched = ((type == wantType) && (cur->parameter == wantParam)) ? 1 : 0;
+			if (type != wantType) {
+				matched = 0;
+			}
+			else if (wantType == XHCI_TRB_TYPE_EVENT_TRANSFER) {
+				/* A control transfer reports completion on whichever stage TRB
+				 * carries it: SUCCESS lands on the IOC'd Status TRB, but an
+				 * ERROR lands on the failing Setup/Data TRB. Matching the exact
+				 * Status-TRB PA therefore MISSES error completions (they time
+				 * out instead of reporting). Match by slot + ep0 so any
+				 * completion for this control transfer is caught and its code
+				 * surfaced. */
+				uint32_t evSlot = (ctrl & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >>
+					XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
+				uint32_t evEp = (ctrl & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >>
+					XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
+				matched = ((evSlot == xhci->slotId) && (evEp == 1u)) ? 1 : 0;
+				(void)wantParam;
+			}
+			else {
+				matched = (cur->parameter == wantParam) ? 1 : 0;
+			}
 			if ((matched != 0) && (out != NULL)) {
 				*out = *cur;
 			}
@@ -1683,10 +1704,19 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 			XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT;
 	}
 
-	err = xhci_enterHaltedState(xhci);
-	if (err < 0) {
-		memset(cmd, 0, sizeof(*cmd));
-		return err;
+	/* Leave the controller running between commands (keepRunning). The rig
+	 * hands off a RUNNING controller and keeps R/S=1 across EnableSlot ->
+	 * AddressDevice; our former halt-per-command pattern dropped R/S after
+	 * each command and re-ran it before the next, and a just-unhalted VL805
+	 * fails the next USB transaction — AddressDevice(BSR=0) returned a
+	 * Context State Error. Only the legacy reset-based init path (keepRunning
+	 * == 0) still halts here. */
+	if (xhci->keepRunning == 0u) {
+		err = xhci_enterHaltedState(xhci);
+		if (err < 0) {
+			memset(cmd, 0, sizeof(*cmd));
+			return err;
+		}
 	}
 
 	memset(cmd, 0, sizeof(*cmd));
@@ -2202,8 +2232,8 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 
 	xhci_dbWrite32(xhci, xhci->slotId * sizeof(uint32_t), 1u);
 
-	/* Consume the transfer event (type-32, parameter == the status-stage
-	 * TRB PA) via the shared dequeue, draining any events ahead of it. */
+	/* Consume the transfer event (type-32) for this slot's ep0 via the shared
+	 * dequeue, draining any events ahead of it. */
 	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, XHCI_CMD_TIMEOUT_MS, &ev);
 	if (err < 0) {
 		fprintf(stderr, "xhci: transfer completion timeout\n");
@@ -2211,7 +2241,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 		return -ETIMEDOUT;
 	}
 
-	/* TRB type + parameter already matched by xhci_eventAwait. */
+	/* Completion event for this slot's ep0 (matched by xhci_eventAwait). */
 	completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
 	endpointId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
 	slotId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
@@ -2223,9 +2253,15 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 		return -ENODEV;
 	}
 
-	err = xhci_enterHaltedState(xhci);
-	if (err < 0) {
-		return err;
+	/* Keep the controller running across successful control transfers (like
+	 * the rig). Halting after each transfer and re-running before the next
+	 * makes the following transfer's USB transaction fail on a just-unhalted
+	 * controller (the halt-per-command failure, here on ep0). */
+	if (xhci->keepRunning == 0u) {
+		err = xhci_enterHaltedState(xhci);
+		if (err < 0) {
+			return err;
+		}
 	}
 
 	if ((completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) && (completion != XHCI_TRB_COMPLETION_CODE_SHORT_PACKET)) {
@@ -2301,12 +2337,22 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 		return -ENODEV;
 	}
 
-	err = xhci_enterHaltedState(xhci);
-	if (err < 0) {
-		return err;
+	/* Keep the controller running across successful control transfers (like
+	 * the rig). Halting after each transfer and re-running before the next
+	 * makes the following transfer's USB transaction fail on a just-unhalted
+	 * controller (the halt-per-command failure, here on ep0). */
+	if (xhci->keepRunning == 0u) {
+		err = xhci_enterHaltedState(xhci);
+		if (err < 0) {
+			return err;
+		}
 	}
 
-	if (completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) {
+	/* A no-data control transfer's status stage is an IN that the device
+	 * answers with a ZLP — the controller reports that as SHORT_PACKET (13),
+	 * which is success here (matches ep0ControlRead). SET_CONFIGURATION on the
+	 * VIA hub returned 13; treating it as an error wrongly failed hub config. */
+	if ((completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) && (completion != XHCI_TRB_COMPLETION_CODE_SHORT_PACKET)) {
 		fprintf(stderr, "xhci: transfer completion code %u\n", completion);
 		return -ENODEV;
 	}
@@ -2513,6 +2559,11 @@ static int xhci_init(hcd_t *hcd)
 		debug("xhci: rig handoff OK, attempting framework EnableSlot\n");
 		fflush(NULL);
 
+		/* The rig handed off a RUNNING controller; keep it running for all
+		 * subsequent commands and control transfers (no R/S=0 between ops) so
+		 * USB transactions are never issued on a just-unhalted controller. */
+		xhci->keepRunning = 1u;
+
 		err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
 		{
 			char dbg[96];
@@ -2524,6 +2575,7 @@ static int xhci_init(hcd_t *hcd)
 		if (err == 0) {
 			err = xhci_allocSlotSpace(xhci);
 		}
+
 	}
 	else
 #endif
@@ -2962,12 +3014,13 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		}
 
 		if ((setup != NULL) && (setup->bRequest == REQ_SET_ADDRESS)) {
-			if ((uint8_t)setup->wValue != xhci->slotId) {
-				fprintf(stderr, "xhci: requested address %u mismatches slot %u\n",
-					(uint8_t)setup->wValue, xhci->slotId);
-				return -ENOSYS;
-			}
-
+			/* The device is ALREADY addressed in hardware (Address Device,
+			 * BSR=0, assigned the slot's USB address during first contact). The
+			 * framework's USB address is its own bookkeeping (here 2 — the root
+			 * hub took 1) and need NOT equal xhci->slotId: xHCI routes by slot
+			 * via the doorbell, not by the address in the SETUP packet. So
+			 * acknowledge whatever address the framework assigns; transfers for
+			 * this device are then routed by dev->address != 0 below. */
 			usb_transferFinished(t, 0);
 			return 0;
 		}
@@ -2989,15 +3042,16 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		return -ENOSYS;
 	}
 
+	/* Any control-IN (DEV2HOST, has data) on the addressed device's ep0 — the
+	 * HCD just runs the control transfer; the device interprets the request.
+	 * Covers standard GetDescriptor as well as class requests the hub driver
+	 * issues (GetHubDescriptor, GetPortStatus, GetStatus, ...). */
 	if ((xhci != NULL) && (setup != NULL) &&
 		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub == NULL) &&
-		(pipe->dev->address == (int)xhci->slotId) &&
-		(setup->bRequest == REQ_GET_DESCRIPTOR) &&
+		(pipe->dev->address != 0) &&
 		(t->type == usb_transfer_control) &&
 		(t->direction == usb_dir_in) &&
-		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_DEV2HOST) &&
-		(EXTRACT_REQ_TYPE(setup->bmRequestType) == REQUEST_TYPE_STANDARD) &&
-		((setup->bmRequestType & 0x1f) == REQUEST_RECIPIENT_DEVICE)) {
+		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_DEV2HOST)) {
 		err = xhci_ep0ControlRead(xhci, t);
 		if (err < 0) {
 			return err;
@@ -3007,20 +3061,17 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		return 0;
 	}
 
+	/* Any no-data control-OUT (HOST2DEV, wLength==0) on ep0 — SetConfiguration,
+	 * SetPortFeature/ClearPortFeature (class, recipient OTHER), SetProtocol,
+	 * SetIdle, etc. */
 	if ((xhci != NULL) && (setup != NULL) &&
 		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub == NULL) &&
-		(pipe->dev->address == (int)xhci->slotId) &&
+		(pipe->dev->address != 0) &&
 		(t->type == usb_transfer_control) &&
 		(t->direction == usb_dir_out) &&
 		(t->size == 0u) &&
 		(setup->wLength == 0u) &&
-		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_HOST2DEV) &&
-		((((EXTRACT_REQ_TYPE(setup->bmRequestType) == REQUEST_TYPE_STANDARD) &&
-			((setup->bmRequestType & 0x1f) == REQUEST_RECIPIENT_DEVICE) &&
-			(setup->bRequest == REQ_SET_CONFIGURATION)) ||
-			((EXTRACT_REQ_TYPE(setup->bmRequestType) == REQUEST_TYPE_CLASS) &&
-			((setup->bmRequestType & 0x1f) == REQUEST_RECIPIENT_INTERFACE) &&
-			((setup->bRequest == CLASS_REQ_SET_PROTOCOL) || (setup->bRequest == CLASS_REQ_SET_IDLE)))))) {
+		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_HOST2DEV)) {
 		err = xhci_ep0ControlWriteNoData(xhci, t);
 		if (err < 0) {
 			return err;
@@ -3032,7 +3083,7 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 
 	if ((xhci != NULL) &&
 		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub == NULL) &&
-		(pipe->dev->address == (int)xhci->slotId) &&
+		(pipe->dev->address != 0) &&
 		(t->type == usb_transfer_interrupt) &&
 		(t->direction == usb_dir_in)) {
 		err = xhci_initInterruptInPipe(xhci, pipe);
