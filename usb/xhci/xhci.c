@@ -2480,6 +2480,8 @@ static int xhci_init(hcd_t *hcd)
 		xhci_rig_handoff_t h;
 		uint32_t hccparams1;
 
+		debug("xhci: RIG-PATH entered, calling rig bring-up handoff\n");
+		fflush(NULL);
 		if (diag_xhci_rigBringupHandoff(&h) != 0) {
 			debug("xhci: rig handoff FAILED (controller not RUNNING after retries)\n");
 			fflush(NULL);
