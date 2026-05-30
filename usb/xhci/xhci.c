@@ -415,7 +415,8 @@ typedef struct {
 	uint32_t ep0RingCount;
 	uint32_t ep0CycleState;
 	uint32_t eventRingTrbs;
-	uint32_t eventCycleState;
+	uint32_t eventCycleState; /* consumer cycle state (CCS) for the shared event-ring dequeue */
+	uint32_t eventDeq;        /* shared event-ring dequeue index (xhci_eventAwait) */
 	uint8_t slotId;
 	uint32_t erstsz;
 	uint32_t erstbaLo;
@@ -1434,7 +1435,8 @@ static int xhci_allocEventRing(xhci_t *xhci)
 	xhci->eventRingPhys = va2pa(xhci->eventRing);
 	xhci->erstPhys = va2pa(xhci->erst);
 	xhci->eventRingTrbs = xhci->eventRingSize / XHCI_TRB_SIZE;
-	xhci->eventCycleState = 1u;
+	xhci->eventCycleState = 1u; /* consumer cycle state (CCS) */
+	xhci->eventDeq = 0u;        /* shared dequeue starts at segment base */
 
 	if (((xhci->eventRingPhys & (XHCI_EVENT_RING_ALIGN - 1u)) != 0u) ||
 		((xhci->erstPhys & (XHCI_ERST_ALIGN - 1u)) != 0u) ||
@@ -1497,14 +1499,80 @@ static int xhci_cmdNoopSelftest(xhci_t *xhci)
 }
 
 
+/* Shared event-ring consumer. Walks forward from the persistent dequeue
+ * (xhci->eventDeq / eventCycleState=consumer cycle), consuming events in
+ * order: it advances the dequeue, writes ERDP (with EHB), and flips the
+ * consumer cycle on wrap for EVERY event whose cycle bit matches. It
+ * returns (copying into *out) the first event whose TRB type == wantType
+ * and parameter == wantParam — the completing command's cmd-ring TRB PA
+ * (type-33) or a transfer's event-data TRB PA (type-32); other events
+ * (port-status, completions for already-finished work) are consumed and
+ * skipped. Returns -ETIMEDOUT if no matching event lands within
+ * timeoutMs.
+ *
+ * This is the SINGLE point of event-ring consumption for the synchronous
+ * command + control-transfer paths, replacing the old per-call "look at
+ * event[0]" logic that lost completions landing behind other events and
+ * re-matched stale completions (no shared dequeue). It is safe while the
+ * caller is the only consumer — true during sequential enumeration, when
+ * no interrupt-IN pipe exists yet (xhci->interruptPriv == NULL). Once an
+ * interrupt endpoint is configured, the roothub thread also consumes
+ * events and must be routed through this same dequeue under a lock (TODO,
+ * Stage 4 / HID). */
+static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, unsigned timeoutMs, xhci_trb_t *out)
+{
+	xhci_trb_t *ring = (xhci_trb_t *)xhci->eventRing;
+	unsigned t;
+
+	for (t = timeoutMs; t > 0u; --t) {
+		for (;;) {
+			xhci_trb_t *cur = &ring[xhci->eventDeq];
+			uint32_t ctrl = cur->control;
+			uint32_t cbit = ((ctrl & XHCI_TRB_CONTROL_C) != 0u) ? 1u : 0u;
+			uint32_t type;
+			int matched;
+
+			if (cbit != ((xhci->eventCycleState != 0u) ? 1u : 0u)) {
+				break; /* dequeue caught up to the producer */
+			}
+
+			type = (ctrl >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+			matched = ((type == wantType) && (cur->parameter == wantParam)) ? 1 : 0;
+			if ((matched != 0) && (out != NULL)) {
+				*out = *cur;
+			}
+
+			/* Advance the dequeue, wrap + flip consumer cycle, publish ERDP. */
+			xhci->eventDeq++;
+			if (xhci->eventDeq >= xhci->eventRingTrbs) {
+				xhci->eventDeq = 0u;
+				xhci->eventCycleState ^= 1u;
+			}
+			{
+				uint64_t deqPhys = xhci->eventRingPhys + ((uint64_t)xhci->eventDeq * (uint64_t)sizeof(xhci_trb_t));
+				xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, (uint32_t)(deqPhys >> 32));
+				xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO,
+					((uint32_t)(deqPhys & 0xFFFFFFFFu) & XHCI_REG_RT_IR_ERDP_LO__MASK) | XHCI_REG_RT_IR_ERDP_LO_EHB);
+			}
+
+			if (matched != 0) {
+				return EOK;
+			}
+			/* non-matching event consumed; keep draining the ring */
+		}
+		usleep(1000);
+	}
+
+	return -ETIMEDOUT;
+}
+
+
 static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId)
 {
 	xhci_trb_t *cmd;
-	xhci_trb_t *event;
+	xhci_trb_t ev;
 	uint64_t cmdPhys;
-	uint32_t type;
 	uint32_t completion;
-	unsigned timeoutMs;
 	int err;
 
 	cmd = &xhci->cmdRingTrbs[0];
@@ -1514,16 +1582,10 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	cmd->control = (control & ~XHCI_TRB_CONTROL_C) | (xhci->cmdCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
 	cmdPhys = xhci->cmdRingPhys;
 
-	event = (xhci_trb_t *)xhci->eventRing;
-	/* (2026-05-30) Stage 2a: removed the idx 0-3 "sentinel paint". It
-	 * overwrote any event TRB the controller had ALREADY posted at idx 0
-	 * (e.g. an autonomous Port-Status Change generated at R/S=1) with a
-	 * cycle-bit-0 pattern, which forced the cycle-bit walk below to break
-	 * at idx 0 and never reach the real Command Completion further in.
-	 * Stage 1 proved the completion DMA-lands (type-33, cc=SUCCESS, at
-	 * idx 1 behind a port event); the paint was the sole thing hiding it.
-	 * Detection now relies purely on the event TRB cycle bit (xHCI 4.9.4),
-	 * the spec-correct mechanism. */
+	/* Completions are consumed via xhci_eventAwait() below (shared
+	 * persistent dequeue, cycle-bit detection). The old idx 0-3 "sentinel
+	 * paint" was removed in Stage 2a — it clobbered events the controller
+	 * had already posted at idx 0, hiding the real completion. */
 
 	err = xhci_enterRunState(xhci);
 	if (err < 0) {
@@ -1569,151 +1631,30 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	 * which the controller doesn't fetch from the cmd ring. */
 	(void)xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
 
-	/* Walk the event ring rather than fixating on event[0]. The
-	 * controller may emit port-status-change events (type 34) or
-	 * other events BEFORE our cmd completion event (type 33). If we
-	 * only look at slot 0 we'd see the port event's cycle-bit flip,
-	 * treat that as "an event arrived", and then fail validation
-	 * because type or parameter doesn't match. Walk forward,
-	 * skipping events that aren't the cmd completion we're waiting
-	 * for, until we find ours or time out. */
-	unsigned int eventIdx = 0u;
-	int found = 0;
-	xhci_trb_t *cur;
+	/* Consume the event ring via the shared dequeue until our command
+	 * completion (type-33, parameter == cmdPhys) lands, draining any
+	 * port-status or stale events queued ahead of it. */
+	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_CMD_COMPLETION, cmdPhys, XHCI_CMD_TIMEOUT_MS, &ev);
 
-	for (timeoutMs = XHCI_CMD_TIMEOUT_MS; timeoutMs > 0u; --timeoutMs) {
-		while (eventIdx < xhci->eventRingTrbs) {
-			cur = &((xhci_trb_t *)xhci->eventRing)[eventIdx];
-			if ((cur->control & XHCI_TRB_CONTROL_C) !=
-				(xhci->eventCycleState != 0u ? XHCI_TRB_CONTROL_C : 0u)) {
-				break;
-			}
-
-			type = (cur->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
-			if ((type == XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) && (cur->parameter == cmdPhys)) {
-				event = cur;
-				found = 1;
-				break;
-			}
-
-			fprintf(stderr, "xhci: skipping non-cmd event ring[%u] type=%u parm=0x%08x\n",
-				eventIdx, type, (uint32_t)cur->parameter);
-			eventIdx++;
-		}
-
-		if (found != 0) {
-			break;
-		}
-
-		usleep(1000);
-
-		if ((timeoutMs % 10u) == 0u) {
-			__asm__ volatile("dsb sy" ::: "memory");
-			xhci_dbWrite32(xhci, 0u, 0u);
-
-			{
-				uint32_t sts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-				if ((sts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
-					fprintf(stderr, "xhci: HSE during cmd wait (timeoutMs=%u USBSTS=0x%08x)\n",
-						timeoutMs, sts);
-					break;
-				}
-			}
-		}
-	}
-
-	if (found == 0) {
-		char dbgbuf[200];
+	if (err < 0) {
+		char dbgbuf[160];
 		uint32_t usbsts2 = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-		uint32_t crcr_lo = xhci_opRead32(xhci, XHCI_REG_OP_CRCR);
 		uint32_t usbcmd2 = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
-		uint32_t erstba_lo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO);
-		uint32_t erstba_hi = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_HI);
-		uint32_t erdp_lo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO);
-		uint32_t erdp_hi = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_HI);
-		xhci_trb_t *evring = (xhci_trb_t *)xhci->eventRing;
 		snprintf(dbgbuf, sizeof(dbgbuf),
-			"xhci_cmdExec TIMEOUT USBSTS=0x%08x USBCMD=0x%08x CRCR=0x%08x\n",
-			usbsts2, usbcmd2, crcr_lo);
+			"xhci_cmdExec TIMEOUT USBSTS=0x%08x USBCMD=0x%08x cmd_phys=0x%08llx deq=%u ccs=%u\n",
+			usbsts2, usbcmd2, (unsigned long long)cmdPhys,
+			(unsigned)xhci->eventDeq, (unsigned)xhci->eventCycleState);
 		debug(dbgbuf);
-		snprintf(dbgbuf, sizeof(dbgbuf),
-			"  cmd_phys=0x%08llx cmd_ctrl=0x%08x cycleState=%u\n",
-			(unsigned long long)cmdPhys, cmd->control,
-			(unsigned)xhci->eventCycleState);
-		debug(dbgbuf);
-		snprintf(dbgbuf, sizeof(dbgbuf),
-			"  ERSTBA=%08x%08x ERDP=%08x%08x evRingPhys=0x%08llx\n",
-			erstba_hi, erstba_lo, erdp_hi, erdp_lo,
-			(unsigned long long)xhci->eventRingPhys);
-		debug(dbgbuf);
-		snprintf(dbgbuf, sizeof(dbgbuf),
-			"  ev[0] parm=0x%08x st=0x%08x ctrl=0x%08x\n",
-			(uint32_t)evring[0].parameter, evring[0].status, evring[0].control);
-		debug(dbgbuf);
-		snprintf(dbgbuf, sizeof(dbgbuf),
-			"  ev[1] parm=0x%08x st=0x%08x ctrl=0x%08x\n",
-			(uint32_t)evring[1].parameter, evring[1].status, evring[1].control);
-		debug(dbgbuf);
-		snprintf(dbgbuf, sizeof(dbgbuf),
-			"  ev[2] parm=0x%08x st=0x%08x ctrl=0x%08x\n",
-			(uint32_t)evring[2].parameter, evring[2].status, evring[2].control);
-		debug(dbgbuf);
-		/* Comparison probe vs the working lwip 'X' path: dump the
-		 * scratchpad pointer actually sitting in DCBAA[0], ERSTSZ,
-		 * and scan the WHOLE event ring for any event TRB the
-		 * controller may have posted past ev[2] (lwip 'X' saw the
-		 * completion at idx 1, after a port-status event at idx 0). */
-		{
-			volatile uint64_t *dcbaa = (volatile uint64_t *)xhci->dcbaa;
-			uint32_t erstsz_rb = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTSZ);
-			unsigned scan;
-			int firstEvt = -1, firstType = 0;
-			for (scan = 0u; scan < xhci->eventRingTrbs; ++scan) {
-				uint32_t ty = (evring[scan].control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
-				if (ty >= 1u && ty <= 39u) {
-					firstEvt = (int)scan;
-					firstType = (int)ty;
-					break;
-				}
-			}
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"  DCBAA[0]=0x%08x%08x scratchpadPhys=0x%08llx ERSTSZ=%u trbs=%u\n",
-				(uint32_t)(dcbaa[0] >> 32), (uint32_t)dcbaa[0],
-				(unsigned long long)xhci->scratchpadArrayPhys,
-				(unsigned)erstsz_rb, (unsigned)xhci->eventRingTrbs);
-			debug(dbgbuf);
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"  ring-scan: first event @idx %d type=%d (any event => writes land)\n",
-				firstEvt, firstType);
-			debug(dbgbuf);
-		}
-
-		/* (Removed 2026-05-28) The FRESH-uncached re-read of the event
-		 * ring used to be here to disambiguate "controller wrote but
-		 * cache aliasing hides the write" vs "controller never wrote".
-		 * Hypothesis was conclusively DISPROVED across many trials:
-		 * FRESH MAP_PHYSMEM|MAP_UNCACHED and the normal MAP_UNCACHED
-		 * always agree, so cache aliasing is not the failure mechanism.
-		 * Removed per CLAUDE.md "remove diagnostic-only code whose
-		 * hypothesis was disproved" guidance. See memory
-		 * usb-dma-write-loss for the full investigation. */
-		(void)event;
 		(void)xhci_enterHaltedState(xhci);
 		memset(cmd, 0, sizeof(*cmd));
 		return -ETIMEDOUT;
 	}
 
-	type = (event->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
-	completion = (event->status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
-	if ((type != XHCI_TRB_TYPE_EVENT_CMD_COMPLETION) || (event->parameter != cmdPhys)) {
-		fprintf(stderr, "xhci: invalid command completion event\n");
-		(void)xhci_enterHaltedState(xhci);
-		memset(cmd, 0, sizeof(*cmd));
-		return -ENODEV;
-	}
+	/* TRB type + parameter were already matched by xhci_eventAwait. */
+	completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
 
 	if (slotId != NULL) {
-		*slotId = (event->control & XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK) >>
+		*slotId = (ev.control & XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK) >>
 			XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT;
 	}
 
@@ -2530,7 +2471,8 @@ static int xhci_init(hcd_t *hcd)
 		xhci->eventRing = h.eventRing;
 		xhci->eventRingPhys = h.eventRingPhys;
 		xhci->eventRingTrbs = h.eventRingTrbs;
-		xhci->eventCycleState = h.eventCycleState;
+		xhci->eventCycleState = h.eventCycleState; /* consumer cycle = 1 from the rig handoff */
+		xhci->eventDeq = 0u;                       /* shared dequeue starts at segment base */
 		xhci->erst = h.erst;
 		xhci->erstPhys = h.erstPhys;
 		xhci->scratchpadArray = h.scratchpadArray;
