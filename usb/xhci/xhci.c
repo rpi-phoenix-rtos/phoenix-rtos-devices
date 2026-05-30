@@ -356,6 +356,26 @@ typedef struct {
 #define XHCI_EVENT_STASH_MAX 16u
 
 
+/* Per-device slot state. The controller drives one Device Slot per attached
+ * device; everything keyed by slot id (device context, ep0 transfer ring,
+ * addressed flag) lives here. The shared input context and the various size
+ * constants stay on xhci_t — commands are serialised, so a single input
+ * context is reused across slots. For now only slots[0] (the primary/rig slot,
+ * slotId 1) is ever populated; the table generalises the single-slot path. */
+typedef struct {
+	uint8_t slotId;
+	uint8_t addressed;        /* this slot has had Address Device issued */
+	uint16_t maxPacket;
+	void *devCtx;
+	uint64_t devCtxPhys;
+	void *ep0Ring;
+	uint64_t ep0RingPhys;
+	uint32_t ep0RingCount;
+	uint32_t ep0CycleState;   /* producer cycle state for the ep0 transfer ring */
+	uint32_t ep0Enqueue;      /* persistent ep0 producer index (xhci_ep0Push) */
+} xhci_slot_t;
+
+
 typedef struct {
 	void *mmio;
 	size_t mapSz;
@@ -403,9 +423,7 @@ typedef struct {
 	uint64_t scratchpadArrayPhys;
 	void *eventRing;
 	void *erst;
-	void *devCtx;
 	void *inputCtx;
-	void *ep0Ring;
 	size_t eventRingSize;
 	size_t erstSize;
 	size_t devCtxSize;
@@ -413,15 +431,10 @@ typedef struct {
 	size_t ep0RingSize;
 	uint64_t eventRingPhys;
 	uint64_t erstPhys;
-	uint64_t devCtxPhys;
 	uint64_t inputCtxPhys;
-	uint64_t ep0RingPhys;
 	uint32_t cmdRingCount;
 	uint32_t cmdCycleState;
 	uint32_t cmdEnqueue;      /* persistent command-ring producer index (xhci_cmdExec) */
-	uint32_t ep0RingCount;
-	uint32_t ep0CycleState;   /* producer cycle state for the ep0 transfer ring */
-	uint32_t ep0Enqueue;      /* persistent ep0 producer index (xhci_ep0Push) */
 	uint32_t eventRingTrbs;
 	uint32_t eventCycleState; /* consumer cycle state (CCS) for the shared event-ring dequeue */
 	uint32_t eventDeq;        /* shared event-ring dequeue index (xhci_eventAwait) */
@@ -430,7 +443,8 @@ typedef struct {
 	xhci_trb_t eventStash[XHCI_EVENT_STASH_MAX]; /* events consumed for the *other* consumer,
 	                             parked here so a dispatch pass never discards them */
 	uint32_t eventStashCount;
-	uint8_t slotId;
+	xhci_slot_t slots[8];     /* per-device slot state; slots[0] is the primary/rig slot */
+	xhci_slot_t *cur;         /* slot currently driven by the ep0/addressing path */
 	uint32_t erstsz;
 	uint32_t erstbaLo;
 	uint32_t erstbaHi;
@@ -439,7 +453,6 @@ typedef struct {
 	uint64_t erstba;
 	uint64_t erdp;
 	struct xhci_pipePriv *interruptPriv;
-	uint8_t slotAddressed;    /* the single tracked slot has had Address Device issued */
 	uint8_t crcrPublished;    /* CRCR re-published once before the first command */
 	uint8_t keepRunning;      /* run the controller continuously (rig-handoff path) — never R/S=0 between ops */
 	unsigned ac64 : 1;
@@ -605,23 +618,27 @@ static void xhci_destroy(xhci_t *xhci)
 		usb_freeAligned(xhci->erst, xhci->erstSize);
 	}
 
-	if (xhci->devCtx != NULL) {
-		usb_freeAligned(xhci->devCtx, xhci->devCtxSize);
+	{
+		unsigned s;
+		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
+			if (xhci->slots[s].devCtx != NULL) {
+				usb_freeAligned(xhci->slots[s].devCtx, xhci->devCtxSize);
+			}
+			if (xhci->slots[s].ep0Ring != NULL) {
+				usb_freeAligned(xhci->slots[s].ep0Ring, xhci->ep0RingSize);
+			}
+		}
 	}
 
 	if (xhci->inputCtx != NULL) {
 		usb_freeAligned(xhci->inputCtx, xhci->inputCtxSize);
 	}
 
-	if (xhci->ep0Ring != NULL) {
-		usb_freeAligned(xhci->ep0Ring, xhci->ep0RingSize);
-	}
-
 	free(xhci);
 }
 
 
-static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out);
+static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint8_t wantSlot, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out);
 
 
 static void xhci_roothubStatusThread(void *arg)
@@ -657,7 +674,7 @@ static void xhci_roothubStatusThread(void *arg)
 			 * dispatcher owns the dequeue/ERDP/cycle and the controller keeps
 			 * running (keepRunning) — so no ERDP-reset or R/S=0 here. */
 			if (xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, priv->pendingTrbPhys,
-					priv->endpointId, 1u, &ev) == EOK) {
+					xhci->slots[0].slotId, priv->endpointId, 1u, &ev) == EOK) {
 				t = priv->pendingTransfer;
 				completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
 					XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
@@ -692,6 +709,10 @@ static int xhci_map(hcd_t *hcd, xhci_t **xhcip)
 	if (xhci == NULL) {
 		return -ENOMEM;
 	}
+
+	/* The ep0/addressing path drives one slot at a time via xhci->cur. For the
+	 * single-slot flow that is always the primary slot, slots[0]. */
+	xhci->cur = &xhci->slots[0];
 
 	/* Serialises the shared event-ring dispatcher (xhci_eventAwait) between the
 	 * enumeration path and the roothub status thread. Created before any command
@@ -1522,10 +1543,11 @@ static int xhci_cmdNoopSelftest(xhci_t *xhci)
  * the failing Setup/Data TRB — so matching the exact Status-TRB PA would MISS
  * error completions. Slot+ep catches any completion for the addressed pipe and
  * surfaces its code; it is also the routing key multi-slot/HID needs. */
-static int xhci_eventMatch(xhci_t *xhci, const xhci_trb_t *ev, uint32_t wantType, uint64_t wantParam, uint32_t wantEp)
+static int xhci_eventMatch(xhci_t *xhci, const xhci_trb_t *ev, uint32_t wantType, uint64_t wantParam, uint8_t wantSlot, uint32_t wantEp)
 {
 	uint32_t type = (ev->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
 
+	(void)xhci;
 	if (type != wantType) {
 		return 0;
 	}
@@ -1535,7 +1557,7 @@ static int xhci_eventMatch(xhci_t *xhci, const xhci_trb_t *ev, uint32_t wantType
 		uint32_t evEp = (ev->control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >>
 			XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
 		(void)wantParam;
-		return ((evSlot == xhci->slotId) && (evEp == wantEp)) ? 1 : 0;
+		return ((evSlot == (uint32_t)wantSlot) && (evEp == wantEp)) ? 1 : 0;
 	}
 	return (ev->parameter == wantParam) ? 1 : 0;
 }
@@ -1571,7 +1593,7 @@ static int xhci_eventStashable(const xhci_trb_t *ev)
  * with *out filled, or -ETIMEDOUT if no matching event lands within timeoutMs.
  * timeoutMs==1 makes this a single non-blocking poll pass (used by the roothub
  * thread, which has its own poll loop). */
-static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out)
+static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint8_t wantSlot, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out)
 {
 	xhci_trb_t *ring = (xhci_trb_t *)xhci->eventRing;
 	unsigned t;
@@ -1582,7 +1604,7 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 
 		/* The other consumer may already have pulled our event off the ring. */
 		for (i = 0u; i < xhci->eventStashCount; ++i) {
-			if (xhci_eventMatch(xhci, &xhci->eventStash[i], wantType, wantParam, wantEp) != 0) {
+			if (xhci_eventMatch(xhci, &xhci->eventStash[i], wantType, wantParam, wantSlot, wantEp) != 0) {
 				uint32_t j;
 				if (out != NULL) {
 					*out = xhci->eventStash[i];
@@ -1606,7 +1628,7 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 				break; /* dequeue caught up to the producer */
 			}
 
-			matched = xhci_eventMatch(xhci, cur, wantType, wantParam, wantEp);
+			matched = xhci_eventMatch(xhci, cur, wantType, wantParam, wantSlot, wantEp);
 			if ((matched == 0) && (xhci_eventStashable(cur) != 0)) {
 				if (xhci->eventStashCount < XHCI_EVENT_STASH_MAX) {
 					/* completion for the other consumer — park, don't discard */
@@ -1738,7 +1760,9 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	/* Consume the event ring via the shared dequeue until our command
 	 * completion (type-33, parameter == cmdPhys) lands, draining any
 	 * port-status or stale events queued ahead of it. */
-	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_CMD_COMPLETION, cmdPhys, 0u, XHCI_CMD_TIMEOUT_MS, &ev);
+	/* CMD completions are matched by parameter (cmdPhys); the slot field is
+	 * ignored for this event type, so wantSlot is irrelevant — pass 0. */
+	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_CMD_COMPLETION, cmdPhys, 0u, 0u, XHCI_CMD_TIMEOUT_MS, &ev);
 
 	if (err < 0) {
 		char dbgbuf[160];
@@ -1811,11 +1835,11 @@ static int xhci_cmdEnableSlot(xhci_t *xhci, uint8_t *slotId)
 }
 
 
-static int xhci_cmdAddressDevice(xhci_t *xhci, int setAddress)
+static int xhci_cmdAddressDevice(xhci_t *xhci, xhci_slot_t *slot, int setAddress)
 {
 	uint32_t control;
 
-	if ((xhci->slotId == 0u) || (xhci->inputCtxPhys == 0u)) {
+	if ((slot->slotId == 0u) || (xhci->inputCtxPhys == 0u)) {
 		return -EINVAL;
 	}
 
@@ -1825,7 +1849,7 @@ static int xhci_cmdAddressDevice(xhci_t *xhci, int setAddress)
 	}
 
 	control = (XHCI_TRB_TYPE_CMD_ADDRESS_DEVICE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
-		((uint32_t)xhci->slotId << XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_SLOTID__SHIFT);
+		((uint32_t)slot->slotId << XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_SLOTID__SHIFT);
 	if (setAddress == 0) {
 		control |= XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_BSR;
 	}
@@ -1834,16 +1858,16 @@ static int xhci_cmdAddressDevice(xhci_t *xhci, int setAddress)
 }
 
 
-static int xhci_cmdConfigureEndpoint(xhci_t *xhci, int deconfigure)
+static int xhci_cmdConfigureEndpoint(xhci_t *xhci, xhci_slot_t *slot, int deconfigure)
 {
 	uint32_t control;
 
-	if ((xhci->slotId == 0u) || (xhci->inputCtxPhys == 0u)) {
+	if ((slot->slotId == 0u) || (xhci->inputCtxPhys == 0u)) {
 		return -EINVAL;
 	}
 
 	control = (XHCI_TRB_TYPE_CMD_CONFIGURE_ENDPOINT << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
-		((uint32_t)xhci->slotId << XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_SLOTID__SHIFT);
+		((uint32_t)slot->slotId << XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_SLOTID__SHIFT);
 	if (deconfigure != 0) {
 		control |= XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_DC;
 	}
@@ -1852,13 +1876,13 @@ static int xhci_cmdConfigureEndpoint(xhci_t *xhci, int deconfigure)
 }
 
 
-static int xhci_allocSlotSpace(xhci_t *xhci)
+static int xhci_allocSlotSpace(xhci_t *xhci, xhci_slot_t *slot)
 {
 	uint64_t *dcbaa;
 	size_t dcbaaOffs;
 
-	if ((xhci->slotId == 0u) || (xhci->slotId > xhci->nslots)) {
-		fprintf(stderr, "xhci: invalid slot id for slot space %u\n", xhci->slotId);
+	if ((slot->slotId == 0u) || (slot->slotId > xhci->nslots)) {
+		fprintf(stderr, "xhci: invalid slot id for slot space %u\n", slot->slotId);
 		return -EINVAL;
 	}
 
@@ -1866,8 +1890,8 @@ static int xhci_allocSlotSpace(xhci_t *xhci)
 	xhci->inputCtxSize = xhci->contextSize * (XHCI_CONTEXT_INPUT + 1u + XHCI_MAX_ENDPOINTS);
 	xhci->ep0RingSize = XHCI_TRANSFER_RING_SIZE;
 
-	xhci->devCtx = usb_allocAligned(xhci->devCtxSize, XHCI_CONTEXT_ALIGN);
-	if (xhci->devCtx == NULL) {
+	slot->devCtx = usb_allocAligned(xhci->devCtxSize, XHCI_CONTEXT_ALIGN);
+	if (slot->devCtx == NULL) {
 		fprintf(stderr, "xhci: failed to allocate device context\n");
 		return -ENOMEM;
 	}
@@ -1878,37 +1902,37 @@ static int xhci_allocSlotSpace(xhci_t *xhci)
 		return -ENOMEM;
 	}
 
-	xhci->ep0Ring = usb_allocAligned(xhci->ep0RingSize, XHCI_TRANSFER_RING_ALIGN);
-	if (xhci->ep0Ring == NULL) {
+	slot->ep0Ring = usb_allocAligned(xhci->ep0RingSize, XHCI_TRANSFER_RING_ALIGN);
+	if (slot->ep0Ring == NULL) {
 		fprintf(stderr, "xhci: failed to allocate ep0 ring\n");
 		return -ENOMEM;
 	}
 
-	memset(xhci->devCtx, 0, xhci->devCtxSize);
+	memset(slot->devCtx, 0, xhci->devCtxSize);
 	memset(xhci->inputCtx, 0, xhci->inputCtxSize);
-	memset(xhci->ep0Ring, 0, xhci->ep0RingSize);
+	memset(slot->ep0Ring, 0, xhci->ep0RingSize);
 
-	xhci->devCtxPhys = va2pa(xhci->devCtx);
+	slot->devCtxPhys = va2pa(slot->devCtx);
 	xhci->inputCtxPhys = va2pa(xhci->inputCtx);
-	xhci->ep0RingPhys = va2pa(xhci->ep0Ring);
+	slot->ep0RingPhys = va2pa(slot->ep0Ring);
 
-	if (((xhci->devCtxPhys & (XHCI_CONTEXT_ALIGN - 1u)) != 0u) ||
+	if (((slot->devCtxPhys & (XHCI_CONTEXT_ALIGN - 1u)) != 0u) ||
 		((xhci->inputCtxPhys & (XHCI_CONTEXT_ALIGN - 1u)) != 0u) ||
-		((xhci->ep0RingPhys & (XHCI_TRANSFER_RING_ALIGN - 1u)) != 0u)) {
+		((slot->ep0RingPhys & (XHCI_TRANSFER_RING_ALIGN - 1u)) != 0u)) {
 		fprintf(stderr, "xhci: invalid slot-space alignment\n");
 		return -ENODEV;
 	}
 
-	dcbaaOffs = xhci->slotId * XHCI_DCBAA_ENTRY_SIZE;
+	dcbaaOffs = slot->slotId * XHCI_DCBAA_ENTRY_SIZE;
 	if ((dcbaaOffs + XHCI_DCBAA_ENTRY_SIZE) > xhci->dcbaaSize) {
-		fprintf(stderr, "xhci: slot id %u exceeds dcbaa size\n", xhci->slotId);
+		fprintf(stderr, "xhci: slot id %u exceeds dcbaa size\n", slot->slotId);
 		return -ENODEV;
 	}
 
 	dcbaa = (uint64_t *)xhci->dcbaa;
-	dcbaa[xhci->slotId] = xhci->devCtxPhys;
+	dcbaa[slot->slotId] = slot->devCtxPhys;
 
-	if (dcbaa[xhci->slotId] != xhci->devCtxPhys) {
+	if (dcbaa[slot->slotId] != slot->devCtxPhys) {
 		fprintf(stderr, "xhci: failed to bind dcbaa slot entry\n");
 		return -ENODEV;
 	}
@@ -1917,30 +1941,30 @@ static int xhci_allocSlotSpace(xhci_t *xhci)
 }
 
 
-static int xhci_initEp0Ring(xhci_t *xhci)
+static int xhci_initEp0Ring(xhci_t *xhci, xhci_slot_t *slot)
 {
 	xhci_trb_t *ring;
 	xhci_trb_t *link;
 
-	xhci->ep0RingCount = xhci->ep0RingSize / XHCI_TRB_SIZE;
-	if (xhci->ep0RingCount <= 1u) {
+	slot->ep0RingCount = xhci->ep0RingSize / XHCI_TRB_SIZE;
+	if (slot->ep0RingCount <= 1u) {
 		fprintf(stderr, "xhci: ep0 ring too small\n");
 		return -ENODEV;
 	}
 
-	memset(xhci->ep0Ring, 0, xhci->ep0RingSize);
-	xhci->ep0CycleState = 1u;
-	xhci->ep0Enqueue = 0u;
+	memset(slot->ep0Ring, 0, xhci->ep0RingSize);
+	slot->ep0CycleState = 1u;
+	slot->ep0Enqueue = 0u;
 
-	ring = (xhci_trb_t *)xhci->ep0Ring;
-	link = &ring[xhci->ep0RingCount - 1u];
-	link->parameter = xhci->ep0RingPhys;
+	ring = (xhci_trb_t *)slot->ep0Ring;
+	link = &ring[slot->ep0RingCount - 1u];
+	link->parameter = slot->ep0RingPhys;
 	link->status = 0u;
 	link->control = XHCI_TRB_CONTROL_C |
 		XHCI_LINK_TRB_CONTROL_TC |
 		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
 
-	if ((link->parameter != xhci->ep0RingPhys) ||
+	if ((link->parameter != slot->ep0RingPhys) ||
 		(((link->control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu) != XHCI_TRB_TYPE_LINK) ||
 		((link->control & (XHCI_TRB_CONTROL_C | XHCI_LINK_TRB_CONTROL_TC)) !=
 			(XHCI_TRB_CONTROL_C | XHCI_LINK_TRB_CONTROL_TC))) {
@@ -2000,7 +2024,7 @@ static uint8_t xhci_convertInterval(const usb_pipe_t *pipe)
 }
 
 
-static int xhci_prepareAddressContext(xhci_t *xhci, usb_dev_t *dev)
+static int xhci_prepareAddressContext(xhci_t *xhci, xhci_slot_t *target, usb_dev_t *dev)
 {
 	xhci_input_ctx_t *input;
 	xhci_slot_ctx_t *slot;
@@ -2036,12 +2060,14 @@ static int xhci_prepareAddressContext(xhci_t *xhci, usb_dev_t *dev)
 		(3u << XHCI_EP_CTX_CERR__SHIFT) |
 		(XHCI_EP_CTX_TYPE_CONTROL << XHCI_EP_CTX_TYPE__SHIFT) |
 		((uint32_t)maxPacket << XHCI_EP_CTX_MAX_PACKET__SHIFT);
-	ep0->trDequeuePtr = xhci->ep0RingPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS;
+	ep0->trDequeuePtr = target->ep0RingPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS;
 	ep0->averageTrbLen_maxEsitPayload = 8u;
+
+	target->maxPacket = maxPacket;
 
 	if ((input->control.addContextFlags != XHCI_INPUT_CTRL_CTX_ADD_A0_A1) ||
 		(slot->maxExitLatency_rootHubPort_ports != (((uint32_t)dev->port & 0xffu) << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT)) ||
-		(ep0->trDequeuePtr != (xhci->ep0RingPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS))) {
+		(ep0->trDequeuePtr != (target->ep0RingPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS))) {
 		fprintf(stderr, "xhci: invalid address context preparation\n");
 		return -ENODEV;
 	}
@@ -2136,7 +2162,7 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	epctx->averageTrbLen_maxEsitPayload = 16u |
 		((uint32_t)pipe->maxPacketLen << XHCI_EP_CTX_MAX_ESIT_PAYLOAD__SHIFT);
 
-	err = xhci_cmdConfigureEndpoint(xhci, 0);
+	err = xhci_cmdConfigureEndpoint(xhci, xhci->cur, 0);
 	if (err < 0) {
 		usb_freeAligned(priv->ring, priv->ringSize);
 		free(priv);
@@ -2199,7 +2225,7 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 
 	priv->pendingTransfer = t;
 	priv->pendingTrbPhys = priv->ringPhys;
-	xhci_dbWrite32(xhci, xhci->slotId * sizeof(uint32_t), priv->endpointId);
+	xhci_dbWrite32(xhci, xhci->cur->slotId * sizeof(uint32_t), priv->endpointId);
 
 	return 0;
 }
@@ -2209,20 +2235,21 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
  * control transfer's stages never straddle the ring wrap. If they would,
  * publish the Link TRB now (with the running producer cycle) and wrap the
  * producer to the segment base, toggling the producer cycle. */
-static void xhci_ep0Reserve(xhci_t *xhci, uint32_t count)
+static void xhci_ep0Reserve(xhci_t *xhci, xhci_slot_t *slot, uint32_t count)
 {
-	xhci_trb_t *ring = (xhci_trb_t *)xhci->ep0Ring;
+	xhci_trb_t *ring = (xhci_trb_t *)slot->ep0Ring;
 	xhci_trb_t *link;
 
-	if ((xhci->ep0Enqueue + count) <= (xhci->ep0RingCount - 1u)) {
+	(void)xhci;
+	if ((slot->ep0Enqueue + count) <= (slot->ep0RingCount - 1u)) {
 		return;
 	}
 
-	link = &ring[xhci->ep0RingCount - 1u];
+	link = &ring[slot->ep0RingCount - 1u];
 	link->control = (link->control & ~XHCI_TRB_CONTROL_C) |
-		(xhci->ep0CycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
-	xhci->ep0Enqueue = 0u;
-	xhci->ep0CycleState ^= 1u;
+		(slot->ep0CycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
+	slot->ep0Enqueue = 0u;
+	slot->ep0CycleState ^= 1u;
 }
 
 
@@ -2237,23 +2264,24 @@ static void xhci_ep0Reserve(xhci_t *xhci, uint32_t count)
  * sees the new work. Callers reserve room via xhci_ep0Reserve so a transfer
  * cannot straddle the trailing Link TRB; this advances only within the
  * segment. */
-static uint64_t xhci_ep0Push(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control)
+static uint64_t xhci_ep0Push(xhci_t *xhci, xhci_slot_t *slot, uint64_t parameter, uint32_t status, uint32_t control)
 {
-	xhci_trb_t *ring = (xhci_trb_t *)xhci->ep0Ring;
-	uint32_t idx = xhci->ep0Enqueue;
-	uint64_t trbPhys = xhci->ep0RingPhys + ((uint64_t)idx * (uint64_t)XHCI_TRB_SIZE);
+	xhci_trb_t *ring = (xhci_trb_t *)slot->ep0Ring;
+	uint32_t idx = slot->ep0Enqueue;
+	uint64_t trbPhys = slot->ep0RingPhys + ((uint64_t)idx * (uint64_t)XHCI_TRB_SIZE);
 
+	(void)xhci;
 	ring[idx].parameter = parameter;
 	ring[idx].status = status;
 	ring[idx].control = (control & ~XHCI_TRB_CONTROL_C) |
-		(xhci->ep0CycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
+		(slot->ep0CycleState != 0u ? XHCI_TRB_CONTROL_C : 0u);
 
-	xhci->ep0Enqueue = idx + 1u;
+	slot->ep0Enqueue = idx + 1u;
 	return trbPhys;
 }
 
 
-static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
+static int xhci_ep0ControlRead(xhci_t *xhci, xhci_slot_t *slot, usb_transfer_t *t)
 {
 	xhci_trb_t ev;
 	uint64_t statusTrbPhys;
@@ -2270,9 +2298,9 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 	}
 
 	/* Setup + Data(IN) + Status(OUT) at the persistent producer position. */
-	xhci_ep0Reserve(xhci, 3u);
+	xhci_ep0Reserve(xhci, slot, 3u);
 
-	(void)xhci_ep0Push(xhci,
+	(void)xhci_ep0Push(xhci, slot,
 		(uint64_t)t->setup->bmRequestType |
 			((uint64_t)t->setup->bRequest << 8) |
 			((uint64_t)t->setup->wValue << 16) |
@@ -2283,12 +2311,12 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 			(XHCI_TRANSFER_TRB_CONTROL_TRT_IN << XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT) |
 			XHCI_TRANSFER_TRB_CONTROL_IDT);
 
-	dataTrbPhys = xhci_ep0Push(xhci, va2pa(t->buffer), (uint32_t)t->size,
+	dataTrbPhys = xhci_ep0Push(xhci, slot, va2pa(t->buffer), (uint32_t)t->size,
 		(XHCI_TRB_TYPE_DATA_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
 			XHCI_TRANSFER_TRB_CONTROL_DIR_IN |
 			XHCI_TRANSFER_TRB_CONTROL_ISP);
 
-	statusTrbPhys = xhci_ep0Push(xhci, 0u, 0u,
+	statusTrbPhys = xhci_ep0Push(xhci, slot, 0u, 0u,
 		(XHCI_TRB_TYPE_STATUS_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
 			XHCI_TRANSFER_TRB_CONTROL_IOC);
 
@@ -2297,7 +2325,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 		return err;
 	}
 
-	xhci_dbWrite32(xhci, xhci->slotId * sizeof(uint32_t), 1u);
+	xhci_dbWrite32(xhci, slot->slotId * sizeof(uint32_t), 1u);
 
 	/* Consume EVERY event this TD produces, in ring order, until the Status-TRB
 	 * event (end of TD) or an error. A short Data stage emits a SHORT_PACKET
@@ -2309,7 +2337,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 	 * left behind. The data-stage residual gives the transferred length. */
 	transferred = (int)t->size;
 	for (;;) {
-		err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
+		err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, slot->slotId, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
 		if (err < 0) {
 			fprintf(stderr, "xhci: transfer completion timeout\n");
 			(void)xhci_enterHaltedState(xhci);
@@ -2321,7 +2349,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 		slotId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
 		residual = ev.status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
 
-		if ((endpointId != 1u) || (slotId != xhci->slotId)) {
+		if ((endpointId != 1u) || (slotId != slot->slotId)) {
 			fprintf(stderr, "xhci: transfer completion ep/slot mismatch (ep=%u slot=%u)\n", endpointId, slotId);
 			(void)xhci_enterHaltedState(xhci);
 			return -ENODEV;
@@ -2368,7 +2396,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 }
 
 
-static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
+static int xhci_ep0ControlWriteNoData(xhci_t *xhci, xhci_slot_t *slot, usb_transfer_t *t)
 {
 	xhci_trb_t ev;
 	uint64_t statusTrbPhys;
@@ -2382,9 +2410,9 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 	}
 
 	/* Setup + Status(IN), no Data stage, at the persistent producer position. */
-	xhci_ep0Reserve(xhci, 2u);
+	xhci_ep0Reserve(xhci, slot, 2u);
 
-	(void)xhci_ep0Push(xhci,
+	(void)xhci_ep0Push(xhci, slot,
 		(uint64_t)t->setup->bmRequestType |
 			((uint64_t)t->setup->bRequest << 8) |
 			((uint64_t)t->setup->wValue << 16) |
@@ -2395,7 +2423,7 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 			(XHCI_TRANSFER_TRB_CONTROL_TRT_NONE << XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT) |
 			XHCI_TRANSFER_TRB_CONTROL_IDT);
 
-	statusTrbPhys = xhci_ep0Push(xhci, 0u, 0u,
+	statusTrbPhys = xhci_ep0Push(xhci, slot, 0u, 0u,
 		(XHCI_TRB_TYPE_STATUS_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
 			XHCI_TRANSFER_TRB_CONTROL_DIR_IN |
 			XHCI_TRANSFER_TRB_CONTROL_IOC);
@@ -2405,14 +2433,14 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 		return err;
 	}
 
-	xhci_dbWrite32(xhci, xhci->slotId * sizeof(uint32_t), 1u);
+	xhci_dbWrite32(xhci, slot->slotId * sizeof(uint32_t), 1u);
 
 	/* Consume events until this TD's Status-TRB event (or an error), draining
 	 * any stale events a prior transfer left behind — see the loop in
 	 * xhci_ep0ControlRead for the drift rationale. No Data stage here, so a
 	 * single Status event is the norm. */
 	for (;;) {
-		err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
+		err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, slot->slotId, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
 		if (err < 0) {
 			fprintf(stderr, "xhci: transfer completion timeout\n");
 			(void)xhci_enterHaltedState(xhci);
@@ -2423,7 +2451,7 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 		endpointId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
 		slotId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
 
-		if ((endpointId != 1u) || (slotId != xhci->slotId)) {
+		if ((endpointId != 1u) || (slotId != slot->slotId)) {
 			fprintf(stderr, "xhci: transfer completion ep/slot mismatch (ep=%u slot=%u)\n", endpointId, slotId);
 			(void)xhci_enterHaltedState(xhci);
 			return -ENODEV;
@@ -2613,6 +2641,9 @@ static int xhci_init(hcd_t *hcd)
 		if (xhci == NULL) {
 			return -ENOMEM;
 		}
+		/* The ep0/addressing path drives one slot at a time via xhci->cur;
+		 * for the single-slot rig flow that is always the primary slot. */
+		xhci->cur = &xhci->slots[0];
 		hcd->priv = xhci;
 		hcd->base = (volatile uint32_t *)h.mmio;
 
@@ -2665,16 +2696,16 @@ static int xhci_init(hcd_t *hcd)
 		 * USB transactions are never issued on a just-unhalted controller. */
 		xhci->keepRunning = 1u;
 
-		err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
+		err = xhci_cmdEnableSlot(xhci, &xhci->slots[0].slotId);
 		{
 			char dbg[96];
 			snprintf(dbg, sizeof(dbg), "xhci: rig EnableSlot err=%d slotId=%u\n",
-				err, (unsigned)xhci->slotId);
+				err, (unsigned)xhci->slots[0].slotId);
 			debug(dbg);
 			fflush(NULL);
 		}
 		if (err == 0) {
-			err = xhci_allocSlotSpace(xhci);
+			err = xhci_allocSlotSpace(xhci, &xhci->slots[0]);
 		}
 
 	}
@@ -2735,9 +2766,9 @@ static int xhci_init(hcd_t *hcd)
 						 * check. */
 						err = xhci_cmdNoopSelftest(xhci);
 						if (err == 0) {
-							err = xhci_cmdEnableSlot(xhci, &xhci->slotId);
+							err = xhci_cmdEnableSlot(xhci, &xhci->slots[0].slotId);
 							if (err == 0) {
-								err = xhci_allocSlotSpace(xhci);
+								err = xhci_allocSlotSpace(xhci, &xhci->slots[0]);
 							}
 						}
 					}
@@ -3095,23 +3126,23 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		 * the first descriptor read and SET_ADDRESS is a no-op for high- and
 		 * super-speed (fixed 64/512) and is a TODO for low/full-speed devices
 		 * once those are reachable behind a hub. */
-		if (xhci->slotAddressed == 0u) {
-			err = xhci_initEp0Ring(xhci);
+		if (xhci->cur->addressed == 0u) {
+			err = xhci_initEp0Ring(xhci, xhci->cur);
 			if (err < 0) {
 				return err;
 			}
 
-			err = xhci_prepareAddressContext(xhci, pipe->dev);
+			err = xhci_prepareAddressContext(xhci, xhci->cur, pipe->dev);
 			if (err < 0) {
 				return err;
 			}
 
-			err = xhci_cmdAddressDevice(xhci, 1);
+			err = xhci_cmdAddressDevice(xhci, xhci->cur, 1);
 			if (err < 0) {
 				return err;
 			}
 
-			xhci->slotAddressed = 1u;
+			xhci->cur->addressed = 1u;
 		}
 
 		if ((setup != NULL) && (setup->bRequest == REQ_SET_ADDRESS)) {
@@ -3131,7 +3162,7 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		 * rather than by dev->address (still 0 at this point). */
 		if ((setup != NULL) && (setup->bRequest == REQ_GET_DESCRIPTOR) &&
 			(t->type == usb_transfer_control) && (t->direction == usb_dir_in)) {
-			err = xhci_ep0ControlRead(xhci, t);
+			err = xhci_ep0ControlRead(xhci, xhci->cur, t);
 			if (err < 0) {
 				return err;
 			}
@@ -3153,7 +3184,7 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		(t->type == usb_transfer_control) &&
 		(t->direction == usb_dir_in) &&
 		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_DEV2HOST)) {
-		err = xhci_ep0ControlRead(xhci, t);
+		err = xhci_ep0ControlRead(xhci, xhci->cur, t);
 		if (err < 0) {
 			return err;
 		}
@@ -3173,7 +3204,7 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		(t->size == 0u) &&
 		(setup->wLength == 0u) &&
 		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_HOST2DEV)) {
-		err = xhci_ep0ControlWriteNoData(xhci, t);
+		err = xhci_ep0ControlWriteNoData(xhci, xhci->cur, t);
 		if (err < 0) {
 			return err;
 		}
