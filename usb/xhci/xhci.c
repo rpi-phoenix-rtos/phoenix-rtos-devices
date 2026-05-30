@@ -225,6 +225,16 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_SLOT_CTX_SPEED__SHIFT 20u
 #define XHCI_SLOT_CTX_CONTEXT_ENTRIES__SHIFT 27u
 #define XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT 16u
+/* xHCI 1.2 §6.2.2 Slot Context bit layout (word indices match the struct
+ * fields: word0 = routeString_speed_mtt_hub_entries, word1 =
+ * maxExitLatency_rootHubPort_ports, word2 = ttHubSlot_ttPort_ttt_intrTarget). */
+#define XHCI_SLOT_CTX_ROUTE_STRING__MASK 0xfffffu /* word0 bits 0-19 (no shift) */
+#define XHCI_SLOT_CTX_MTT  (1u << 25)             /* word0 bit 25: Multi-TT */
+#define XHCI_SLOT_CTX_HUB  (1u << 26)             /* word0 bit 26: device is a hub */
+#define XHCI_SLOT_CTX_NUMBER_OF_PORTS__SHIFT 24u  /* word1 bits 24-31 */
+#define XHCI_SLOT_CTX_TT_HUB_SLOT_ID__SHIFT 0u    /* word2 bits 0-7 */
+#define XHCI_SLOT_CTX_TT_PORT_NUMBER__SHIFT 8u    /* word2 bits 8-15 */
+#define XHCI_SLOT_CTX_TT_THINK_TIME__SHIFT 16u    /* word2 bits 16-17 */
 #define XHCI_EP_CTX_CERR__SHIFT  1u
 #define XHCI_EP_CTX_TYPE__SHIFT  3u
 #define XHCI_EP_CTX_TYPE_CONTROL 4u
@@ -365,7 +375,9 @@ typedef struct {
 typedef struct {
 	uint8_t slotId;
 	uint8_t addressed;        /* this slot has had Address Device issued */
+	uint8_t hubFixedUp;       /* this slot's (hub) ctx has had Hub=1/NumPorts/TTT applied */
 	uint16_t maxPacket;
+	void *dev;                /* framework usb_dev_t this slot was allocated for (NULL = unused/primary) */
 	void *devCtx;
 	uint64_t devCtxPhys;
 	void *ep0Ring;
@@ -2031,10 +2043,21 @@ static int xhci_prepareAddressContext(xhci_t *xhci, xhci_slot_t *target, usb_dev
 	xhci_ep_ctx_t *ep0;
 	unsigned int psi;
 	uint16_t maxPacket;
+	uint32_t word0;
+	uint32_t word1;
+	uint32_t rootHubPort;
+	int behindHub;
 
-	if ((dev == NULL) || (dev->hub == NULL) || (dev->hub->hub != NULL)) {
+	/* Two topologies are handled:
+	 *   - a device on a root-hub port (dev->hub is the root hub, dev->hub->hub
+	 *     == NULL): root hub port = dev->port, no route string, no TT.
+	 *   - a device behind a non-root hub (dev->hub->hub != NULL), e.g. the
+	 *     low-speed keyboard behind the external VIA hub: it needs a route
+	 *     string + TT (split transactions) and the ROOT-hub port of the chain. */
+	if ((dev == NULL) || (dev->hub == NULL)) {
 		return -ENOSYS;
 	}
+	behindHub = (dev->hub->hub != NULL) ? 1 : 0;
 
 	psi = xhci_usbSpeedToPsi(dev->speed);
 	maxPacket = xhci_ep0MaxPacket(dev->speed);
@@ -2051,10 +2074,51 @@ static int xhci_prepareAddressContext(xhci_t *xhci, xhci_slot_t *target, usb_dev
 
 	input->control.addContextFlags = XHCI_INPUT_CTRL_CTX_ADD_A0_A1;
 
-	slot->routeString_speed_mtt_hub_entries =
-		(psi << XHCI_SLOT_CTX_SPEED__SHIFT) |
+	word0 = (psi << XHCI_SLOT_CTX_SPEED__SHIFT) |
 		(1u << XHCI_SLOT_CTX_CONTEXT_ENTRIES__SHIFT);
-	slot->maxExitLatency_rootHubPort_ports = ((uint32_t)dev->port & 0xffu) << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT;
+
+	if (behindHub == 0) {
+		/* Root-port device (the external hub). Root hub port = dev->port; no
+		 * route string, no TT. Behaviour identical to the pre-Step-2 path. */
+		rootHubPort = (uint32_t)dev->port & 0xffu;
+		word1 = rootHubPort << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT;
+		slot->ttHubSlot_ttPort_ttt_intrTarget = 0u;
+	}
+	else {
+		/* Device behind a non-root hub. Route string is the downstream-port
+		 * path below the root hub; the root hub port lives in its own field
+		 * (word1) and is NOT part of the route string.
+		 *
+		 * TODO(multi-tier): for the single-tier case (keyboard one level below
+		 * the root hub) the route string is a single nibble = the device's port
+		 * on its parent hub (dev->port). A deeper topology would need the full
+		 * per-tier nibble path; that is (dev->locationID >> 8) for tier>=2, but
+		 * only the single-tier VIA-hub case is exercised today. */
+		uint32_t routeString = (uint32_t)dev->port & 0xfu;
+
+		/* Root hub port of the whole chain = the parent hub's root-hub port.
+		 * dev->hub is the VIA hub, which enumerated on a root port; its own
+		 * ->port is that root port (1). NOT dev->port (the keyboard's port on
+		 * the hub). */
+		rootHubPort = (uint32_t)dev->hub->port & 0xffu;
+
+		word0 |= routeString & XHCI_SLOT_CTX_ROUTE_STRING__MASK;
+		/* MTT=0: the VIA hub (2109:3431) is single-TT. */
+		word1 = rootHubPort << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT;
+
+		/* TT for a low/full-speed device behind a high-speed hub: the TT hub is
+		 * the parent hub's xHCI slot. TODO(hub-slot-map): the only non-root hub
+		 * today is the primary slot (slots[0], slotId 1); map dev->hub -> its
+		 * slot generally once a second hub can appear. TT Port = device's port
+		 * on the hub; TT Think Time = 0. */
+		slot->ttHubSlot_ttPort_ttt_intrTarget =
+			((uint32_t)xhci->slots[0].slotId << XHCI_SLOT_CTX_TT_HUB_SLOT_ID__SHIFT) |
+			(((uint32_t)dev->port & 0xffu) << XHCI_SLOT_CTX_TT_PORT_NUMBER__SHIFT) |
+			(0u << XHCI_SLOT_CTX_TT_THINK_TIME__SHIFT);
+	}
+
+	slot->routeString_speed_mtt_hub_entries = word0;
+	slot->maxExitLatency_rootHubPort_ports = word1;
 
 	ep0->cerr_type_burst_packet =
 		(3u << XHCI_EP_CTX_CERR__SHIFT) |
@@ -2066,13 +2130,176 @@ static int xhci_prepareAddressContext(xhci_t *xhci, xhci_slot_t *target, usb_dev
 	target->maxPacket = maxPacket;
 
 	if ((input->control.addContextFlags != XHCI_INPUT_CTRL_CTX_ADD_A0_A1) ||
-		(slot->maxExitLatency_rootHubPort_ports != (((uint32_t)dev->port & 0xffu) << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT)) ||
+		(slot->maxExitLatency_rootHubPort_ports != word1) ||
 		(ep0->trDequeuePtr != (target->ep0RingPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS))) {
 		fprintf(stderr, "xhci: invalid address context preparation\n");
 		return -ENODEV;
 	}
 
 	return EOK;
+}
+
+
+/* PITFALL (xHCI 1.2 §4.6.6): for the controller to route split transactions to
+ * a low/full-speed device behind a high-speed hub, the HUB's OWN slot context
+ * must declare Hub=1, Number of Ports and TT Think Time. The hub was
+ * Address-Device'd before its descriptor (port count) was known, so these are
+ * unset. They are evaluated only by Configure Endpoint, NOT Evaluate Context
+ * (Evaluate Context touches only Max Exit Latency / Interrupter Target / ep0
+ * Max Packet Size). We copy the hub's current slot context out of its device
+ * context, set only the A0 (slot) add flag, OR in the hub fields, and issue
+ * Configure Endpoint so the existing Speed/RootHubPort/ContextEntries survive.
+ * One-shot per hub slot (slot->hubFixedUp). */
+static int xhci_cmdHubSlotFixup(xhci_t *xhci, xhci_slot_t *hubSlot, usb_dev_t *hubDev)
+{
+	xhci_input_ctx_t *input;
+	xhci_dev_ctx_t *devCtx;
+	xhci_slot_ctx_t *slot;
+	uint32_t nports;
+	int err;
+
+	if (hubSlot->hubFixedUp != 0u) {
+		return EOK;
+	}
+
+	nports = (uint32_t)hubDev->nports;
+	if (nports == 0u) {
+		/* Hub descriptor not parsed yet; nothing useful to program. */
+		return -EAGAIN;
+	}
+
+	memset(xhci->inputCtx, 0, xhci->inputCtxSize);
+	input = (xhci_input_ctx_t *)xhci->inputCtx;
+	slot = &input->device.slot;
+
+	/* A0 (slot context) only — Configure Endpoint with no endpoint add/drop. */
+	input->control.addContextFlags = 0x1u;
+
+	/* Preserve the hub's live slot context (Speed/RootHubPort/ContextEntries). */
+	devCtx = (xhci_dev_ctx_t *)hubSlot->devCtx;
+	slot->routeString_speed_mtt_hub_entries = devCtx->slot.routeString_speed_mtt_hub_entries;
+	slot->maxExitLatency_rootHubPort_ports = devCtx->slot.maxExitLatency_rootHubPort_ports;
+	slot->ttHubSlot_ttPort_ttt_intrTarget = devCtx->slot.ttHubSlot_ttPort_ttt_intrTarget;
+
+	/* Hub=1, Number of Ports; TT Think Time = 0, MTT = 0 (VIA hub is single-TT). */
+	slot->routeString_speed_mtt_hub_entries |= XHCI_SLOT_CTX_HUB;
+	slot->maxExitLatency_rootHubPort_ports =
+		(slot->maxExitLatency_rootHubPort_ports & ~(0xffu << XHCI_SLOT_CTX_NUMBER_OF_PORTS__SHIFT)) |
+		((nports & 0xffu) << XHCI_SLOT_CTX_NUMBER_OF_PORTS__SHIFT);
+
+	err = xhci_cmdConfigureEndpoint(xhci, hubSlot, 0);
+	if (err < 0) {
+		fprintf(stderr, "xhci: hub slot-ctx fixup (Configure Endpoint) failed rc=%d\n", err);
+		return err;
+	}
+
+	hubSlot->hubFixedUp = 1u;
+	return EOK;
+}
+
+
+/* Find the slot table entry already bound to `dev`, or NULL. The primary slot
+ * (slots[0]) is reserved for the root-port device (the external hub) and is
+ * matched by topology in xhci_slotForDev, not by this exact-pointer lookup. */
+static xhci_slot_t *xhci_findSlotForDev(xhci_t *xhci, usb_dev_t *dev)
+{
+	unsigned i;
+
+	for (i = 1u; i < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++i) {
+		if ((xhci->slots[i].slotId != 0u) && (xhci->slots[i].dev == dev)) {
+			return &xhci->slots[i];
+		}
+	}
+
+	return NULL;
+}
+
+
+/* Allocate, enable and Address-Device a fresh xHCI slot for a device sitting
+ * behind a non-root hub (the low-speed keyboard behind the VIA hub). Returns
+ * the new slot, or NULL on failure (errno-style rc via *err). The framework's
+ * subsequent SET_ADDRESS is acknowledged without re-issuing Address Device,
+ * exactly as the primary (slots[0]) path does. */
+static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
+{
+	xhci_slot_t *slot = NULL;
+	uint8_t slotId = 0u;
+	unsigned i;
+
+	*err = EOK;
+
+	for (i = 1u; i < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++i) {
+		if (xhci->slots[i].slotId == 0u) {
+			slot = &xhci->slots[i];
+			break;
+		}
+	}
+
+	if (slot == NULL) {
+		fprintf(stderr, "xhci: no free slot for device behind hub\n");
+		*err = -ENOMEM;
+		return NULL;
+	}
+
+	*err = xhci_cmdEnableSlot(xhci, &slotId);
+	if (*err < 0) {
+		return NULL;
+	}
+
+	slot->slotId = slotId;
+	slot->dev = dev;
+
+	*err = xhci_allocSlotSpace(xhci, slot);
+	if (*err < 0) {
+		return NULL;
+	}
+
+	*err = xhci_initEp0Ring(xhci, slot);
+	if (*err < 0) {
+		return NULL;
+	}
+
+	/* Ensure the parent hub's slot ctx declares Hub=1/NumPorts/TTT before the
+	 * keyboard slot is addressed, so the controller can route split transactions
+	 * down to it. The framework drives the hub's class-descriptor read through
+	 * this HCD, so nports is known by the time the keyboard first appears. */
+	*err = xhci_cmdHubSlotFixup(xhci, &xhci->slots[0], dev->hub);
+	if (*err < 0) {
+		return NULL;
+	}
+
+	*err = xhci_prepareAddressContext(xhci, slot, dev);
+	if (*err < 0) {
+		return NULL;
+	}
+
+	*err = xhci_cmdAddressDevice(xhci, slot, 1);
+	if (*err < 0) {
+		return NULL;
+	}
+
+	slot->addressed = 1u;
+	return slot;
+}
+
+
+/* Map a device to the slot that drives it. Root-port devices (the external hub:
+ * dev->hub->hub == NULL) use the primary slot, slots[0]. Devices behind a
+ * non-root hub use their dedicated slot (allocated lazily by
+ * xhci_allocSlotForDev). Returns slots[0] as the safe default so the existing
+ * single-slot path is unchanged when no per-dev slot exists yet. */
+static xhci_slot_t *xhci_slotForDev(xhci_t *xhci, usb_dev_t *dev)
+{
+	xhci_slot_t *slot;
+
+	if ((dev->hub != NULL) && (dev->hub->hub != NULL)) {
+		slot = xhci_findSlotForDev(xhci, dev);
+		if (slot != NULL) {
+			return slot;
+		}
+	}
+
+	return &xhci->slots[0];
 }
 
 
@@ -3113,6 +3340,16 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		return xhci_roothubReq(pipe->dev, t);
 	}
 
+	/* Route every transfer to the slot that drives this device: the external
+	 * hub on a root port -> slots[0]; a device behind a non-root hub (the
+	 * keyboard) -> its own slot. Defaults to slots[0] (the single-slot path) so
+	 * root-port behaviour is unchanged. The behind-hub slot is created lazily in
+	 * the address==0 block below; until then this returns slots[0], but the
+	 * address==0 branch overrides xhci->cur after allocation. */
+	if (xhci != NULL) {
+		xhci->cur = xhci_slotForDev(xhci, pipe->dev);
+	}
+
 	if ((pipe->dev->address == 0) && (xhci != NULL)) {
 		/* First contact with a freshly-connected device. xHCI requires the
 		 * slot to be addressed before ANY ep0 transfer, so set up the ep0
@@ -3126,7 +3363,22 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		 * the first descriptor read and SET_ADDRESS is a no-op for high- and
 		 * super-speed (fixed 64/512) and is a TODO for low/full-speed devices
 		 * once those are reachable behind a hub. */
-		if (xhci->cur->addressed == 0u) {
+		if ((pipe->dev->hub != NULL) && (pipe->dev->hub->hub != NULL)) {
+			/* Device behind a non-root hub (the low-speed keyboard behind the
+			 * VIA hub). It needs its OWN xHCI slot with a route string + TT;
+			 * slots[0] (the hub) cannot be reused. Allocate + address it once,
+			 * then drive its descriptor reads on that slot. ADDITIVE: the
+			 * root-port (hub/slots[0]) path below is untouched. */
+			xhci_slot_t *kbdSlot = xhci_findSlotForDev(xhci, pipe->dev);
+			if (kbdSlot == NULL) {
+				kbdSlot = xhci_allocSlotForDev(xhci, pipe->dev, &err);
+				if (kbdSlot == NULL) {
+					return err;
+				}
+			}
+			xhci->cur = kbdSlot;
+		}
+		else if (xhci->cur->addressed == 0u) {
 			err = xhci_initEp0Ring(xhci, xhci->cur);
 			if (err < 0) {
 				return err;
@@ -3224,6 +3476,46 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		}
 
 		return xhci_submitInterruptIn(xhci, t, pipe);
+	}
+
+	/* Addressed device BEHIND a non-root hub (the keyboard on its own slot).
+	 * Parallel to the root-port branches above, gated on dev->hub->hub != NULL
+	 * and on a per-dev slot existing; xhci->cur was set to that slot at the top.
+	 * ADDITIVE: the root-port branches above are unchanged. Interrupt-IN on the
+	 * keyboard's own ep is a TODO — usbkbd binding needs a per-slot interrupt
+	 * pipe (xhci->interruptPriv is currently the hub's single status pipe). */
+	if ((xhci != NULL) && (setup != NULL) &&
+		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub != NULL) &&
+		(pipe->dev->address != 0) &&
+		(xhci_findSlotForDev(xhci, pipe->dev) != NULL) &&
+		(t->type == usb_transfer_control) &&
+		(t->direction == usb_dir_in) &&
+		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_DEV2HOST)) {
+		err = xhci_ep0ControlRead(xhci, xhci->cur, t);
+		if (err < 0) {
+			return err;
+		}
+
+		usb_transferFinished(t, err);
+		return 0;
+	}
+
+	if ((xhci != NULL) && (setup != NULL) &&
+		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub != NULL) &&
+		(pipe->dev->address != 0) &&
+		(xhci_findSlotForDev(xhci, pipe->dev) != NULL) &&
+		(t->type == usb_transfer_control) &&
+		(t->direction == usb_dir_out) &&
+		(t->size == 0u) &&
+		(setup->wLength == 0u) &&
+		((setup->bmRequestType & REQUEST_DIR_MASK) == REQUEST_DIR_HOST2DEV)) {
+		err = xhci_ep0ControlWriteNoData(xhci, xhci->cur, t);
+		if (err < 0) {
+			return err;
+		}
+
+		usb_transferFinished(t, 0);
+		return 0;
 	}
 
 	return -ENOSYS;
