@@ -2250,10 +2250,12 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 {
 	xhci_trb_t ev;
 	uint64_t statusTrbPhys;
+	uint64_t dataTrbPhys;
 	uint32_t completion;
 	uint32_t endpointId;
 	uint32_t slotId;
 	uint32_t residual;
+	int transferred;
 	int err;
 
 	if ((xhci == NULL) || (t == NULL) || (t->setup == NULL) || (t->buffer == NULL) || (t->size == 0u)) {
@@ -2274,7 +2276,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 			(XHCI_TRANSFER_TRB_CONTROL_TRT_IN << XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT) |
 			XHCI_TRANSFER_TRB_CONTROL_IDT);
 
-	(void)xhci_ep0Push(xhci, va2pa(t->buffer), (uint32_t)t->size,
+	dataTrbPhys = xhci_ep0Push(xhci, va2pa(t->buffer), (uint32_t)t->size,
 		(XHCI_TRB_TYPE_DATA_STAGE << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
 			XHCI_TRANSFER_TRB_CONTROL_DIR_IN |
 			XHCI_TRANSFER_TRB_CONTROL_ISP);
@@ -2290,25 +2292,58 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 
 	xhci_dbWrite32(xhci, xhci->slotId * sizeof(uint32_t), 1u);
 
-	/* Consume the transfer event (type-32) for this slot's ep0 via the shared
-	 * dequeue, draining any events ahead of it. */
-	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
-	if (err < 0) {
-		fprintf(stderr, "xhci: transfer completion timeout\n");
-		(void)xhci_enterHaltedState(xhci);
-		return -ETIMEDOUT;
-	}
+	/* Consume EVERY event this TD produces, in ring order, until the Status-TRB
+	 * event (end of TD) or an error. A short Data stage emits a SHORT_PACKET
+	 * event (ISP) IN ADDITION to the Status-stage IOC event, so a control read
+	 * can yield two events; consuming only one per call leaves the other to be
+	 * mis-matched by the NEXT transfer (an off-by-one "drift" that returns a
+	 * stale completion before the current data lands). Looping until our own
+	 * Status TRB drains both, and also drains any stale events a prior transfer
+	 * left behind. The data-stage residual gives the transferred length. */
+	transferred = (int)t->size;
+	for (;;) {
+		err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
+		if (err < 0) {
+			fprintf(stderr, "xhci: transfer completion timeout\n");
+			(void)xhci_enterHaltedState(xhci);
+			return -ETIMEDOUT;
+		}
 
-	/* Completion event for this slot's ep0 (matched by xhci_eventAwait). */
-	completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
-	endpointId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
-	slotId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
-	residual = ev.status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
+		completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+		endpointId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
+		slotId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
+		residual = ev.status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
 
-	if ((endpointId != 1u) || (slotId != xhci->slotId)) {
-		fprintf(stderr, "xhci: transfer completion ep/slot mismatch (ep=%u slot=%u)\n", endpointId, slotId);
-		(void)xhci_enterHaltedState(xhci);
-		return -ENODEV;
+		if ((endpointId != 1u) || (slotId != xhci->slotId)) {
+			fprintf(stderr, "xhci: transfer completion ep/slot mismatch (ep=%u slot=%u)\n", endpointId, slotId);
+			(void)xhci_enterHaltedState(xhci);
+			return -ENODEV;
+		}
+
+		/* An error completes on the failing Setup/Data TRB and aborts the TD
+		 * (no Status event follows) — stop here. */
+		if ((completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) && (completion != XHCI_TRB_COMPLETION_CODE_SHORT_PACKET)) {
+			fprintf(stderr, "xhci: transfer completion code %u\n", completion);
+			if (xhci->keepRunning == 0u) {
+				(void)xhci_enterHaltedState(xhci);
+			}
+			return -ENODEV;
+		}
+
+		/* Data-stage event carries the transferred length (size - residual). */
+		if (ev.parameter == dataTrbPhys) {
+			if (residual > t->size) {
+				fprintf(stderr, "xhci: invalid transfer residual %u\n", residual);
+				return -ENODEV;
+			}
+			transferred = (int)(t->size - residual);
+		}
+
+		/* Status-stage event marks the end of this TD. */
+		if (ev.parameter == statusTrbPhys) {
+			break;
+		}
+		/* Otherwise a stale event from a prior transfer — skip, keep draining. */
 	}
 
 	/* Keep the controller running across successful control transfers (like
@@ -2322,17 +2357,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, usb_transfer_t *t)
 		}
 	}
 
-	if ((completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) && (completion != XHCI_TRB_COMPLETION_CODE_SHORT_PACKET)) {
-		fprintf(stderr, "xhci: transfer completion code %u\n", completion);
-		return -ENODEV;
-	}
-
-	if (residual > t->size) {
-		fprintf(stderr, "xhci: invalid transfer residual %u\n", residual);
-		return -ENODEV;
-	}
-
-	return (int)(t->size - residual);
+	return transferred;
 }
 
 
@@ -2375,24 +2400,44 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 
 	xhci_dbWrite32(xhci, xhci->slotId * sizeof(uint32_t), 1u);
 
-	/* Consume the transfer event (type-32, parameter == the status-stage
-	 * TRB PA) via the shared dequeue, draining any events ahead of it. */
-	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
-	if (err < 0) {
-		fprintf(stderr, "xhci: transfer completion timeout\n");
-		(void)xhci_enterHaltedState(xhci);
-		return -ETIMEDOUT;
-	}
+	/* Consume events until this TD's Status-TRB event (or an error), draining
+	 * any stale events a prior transfer left behind — see the loop in
+	 * xhci_ep0ControlRead for the drift rationale. No Data stage here, so a
+	 * single Status event is the norm. */
+	for (;;) {
+		err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
+		if (err < 0) {
+			fprintf(stderr, "xhci: transfer completion timeout\n");
+			(void)xhci_enterHaltedState(xhci);
+			return -ETIMEDOUT;
+		}
 
-	/* TRB type + parameter already matched by xhci_eventAwait. */
-	completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
-	endpointId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
-	slotId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
+		completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+		endpointId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_ENDPOINTID__SHIFT;
+		slotId = (ev.control & XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK) >> XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT;
 
-	if ((endpointId != 1u) || (slotId != xhci->slotId)) {
-		fprintf(stderr, "xhci: transfer completion ep/slot mismatch (ep=%u slot=%u)\n", endpointId, slotId);
-		(void)xhci_enterHaltedState(xhci);
-		return -ENODEV;
+		if ((endpointId != 1u) || (slotId != xhci->slotId)) {
+			fprintf(stderr, "xhci: transfer completion ep/slot mismatch (ep=%u slot=%u)\n", endpointId, slotId);
+			(void)xhci_enterHaltedState(xhci);
+			return -ENODEV;
+		}
+
+		/* A no-data control transfer's status stage is an IN that the device
+		 * answers with a ZLP — the controller reports that as SHORT_PACKET (13),
+		 * which is success here (matches ep0ControlRead). SET_CONFIGURATION on the
+		 * VIA hub returned 13; treating it as an error wrongly failed hub config. */
+		if ((completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) && (completion != XHCI_TRB_COMPLETION_CODE_SHORT_PACKET)) {
+			fprintf(stderr, "xhci: transfer completion code %u\n", completion);
+			if (xhci->keepRunning == 0u) {
+				(void)xhci_enterHaltedState(xhci);
+			}
+			return -ENODEV;
+		}
+
+		if (ev.parameter == statusTrbPhys) {
+			break;
+		}
+		/* Otherwise a stale event from a prior transfer — skip, keep draining. */
 	}
 
 	/* Keep the controller running across successful control transfers (like
@@ -2404,15 +2449,6 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, usb_transfer_t *t)
 		if (err < 0) {
 			return err;
 		}
-	}
-
-	/* A no-data control transfer's status stage is an IN that the device
-	 * answers with a ZLP — the controller reports that as SHORT_PACKET (13),
-	 * which is success here (matches ep0ControlRead). SET_CONFIGURATION on the
-	 * VIA hub returned 13; treating it as an error wrongly failed hub config. */
-	if ((completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) && (completion != XHCI_TRB_COMPLETION_CODE_SHORT_PACKET)) {
-		fprintf(stderr, "xhci: transfer completion code %u\n", completion);
-		return -ENODEV;
 	}
 
 	return 0;
