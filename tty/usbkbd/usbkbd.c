@@ -44,7 +44,26 @@
 #endif
 
 #ifndef USBKBD_N_URBS
-#define USBKBD_N_URBS 1
+/* Number of interrupt-IN URBs kept in flight on the HID endpoint.
+ *
+ * A boot keyboard's report rate is bounded by the endpoint poll interval
+ * (bInterval, ~8 ms => <=~125 reports/s), far above any human typing rate, so
+ * throughput is never the constraint. The real hazard is the RE-ARM GAP: when
+ * a URB completes it must be resubmitted before the next poll, or that poll's
+ * report is lost. Linux/BSD HID drivers use a single URB but resubmit it inside
+ * the completion callback (interrupt context), so the gap is ~microseconds.
+ * Phoenix delivers URB completions to the driver via an async message
+ * round-trip (URB-consumer thread -> msgSend -> usbkbd msgthr -> handleCompletion
+ * -> resubmit), so the gap is much larger and variable; a single URB therefore
+ * misses polls (observed on Pi 4 as dropped keystrokes: 3 presses, 1 echoed).
+ * The standard remedy for interrupt/bulk endpoints under high resubmit latency
+ * is a small ring of URBs kept queued (as USB-serial/CDC/audio drivers do), so
+ * the endpoint stays armed while completions are processed. Depth needed ~=
+ * ceil(rearm_latency / poll_interval); 8 gives comfortable margin over a
+ * worst-case multi-ms async re-arm at an ~8 ms poll, at trivial cost
+ * (8 * 8-byte report buffers). _usbkbd_start submits all of them; each is
+ * resubmitted in handleCompletion as it completes. */
+#define USBKBD_N_URBS 8
 #endif
 
 
