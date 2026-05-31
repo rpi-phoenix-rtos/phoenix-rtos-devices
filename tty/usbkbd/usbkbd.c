@@ -116,6 +116,23 @@ static struct {
 } usbkbd_common;
 
 
+/* TODO(#127): USB-keyboard input observability, queried over diag-udp ('k')
+ * from the lwip process this driver is embedded in. The three counters localize
+ * exactly where a typed byte dies along the path:
+ *   insertions -> the keyboard enumerated and /dev/kbdN was created
+ *   opens      -> something (pl011_kbdthr) opened /dev/kbdN, so interrupt URBs
+ *                 were submitted and the endpoint is being polled
+ *   reports    -> HID reports actually arrived at handleCompletion (input is
+ *                 reaching the driver; any failure is downstream in the
+ *                 kbd->tty bridge or psh interactivity)
+ * Non-static so diag-udp.c (linked into the same lwip image) can extern them.
+ * Remove once the keyboard input path is confirmed working end-to-end. */
+volatile unsigned usbkbd_diagInsertions = 0u;
+volatile unsigned usbkbd_diagOpens = 0u;
+volatile unsigned usbkbd_diagReports = 0u;
+volatile uint8_t usbkbd_diagLastReport[usbkbd_reportSize];
+
+
 static const usb_device_id_t filters[] = {
 	{ USBDRV_ANY, USBDRV_ANY, USB_CLASS_HID, usbkbd_bootSubclass, usbkbd_keyboardProtocol },
 };
@@ -488,6 +505,8 @@ static int _usbkbd_open(usbkbd_dev_t *dev, int flags, pid_t pid)
 	dev->flags = flags;
 	dev->clientpid = pid;
 
+	usbkbd_diagOpens++;
+
 	return EOK;
 }
 
@@ -622,6 +641,11 @@ static int usbkbd_handleCompletion(usb_driver_t *drv, usb_completion_t *c, const
 		mutexUnlock(dev->lock);
 		usbkbd_put(dev);
 		return -EIO;
+	}
+
+	usbkbd_diagReports++;
+	if (len >= (size_t)usbkbd_reportSize) {
+		memcpy((void *)usbkbd_diagLastReport, data, usbkbd_reportSize);
 	}
 
 	usbkbd_handleReport(dev, (const uint8_t *)data, len);
@@ -760,6 +784,8 @@ static int usbkbd_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, u
 	event->deviceCreated = true;
 	event->dev = oid;
 	strncpy(event->devPath, dev->path, sizeof(event->devPath));
+
+	usbkbd_diagInsertions++;
 
 	return EOK;
 }
