@@ -1091,6 +1091,23 @@ int main(void)
 	 * by early shell startup and mirrors create_dev()'s fallback behavior. */
 	(void)portRegister(port, _PATH_CONSOLE, &pl011_common.uart.oid);
 
+	/* TD-14/#127: initialize the HDMI fbcon (which sets uart->fbaddr) BEFORE
+	 * registering the klog callback and BEFORE starting pl011_thr, so every
+	 * console byte (kernel klog + psh output) is mirrored to HDMI from the very
+	 * first drained batch. Previously fbcon_init ran AFTER pl011_thr started, so
+	 * bytes drained during the init window reached UART but not fbcon — a
+	 * non-deterministic "fbcon shows only the banner/psh prompt, no klog"
+	 * depending on how much console output drained before fbaddr was set. */
+	{
+		int fbres = pl011_fbcon_init(&pl011_common.uart);
+		if (fbres == EOK) {
+			pl011_writeRaw(&pl011_common.uart, "fbcon: ok\r\n");
+		}
+		else {
+			fprintf(stderr, "pl011-tty: fbcon init failed: %d\n", fbres);
+		}
+	}
+
 	libklog_init(pl011_klogClbk);
 	oid_t kmsgctrl = { .port = port, .id = KMSG_CTRL_ID };
 	libklog_ctrlRegister(&kmsgctrl);
@@ -1103,19 +1120,6 @@ int main(void)
 		beginthread(pl011_mousethr, 4, pl011_common.uart.mousestack, sizeof(pl011_common.uart.mousestack), &pl011_common.uart);
 	}
 	beginthread(poolthr, 4, pl011_common.stack, sizeof(pl011_common.stack), (void *)(uintptr_t)port);
-
-	{
-		/* fbcon init: emit a single boot marker so post-fbcon-ok timing
-		 * is visible on UART. Failure reasons go to stderr where useful;
-		 * direct pl011_writeRaw avoids debug() IPC on the success path. */
-		int fbres = pl011_fbcon_init(&pl011_common.uart);
-		if (fbres == EOK) {
-			pl011_writeRaw(&pl011_common.uart, "fbcon: ok\r\n");
-		}
-		else {
-			fprintf(stderr, "pl011-tty: fbcon init failed: %d\n", fbres);
-		}
-	}
 
 	poolthr((void *)(uintptr_t)port);
 
