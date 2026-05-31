@@ -44,26 +44,22 @@
 #endif
 
 #ifndef USBKBD_N_URBS
-/* Number of interrupt-IN URBs kept in flight on the HID endpoint.
+/* Number of interrupt-IN URBs queued on the HID endpoint.
  *
- * A boot keyboard's report rate is bounded by the endpoint poll interval
- * (bInterval, ~8 ms => <=~125 reports/s), far above any human typing rate, so
- * throughput is never the constraint. The real hazard is the RE-ARM GAP: when
- * a URB completes it must be resubmitted before the next poll, or that poll's
- * report is lost. Linux/BSD HID drivers use a single URB but resubmit it inside
- * the completion callback (interrupt context), so the gap is ~microseconds.
- * Phoenix delivers URB completions to the driver via an async message
- * round-trip (URB-consumer thread -> msgSend -> usbkbd msgthr -> handleCompletion
- * -> resubmit), so the gap is much larger and variable; a single URB therefore
- * misses polls (observed on Pi 4 as dropped keystrokes: 3 presses, 1 echoed).
- * The standard remedy for interrupt/bulk endpoints under high resubmit latency
- * is a small ring of URBs kept queued (as USB-serial/CDC/audio drivers do), so
- * the endpoint stays armed while completions are processed. Depth needed ~=
- * ceil(rearm_latency / poll_interval); 8 gives comfortable margin over a
- * worst-case multi-ms async re-arm at an ~8 ms poll, at trivial cost
- * (8 * 8-byte report buffers). _usbkbd_start submits all of them; each is
- * resubmitted in handleCompletion as it completes. */
-#define USBKBD_N_URBS 8
+ * MUST stay 1 with the current Pi 4 xHCI HCD: queuing multiple URBs on a single
+ * interrupt endpoint corrupted xHCI controller state and faulted (Data Abort in
+ * xhci_enterRunState->writeReg with a wild register base) once the keyboard's
+ * interrupt pipe was driven. The xHCI per-slot interrupt-pipe support tracks a
+ * single priv per slot (see xhci_initInterruptInPipe / the roothub poll), so it
+ * does not yet handle a ring of in-flight URBs per pipe.
+ *
+ * Consequence: a single URB leaves a re-arm gap between a completion and its
+ * resubmit (Phoenix delivers completions over an async message round-trip), so
+ * fast keypresses can be dropped (observed: 3 presses, 1 echoed). Fixing that
+ * reliably needs HCD-level work (multi-URB-per-interrupt-pipe support, or a
+ * faster in-completion resubmit) — tracked separately — NOT a bump of this
+ * constant, which crashes. */
+#define USBKBD_N_URBS 1
 #endif
 
 
