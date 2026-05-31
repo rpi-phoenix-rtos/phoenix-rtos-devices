@@ -385,6 +385,7 @@ typedef struct {
 	uint32_t ep0RingCount;
 	uint32_t ep0CycleState;   /* producer cycle state for the ep0 transfer ring */
 	uint32_t ep0Enqueue;      /* persistent ep0 producer index (xhci_ep0Push) */
+	struct xhci_pipePriv *interruptPriv; /* this slot's interrupt-IN pipe (NULL = none) */
 } xhci_slot_t;
 
 
@@ -464,7 +465,6 @@ typedef struct {
 	uint32_t erdpHi;
 	uint64_t erstba;
 	uint64_t erdp;
-	struct xhci_pipePriv *interruptPriv;
 	uint8_t crcrPublished;    /* CRCR re-published once before the first command */
 	uint8_t keepRunning;      /* run the controller continuously (rig-handoff path) — never R/S=0 between ops */
 	unsigned ac64 : 1;
@@ -478,6 +478,7 @@ typedef struct xhci_pipePriv {
 	uint64_t ringPhys;
 	uint32_t ringCount;
 	uint32_t cycleState;
+	uint8_t slotId;           /* xHCI slot this interrupt pipe belongs to */
 	uint8_t endpointId;
 	uint8_t endpointType;
 	usb_transfer_t *pendingTransfer;
@@ -665,6 +666,7 @@ static void xhci_roothubStatusThread(void *arg)
 	uint32_t completion;
 	uint32_t residual;
 	unsigned sleepUs;
+	unsigned s;
 	int ret;
 
 	for (;;) {
@@ -678,15 +680,24 @@ static void xhci_roothubStatusThread(void *arg)
 			}
 		}
 
-		priv = xhci->interruptPriv;
-		if ((priv != NULL) && (priv->pendingTransfer != NULL)) {
+		/* Poll every active interrupt-IN pipe once per pass. Each slot owns its
+		 * own pipe (slots[0] is the external hub's status-change ep; a device
+		 * behind a non-root hub uses its own slot). The shared event dispatcher
+		 * keys completions by (slot, endpoint), so each pipe must be awaited with
+		 * its own slotId — NOT a hardcoded slots[0]. */
+		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
+			priv = xhci->slots[s].interruptPriv;
+			if ((priv == NULL) || (priv->pendingTransfer == NULL)) {
+				continue;
+			}
+
 			sleepUs = 1000u;
 			/* Single non-blocking poll of the shared event ring (locked,
 			 * stash-aware) for this interrupt endpoint's completion. The
 			 * dispatcher owns the dequeue/ERDP/cycle and the controller keeps
 			 * running (keepRunning) — so no ERDP-reset or R/S=0 here. */
 			if (xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, priv->pendingTrbPhys,
-					xhci->slots[0].slotId, priv->endpointId, 1u, &ev) == EOK) {
+					priv->slotId, priv->endpointId, 1u, &ev) == EOK) {
 				t = priv->pendingTransfer;
 				completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
 					XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
@@ -2310,6 +2321,7 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	xhci_trb_t *ring;
 	xhci_trb_t *link;
 	xhci_pipePriv_t *priv;
+	xhci_slot_t *slot;
 	uint8_t endpointId;
 	uint32_t interval;
 	int err;
@@ -2322,15 +2334,15 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 		return 0;
 	}
 
-	/* Require an ADDRESSED device on a root-port hub, but do NOT require
-	 * dev->address == slotId: the framework's USB address is its own bookkeeping
-	 * (the external hub is address 2 — the root hub took 1) and need not equal
-	 * the xHCI slot id. xHCI routes by slot via the doorbell (slotId below), not
-	 * by the framework address — same rationale as the SET_ADDRESS handler in
-	 * xhci_transferEnqueue. Requiring ==slotId here rejected the hub's
-	 * status-change interrupt pipe with -EINVAL, failing hub_conf. */
+	/* Require an ADDRESSED device that hangs off a hub, but do NOT require
+	 * dev->address == slotId (the framework address is its own bookkeeping; xHCI
+	 * routes by slot via the doorbell) NOR that the parent hub be the root hub.
+	 * A device behind a non-root hub (the low-speed keyboard behind the external
+	 * hub) has its own slot (xhci_slotForDev) with route string + TT already set
+	 * by Address Device, so its interrupt-IN endpoint is configured on that slot
+	 * the same way the hub's status endpoint is on slots[0]. */
 	if ((pipe->type != usb_transfer_interrupt) || (pipe->dir != usb_dir_in) ||
-		(pipe->dev->hub == NULL) || (pipe->dev->hub->hub != NULL) ||
+		(pipe->dev->hub == NULL) ||
 		(pipe->dev->address == 0)) {
 		return -EINVAL;
 	}
@@ -2340,12 +2352,20 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 		return -EINVAL;
 	}
 
+	/* The owning slot drives the Configure Endpoint command and the doorbell,
+	 * NOT a hardcoded slots[0]: the external hub maps to slots[0] (slotId 1),
+	 * a device behind a non-root hub to its own slot. Per-slot interruptPriv
+	 * tracking lets a second interrupt pipe on a different slot coexist with
+	 * the hub's without clobbering it. */
+	slot = xhci_slotForDev(xhci, pipe->dev);
+
 	priv = calloc(1, sizeof(*priv));
 	if (priv == NULL) {
 		return -ENOMEM;
 	}
 
 	priv->ringSize = XHCI_TRANSFER_RING_SIZE;
+	priv->slotId = slot->slotId;
 	priv->endpointId = endpointId;
 	priv->endpointType = XHCI_EP_CTX_TYPE_INTERRUPT_IN;
 	priv->ring = usb_allocAligned(priv->ringSize, XHCI_TRANSFER_RING_ALIGN);
@@ -2389,7 +2409,7 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	epctx->averageTrbLen_maxEsitPayload = 16u |
 		((uint32_t)pipe->maxPacketLen << XHCI_EP_CTX_MAX_ESIT_PAYLOAD__SHIFT);
 
-	err = xhci_cmdConfigureEndpoint(xhci, xhci->cur, 0);
+	err = xhci_cmdConfigureEndpoint(xhci, slot, 0);
 	if (err < 0) {
 		usb_freeAligned(priv->ring, priv->ringSize);
 		free(priv);
@@ -2397,7 +2417,9 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	}
 
 	pipe->hcdpriv = priv;
-	xhci->interruptPriv = priv;
+	slot->interruptPriv = priv;
+	fprintf(stderr, "xhci: interrupt-IN pipe ready slot=%u ep=%u maxpkt=%u\n",
+		(unsigned)slot->slotId, (unsigned)endpointId, (unsigned)pipe->maxPacketLen);
 	return 0;
 }
 
@@ -2452,7 +2474,7 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 
 	priv->pendingTransfer = t;
 	priv->pendingTrbPhys = priv->ringPhys;
-	xhci_dbWrite32(xhci, xhci->cur->slotId * sizeof(uint32_t), priv->endpointId);
+	xhci_dbWrite32(xhci, (uintptr_t)priv->slotId * sizeof(uint32_t), priv->endpointId);
 
 	return 0;
 }
@@ -3465,8 +3487,13 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		return 0;
 	}
 
+	/* Interrupt-IN endpoint on any addressed device hanging off a hub: the hub's
+	 * own status-change endpoint (slots[0]) AND a device behind a non-root hub
+	 * (the keyboard's HID endpoint, on its own slot). Per-slot interrupt pipes
+	 * (slot->interruptPriv) let both coexist; xhci_initInterruptInPipe derives
+	 * the owning slot from pipe->dev and the roothub thread polls all slots. */
 	if ((xhci != NULL) &&
-		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub == NULL) &&
+		(pipe->dev->hub != NULL) &&
 		(pipe->dev->address != 0) &&
 		(t->type == usb_transfer_interrupt) &&
 		(t->direction == usb_dir_in)) {
@@ -3478,12 +3505,8 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		return xhci_submitInterruptIn(xhci, t, pipe);
 	}
 
-	/* Addressed device BEHIND a non-root hub (the keyboard on its own slot).
-	 * Parallel to the root-port branches above, gated on dev->hub->hub != NULL
-	 * and on a per-dev slot existing; xhci->cur was set to that slot at the top.
-	 * ADDITIVE: the root-port branches above are unchanged. Interrupt-IN on the
-	 * keyboard's own ep is a TODO — usbkbd binding needs a per-slot interrupt
-	 * pipe (xhci->interruptPriv is currently the hub's single status pipe). */
+	/* Addressed device BEHIND a non-root hub (the keyboard on its own slot):
+	 * control transfers. xhci->cur was set to that slot at the top. */
 	if ((xhci != NULL) && (setup != NULL) &&
 		(pipe->dev->hub != NULL) && (pipe->dev->hub->hub != NULL) &&
 		(pipe->dev->address != 0) &&
@@ -3540,8 +3563,15 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 
 	priv = (xhci_pipePriv_t *)pipe->hcdpriv;
 	pipe->hcdpriv = NULL;
-	if (xhci->interruptPriv == priv) {
-		xhci->interruptPriv = NULL;
+	/* Clear the owning slot's interrupt pipe by pointer match (slots[] is indexed
+	 * by array position, not slotId, so don't index by priv->slotId here). */
+	{
+		unsigned s;
+		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
+			if (xhci->slots[s].interruptPriv == priv) {
+				xhci->slots[s].interruptPriv = NULL;
+			}
+		}
 	}
 
 	if (priv->ring != NULL) {
