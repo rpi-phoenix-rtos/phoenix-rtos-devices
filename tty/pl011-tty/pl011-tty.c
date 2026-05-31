@@ -64,6 +64,10 @@
 #define PL011_TTY_KBD_RETRY_US 500000
 #endif
 
+#ifndef PL011_TTY_MOUSE_PATH
+#define PL011_TTY_MOUSE_PATH ((const char *)NULL)
+#endif
+
 
 enum { dr = 0x00, fr = 0x18, ibrd = 0x24, fbrd = 0x28, lcrh = 0x2c, cr = 0x30, imsc = 0x38, icr = 0x44 };
 
@@ -133,6 +137,7 @@ typedef struct {
 
 	char stack[4096] __attribute__((aligned(8)));
 	char kbdstack[4096] __attribute__((aligned(8)));
+	char mousestack[4096] __attribute__((aligned(8)));
 } pl011_t;
 
 
@@ -956,6 +961,11 @@ static void pl011_kbdthr(void *arg)
 			continue;
 		}
 
+		/* TODO(#127): bring-up observability — the open succeeding both starts
+		 * the keyboard's URB polling (usbkbd opens on first client) and marks
+		 * when the USB keyboard became usable relative to boot. */
+		fprintf(stderr, "pl011-tty: kbd bridge opened %s\n", path);
+
 		for (;;) {
 			int wake_reader = 0;
 			size_t i;
@@ -982,6 +992,57 @@ static void pl011_kbdthr(void *arg)
 
 			if (wake_reader != 0) {
 				libtty_wake_reader(&uart->tty);
+			}
+		}
+
+		close(fd);
+		usleep(PL011_TTY_KBD_RETRY_US);
+	}
+}
+
+
+/* TODO(#126-mouse-validate): throwaway bring-up diagnostic. Nothing in-tree yet
+ * consumes /dev/mouseN, so usbmouse's interrupt URBs (submitted on first open)
+ * never start. This thread opens the mouse node to (a) kick off polling and
+ * (b) decode raw 4-byte HID boot-mouse reports to the UART so movement/buttons
+ * can be validated. Remove once a real pointer consumer exists. */
+static void pl011_mousethr(void *arg)
+{
+	const char *path = PL011_TTY_MOUSE_PATH;
+	uint8_t buf[64];
+	ssize_t len;
+	int fd;
+	size_t i;
+
+	(void)arg;
+	if (path == NULL) {
+		endthread();
+	}
+
+	for (;;) {
+		fd = open(path, O_RDONLY);
+		if (fd < 0) {
+			usleep(PL011_TTY_KBD_RETRY_US);
+			continue;
+		}
+
+		fprintf(stderr, "pl011-tty: mouse reader opened %s\n", path);
+
+		for (;;) {
+			len = read(fd, buf, sizeof(buf));
+			if (len == 0) {
+				break;
+			}
+			if (len < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				break;
+			}
+
+			for (i = 0u; (i + 4u) <= (size_t)len; i += 4u) {
+				fprintf(stderr, "mouse: btn=0x%02x x=%d y=%d wheel=%d\n",
+					buf[i], (int)(int8_t)buf[i + 1u], (int)(int8_t)buf[i + 2u], (int)(int8_t)buf[i + 3u]);
 			}
 		}
 
@@ -1037,6 +1098,9 @@ int main(void)
 	beginthread(pl011_thr, 4, pl011_common.uart.stack, sizeof(pl011_common.uart.stack), &pl011_common.uart);
 	if (PL011_TTY_KBD_PATH != NULL) {
 		beginthread(pl011_kbdthr, 4, pl011_common.uart.kbdstack, sizeof(pl011_common.uart.kbdstack), &pl011_common.uart);
+	}
+	if (PL011_TTY_MOUSE_PATH != NULL) {
+		beginthread(pl011_mousethr, 4, pl011_common.uart.mousestack, sizeof(pl011_common.uart.mousestack), &pl011_common.uart);
 	}
 	beginthread(poolthr, 4, pl011_common.stack, sizeof(pl011_common.stack), (void *)(uintptr_t)port);
 
