@@ -2533,9 +2533,9 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 	 * near any -> CPU write and the interrupt-ring theory is dead. */
 	{
 		static unsigned dumped = 0u;
-		if (dumped == 0u) {
+		if (dumped < 8u) {
 			char d[256];
-			dumped = 1u;
+			dumped++;
 			snprintf(d, sizeof(d),
 				"xhci DMAMAP intr slot=%u ep=%u: buf=0x%llx sz=%u intrRing=0x%llx sz=%u evtRing=0x%llx trbs=%u cmdRing=0x%llx dcbaa=0x%llx\n",
 				(unsigned)priv->slotId, (unsigned)priv->endpointId,
