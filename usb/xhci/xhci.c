@@ -1493,6 +1493,18 @@ static int xhci_enterHaltedState(xhci_t *xhci)
 	uint32_t usbsts;
 	int err;
 
+	/* Under keepRunning the controller must NEVER be halted (it runs continuously
+	 * across all ops). Several error/timeout paths (cmdExec timeout, the ep0/
+	 * address helpers) call this unconditionally; on the VL805 the halt never
+	 * completes (HCH won't set) so it would spin XHCI_RUNSTOP_TIMEOUT_MS and, with
+	 * the next command re-entering the run state, churn into an unbounded
+	 * "halt transition timeout" loop (observed 106k lines = system hang). On a
+	 * command timeout we want to leave the controller running and just return the
+	 * error to the caller. keepRunning==0 boards keep the legacy halt behaviour. */
+	if (xhci->keepRunning != 0u) {
+		return EOK;
+	}
+
 	xhci->running = 0u; /* see xhci_enterRunState: re-enter on the next command */
 
 	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
