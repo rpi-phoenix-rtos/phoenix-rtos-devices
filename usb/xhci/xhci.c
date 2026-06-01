@@ -2523,6 +2523,30 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 
 	priv->pendingTransfer = t;
 	priv->pendingTrbPhys = priv->ringPhys;
+
+	/* TODO(#129) one-shot DMA-region PA map: the #121/#129 corruption (lwIP mbox
+	 * structurally clobbered when the first kbd interrupt-IN transfer is driven)
+	 * is either a DMA overrun of one of these regions or a CPU write. Dump every
+	 * PA the controller is programmed to touch so it can be compared against the
+	 * corrupted mbox's va2pa (logged by port/mbox.c). If the mbox PA lands inside
+	 * or one slot past a region below -> DMA overrun of that region; if nowhere
+	 * near any -> CPU write and the interrupt-ring theory is dead. */
+	{
+		static unsigned dumped = 0u;
+		if (dumped == 0u) {
+			char d[256];
+			dumped = 1u;
+			snprintf(d, sizeof(d),
+				"xhci DMAMAP intr slot=%u ep=%u: buf=0x%llx sz=%u intrRing=0x%llx sz=%u evtRing=0x%llx trbs=%u cmdRing=0x%llx dcbaa=0x%llx\n",
+				(unsigned)priv->slotId, (unsigned)priv->endpointId,
+				(unsigned long long)va2pa(t->buffer), (unsigned)t->size,
+				(unsigned long long)priv->ringPhys, (unsigned)priv->ringSize,
+				(unsigned long long)xhci->eventRingPhys, (unsigned)xhci->eventRingTrbs,
+				(unsigned long long)xhci->cmdRingPhys, (unsigned long long)xhci->dcbaaPhys);
+			debug(d);
+		}
+	}
+
 	xhci_dbWrite32(xhci, (uintptr_t)priv->slotId * sizeof(uint32_t), priv->endpointId);
 
 	return 0;
