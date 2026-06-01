@@ -490,6 +490,7 @@ typedef struct {
 	uint64_t erdp;
 	uint8_t crcrPublished;    /* CRCR re-published once before the first command */
 	uint8_t keepRunning;      /* run the controller continuously (rig-handoff path) — never R/S=0 between ops */
+	uint8_t running;          /* controller is in R/S=1: enterRunState is then a no-op (skip per-command re-settle) */
 	unsigned ac64 : 1;
 	unsigned spr : 1;
 } xhci_t;
@@ -1357,6 +1358,21 @@ static int xhci_enterRunState(xhci_t *xhci)
 	uint32_t usbsts;
 	int err;
 
+	/* Idempotent when already running. cmdExec (and the addressing /
+	 * configure-endpoint helpers) call this before every command; on the
+	 * keepRunning path the controller never halts between commands, so
+	 * re-asserting R/S here is pointless and actively harmful: it re-runs
+	 * FIX-19's bridge outbound-window re-settle on every command (which the
+	 * FIX-19 comment itself warns churns the inbound-DMA translation), adds a
+	 * 10 ms settle per command, and floods the back-pressured UART with the
+	 * re-settle's register dump — enough to stall the host lwip process so
+	 * DHCP never completes. The `running` flag is set on the first successful
+	 * R/S and cleared by xhci_enterHaltedState, so keepRunning==0 boards
+	 * (which halt per command) still re-enter the run state each time. */
+	if (xhci->running != 0u) {
+		return EOK;
+	}
+
 	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
 	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
 		fprintf(stderr, "xhci: controller error state before run\n");
@@ -1436,6 +1452,7 @@ static int xhci_enterRunState(xhci_t *xhci)
 						"xhci: enterRun recovered on attempt %u\n", attempt);
 					debug(dbgbuf);
 				}
+				xhci->running = 1u;
 				return EOK;
 			}
 
@@ -1475,6 +1492,8 @@ static int xhci_enterHaltedState(xhci_t *xhci)
 	uint32_t usbcmd;
 	uint32_t usbsts;
 	int err;
+
+	xhci->running = 0u; /* see xhci_enterRunState: re-enter on the next command */
 
 	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
 	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd & ~XHCI_REG_OP_USBCMD_RS);
@@ -3043,6 +3062,20 @@ static int xhci_init(hcd_t *hcd)
 						 * already enters the run state via cmdExec,
 						 * which is the canonical "controller alive"
 						 * check. */
+#if defined(__TARGET_AARCH64A72) && defined(PCI_EXPRESS_BCM2711_INDEXED_CFG)
+						/* VL805 must run continuously: the halt-per-command
+						 * pattern (keepRunning==0) drops R/S after each command
+						 * and a just-unhalted VL805 fails the NEXT USB
+						 * transaction (AddressDevice -> Context State Error) and,
+						 * worse, leaves the controller halted when xhci_init
+						 * returns so it posts no Port-Status-Change events and
+						 * the roothub enumeration never starts. The rig path set
+						 * this after its handoff (#129); set it here too so the
+						 * framework's own bring-up keeps R/S=1 across the whole
+						 * No-Op -> EnableSlot -> enumeration sequence. Pi4-only:
+						 * imx6ull/ia32 et al. shipped on halt-per-command. */
+						xhci->keepRunning = 1u;
+#endif
 						err = xhci_cmdNoopSelftest(xhci);
 						if (err == 0) {
 							err = xhci_cmdEnableSlot(xhci, &xhci->slots[0].slotId);
