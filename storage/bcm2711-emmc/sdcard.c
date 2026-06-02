@@ -209,6 +209,11 @@ static int _sdio_cmdExecutionWait(sdcard_hostData_t *host, uint32_t flags, time_
 
 	uint32_t val = *(host->base + SDHOST_REG_INTR_STATUS);
 	if ((val & SDHOST_ERROR_REASONS) != 0) {
+		/* TODO(rpi4b-emmc): bring-up diagnostic — log the SDHCI error bits so we
+		 * can see why a command failed (e.g. ACMD41 op-cond). Remove once the
+		 * EMMC2 card-init works. */
+		LOG_ERROR("cmd error: intr_status=0x%08x err=0x%08x caps=0x%08x", (unsigned)val,
+			(unsigned)(val & SDHOST_ERROR_REASONS), (unsigned)*(host->base + SDHOST_REG_CAPABILITIES));
 		doResetCmd = (val & SDHOST_INTR_CMD_ERRORS) != 0;
 		doResetDat = (val & SDHOST_INTR_DAT_ERRORS) != 0;
 		*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_ERROR_REASONS;
