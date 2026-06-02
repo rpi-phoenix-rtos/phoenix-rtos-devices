@@ -138,6 +138,7 @@ typedef struct {
 	char stack[4096] __attribute__((aligned(8)));
 	char kbdstack[4096] __attribute__((aligned(8)));
 	char mousestack[4096] __attribute__((aligned(8)));
+	char klogstack[4096] __attribute__((aligned(8)));
 } pl011_t;
 
 
@@ -693,9 +694,66 @@ static void signal_txready(void *arg)
 }
 
 
-static void pl011_klogClbk(const char *data, size_t size)
+/* TD-14/#127 split-sink klog->fbcon drain.
+ *
+ * The kernel klog ring is served by the well-known kernel port (port 0, id 0 —
+ * created during kernel init before any userspace; this is the same oid the
+ * kernel mirror and libklog target). We attach to it DIRECTLY by message rather
+ * than resolving "/dev/kmsg" through devfs, whose bind/lookup is slow and
+ * fragile on Pi 4 (TD-14) — that path left the klog drain permanently
+ * unattached, so the kernel boot log never reached the HDMI fbcon.
+ *
+ * Sink split: the kernel UART already carries the complete klog via its
+ * permanent mirror (kernel log.c). This drain therefore writes the ring's bytes
+ * to the HDMI fbcon ONLY (pl011_fbcon_write, never libtty/UART), so the mirror
+ * and this drain never double up on the UART. On attach (mtOpen) the kernel
+ * sets our reader's ridx to the ring head, so we replay the whole pre-attach
+ * backlog to fbcon — i.e. HDMI gets the full early-boot log too. */
+#define KLOG_OID_PORT 0u
+#define KLOG_OID_ID   0u
+
+static void pl011_klogthr(void *arg)
 {
-	libtty_write(&pl011_common.uart.tty, data, size, 0);
+	pl011_t *uart = (pl011_t *)arg;
+	oid_t klog = { .port = KLOG_OID_PORT, .id = KLOG_OID_ID };
+	char buf[256];
+	msg_t msg;
+	int rc;
+
+	/* Register as a blocking klog reader: mtOpen(O_RDONLY) -> log_readerAdd. */
+	memset(&msg, 0, sizeof(msg));
+	msg.type = mtOpen;
+	msg.oid = klog;
+	msg.i.openclose.flags = O_RDONLY;
+	rc = msgSend(klog.port, &msg);
+	fprintf(stderr, "pl011-tty: klog attach rc=%d err=%d\n", rc, msg.o.err);
+	if ((rc < 0) || (msg.o.err < 0)) {
+		endthread();
+	}
+
+	for (;;) {
+		memset(&msg, 0, sizeof(msg));
+		msg.type = mtRead;
+		msg.oid = klog;
+		msg.o.data = buf;
+		msg.o.size = sizeof(buf);
+
+		rc = msgSend(klog.port, &msg);
+		if (rc < 0) {
+			usleep(PL011_TTY_KBD_RETRY_US);
+			continue;
+		}
+
+		if (msg.o.err > 0) {
+			/* fbcon-only: UART is covered by the kernel mirror. */
+			pl011_fbcon_write(uart, buf, (size_t)msg.o.err);
+		}
+		else if (msg.o.err < 0) {
+			/* -EPIPE: fell behind, ring wrapped; kernel reset us to head. */
+			usleep(PL011_TTY_KBD_RETRY_US);
+		}
+		/* msg.o.err == 0: a blocking read returned no data; just loop. */
+	}
 }
 
 
@@ -1108,9 +1166,11 @@ int main(void)
 		}
 	}
 
-	libklog_init(pl011_klogClbk);
-	oid_t kmsgctrl = { .port = port, .id = KMSG_CTRL_ID };
-	libklog_ctrlRegister(&kmsgctrl);
+	/* klog -> HDMI fbcon. Direct-attach to the kernel log port (see
+	 * pl011_klogthr); replaces libklog's devfs-path drain, which never
+	 * attached on Pi 4. The kernel UART mirror covers the UART, so this is
+	 * fbcon-only. */
+	beginthread(pl011_klogthr, 4, pl011_common.uart.klogstack, sizeof(pl011_common.uart.klogstack), &pl011_common.uart);
 
 	beginthread(pl011_thr, 4, pl011_common.uart.stack, sizeof(pl011_common.uart.stack), &pl011_common.uart);
 	if (PL011_TTY_KBD_PATH != NULL) {

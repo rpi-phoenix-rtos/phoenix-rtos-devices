@@ -896,38 +896,6 @@ static int pcie_cfgInitBcm2711(pcie_cfgio_t *cfgio)
 	cfgio->write32 = bcm2711Write32;
 	cfgio->destroy = pcie_cfgDestroyBcm2711;
 
-	/* USB-FIX-18: dump Pi-firmware-left bridge state BEFORE we touch
-	 * anything. Pi firmware (start4.elf) uses USB during boot menu,
-	 * meaning the bridge is in a working state at this point. If our
-	 * pcie_cfgInitBcm2711 then overwrites that working state with a
-	 * non-equivalent value, we'd break inbound DMA. */
-	{
-		char dbgbuf[200];
-		uint32_t v;
-		debug("pcie: --- Pi-firmware bridge state (pre-Phoenix init) ---\n");
-		v = readReg(bcm->base, BCM2711_PCIE_MISC_CTRL);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  MISC_CTRL    =0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_HARD_DEBUG);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  HARD_DEBUG   =0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_RC_BAR1_CONFIG_LO);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  RC_BAR1_LO   =0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_RC_BAR2_CONFIG_LO);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  RC_BAR2_LO   =0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_RC_BAR2_CONFIG_HI);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  RC_BAR2_HI   =0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_RC_BAR3_CONFIG_LO);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  RC_BAR3_LO   =0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_UBUS_BAR2_REMAP_LO);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  UBUS_REMAP_LO=0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_MISC_STATUS);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  MISC_STATUS  =0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_MEM_WIN0_LO);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  MEM_WIN0_LO  =0x%08x\n", v); debug(dbgbuf);
-		v = readReg(bcm->base, BCM2711_PCIE_MEM_WIN0_BASE_LIMIT);
-		snprintf(dbgbuf, sizeof(dbgbuf), "  MEM_WIN0_BL  =0x%08x\n", v); debug(dbgbuf);
-		debug("pcie: ----------------------------------------------------\n");
-	}
-
 	bcm2711PrepareHostBridge(bcm);
 	bcm2711PrepareLinkState(bcm);
 	if (bcm->linkUp && bcm->rcMode) {
