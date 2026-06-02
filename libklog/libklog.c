@@ -12,20 +12,30 @@
  */
 
 #include <errno.h>
-#include <fcntl.h>
-#include <paths.h>
-#include <stdint.h>
-#include <string.h>
 #include <sys/msg.h>
 #include <sys/threads.h>
-#include <sys/types.h>
+#include <sys/debug.h>
+#include <sys/mman.h>
+#include <sys/platform.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/file.h>
+#include <paths.h>
 
+#include <board_config.h>
 #include <posix/utils.h>
 
 #include "libklog.h"
+
+extern int sys_open(const char *filename, int oflag, ...);
+extern void ioctl_setResponse(msg_t *msg, unsigned long req, int err, const void *data);
+
+#define KMSG_CTRL_ID 100
 
 #define ERROR_MSG "libklog: Fatal error, exiting\n"
 
@@ -34,13 +44,9 @@ static struct {
 	libklog_write_t ttywrite;
 	struct __errno_t e;
 	volatile int enabled;
-	handle_t cond;
-	handle_t lock;
-	oid_t ctrl;
+	int createDevs;
+	int port;
 } libklog_common;
-
-
-extern int sys_open(const char *filename, int oflag, ...);
 
 
 static void pumpthr(void *arg)
@@ -49,7 +55,6 @@ static void pumpthr(void *arg)
 	int fd, ret;
 	oid_t dev;
 	char *name;
-	int createDevs = (int)(addr_t)arg;
 
 	dev.id = 0;
 	dev.port = 0;
@@ -66,7 +71,7 @@ static void pumpthr(void *arg)
 
 		strcat(buf, name);
 
-		if (createDevs == 0) {
+		if (libklog_common.createDevs == 0) {
 			/* Wait for KLOG device */
 			do {
 				fd = open(_PATH_KLOG, O_RDONLY);
@@ -105,168 +110,89 @@ static void pumpthr(void *arg)
 				continue;
 			}
 			else {
-				libklog_common.ttywrite(ERROR_MSG, sizeof(ERROR_MSG));
-				break;
+				_errno_remove(&libklog_common.e);
+				endthread();
 			}
 		}
 
-		/* Just stop here while dmesg on the console is disabled */
-		if (libklog_common.enabled == 0) {
-			mutexLock(libklog_common.lock);
-			while (libklog_common.enabled == 0) {
-				condWait(libklog_common.cond, libklog_common.lock, 0);
-			}
-			mutexUnlock(libklog_common.lock);
+		if (libklog_common.enabled != 0) {
+			libklog_common.ttywrite(buf, ret);
 		}
-
-		libklog_common.ttywrite(buf, ret);
-	}
-
-	close(fd);
-	_errno_remove(&libklog_common.e);
-	endthread();
-}
-
-
-void libklog_enable(int enable)
-{
-	if (enable == 0) {
-		libklog_common.enabled = 0;
-	}
-	else {
-		libklog_common.enabled = 1;
-		condSignal(libklog_common.cond);
 	}
 }
 
 
-int libklog_ctrlHandle(uint32_t port, msg_t *msg, msg_rid_t rid)
+int libklog_ctrlHandle(unsigned int port, msg_t *msg, msg_rid_t rid)
 {
-	int handled = 0;
-
-	if (port != libklog_common.ctrl.port) {
-		/* Failsafe - oid not registered */
+	if (msg->type != mtDevCtl) {
 		return -1;
 	}
 
-	switch (msg->type) {
-		case mtOpen:
-		case mtClose:
-			if (msg->oid.id == libklog_common.ctrl.id) {
-				msg->o.err = 0;
-				handled = 1;
-			}
-			break;
-
-		case mtRead:
-			if (msg->oid.id == libklog_common.ctrl.id) {
-				if ((msg->o.size != 0) && (msg->o.data != NULL)) {
-					strncpy(msg->o.data, (libklog_common.enabled != 0) ? "1" : "0", msg->o.size);
-					msg->o.err = (msg->o.size > 1) ? 2 : 1;
-				}
-				else {
-					msg->o.err = -EINVAL;
-				}
-				handled = 1;
-			}
-			break;
-
-		case mtWrite:
-			if (msg->oid.id == libklog_common.ctrl.id) {
-				if ((msg->i.size != 0) && (msg->i.data != NULL)) {
-					switch (((const char *)msg->i.data)[0]) {
-						case '0':
-							libklog_enable(0);
-							break;
-
-						case '1':
-							libklog_enable(1);
-							break;
-
-						default:
-							break;
-					}
-					msg->o.err = msg->i.size;
-				}
-				else {
-					msg->o.err = -EINVAL;
-				}
-				handled = 1;
-			}
-			break;
-
-		case mtGetAttr:
-			if (msg->oid.id == libklog_common.ctrl.id) {
-				if (msg->i.attr.type == atPollStatus) {
-					msg->o.attr.val = POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM;
-					msg->o.err = 0;
-				}
-				else {
-					msg->o.err = -EINVAL;
-				}
-				handled = 1;
-			}
-			break;
-
-		default:
-			break;
+	if (msg->i.data == NULL) {
+		return -1;
 	}
 
-	if (handled != 0) {
-		msgRespond(port, msg, rid);
+	if (msg->oid.id != KMSG_CTRL_ID) {
+		return -1;
 	}
 
-	return (handled != 0) ? 0 : -1;
+	unsigned long req;
+	const void *idata;
+	int err = 0;
+
+	idata = ioctl_unpack(msg, &req, NULL);
+	if (req == KIOEN) {
+		libklog_common.enabled = (int)(intptr_t)idata;
+	}
+	else {
+		err = -ENOSYS;
+	}
+
+	ioctl_setResponse(msg, req, err, NULL);
+	msgRespond(port, msg, rid);
+
+	return 0;
 }
 
 
 int libklog_ctrlRegister(oid_t *oid)
 {
-	int err = create_dev(oid, "kmsgctrl");
-	if (err >= 0) {
-		libklog_common.ctrl = *oid;
+	msg_t msg = { 0 };
+	oid_t odev;
+
+	if (lookup("devfs", NULL, &odev) < 0) {
+		return -1;
 	}
-	return err;
+
+	msg.type = mtCreate;
+	msg.oid = odev;
+	msg.i.create.type = otDev;
+	msg.i.create.mode = 0666;
+	msg.i.create.dev = *oid;
+	msg.i.data = "kmsgctrl";
+	msg.i.size = sizeof("kmsgctrl");
+
+	if (msgSend(odev.port, &msg) < 0) {
+		return -1;
+	}
+
+	return msg.o.err;
+}
+
+
+void libklog_enable(int val)
+{
+	libklog_common.enabled = val;
 }
 
 
 static int libklog_initHelper(libklog_write_t clbk, int createDevs)
 {
-	oid_t dev;
-	int err;
-
 	libklog_common.ttywrite = clbk;
 	libklog_common.enabled = 1;
+	libklog_common.createDevs = createDevs;
 
-	err = mutexCreate(&libklog_common.lock);
-	if (err < 0) {
-		return err;
-	}
-
-	err = condCreate(&libklog_common.cond);
-	if (err < 0) {
-		resourceDestroy(libklog_common.lock);
-		return err;
-	}
-
-	if (createDevs != 0) {
-		/* kmsg device is handled inside kernel */
-		dev.port = 0;
-		dev.id = 0;
-		err = create_dev(&dev, _PATH_KLOG);
-		if (err < 0) {
-			resourceDestroy(libklog_common.lock);
-			resourceDestroy(libklog_common.cond);
-			return err;
-		}
-	}
-
-	/* Pump klog messages from kernel buffer to tty driver */
-	if (beginthread(pumpthr, 4, libklog_common.stack, sizeof(libklog_common.stack), (void *)(addr_t)createDevs) != 0) {
-		resourceDestroy(libklog_common.lock);
-		resourceDestroy(libklog_common.cond);
-		return -ENOMEM;
-	}
+	beginthread(pumpthr, 4, libklog_common.stack, sizeof(libklog_common.stack), NULL);
 
 	return 0;
 }

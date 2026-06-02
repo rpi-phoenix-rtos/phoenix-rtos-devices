@@ -24,4 +24,8 @@ ifeq ($(PCI_EXPRESS_XILINX_AXI),y)
   DEP_LIBS += pcie-xilinx-axi
 endif
 
+ifeq ($(PCI_EXPRESS_BCM2711_INDEXED_CFG),y)
+  CFLAGS += -DPCI_EXPRESS_BCM2711_INDEXED_CFG
+endif
+
 include $(binary.mk)

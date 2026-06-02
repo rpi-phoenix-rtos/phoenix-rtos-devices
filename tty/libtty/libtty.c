@@ -504,7 +504,7 @@ int libtty_ioctl(libtty_common_t *tty, pid_t sender_pid, unsigned int cmd, const
 		case TIOCSPGRP:
 			log_ioctl("TIOCSPGRP(%u)", *pid);
 			/* FIXME: check permissions */
-			tty->pgrp = getpgid(*pid);
+			tty->pgrp = *pid;
 			break;
 		case TIOCNOTTY:
 			log_ioctl("TIOCNOTTY");
