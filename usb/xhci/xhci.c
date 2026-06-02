@@ -571,6 +571,16 @@ static inline void xhci_dbWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
 {
 	volatile uint32_t *reg = (volatile uint32_t *)((volatile uint8_t *)xhci->mmio + xhci->dboff + off);
 
+	/* Ring writes (TRBs + cycle bits) live in Normal-NonCacheable DMA memory;
+	 * the doorbell is Device memory. ARM does NOT order a Normal-NC store before
+	 * a later Device store without an explicit barrier, so the controller can act
+	 * on the doorbell and DMA-read a ring whose newest TRB/cycle-bit has not yet
+	 * reached DRAM — it then finds no work and the transfer/command never
+	 * completes (a silent, per-transaction, timing-dependent failure). The
+	 * command ring path open-coded this barrier (xhci_cmdExec); centralising it
+	 * here gives the ep0/transfer and interrupt-IN doorbells the same guarantee.
+	 * Mirrors Linux xhci_ring_*_doorbell(), which wmb() before the DB write. */
+	__asm__ volatile("dsb sy" ::: "memory");
 	*reg = val;
 }
 
@@ -1757,6 +1767,75 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 }
 
 
+/* Recover a wedged command ring after a command timed out.
+ *
+ * A command that the controller dequeues but never completes (observed on the
+ * Pi4 VL805: AddressDevice/ep0 ops intermittently produce no completion event
+ * while the port stays healthy) parks the controller's command dequeue on that
+ * TRB. The producer (cmdEnqueue) then runs ahead, so naive "write another TRB +
+ * ring the doorbell" retries are never reached — the controller is still stuck
+ * on the original. xHCI 1.2 §4.6.1.2 / §5.4.5 give the escape: write CRCR.CA to
+ * abort the running command, wait for CRR (Command Ring Running) to clear, then
+ * the ring is Stopped and can be re-initialised. After this the caller may
+ * re-issue the command and the controller will actually run it.
+ *
+ * Steps: (1) abort (CA=1, keep the ring pointer + RCS); (2) wait CRR=0;
+ * (3) drain the event ring of the abort/stop completion so it can't be
+ * mis-matched later; (4) re-init the command-ring producer (cmdEnqueue/cycle +
+ * Link TRB) and clear crcrPublished so the next cmdExec re-publishes CRCR=base,
+ * which resets the controller's dequeue to index 0 in lock-step. */
+static int xhci_cmdRingRecover(xhci_t *xhci)
+{
+	uint32_t crcr;
+	int err;
+
+	crcr = xhci_opRead32(xhci, XHCI_REG_OP_CRCR);
+	if ((crcr & XHCI_REG_OP_CRCR_CRR) != 0u) {
+		xhci_opWrite32(xhci, XHCI_REG_OP_CRCR_HI, (uint32_t)(xhci->cmdRingPhys >> 32));
+		xhci_opWrite32(xhci, XHCI_REG_OP_CRCR,
+			((uint32_t)(xhci->cmdRingPhys & XHCI_REG_OP_CRCR_CR_PTR_LO__MASK)) |
+				XHCI_REG_OP_CRCR_RCS | XHCI_REG_OP_CRCR_CA);
+		(void)xhci_opRead32(xhci, XHCI_REG_OP_USBSTS); /* flush the posted write */
+		err = xhci_waitOpBits(xhci, XHCI_REG_OP_CRCR, XHCI_REG_OP_CRCR_CRR, 0u, 100u);
+		if (err < 0) {
+			debug("xhci_cmdRingRecover: CRR did not clear after abort\n");
+		}
+	}
+
+	/* Drain every event the controller has posted (incl. the abort/stop
+	 * completion) so a stale completion can't satisfy the next waiter. Walk
+	 * the hardware ring from the shared dequeue, discarding all valid events. */
+	{
+		xhci_trb_t *ring = (xhci_trb_t *)xhci->eventRing;
+		unsigned guard = 0u;
+		mutexLock(xhci->eventLock);
+		for (; guard < xhci->eventRingTrbs; ++guard) {
+			xhci_trb_t *cur = &ring[xhci->eventDeq];
+			uint32_t cbit = ((cur->control & XHCI_TRB_CONTROL_C) != 0u) ? 1u : 0u;
+			uint64_t deqPhys;
+			if (cbit != ((xhci->eventCycleState != 0u) ? 1u : 0u)) {
+				break; /* caught up to the producer */
+			}
+			xhci->eventDeq++;
+			if (xhci->eventDeq >= xhci->eventRingTrbs) {
+				xhci->eventDeq = 0u;
+				xhci->eventCycleState ^= 1u;
+			}
+			deqPhys = xhci->eventRingPhys + ((uint64_t)xhci->eventDeq * (uint64_t)sizeof(xhci_trb_t));
+			xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, (uint32_t)(deqPhys >> 32));
+			xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO,
+				((uint32_t)(deqPhys & 0xFFFFFFFFu) & XHCI_REG_RT_IR_ERDP_LO__MASK) | XHCI_REG_RT_IR_ERDP_LO_EHB);
+		}
+		xhci->eventStashCount = 0u; /* drop any cross-consumer stash too */
+		mutexUnlock(xhci->eventLock);
+	}
+
+	(void)xhci_initCommandRing(xhci);
+	xhci->crcrPublished = 0u;
+	return EOK;
+}
+
+
 static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId)
 {
 	xhci_trb_t *cmd;
@@ -1849,16 +1928,37 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_CMD_COMPLETION, cmdPhys, 0u, 0u, XHCI_CMD_TIMEOUT_MS, &ev);
 
 	if (err < 0) {
-		char dbgbuf[160];
-		uint32_t usbsts2 = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-		uint32_t usbcmd2 = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
-		snprintf(dbgbuf, sizeof(dbgbuf),
-			"xhci_cmdExec TIMEOUT USBSTS=0x%08x USBCMD=0x%08x cmd_phys=0x%08llx deq=%u ccs=%u\n",
-			usbsts2, usbcmd2, (unsigned long long)cmdPhys,
-			(unsigned)xhci->eventDeq, (unsigned)xhci->eventCycleState);
-		debug(dbgbuf);
+		/* TODO(#129) diag: rate-limit the timeout report. A wedged controller
+		 * (event ring stops advancing) makes every subsequent command time out;
+		 * an unbounded caller then floods the UART, which both hides the boot and
+		 * back-pressure-truncates the very line we need (the leading USBSTS got
+		 * eaten in earlier captures). Print the first few IN FULL — including the
+		 * in-flight command TRB type and the cmd-ring producer index, to identify
+		 * which command wedges and confirm whether the ring is being re-inited
+		 * (cmdEnqueue resetting) — then suppress. */
+		static unsigned timeoutLogged = 0u;
+		if (timeoutLogged < 12u) {
+			char dbgbuf[200];
+			uint32_t usbsts2 = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
+			uint32_t usbcmd2 = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
+			uint32_t trbType = (control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
+			snprintf(dbgbuf, sizeof(dbgbuf),
+				"xhci_cmdExec TIMEOUT trb=%u USBSTS=0x%08x USBCMD=0x%08x cmd_phys=0x%08llx enq=%u deq=%u ccs=%u\n",
+				(unsigned)trbType, usbsts2, usbcmd2, (unsigned long long)cmdPhys,
+				(unsigned)xhci->cmdEnqueue, (unsigned)xhci->eventDeq, (unsigned)xhci->eventCycleState);
+			debug(dbgbuf);
+			if (++timeoutLogged == 12u) {
+				debug("xhci_cmdExec TIMEOUT: suppressing further timeout reports\n");
+			}
+		}
 		(void)xhci_enterHaltedState(xhci);
 		memset(cmd, 0, sizeof(*cmd));
+		/* The controller dequeued this command but never completed it, wedging the
+		 * command ring (its dequeue is parked on this TRB; the producer runs ahead,
+		 * so a plain re-enqueue is never reached). Abort + re-init the ring so the
+		 * caller's retry (HUB_ENUM_RETRIES) actually executes on the controller.
+		 * TODO(#129): if this reliably rescues, promote to a real bounded retry. */
+		(void)xhci_cmdRingRecover(xhci);
 		return -ETIMEDOUT;
 	}
 
@@ -2673,7 +2773,23 @@ static int xhci_ep0ControlRead(xhci_t *xhci, xhci_slot_t *slot, usb_transfer_t *
 	for (;;) {
 		err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, slot->slotId, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
 		if (err < 0) {
-			fprintf(stderr, "xhci: transfer completion timeout\n");
+			/* The controller intermittently never completes a transfer to a
+			 * freshly-reset device (the same inbound-side non-completion as the
+			 * command path — see project_usb_addressdevice_wall_129 / the masked
+			 * PCIe SError lead). An upstream caller can re-issue the failing
+			 * transfer many times; logging every timeout floods the UART and the
+			 * back-pressure reset-loops the box. Rate-limit the report so the
+			 * system stays up and networked even when enumeration fails this boot
+			 * (matches the command-ring treatment in xhci_cmdExec). */
+			{
+				static unsigned xferTimeoutLogged = 0u;
+				if (xferTimeoutLogged < 12u) {
+					fprintf(stderr, "xhci: transfer completion timeout\n");
+					if (++xferTimeoutLogged == 12u) {
+						fprintf(stderr, "xhci: transfer completion timeout: suppressing further reports\n");
+					}
+				}
+			}
 			(void)xhci_enterHaltedState(xhci);
 			return -ETIMEDOUT;
 		}
@@ -2776,7 +2892,23 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, xhci_slot_t *slot, usb_trans
 	for (;;) {
 		err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, statusTrbPhys, slot->slotId, 1u, XHCI_CMD_TIMEOUT_MS, &ev);
 		if (err < 0) {
-			fprintf(stderr, "xhci: transfer completion timeout\n");
+			/* The controller intermittently never completes a transfer to a
+			 * freshly-reset device (the same inbound-side non-completion as the
+			 * command path — see project_usb_addressdevice_wall_129 / the masked
+			 * PCIe SError lead). An upstream caller can re-issue the failing
+			 * transfer many times; logging every timeout floods the UART and the
+			 * back-pressure reset-loops the box. Rate-limit the report so the
+			 * system stays up and networked even when enumeration fails this boot
+			 * (matches the command-ring treatment in xhci_cmdExec). */
+			{
+				static unsigned xferTimeoutLogged = 0u;
+				if (xferTimeoutLogged < 12u) {
+					fprintf(stderr, "xhci: transfer completion timeout\n");
+					if (++xferTimeoutLogged == 12u) {
+						fprintf(stderr, "xhci: transfer completion timeout: suppressing further reports\n");
+					}
+				}
+			}
 			(void)xhci_enterHaltedState(xhci);
 			return -ETIMEDOUT;
 		}
