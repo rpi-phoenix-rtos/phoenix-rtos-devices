@@ -142,8 +142,13 @@ static const char usbkbd_letters[] = "abcdefghijklmnopqrstuvwxyz";
 static const char usbkbd_lettersShift[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 static const char usbkbd_digits[] = "1234567890";
 static const char usbkbd_digitsShift[] = "!@#$%^&*()";
-static const char usbkbd_symbols[] = "-=[]\\;'`,./";
-static const char usbkbd_symbolsShift[] = "_+{}|:\"~<>?";
+/* HID Keyboard/Keypad usages 0x2d..0x38, indexed by (usage - 0x2d). The range
+ * is contiguous and INCLUDES 0x32 (Non-US # and ~) between 0x31 (\ |) and
+ * 0x33 (; :); a US keyboard never emits 0x32 but the slot must be present or
+ * every entry from 0x33 onward shifts down by one (which previously made / ?
+ * at 0x38 read the string terminator -> dead key). Keep both tables 12 long. */
+static const char usbkbd_symbols[] = "-=[]\\#;'`,./";
+static const char usbkbd_symbolsShift[] = "_+{}|~:\"~<>?";
 
 
 static usbkbd_dev_t *usbkbd_get(int id)
