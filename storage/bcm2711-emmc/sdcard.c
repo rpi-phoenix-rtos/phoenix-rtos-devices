@@ -221,17 +221,26 @@ static int _sdio_cmdExecutionWait(sdcard_hostData_t *host, uint32_t flags, time_
 
 	uint32_t val = *(host->base + SDHOST_REG_INTR_STATUS);
 	if ((val & SDHOST_ERROR_REASONS) != 0) {
-		/* TODO(rpi4b-emmc): bring-up diagnostic — log the SDHCI error bits so we
-		 * can see why a command failed (e.g. ACMD41 op-cond). Remove once the
-		 * EMMC2 card-init works. */
-		LOG_ERROR("cmd error: intr_status=0x%08x err=0x%08x caps=0x%08x", (unsigned)val,
-			(unsigned)(val & SDHOST_ERROR_REASONS), (unsigned)*(host->base + SDHOST_REG_CAPABILITIES));
+		uint32_t errBits = val & SDHOST_ERROR_REASONS;
+		/* A pure command/data TIMEOUT means the card did not respond in time —
+		 * expected when probing an absent or not-yet-ready card (e.g. ACMD41 on
+		 * an empty slot, which the EMMC2 slot can't detect electrically). Report
+		 * it as -ETIME and keep it quiet; reserve the loud error log + -EIO for
+		 * genuine bus errors (CRC / end-bit / index / data corruption). */
+		if ((errBits & ~(uint32_t)(SDHOST_INTR_CMD_TIMEOUT | SDHOST_INTR_DATA_TIMEOUT)) == 0u) {
+			TRACE("cmd timeout: intr_status=0x%08x", (unsigned)val);
+			ret = -ETIME;
+		}
+		else {
+			LOG_ERROR("cmd error: intr_status=0x%08x err=0x%08x caps=0x%08x", (unsigned)val,
+				(unsigned)errBits, (unsigned)*(host->base + SDHOST_REG_CAPABILITIES));
+			ret = -EIO;
+		}
 		doResetCmd = (val & SDHOST_INTR_CMD_ERRORS) != 0;
 		doResetDat = (val & SDHOST_INTR_DAT_ERRORS) != 0;
 		*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_ERROR_REASONS;
 		/* Under QEMU it is important to zero out this register if an incomplete transfer happens */
 		*(host->base + SDHOST_REG_TRANSFER_BLOCK) = 0;
-		ret = -EIO;
 	}
 	else if ((val & flags) == flags) {
 		*(host->base + SDHOST_REG_INTR_STATUS) = flags;
@@ -620,7 +629,18 @@ int sdcard_initCard(unsigned int slot, bool fallbackMode)
 
 	uint32_t acmd41Response;
 	uint32_t acmd41Arg = trySdhc ? (1 << 30) : 0;
-	if (sdio_cmdSend(host, SDIO_ACMD41_SD_SEND_OP_COND, acmd41Arg, &acmd41Response) < 0) {
+	int acmd41Ret = sdio_cmdSend(host, SDIO_ACMD41_SD_SEND_OP_COND, acmd41Arg, &acmd41Response);
+	if (acmd41Ret < 0) {
+		/* The Pi 4 EMMC2 SD slot has no software-readable card-detect, so the
+		 * driver spoofs card-present and only finds out a card is absent when it
+		 * fails to respond. A pure timeout (-ETIME) on ACMD41 — the OCR query
+		 * every real SD card (v1 and v2) answers — means no card is present;
+		 * report it as -ENODEV without logging an error so a card-absent boot
+		 * (e.g. netboot with the slot empty) stays quiet. A non-timeout error is
+		 * a real failure. */
+		if (acmd41Ret == -ETIME) {
+			return -ENODEV;
+		}
 		LOG_ERROR("op cond fail");
 		return -EIO;
 	}

@@ -437,8 +437,20 @@ int sdstorage_handleInsertion(unsigned int slot)
 		if (ret == 0) {
 			break;
 		}
+		/* No card present (-ENODEV from a no-response ACMD41): there is nothing
+		 * to retry and it is not an error — common on netboot with the slot
+		 * empty. Bail out quietly without the retry loop or the error log. */
+		if (ret == -ENODEV) {
+			break;
+		}
 
 		usleep(1000);
+	}
+
+	if (ret == -ENODEV) {
+		fprintf(stderr, "sdcard: no card present in slot %u\n", slot);
+		mutexUnlock(sdcard_common.lock);
+		return ret;
 	}
 
 	if (ret < 0) {
