@@ -6,7 +6,12 @@
 # Copyright 2026 Phoenix Systems
 #
 
-DEFAULT_COMPONENTS := pl011-tty libusbxhci usbkbd libusbdrv-usbkbd usbmouse libusbdrv-usbmouse
+# The HID drivers (usbkbd, usbmouse) are hosted INSIDE the `usb` daemon, linked
+# via USB_HOSTDRV_LIBS in build-core-aarch64a72-generic.sh — so only their static
+# libs are needed here. The standalone usbkbd/usbmouse binaries are intentionally
+# omitted: with the daemon built -DUSB_INTERNAL_ONLY they have no connect path and
+# would just fail with "unsupported usb_msg type: 0".
+DEFAULT_COMPONENTS := pl011-tty libusbxhci libusbdrv-usbkbd libusbdrv-usbmouse
 # BCM2711 EMMC2 SD-card block driver (rootfs storage). DEP_LIBS pulls in
 # libsdcard-bcm2711 (generic SDHCI core + bcm2711 platform layer).
 DEFAULT_COMPONENTS += bcm2711-emmc
