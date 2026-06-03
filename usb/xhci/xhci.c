@@ -47,29 +47,6 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #endif
 
 
-/* TODO(#129) diag: cross-process bring-up observability for the merged-config
- * test (no rig, no DRIVE_ONLY). The framework's own bring-up otherwise only
- * debug()-prints, which drains corrupted over the back-pressured UART. These
- * non-static globals are externed by phoenix-rtos-lwip/port/diag-udp.c and read
- * over the network via the diag-udp 'U' command, the same pattern as the usbkbd
- * 'k' counters. Decisive signals:
- *   - diagEventsSeen  : count of valid events the consumer pulled off the HW
- *                       event ring. >0 ⇒ inbound DMA writes land (the "wall" is
- *                       gone); 0 after bring-up ⇒ the controller runs but posts
- *                       zero events (the documented @idx -1 wall).
- *   - diagFix19Rc     : return of bcm2711_pcie_resettleOutboundWindow() at R/S.
- *                       EOK ⇒ FIX-19 did real work (lastCtx set, premise holds);
- *                       -ENODEV ⇒ inert (lastCtx NULL) ⇒ test is meaningless.
- *   - diagUsbsts      : USBSTS snapshot taken just after the R/S=1 transition.
- *   - diagBringupRc   : xhci_init()'s final return (0 ⇒ controller usable).
- * Remove together with the rig path once the clean bring-up is validated. */
-#define XHCI_DIAG_RC_UNSET 0x7fffffff
-volatile unsigned xhci_diagEventsSeen = 0u;
-volatile int xhci_diagFix19Rc = XHCI_DIAG_RC_UNSET;
-volatile uint32_t xhci_diagUsbsts = 0u;
-volatile int xhci_diagBringupRc = XHCI_DIAG_RC_UNSET;
-
-
 /* VL805 BAR0 is 4 KiB on the Pi 4 (verified via cross-OS reference:
  * FreeBSD bcm2838_xhci, Circle USBStandardHub, Raspberry Pi linux-rpi
  * "xhci_pci_setup" probe). Mapping 64 KiB (the old XHCI_MAP_SIZE)
@@ -1403,7 +1380,6 @@ static int xhci_enterRunState(xhci_t *xhci)
 	 * and restores the inbound write path after the last mmap. */
 	{
 		int re = bcm2711_pcie_resettleOutboundWindow();
-		xhci_diagFix19Rc = re; /* TODO(#129) diag: EOK ⇒ FIX-19 armed; -ENODEV ⇒ inert */
 		if (re != EOK && re != -ENODEV) {
 			fprintf(stderr, "xhci: bridge re-settle before R/S returned %d\n", re);
 		}
@@ -1454,7 +1430,6 @@ static int xhci_enterRunState(xhci_t *xhci)
 			}
 
 			usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-			xhci_diagUsbsts = usbsts; /* TODO(#129) diag: controller state just after R/S=1 */
 			if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) == 0u) {
 				if (attempt > 0u) {
 					char dbgbuf[64];
@@ -1716,11 +1691,6 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 			if (cbit != ((xhci->eventCycleState != 0u) ? 1u : 0u)) {
 				break; /* dequeue caught up to the producer */
 			}
-
-			/* TODO(#129) diag: a valid producer-written event is present — the
-			 * controller's inbound DMA reached DRAM. Counts every HW-ring event
-			 * (incl. port-status-change at R/S), so >0 ⇒ the @idx -1 wall fell. */
-			xhci_diagEventsSeen++;
 
 			matched = xhci_eventMatch(xhci, cur, wantType, wantParam, wantSlot, wantEp);
 			if ((matched == 0) && (xhci_eventStashable(cur) != 0)) {
@@ -3277,7 +3247,6 @@ static int xhci_init(hcd_t *hcd)
 		err = -ENOMEM;
 	}
 
-	xhci_diagBringupRc = err; /* TODO(#129) diag: 0 ⇒ controller usable */
 	return err;
 }
 
