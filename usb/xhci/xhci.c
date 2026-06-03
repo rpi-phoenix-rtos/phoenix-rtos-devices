@@ -465,7 +465,8 @@ typedef struct xhci_pipePriv {
 	size_t ringSize;
 	uint64_t ringPhys;
 	uint32_t ringCount;
-	uint32_t cycleState;
+	uint32_t cycleState;      /* producer cycle bit (toggles on each Link-TRB wrap) */
+	uint32_t enqueue;         /* producer index into ring[0..ringCount-2] */
 	uint8_t slotId;           /* xHCI slot this interrupt pipe belongs to */
 	uint8_t endpointId;
 	uint8_t endpointType;
@@ -2496,6 +2497,7 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	priv->ringPhys = va2pa(priv->ring);
 	priv->ringCount = priv->ringSize / XHCI_TRB_SIZE;
 	priv->cycleState = 1u;
+	priv->enqueue = 0u;
 	if (((priv->ringPhys & (XHCI_TRANSFER_RING_ALIGN - 1u)) != 0u) || (priv->ringCount <= 1u)) {
 		usb_freeAligned(priv->ring, priv->ringSize);
 		free(priv);
@@ -2563,20 +2565,41 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 	}
 
 	ring = (xhci_trb_t *)priv->ring;
-	memset(ring, 0, priv->ringSize);
-	ring[0].parameter = va2pa(t->buffer);
-	ring[0].status = (uint32_t)t->size;
-	ring[0].control = XHCI_TRB_CONTROL_C |
-		XHCI_TRANSFER_TRB_CONTROL_IOC |
-		XHCI_TRANSFER_TRB_CONTROL_ISP |
-		(XHCI_TRB_TYPE_NORMAL << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
 
-	link = &ring[priv->ringCount - 1u];
-	link->parameter = priv->ringPhys;
-	link->status = 0u;
-	link->control = XHCI_TRB_CONTROL_C |
-		XHCI_LINK_TRB_CONTROL_TC |
-		(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+	/* Circular producer. The previous code memset the whole ring and rewrote
+	 * ring[0] with a FIXED cycle bit on every submit, leaving pendingTrbPhys at
+	 * the ring base — so only the FIRST interrupt report was ever delivered:
+	 * after the controller consumed ring[0] and followed the Link TRB (TC) its
+	 * dequeue cycle toggled to 0, but each resubmit re-armed ring[0] with cycle 1,
+	 * which the controller no longer owns, so it stopped. Instead, place the
+	 * Normal TRB at the running enqueue index with the producer cycle, advance,
+	 * and at the trailing Link TRB wrap to 0 and toggle the cycle (TC toggles the
+	 * controller's dequeue cycle in step). Only one transfer is ever in flight
+	 * (pendingTransfer gates it), so producer and consumer advance in lock-step. */
+	{
+		uint32_t idx = priv->enqueue;
+		uint32_t pcs = (priv->cycleState != 0u) ? XHCI_TRB_CONTROL_C : 0u;
+
+		ring[idx].parameter = va2pa(t->buffer);
+		ring[idx].status = (uint32_t)t->size;
+		ring[idx].control = pcs |
+			XHCI_TRANSFER_TRB_CONTROL_IOC |
+			XHCI_TRANSFER_TRB_CONTROL_ISP |
+			(XHCI_TRB_TYPE_NORMAL << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+		priv->pendingTrbPhys = priv->ringPhys + (uint64_t)idx * (uint64_t)XHCI_TRB_SIZE;
+
+		priv->enqueue++;
+		if (priv->enqueue >= (priv->ringCount - 1u)) {
+			link = &ring[priv->ringCount - 1u];
+			link->parameter = priv->ringPhys;
+			link->status = 0u;
+			link->control = pcs |
+				XHCI_LINK_TRB_CONTROL_TC |
+				(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+			priv->enqueue = 0u;
+			priv->cycleState ^= 1u;
+		}
+	}
 
 	/* Do NOT touch the event ring / ERDP here: the shared dispatcher
 	 * (xhci_eventAwait, consumed by the roothub status thread) owns the event
@@ -2591,30 +2614,6 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 	}
 
 	priv->pendingTransfer = t;
-	priv->pendingTrbPhys = priv->ringPhys;
-
-	/* TODO(#129) one-shot DMA-region PA map: the #121/#129 corruption (lwIP mbox
-	 * structurally clobbered when the first kbd interrupt-IN transfer is driven)
-	 * is either a DMA overrun of one of these regions or a CPU write. Dump every
-	 * PA the controller is programmed to touch so it can be compared against the
-	 * corrupted mbox's va2pa (logged by port/mbox.c). If the mbox PA lands inside
-	 * or one slot past a region below -> DMA overrun of that region; if nowhere
-	 * near any -> CPU write and the interrupt-ring theory is dead. */
-	{
-		static unsigned dumped = 0u;
-		if (dumped < 8u) {
-			char d[256];
-			dumped++;
-			snprintf(d, sizeof(d),
-				"xhci DMAMAP intr slot=%u ep=%u: buf=0x%llx sz=%u intrRing=0x%llx sz=%u evtRing=0x%llx trbs=%u cmdRing=0x%llx dcbaa=0x%llx\n",
-				(unsigned)priv->slotId, (unsigned)priv->endpointId,
-				(unsigned long long)va2pa(t->buffer), (unsigned)t->size,
-				(unsigned long long)priv->ringPhys, (unsigned)priv->ringSize,
-				(unsigned long long)xhci->eventRingPhys, (unsigned)xhci->eventRingTrbs,
-				(unsigned long long)xhci->cmdRingPhys, (unsigned long long)xhci->dcbaaPhys);
-			debug(d);
-		}
-	}
 
 	xhci_dbWrite32(xhci, (uintptr_t)priv->slotId * sizeof(uint32_t), priv->endpointId);
 
