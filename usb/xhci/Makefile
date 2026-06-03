@@ -16,10 +16,6 @@ LOCAL_SRCS := xhci.c phy-$(TARGET_FAMILY)-$(TARGET_SUBFAMILY).c
 ifeq ($(PCI_EXPRESS_BCM2711_INDEXED_CFG),y)
   LOCAL_SRCS += bcm2711-pcie.c
   CFLAGS += -DPCI_EXPRESS_BCM2711_INDEXED_CFG
-  # Stage-1 rig-bring-up handoff: xhci.c includes "xhci-rig-handoff.h",
-  # whose contract lives in the lwip-port tree (the rig and the framework
-  # HCD link into the same Pi 4 binary). Add that dir to the include path.
-  CFLAGS += -I"$(PREFIX_PROJECT)/phoenix-rtos-lwip/port/usb-embed"
 endif
 
 include $(static-lib.mk)
