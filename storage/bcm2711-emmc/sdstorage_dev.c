@@ -566,6 +566,8 @@ int sdstorage_handleInsertion(unsigned int slot)
 		}
 	}
 
+	fprintf(stderr, "sdcard: /dev/" BLOCK_DEV_FORMAT " ready: %u MiB, %d partition(s)\n",
+		slot, (unsigned)(sizeBytes >> 20), nParts);
 	mutexUnlock(sdcard_common.lock);
 	return EOK;
 }

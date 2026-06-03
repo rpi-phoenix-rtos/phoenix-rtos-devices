@@ -197,8 +197,20 @@ static int _sdio_cmdExecutionWait(sdcard_hostData_t *host, uint32_t flags, time_
 	bool doResetCmd = false, doResetDat = false;
 
 	*(host->base + SDHOST_REG_INTR_SIGNAL_ENABLE) = AWAITABLE_INTRS;
-	/* If there is a pending interrupt from flagsWithErrors set, it will fire now */
-	int waitret = condWait(host->eventCond, host->eventLock, wait_us);
+	/* Lost-wakeup guard (#119): the command is written to SDHOST_REG_CMD before
+	 * this wait runs, so its completion interrupt can fire and latch its bit in
+	 * INTR_STATUS before we arm the cond here. Empirically (CMD7 R1b: INTR_STATUS
+	 * read 0x3 = CMD_DONE|TRANSFER_DONE at the poll point) re-enabling
+	 * SIGNAL_ENABLE does NOT re-trigger on an already-high level on this
+	 * controller, so condWait would block to timeout despite the result being
+	 * ready. Check the latched status first and skip the sleep if the awaited
+	 * flags (or an error) are already present. */
+	int waitret = 0;
+	uint32_t pending = *(host->base + SDHOST_REG_INTR_STATUS);
+	if (((pending & flags) != flags) && ((pending & SDHOST_ERROR_REASONS) == 0u)) {
+		/* If there is a pending interrupt from flagsWithErrors set, it will fire now */
+		waitret = condWait(host->eventCond, host->eventLock, wait_us);
+	}
 	if (waitret == -ETIME) {
 		/* It's a bit odd, but card ejection doesn't cause any errors - only timeouts
 		 * We may get a SDHOST_INTR_CARD_OUT, but only if physical card detect is available
@@ -250,6 +262,77 @@ static int _sdio_cmdExecutionWait(sdcard_hostData_t *host, uint32_t flags, time_
 
 
 /* res is single u32 if isLongResponse == 0, array of 4 u32 otherwise */
+/* Completion path for R1b (response-with-busy, no data) commands such as CMD7
+ * SELECT_CARD / CMD38 ERASE. On the BCM2711/Arasan EMMC2 controller the
+ * Command-Complete interrupt is NOT reliably delivered for a check-busy command
+ * (observed #119: CMD7 completes — Command-Inhibit-CMD clears — yet CMD_DONE
+ * never fires, so the IRQ-driven wait times out). The Present State register
+ * reflects the truth, so poll it instead: wait for the response (Command-
+ * Inhibit-CMD clear) then for busy release (DAT0 / Command-Inhibit-DAT clear),
+ * watching the error-status bits. Data-transfer commands keep the IRQ path. */
+static int _sdio_pollBusyCmd(sdcard_hostData_t *host, uint8_t cmd)
+{
+	enum { cmdPollUs = 10u, cmdPollMax = 2000u, busyPollMax = 100000u }; /* ~20 ms cmd, ~1 s busy */
+	unsigned int i;
+	uint32_t st;
+
+	/* No interrupts during the poll: completion bits stay latched in
+	 * INTR_STATUS regardless of SIGNAL_ENABLE, and we read PRES_STATE directly. */
+	*(host->base + SDHOST_REG_INTR_SIGNAL_ENABLE) = 0;
+
+	for (i = 0; i < cmdPollMax; i++) {
+		st = *(host->base + SDHOST_REG_INTR_STATUS);
+		if ((st & SDHOST_ERROR_REASONS) != 0) {
+			LOG_ERROR("R1b cmd %u error (response phase): intr=0x%08x", (unsigned)cmd, (unsigned)st);
+			*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_ERROR_REASONS;
+			sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+			sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+			return -EIO;
+		}
+		if ((*(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_CMD_BUSY) == 0u) {
+			break;
+		}
+		usleep(cmdPollUs);
+	}
+	if (i == cmdPollMax) {
+		TRACE("R1b cmd %u: command-inhibit stuck (pres=0x%08x)", (unsigned)cmd,
+			(unsigned)*(host->base + SDHOST_REG_PRES_STATE));
+		sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+		return -ETIME;
+	}
+
+	/* Diagnostic (#119): did the controller raise CMD_DONE / TRANSFER_DONE for
+	 * this R1b after the response latched? */
+	TRACE("R1b cmd %u response done: intr=0x%08x", (unsigned)cmd,
+		(unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
+
+	for (i = 0; i < busyPollMax; i++) {
+		st = *(host->base + SDHOST_REG_INTR_STATUS);
+		if ((st & SDHOST_ERROR_REASONS) != 0) {
+			LOG_ERROR("R1b cmd %u error (busy phase): intr=0x%08x", (unsigned)cmd, (unsigned)st);
+			*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_ERROR_REASONS;
+			sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+			return -EIO;
+		}
+		if ((*(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_DAT_BUSY) == 0u) {
+			break;
+		}
+		usleep(cmdPollUs);
+	}
+	if (i == busyPollMax) {
+		TRACE("R1b cmd %u: DAT0 busy stuck (pres=0x%08x)", (unsigned)cmd,
+			(unsigned)*(host->base + SDHOST_REG_PRES_STATE));
+		sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+		return -ETIME;
+	}
+
+	/* Drop any latched completion bits so they don't bleed into the next
+	 * command's IRQ-driven wait. */
+	*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_INTR_CMD_DONE | SDHOST_INTR_TRANSFER_DONE;
+	return 0;
+}
+
+
 static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uint32_t *res, uint16_t blockCount, bool isLongResponse)
 {
 	sdhost_command_reg_t cmdFrame;
@@ -326,21 +409,37 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 	/* This register write starts command execution and must be done last */
 	*(host->base + SDHOST_REG_CMD) = cmdFrame.raw;
 
-	/* wait 1 ms max */
-	int ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_CMD_DONE, 1000);
-	if (ret < 0) {
-		TRACE("error %d on cmd %d", ret, cmd);
-		mutexUnlock(host->eventLock);
-		return ret;
-	}
-
-	if (dataType != CMD_NO_DATA) {
-		/* wait 1 s max */
-		ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_TRANSFER_DONE, 1000 * 1000);
+	int ret;
+	if (dataType == CMD_NO_DATA_WAIT) {
+		/* R1b (response-with-busy, no data): poll Present State for completion
+		 * — the Command-Complete IRQ is not reliably raised for check-busy
+		 * commands on this controller (#119). See _sdio_pollBusyCmd. */
+		ret = _sdio_pollBusyCmd(host, cmd);
 		if (ret < 0) {
-			TRACE("error %d on cmd %d", ret, cmd);
+			TRACE("error %d on cmd %d (R1b poll)", ret, cmd);
 			mutexUnlock(host->eventLock);
 			return ret;
+		}
+	}
+	else {
+		/* wait 1 ms max for the command response */
+		ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_CMD_DONE, 1000);
+		if (ret < 0) {
+			TRACE("error %d on cmd %d (cmd_done wait, pres=0x%08x)", ret, cmd,
+				(unsigned)*(host->base + SDHOST_REG_PRES_STATE));
+			mutexUnlock(host->eventLock);
+			return ret;
+		}
+
+		if (dataType != CMD_NO_DATA) {
+			/* data transfer: wait up to 1 s for Transfer Complete */
+			ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_TRANSFER_DONE, 1000 * 1000);
+			if (ret < 0) {
+				TRACE("error %d on cmd %d (data transfer_done wait, pres=0x%08x intr=0x%08x)", ret, cmd,
+					(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
+				mutexUnlock(host->eventLock);
+				return ret;
+			}
 		}
 	}
 
