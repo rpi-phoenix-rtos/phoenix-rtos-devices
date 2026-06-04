@@ -15,6 +15,9 @@ DEFAULT_COMPONENTS := pl011-tty libusbxhci libusbdrv-usbkbd libusbdrv-usbmouse
 # BCM2711 EMMC2 SD-card block driver (rootfs storage). DEP_LIBS pulls in
 # libsdcard-bcm2711 (generic SDHCI core + bcm2711 platform layer).
 DEFAULT_COMPONENTS += bcm2711-emmc
+# SoC thermal / throttle telemetry via the VideoCore property mailbox
+# (/dev/thermal, /dev/throttled). Telemetry only - the firmware owns the trip.
+DEFAULT_COMPONENTS += rpi4-thermal
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
