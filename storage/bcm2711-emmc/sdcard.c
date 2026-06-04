@@ -400,7 +400,11 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 		}
 
 		cmdFrame.dataPresent = 1;
-		cmdFrame.dmaEnable = 1;
+		/* PIO, not SDMA: the BCM2711 EMMC2 SDMA engine advances its address
+		 * register but never lands data in the driver's buffer (a DMA address
+		 * limit — it can't reach the >1GB ARM-physical buffer the allocator
+		 * returns; #120). Move data over the BUFFER_DATA FIFO instead (below). */
+		cmdFrame.dmaEnable = 0;
 		cmdFrame.blockCountEnable = 1;
 		if ((dataType == CMD_READ) || (dataType == CMD_READ_MULTI) || (dataType == CMD_READ8) || (dataType == CMD_READ64)) {
 			cmdFrame.directionRead = 1;
@@ -441,6 +445,56 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 		}
 
 		if (dataType != CMD_NO_DATA) {
+			/* PIO data transfer over the BUFFER_DATA FIFO (SDMA is unusable here —
+			 * see the dmaEnable=0 note above). The read/write-ready bits are NOT in
+			 * AWAITABLE_INTRS, so poll INTR_STATUS per block rather than wait on the
+			 * cond. The buffer is the uncached DMA buffer; the caller memcpy's it. */
+			uint32_t pioBlockLen = (dataType == CMD_READ8) ? 8u : ((dataType == CMD_READ64) ? 64u : SDCARD_BLOCKLEN);
+			uint32_t pioWords = pioBlockLen / 4u;
+			bool pioRead = (dataType == CMD_READ) || (dataType == CMD_READ_MULTI) || (dataType == CMD_READ8) || (dataType == CMD_READ64);
+			uint32_t pioReady = pioRead ? SDHOST_INTR_RW_READ_READY : SDHOST_INTR_RW_WRITE_READY;
+			volatile uint32_t *pioFifo = host->base + SDHOST_REG_BUFFER_DATA;
+			uint8_t *pioBuf = (uint8_t *)host->dmaBuffer;
+			int pioErr = 0;
+
+			for (uint32_t pioBlk = 0; pioBlk < (uint32_t)blockCount; pioBlk++) {
+				uint32_t st = 0;
+				long spin;
+				for (spin = 0; spin < 2000000; spin++) {
+					st = *(host->base + SDHOST_REG_INTR_STATUS);
+					if ((st & (pioReady | SDHOST_ERROR_REASONS)) != 0u) {
+						break;
+					}
+				}
+				if ((st & SDHOST_ERROR_REASONS) != 0u) {
+					LOG_ERROR("pio xfer error on cmd %d: intr=0x%08x", cmd, (unsigned)st);
+					*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_ERROR_REASONS;
+					pioErr = -EIO;
+					break;
+				}
+				if ((st & pioReady) == 0u) {
+					pioErr = -ETIME;
+					break;
+				}
+				*(host->base + SDHOST_REG_INTR_STATUS) = pioReady; /* write-1-to-clear */
+				uint32_t *pioW = (uint32_t *)(pioBuf + (size_t)pioBlk * pioBlockLen);
+				if (pioRead) {
+					for (uint32_t i = 0; i < pioWords; i++) {
+						pioW[i] = *pioFifo;
+					}
+				}
+				else {
+					for (uint32_t i = 0; i < pioWords; i++) {
+						*pioFifo = pioW[i];
+					}
+				}
+			}
+			if (pioErr != 0) {
+				mutexUnlock(host->eventLock);
+				sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+				return pioErr;
+			}
+
 			/* data transfer: wait up to 1 s for Transfer Complete */
 			ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_TRANSFER_DONE, 1000 * 1000);
 			if (ret < 0) {
@@ -966,7 +1020,12 @@ int sdcard_initHost(unsigned int slot)
 		*(host->base + SDHOST_REG_HOST_CONTROL) |= HOST_CONTROL_CARD_DET_TEST | HOST_CONTROL_CARD_DET_TEST_ENABLE;
 	}
 
-	*(host->base + SDHOST_REG_INTR_STATUS_ENABLE) = SDHOST_STATUS_MASK;
+	/* Enable the buffer read/write-ready bits in the status register too: the PIO
+	 * data path (see _sdio_cmdSend) polls them in INTR_STATUS, and a bit only
+	 * latches there if it is set in STATUS_ENABLE. Without this the PIO poll never
+	 * sees RW_READ_READY and every data command times out (#120). */
+	*(host->base + SDHOST_REG_INTR_STATUS_ENABLE) =
+		SDHOST_STATUS_MASK | SDHOST_INTR_RW_READ_READY | SDHOST_INTR_RW_WRITE_READY;
 	if (sdcard_startEventISR(host, info.interruptNum) < 0) {
 		_sdcard_free(host);
 		return -ENOMEM;
