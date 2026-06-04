@@ -18,6 +18,8 @@ DEFAULT_COMPONENTS += bcm2711-emmc
 # SoC thermal / throttle telemetry via the VideoCore property mailbox
 # (/dev/thermal, /dev/throttled). Telemetry only - the firmware owns the trip.
 DEFAULT_COMPONENTS += rpi4-thermal
+# Hardware RNG (BCM2711 iproc RNG200 @ 0xfe104000) -> /dev/hwrng entropy source.
+DEFAULT_COMPONENTS += rpi4-hwrng
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
