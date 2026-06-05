@@ -433,8 +433,11 @@ int main(int argc, char *argv[])
 
 	ret = sdstorage_mountRootFs(&opts);
 	if (ret < 0) {
-		LOG_ERROR("failed to mount rootfs, err: %d", ret);
-		exit(EXIT_FAILURE);
+		/* Non-fatal: keep the daemon up so /dev/mmcblk0[pN] stay served even when
+		 * the root mount fails -- the system can still boot on dummyfs-root and the
+		 * block device remains usable for recovery/inspection (and, during #120
+		 * bring-up, for a live diag-udp SD-read probe). */
+		LOG_ERROR("failed to mount rootfs, err: %d (continuing; /dev/mmcblk0* stay available)", ret);
 	}
 
 	kill(getppid(), SIGUSR1);

@@ -117,8 +117,22 @@ static ssize_t sdcard_readCb(uint64_t offs, void *buff, size_t len, cache_devCtx
 
 	uint32_t lba = offs / SDCARD_BLOCKLEN;
 	len = min(len, SDCARD_MAX_TRANSFER);
-	int ret = sdcard_transferBlocks(ctx->id, sdio_read, lba, buff, len);
-	return ret < 0 ? ret : len;
+
+	/* TODO(#120): CMD18 (READ_MULTIPLE_BLOCK) is unproven on this controller --
+	 * the ext2 mount's 2-block reads returned -EIO while the single-block CMD17
+	 * path (validated by the boot-time MBR read) works. The multi-block transfer
+	 * path (block-count / auto-CMD12 setup) is NOT yet fixed; force single-block
+	 * reads so the filesystem comes up. Remove this loop and use a single
+	 * sdcard_transferBlocks(len) once multi-block CMD18 is fixed and validated. */
+	for (size_t done = 0; done < len; done += SDCARD_BLOCKLEN) {
+		int ret = sdcard_transferBlocks(ctx->id, sdio_read,
+			lba + (uint32_t)(done / SDCARD_BLOCKLEN),
+			(uint8_t *)buff + done, SDCARD_BLOCKLEN);
+		if (ret < 0) {
+			return ret;
+		}
+	}
+	return len;
 }
 
 
