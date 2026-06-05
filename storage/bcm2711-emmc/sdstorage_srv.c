@@ -211,21 +211,32 @@ static void sdcard_msgHandler(void *arg, msg_t *msg)
 
 static int storage_oidResolve(const char *devPath, oid_t *oid)
 {
-	int ret;
+	int retLiteral, retDevfs = -ENOENT;
 	char temp[32];
 
 	if (strncmp("/dev/", devPath, 5) != 0) {
 		return -EINVAL;
 	}
 
-	ret = snprintf(temp, sizeof(temp), "devfs/%s", devPath + 5);
-	if (ret >= sizeof(temp)) {
-		ret = -ENAMETOOLONG;
-		LOG_ERROR("failed to build file path, err: %d", ret);
-		return ret;
+	/* Resolve the literal path first. On the Pi 4 the root namespace is
+	 * dummyfs-root with devfs bound at /dev, so "/dev/<name>" resolves; the
+	 * zynq-style "devfs/<name>" synthesis does NOT, because here "devfs" is not
+	 * a root-level entry (only "/dev" is). The fallback keeps the zynq-shaped
+	 * namespace (devfs as the root fs) working too. */
+	retLiteral = lookup(devPath, NULL, oid);
+	if (retLiteral >= 0) {
+		return retLiteral;
 	}
 
-	return lookup(temp, NULL, oid);
+	/* Fallback: the zynq-shaped namespace where devfs IS the root fs and is
+	 * reachable as "devfs/<name>" (no dummyfs-root + /dev bind). */
+	int n = snprintf(temp, sizeof(temp), "devfs/%s", devPath + 5);
+	if ((n < 0) || ((size_t)n >= sizeof(temp))) {
+		return -ENAMETOOLONG;
+	}
+	retDevfs = lookup(temp, NULL, oid);
+
+	return retDevfs;
 }
 
 
@@ -312,10 +323,27 @@ static int sdstorage_mountRootFs(options_parsed_t *opts)
 	}
 
 	oid_t oid, devOid;
-	int err = storage_oidResolve(opts->rootDev, &devOid);
+	int err = -ENOENT;
+	int tries;
+	/* The partition device node is registered by the card-presence path, which
+	 * can run slightly late (the at-boot insertion is only synchronous if the
+	 * card already reads as stably inserted; otherwise it lands on the async
+	 * presence thread). Retry the resolve briefly so a late node registration
+	 * does not abort the root mount. ~5 s total. */
+	for (tries = 0; tries < 50; tries++) {
+		err = storage_oidResolve(opts->rootDev, &devOid);
+		if (err >= 0) {
+			break;
+		}
+		usleep(100000);
+	}
 	if (err < 0) {
-		LOG_ERROR("cannot resolve %s: %d", opts->rootDev, err);
+		LOG_ERROR("cannot resolve %s: %d (after %d tries)", opts->rootDev, err, tries);
 		return err;
+	}
+	if (tries > 0) {
+		fprintf(stderr, "sdstorage: resolved %s after %d retr%s\n",
+			opts->rootDev, tries, (tries == 1) ? "y" : "ies");
 	}
 
 	err = storage_mountfs(storage_get(GET_STORAGE_ID(devOid.id)), opts->rootFsName, NULL, 0, NULL, &oid);
