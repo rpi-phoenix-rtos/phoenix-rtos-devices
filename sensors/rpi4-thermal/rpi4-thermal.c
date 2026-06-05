@@ -51,6 +51,12 @@
 
 #define MBOX_FAIL               0xffffffffu
 
+/* Bounded mailbox-wait spin cap. The VideoCore mailbox is a single shared
+ * peripheral with no cross-process lock (this driver and diag-udp can both
+ * drive it); a response raced/consumed by another client must not hang us
+ * forever. The happy path completes in microseconds, far under this. */
+#define MBOX_SPINS              4000000u
+
 /* Device node ids (one port, two nodes). */
 #define DEV_THERMAL_ID          0
 #define DEV_THROTTLED_ID        1
@@ -73,6 +79,7 @@ static uint32_t rpi4_mboxProp1in1out(uint32_t tag, uint32_t arg_in)
 	uintptr_t msg_pa;
 	uint32_t request;
 	uint32_t result = MBOX_FAIL;
+	uint32_t spins;
 	void *mbox_page;
 	void *msg_page;
 
@@ -110,16 +117,27 @@ static uint32_t rpi4_mboxProp1in1out(uint32_t tag, uint32_t arg_in)
 	}
 	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
 
-	while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u) {
+	for (spins = MBOX_SPINS; (mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u; spins--) {
+		if (spins == 0u) {
+			munmap(msg_page, _PAGE_SIZE);
+			munmap(mbox_page, _PAGE_SIZE);
+			return MBOX_FAIL;
+		}
 	}
 	mbox[VC_MBOX_WRITE / 4] = request;
 
-	for (;;) {
-		while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) != 0u) {
+	for (spins = MBOX_SPINS; spins != 0u; spins--) {
+		if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u) {
+			/* Reading MBOX0 consumes the entry; only ours matches `request`. */
+			if (mbox[VC_MBOX_READ / 4] == request) {
+				break;
+			}
 		}
-		if (mbox[VC_MBOX_READ / 4] == request) {
-			break;
-		}
+	}
+	if (spins == 0u) {
+		munmap(msg_page, _PAGE_SIZE);
+		munmap(mbox_page, _PAGE_SIZE);
+		return MBOX_FAIL;
 	}
 
 	if (msg[1] == VC_MBOX_RESP_OK) {
@@ -153,13 +171,20 @@ static uint32_t thermal_throttled(void)
 }
 
 
-/* Render the requested node's current value into buf. Returns length. */
+/* Render the requested node's current value into buf. Returns the byte count,
+ * or -EIO if the mailbox query failed (so read() reports an error rather than
+ * formatting the MBOX_FAIL sentinel as a bogus value). */
 static int thermal_format(id_t id, char *buf, size_t size)
 {
-	if (id == DEV_THROTTLED_ID) {
-		return snprintf(buf, size, "0x%08x\n", thermal_throttled());
+	uint32_t v = (id == DEV_THROTTLED_ID) ? thermal_throttled() : thermal_temp();
+
+	if (v == MBOX_FAIL) {
+		return -EIO;
 	}
-	return snprintf(buf, size, "%u\n", thermal_temp());
+	if (id == DEV_THROTTLED_ID) {
+		return snprintf(buf, size, "0x%08x\n", v);
+	}
+	return snprintf(buf, size, "%u\n", v);
 }
 
 
