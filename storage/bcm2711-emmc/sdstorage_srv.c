@@ -209,37 +209,6 @@ static void sdcard_msgHandler(void *arg, msg_t *msg)
 }
 
 
-static int storage_oidResolve(const char *devPath, oid_t *oid)
-{
-	int retLiteral, retDevfs = -ENOENT;
-	char temp[32];
-
-	if (strncmp("/dev/", devPath, 5) != 0) {
-		return -EINVAL;
-	}
-
-	/* Resolve the literal path first. On the Pi 4 the root namespace is
-	 * dummyfs-root with devfs bound at /dev, so "/dev/<name>" resolves; the
-	 * zynq-style "devfs/<name>" synthesis does NOT, because here "devfs" is not
-	 * a root-level entry (only "/dev" is). The fallback keeps the zynq-shaped
-	 * namespace (devfs as the root fs) working too. */
-	retLiteral = lookup(devPath, NULL, oid);
-	if (retLiteral >= 0) {
-		return retLiteral;
-	}
-
-	/* Fallback: the zynq-shaped namespace where devfs IS the root fs and is
-	 * reachable as "devfs/<name>" (no dummyfs-root + /dev bind). */
-	int n = snprintf(temp, sizeof(temp), "devfs/%s", devPath + 5);
-	if ((n < 0) || ((size_t)n >= sizeof(temp))) {
-		return -ENAMETOOLONG;
-	}
-	retDevfs = lookup(temp, NULL, oid);
-
-	return retDevfs;
-}
-
-
 static void flash_help(const char *prog)
 {
 	printf("Usage: %s [options] or no args to automatically detect and initialize SD cards\n", prog);
@@ -322,37 +291,40 @@ static int sdstorage_mountRootFs(options_parsed_t *opts)
 		return EOK;
 	}
 
-	oid_t oid, devOid;
+	oid_t oid;
+	unsigned int rootId;
 	int err = -ENOENT;
 	int tries;
-	/* The partition device node is registered by the card-presence path, which
-	 * can run slightly late (the at-boot insertion is only synchronous if the
-	 * card already reads as stably inserted; otherwise it lands on the async
-	 * presence thread). Retry the resolve briefly so a late node registration
-	 * does not abort the root mount. ~5 s total. */
+	/* The root partition's storage id is recorded by the card-presence path when
+	 * the node is created. The at-boot insertion is synchronous when the card
+	 * reads as stably inserted (the common case), so the id is already available;
+	 * otherwise it lands on the async presence thread. Poll briefly (~5 s) so a
+	 * late node registration does not abort the root mount. We mount by the id
+	 * directly -- the zynq-flash/pc-ata pattern -- rather than re-resolving the
+	 * /dev path, which cannot be looked up here: the root mounts BEFORE "/" exists
+	 * and before devfs is bound at /dev. (#120) */
 	for (tries = 0; tries < 50; tries++) {
-		err = storage_oidResolve(opts->rootDev, &devOid);
-		if (err >= 0) {
+		err = sdstorage_getRootStorageId(&rootId);
+		if (err == EOK) {
 			break;
 		}
 		usleep(100000);
 	}
 	if (err < 0) {
-		LOG_ERROR("cannot resolve %s: %d (after %d tries)", opts->rootDev, err, tries);
+		LOG_ERROR("root device %s not found: %d (after %d tries)", opts->rootDev, err, tries);
 		return err;
 	}
-	if (tries > 0) {
-		fprintf(stderr, "sdstorage: resolved %s after %d retr%s\n",
-			opts->rootDev, tries, (tries == 1) ? "y" : "ies");
-	}
 
-	err = storage_mountfs(storage_get(GET_STORAGE_ID(devOid.id)), opts->rootFsName, NULL, 0, NULL, &oid);
+	err = storage_mountfs(storage_get(rootId), opts->rootFsName, NULL, 0, NULL, &oid);
 	if (err < 0) {
-		LOG_ERROR("failed to mount %s: %d", opts->rootFsName, err);
+		LOG_ERROR("failed to mount %s (%s, id=%u): %d", opts->rootDev, opts->rootFsName, rootId, err);
 		return err;
 	}
 
-	return portRegister(oid.port, "/", &oid);
+	err = portRegister(oid.port, "/", &oid);
+	fprintf(stderr, LOG_TAG ": mounted %s (%s, id=%u) as / after %d tr%s, portRegister=%d\n",
+		opts->rootDev, opts->rootFsName, rootId, tries, (tries == 1) ? "y" : "ies", err);
+	return err;
 }
 
 
@@ -424,6 +396,10 @@ int main(int argc, char *argv[])
 		LOG_ERROR("failed to register ext2 filesystem, err: %d", ret);
 		exit(EXIT_FAILURE);
 	}
+
+	/* Record the configured root device BEFORE presence detection so the
+	 * synchronous boot-time insertion can capture its storage id (#120). */
+	sdstorage_setRootDev((opts.rootDev[0] != '\0') ? opts.rootDev : NULL);
 
 	ret = sdstorage_runPresenceDetection();
 	if (ret < 0) {

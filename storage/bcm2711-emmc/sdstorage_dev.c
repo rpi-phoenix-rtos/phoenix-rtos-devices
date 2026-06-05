@@ -77,6 +77,13 @@ static struct {
 	handle_t lock;
 	mbr_t mbr_temp;
 	int defaultCachePolicy;
+	/* Root device selection (#120): the /dev path of the partition to mount as
+	 * "/" and the storage id recorded for it when its node is created, so the
+	 * root mount uses the id directly (zynq-flash/pc-ata pattern) instead of
+	 * re-resolving the /dev path through a namespace that does not yet exist. */
+	char rootDev[32];
+	bool rootFound;
+	unsigned int rootStorageId;
 } sdcard_common = { .commonInit = false };
 
 #define PRESENCE_THREAD_STACK_SIZE 1024
@@ -150,8 +157,18 @@ static ssize_t sdcard_writeCb(uint64_t offs, const void *buff, size_t len, cache
 	uint32_t lba = offs / SDCARD_BLOCKLEN;
 	len = min(len, SDCARD_MAX_TRANSFER);
 
-	int ret = sdcard_transferBlocks(ctx->id, sdio_write, lba, (void *)buff, len);
-	return ret < 0 ? ret : len;
+	/* TODO(#120): force single-block CMD24 writes, mirroring the read sidestep --
+	 * multi-block CMD25 (WRITE_MULTIPLE_BLOCK) uses the same unproven multi-block
+	 * path that returned -EIO for reads. Remove once multi-block is fixed. */
+	for (size_t done = 0; done < len; done += SDCARD_BLOCKLEN) {
+		int ret = sdcard_transferBlocks(ctx->id, sdio_write,
+			lba + (uint32_t)(done / SDCARD_BLOCKLEN),
+			(uint8_t *)buff + done, SDCARD_BLOCKLEN);
+		if (ret < 0) {
+			return ret;
+		}
+	}
+	return len;
 }
 
 
@@ -330,6 +347,17 @@ static int sdstorage_createDeviceFile(oid_t *oid, const char *pathFmt, unsigned 
 	if (ret < 0) {
 		LOG_ERROR("failed to create a device file, err: %d", ret);
 		return ret;
+	}
+
+	/* If this node is the configured root device, record its storage id so the
+	 * root mount can use it directly (#120). The block-device path
+	 * ("/dev/mmcblkXpN") is the one matched; the mtd node uses a different format
+	 * so it never collides. Always invoked under sdcard_common.lock (held by
+	 * sdstorage_handleInsertion across the whole insertion), so no extra lock. */
+	if ((sdcard_common.rootDev[0] != '\0') && !sdcard_common.rootFound &&
+			(strcmp(path, sdcard_common.rootDev) == 0)) {
+		sdcard_common.rootStorageId = GET_STORAGE_ID(oid->id);
+		sdcard_common.rootFound = true;
 	}
 
 	return EOK;
@@ -771,4 +799,34 @@ int sdstorage_initHost(unsigned int slot)
 void sdstorage_setDefaultCachePolicy(int cachePolicy)
 {
 	sdcard_common.defaultCachePolicy = cachePolicy;
+}
+
+
+void sdstorage_setRootDev(const char *rootDev)
+{
+	/* Called from main before any worker thread exists, so no lock needed. */
+	if (rootDev == NULL) {
+		sdcard_common.rootDev[0] = '\0';
+	}
+	else {
+		strncpy(sdcard_common.rootDev, rootDev, sizeof(sdcard_common.rootDev) - 1);
+		sdcard_common.rootDev[sizeof(sdcard_common.rootDev) - 1] = '\0';
+	}
+	sdcard_common.rootFound = false;
+}
+
+
+int sdstorage_getRootStorageId(unsigned int *id)
+{
+	int ret;
+	mutexLock(sdcard_common.lock);
+	if (sdcard_common.rootFound) {
+		*id = sdcard_common.rootStorageId;
+		ret = EOK;
+	}
+	else {
+		ret = -ENOENT;
+	}
+	mutexUnlock(sdcard_common.lock);
+	return ret;
 }

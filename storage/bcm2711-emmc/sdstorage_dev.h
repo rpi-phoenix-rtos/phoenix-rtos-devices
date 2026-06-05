@@ -38,4 +38,16 @@ int sdstorage_runPresenceDetection(void);
 
 void sdstorage_setDefaultCachePolicy(int cachePolicy);
 
+
+/* Configure the /dev path of the partition to be mounted as root (e.g.
+ * "/dev/mmcblk0p2"). Must be called before sdstorage_runPresenceDetection() so
+ * the synchronous boot-time insertion can record the matching partition's
+ * storage id. Pass NULL/"" to disable. */
+void sdstorage_setRootDev(const char *rootDev);
+
+
+/* Retrieve the storage id recorded for the configured root device, if its node
+ * has been created. Returns EOK and *id on success, -ENOENT if not yet found. */
+int sdstorage_getRootStorageId(unsigned int *id);
+
 #endif /* _SDSTORAGE_DEV_H_ */
