@@ -23,6 +23,9 @@ DEFAULT_COMPONENTS += rpi4-hwrng
 # VideoCore HDMI framebuffer (/dev/fb0): read/write byte access + geometry
 # devctl over the plo-allocated 32-bpp surface (pctl_graphmode + MAP_PHYSMEM).
 DEFAULT_COMPONENTS += rpi4-fb
+# BCM2711 GPIO observer (/dev/gpio @ 0xfe200000): read-only register snapshot +
+# per-pin {fsel,level,pull} devctl. Outputs deferred to an attended bench session.
+DEFAULT_COMPONENTS += rpi4-gpio
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
