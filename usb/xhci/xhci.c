@@ -1262,62 +1262,6 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 }
 
 
-__attribute__((unused))
-static int xhci_runStateSelftest(xhci_t *xhci)
-{
-	uint32_t usbcmd;
-	uint32_t usbsts;
-	int err;
-
-	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
-		fprintf(stderr, "xhci: controller error state before run\n");
-		return -ENODEV;
-	}
-
-	if ((usbsts & XHCI_REG_OP_USBSTS_HCH) == 0u) {
-		fprintf(stderr, "xhci: controller not halted before run\n");
-		return -ENODEV;
-	}
-
-	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
-	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd | XHCI_REG_OP_USBCMD_RS);
-
-	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, 0u, XHCI_RUNSTOP_TIMEOUT_MS);
-	if (err < 0) {
-		fprintf(stderr, "xhci: run transition timeout\n");
-		return err;
-	}
-
-	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
-		fprintf(stderr, "xhci: controller error state after run (USBSTS=0x%08x ERDP_LO=0x%08x ERSTBA_LO=0x%08x DCBAAP_LO=0x%08x)\n",
-			usbsts,
-			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO),
-			xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO),
-			xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP));
-		return -ENODEV;
-	}
-
-	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
-	xhci_opWrite32(xhci, XHCI_REG_OP_USBCMD, usbcmd & ~XHCI_REG_OP_USBCMD_RS);
-
-	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, XHCI_REG_OP_USBSTS_HCH, XHCI_RUNSTOP_TIMEOUT_MS);
-	if (err < 0) {
-		fprintf(stderr, "xhci: halt transition timeout\n");
-		return err;
-	}
-
-	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-	if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) != 0u) {
-		fprintf(stderr, "xhci: controller error state after halt (USBSTS=0x%08x)\n", usbsts);
-		return -ENODEV;
-	}
-
-	return EOK;
-}
-
-
 static int xhci_enterRunState(xhci_t *xhci)
 {
 	uint32_t usbcmd;
@@ -3026,17 +2970,8 @@ static int xhci_init(hcd_t *hcd)
 						err = xhci_programEventRing(xhci);
 					}
 					if (err == 0) {
-						/* xhci_runStateSelftest (toggle R/S then back
-						 * to verify the transition) was a Phoenix
-						 * addition not done by Linux/FreeBSD/Circle.
-						 * On VL805 the controller spends real time
-						 * processing the brief R/S=1 (port scan,
-						 * device discovery) and the subsequent
-						 * R/S=0 halt-transition can't meet our 250ms
-						 * timeout. Skip the selftest; cmdNoopSelftest
-						 * already enters the run state via cmdExec,
-						 * which is the canonical "controller alive"
-						 * check. */
+						/* No R/S self-test: xhci_cmdNoopSelftest (which enters
+						 * the run state via cmdExec) is the liveness check. */
 #if defined(__TARGET_AARCH64A72) && defined(PCI_EXPRESS_BCM2711_INDEXED_CFG)
 						/* VL805 must run continuously: the halt-per-command
 						 * pattern (keepRunning==0) drops R/S after each command
