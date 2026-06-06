@@ -217,9 +217,15 @@ int main(int argc, char **argv)
 	}
 
 	/* Read-only self-test: prove this process can reach scanout DRAM through
-	 * the uncached mapping. No write -- drawing would race the pl011-tty boot
-	 * console, which owns the same surface. */
-	firstpx = *(volatile uint32_t *)fb_common.fb;
+	 * the uncached mapping. Routed through fb_read() (not a raw pointer deref)
+	 * so the read path's bounds + memcpy run on real hardware too, the way the
+	 * sibling thermal/hwrng canaries exercise their read() path. No write --
+	 * drawing would race the pl011-tty boot console, which owns the surface. */
+	firstpx = 0;
+	if (fb_read(0, &firstpx, sizeof(firstpx)) != (int)sizeof(firstpx)) {
+		printf("rpi4-fb: framebuffer read self-test failed -- not registering\n");
+		return 1;
+	}
 
 	if (portCreate(&port) != EOK) {
 		printf("rpi4-fb: portCreate failed\n");
