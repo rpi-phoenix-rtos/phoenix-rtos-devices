@@ -6,7 +6,7 @@
 # Copyright 2026 Phoenix Systems
 # Author: Witold Bołt
 #
-# NOTE(rpi4b-emmc): sdcard.c / sdhost_defs.h / sdcard.h / sdstorage_*.c are the
+# TODO: sdcard.c / sdhost_defs.h / sdcard.h / sdstorage_*.c are the
 # generic SDHCI core, currently copied from storage/zynq7000-sdcard. Only
 # bcm2711-sdio.c is BCM2711-specific. De-duplicate into a shared lib before
 # upstreaming.

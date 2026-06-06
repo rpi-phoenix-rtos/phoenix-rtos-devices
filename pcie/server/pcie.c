@@ -780,7 +780,7 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		if (err < 0) {
 			fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
 		}
-		/* TD-USB: VL805 firmware load is async after the mailbox
+		/* TODO: VL805 firmware load is async after the mailbox
 		 * reset call returns. Without an explicit wait, the next
 		 * config-space writes and (especially) MMIO reads to BAR0
 		 * race the VL805 boot ROM → firmware handoff and the
@@ -797,8 +797,8 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		 * Vendor ID / caplen reads instead of a fixed delay.
 		 */
 		usleep(200000);
-		/* TD-15 Stage 4 phase 2: program VL805 BAR0 to the outbound
-		 * window's PCIe base address. The bcm2711NotifyXhciReset
+		/* Program VL805 BAR0 to the outbound window's PCIe base
+		 * address. The bcm2711NotifyXhciReset
 		 * mailbox call resets the VL805 and reloads its firmware, but
 		 * does NOT program BAR0 — that's the OS's job. Linux's
 		 * brcmstb pcie driver does standard PCI BAR allocation; here
@@ -824,7 +824,7 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			snprintf(m, sizeof(m), "pcie: VL805 BAR0 programmed lo=%08x hi=%08x\n", bar_lo, bar_hi);
 			debug(m);
 		}
-		/* TD-USB diag 2026-05-16: read xhci CAPLENGTH + HCIVERSION
+		/* Diagnostic: read xhci CAPLENGTH + HCIVERSION
 		 * directly through the outbound window. If this reads the
 		 * expected 0x20 / 0x0100 the path CPU PA 0x600000000 ->
 		 * PCIe bus 0xf8000000 -> VL805 BAR0 works and xhci has a
@@ -954,10 +954,11 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 }
 
 
-/* TD-15 Stage 4 phase 2 DIAGNOSTIC: pcie daemon doesn't print to UART
- * by default (uses fprintf which is buffered). Use debug() for direct
- * kernel klog → UART output so we can see what's happening on real
- * Pi 4. Remove once VL805 BAR-programming is fixed. */
+/* Diagnostic: the pcie daemon doesn't print to UART by default (uses
+ * buffered fprintf). Use debug() for direct kernel klog -> UART output
+ * so the bring-up sequence is visible on real Pi 4.
+ * TODO: remove this diagnostic include once VL805 BAR-programming is
+ * proven stable. */
 #include <sys/debug.h>
 
 int main(int argc, char **argv)
@@ -1009,7 +1010,7 @@ int main(int argc, char **argv)
 	pcie_scanBus(&cfgio, 0);
 	debug("pcie: post-scanBus\n");
 
-	/* TD-USB: VL805-warm-up loop. The xhci_capProbe retry sometimes
+	/* TODO: VL805-warm-up loop. The xhci_capProbe retry sometimes
 	 * stalls with "attempt=0 ENODEV" because the BCM2711 PCIe bridge
 	 * returns 0xdead-pattern MMIO reads when VL805 hasn't had a recent
 	 * host-initiated transaction. The earlier diag-outbound read

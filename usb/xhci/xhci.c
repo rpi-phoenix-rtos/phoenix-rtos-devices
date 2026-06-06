@@ -232,7 +232,7 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS (1u << 0)
 #define XHCI_EP_CTX_MAX_ESIT_PAYLOAD__SHIFT 16u
 #define XHCI_INPUT_CTRL_CTX_ADD_A0_A1 0x3u
-#define XHCI_CMD_TIMEOUT_MS      1000u  /* xHCI commands (enable-slot, address-device) can need ~hundreds of ms; 100 was too aggressive. Note: the current usb-hcd cmd-completion gap is NOT timing (a 30 s test still saw zero events) — it's a process-context inbound-write issue. */
+#define XHCI_CMD_TIMEOUT_MS      1000u  /* xHCI commands (enable-slot, address-device) can need ~hundreds of ms; 1000 ms budget. */
 #define XHCI_PORT_RESET_TIMEOUT_MS 100u
 #define XHCI_PORT_POWER_GOOD_DELAY_US 20000u
 
@@ -941,21 +941,12 @@ static int xhci_reset(xhci_t *xhci)
 	 * has a similar post-reset delay (xhci_handshake + udelay). */
 	usleep(100000);
 
-	/* USB-FIX-3 (2026-05-26): HCRST may churn BCM2711 bridge state
-	 * analogous to the mailbox-notify path. Re-program the outbound
-	 * window AND inbound BAR1/BAR2 here so the subsequent
-	 * DCBAAP/CRCR/ERSTBA writes from xhci_programCommandSpace +
-	 * xhci_programEventRing land on a stable bridge translation
-	 * and any inbound DMA the controller issues at R/S=1 still
-	 * reaches DRAM. The CRCR re-publish before each doorbell that
-	 * exists today is a symptom-workaround for the same class of
-	 * bug; if FIX-3 holds we can drop that hack.
-	 *
-	 * NOTE 2026-05-28: tested skipping this call to match the known-
-	 * good 'X' diag rig (which doesn't touch the bridge after HCRST).
-	 * It did NOT change the outcome — the PoC still failed with zero
-	 * events landing. Keep FIX-3 active; the rig-vs-PoC divergence
-	 * must be elsewhere in the controller-side sequence. */
+	/* HCRST may churn BCM2711 bridge state analogous to the
+	 * mailbox-notify path. Re-program the outbound window AND inbound
+	 * BAR1/BAR2 here so the subsequent DCBAAP/CRCR/ERSTBA writes from
+	 * xhci_programCommandSpace + xhci_programEventRing land on a stable
+	 * bridge translation and any inbound DMA the controller issues at
+	 * R/S=1 still reaches DRAM. */
 	{
 		int re = bcm2711_pcie_resettleOutboundWindow();
 		if (re != EOK && re != -ENODEV) {
@@ -1354,18 +1345,13 @@ static int xhci_enterRunState(xhci_t *xhci)
 		return -ENODEV;
 	}
 
-	/* USB-FIX-19 (2026-05-27): re-settle the BCM2711 inbound DMA window
-	 * (RC_BAR2 / UBUS_BAR2) one more time RIGHT BEFORE R/S=1. FIX-3
-	 * re-settles after HCRST, but between HCRST and here usb-hcd does
-	 * the scratchpad + event-ring DMA mmaps; in usb-hcd's process
-	 * (which also holds the bridge MMIO mapping) those mmaps re-churn
-	 * the bridge inbound translation (the TD-USB-pmap interaction),
-	 * leaving inbound DMA WRITES dead at R/S=1 — the controller runs
-	 * commands (CRR=1, inbound reads work) but posts ZERO events.
-	 * Diagnosis: the lwip-port 'X' bring-up, which does NOT hold the
-	 * bridge mapping, posts events fine with an identical register
-	 * setup; usb-hcd does not. Re-asserting RC_BAR2 here is idempotent
-	 * and restores the inbound write path after the last mmap. */
+	/* Re-settle the BCM2711 inbound DMA window (RC_BAR2 / UBUS_BAR2)
+	 * one more time right before R/S=1. The re-settle after HCRST
+	 * covers reset, but between HCRST and here the scratchpad +
+	 * event-ring DMA mmaps can re-churn the bridge inbound translation
+	 * (this process also holds the bridge MMIO mapping). Re-asserting
+	 * RC_BAR2 here is idempotent and keeps the inbound DMA path valid
+	 * after the last mmap. */
 	{
 		int re = bcm2711_pcie_resettleOutboundWindow();
 		if (re != EOK && re != -ENODEV) {
@@ -1385,11 +1371,9 @@ static int xhci_enterRunState(xhci_t *xhci)
 	 * memory access. */
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	/* Pre-R/S settle: the working lwip-port 'X' rig sleeps 10 ms after
-	 * the DSB and before the first R/S=1 (diag-udp.c:1644-1645), giving
-	 * the controller time to settle after the burst of ring-pointer
-	 * register writes. The PoC previously went straight to R/S. Matched
-	 * here to eliminate it as a rig-vs-PoC variable. */
+	/* Pre-R/S settle: sleep 10 ms after the DSB and before the first
+	 * R/S=1, giving the controller time to settle after the burst of
+	 * ring-pointer register writes. */
 	usleep(10000);
 
 	/* HSE-on-R/S=1 soft retry (2026-05-24): on bridge state where the
@@ -2932,27 +2916,21 @@ static int xhci_programEventRing(xhci_t *xhci)
 	/* Order matters: ERSTSZ first, then ERDP, then ERSTBA LAST. Writing
 	 * ERSTBA is what makes the xHC (re)read the ERST and latch its
 	 * internal event-ring enqueue/dequeue (xHCI 1.2 §4.9.4 / §5.5.2.3).
-	 * Within each 64-bit register pair, write LO then HI to byte-match
-	 * the working lwip-port bring-up ('X' diag, diag-udp.c:1631-1635),
-	 * which uses ERSTSZ, ERDP_LO, ERDP_HI, ERSTBA_LO, ERSTBA_HI. (For
-	 * the low-memory rings the HI halves are 0, so the half-order should
-	 * be inert — but we keep it byte-identical to the known-good rig to
-	 * eliminate it as a variable; see the rig-vs-PoC bring-up diff.) */
+	 * Within each 64-bit register pair, write LO then HI. (For the
+	 * low-memory rings the HI halves are 0, so the half-order is inert,
+	 * but LO-then-HI matches the known-good lwip-port bring-up
+	 * sequence.) */
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTSZ, XHCI_ERST_ENTRY_COUNT & XHCI_REG_RT_IR_ERSTSZ__MASK);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO, erdpLo);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, erdpHi);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_LO, erstbaLo);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTBA_HI, erstbaHi);
 
-	/* NOTE: deliberately NOT setting IMAN.IE / IMOD here. The working
-	 * lwip-port 'X' bring-up leaves both at their post-HCRST default
-	 * (IE=0, IMOD=0) and the controller posts Command Completion and
-	 * Port Status events to the ring fine — confirming (with iPXE,
-	 * which polls without interrupts) that IE is NOT required for the
-	 * controller to DMA events to memory; IE only gates the IRQ line.
-	 * usb-hcd polls the event ring, so leaving the interrupter masked
-	 * matches the known-good path. (Comparison test for the usb-hcd
-	 * "CRR=1 but zero events land" gap vs the working 'X' path.) */
+	/* Deliberately NOT setting IMAN.IE / IMOD here: leave both at their
+	 * post-HCRST default (IE=0, IMOD=0). IE only gates the IRQ line, not
+	 * the controller's DMA of Command Completion / Port Status events to
+	 * the ring, so a polled event-ring driver (as here) works with the
+	 * interrupter masked. */
 
 	xhci->erstsz = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTSZ);
 	xhci->erstbaLo = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO);

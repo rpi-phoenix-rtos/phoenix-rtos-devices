@@ -1,10 +1,9 @@
 /*
  * Phoenix-RTOS
  *
- * PCI Express driver server
+ * BCM2711 PCIe bridge bring-up for VL805 USB (xhci PHY)
  *
- * Copyright 2025 Phoenix Systems
- * Author: Dariusz Sabala
+ * Copyright 2026 Phoenix Systems
  *
  * %LICENSE%
  */
@@ -352,8 +351,7 @@ static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
  * window. On BCM2711 reset, bit 0 (ACCESS_ENABLE) is 0, gating all
  * inbound DMA from PCIe devices at the UBUS interconnect. Linux's
  * pcie-brcmstb.c::brcm_pcie_setup() sets it; without it, VL805's
- * DMA reads/writes silently disappear at the bridge -- exactly the
- * symptom we've been chasing all day. */
+ * DMA reads/writes silently disappear at the bridge. */
 #define BCM2711_PCIE_UBUS_BAR2_REMAP_LO   0x40b4u
 #define BCM2711_PCIE_UBUS_BAR2_REMAP_HI   0x40b8u
 #define BCM2711_PCIE_UBUS_BAR2_ACCESS_EN  0x1u
@@ -1004,32 +1002,16 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 	if ((bus == XHCI_BCM2711_PCIE_BUS) && (dev == XHCI_BCM2711_PCIE_SLOT) &&
 		(fun == XHCI_BCM2711_PCIE_FUNC) && ((class24 >> 8) == XHCI_BCM2711_PCI_CLASS_CODE)) {
 		/*
-		 * USB-FIX-1 (2026-05-26): split PCI_COMMAND write into two
-		 * stages around the firmware mailbox notify.
-		 *
-		 * Background: the previous form enabled both MEM_ENABLE
-		 * (outbound CPU->VL805) and BUS_MASTER (inbound VL805->DRAM
-		 * DMA) BEFORE the mailbox notify. That ordering disagrees
-		 * with every reference (Linux pci-quirks.c::quirk_usb_early_handoff,
-		 * Circle's bcmpciehostbridge.cpp::EnableDevice, NetBSD bwfm):
-		 * they all enable MEM only pre-notify and defer BUS_MASTER
-		 * until after BAR0 program + post-notify settle.
-		 *
-		 * Why the divergence matters: the mailbox handler
+		 * Split the PCI_COMMAND write into two stages around the
+		 * firmware mailbox notify, matching Linux
+		 * (quirk_usb_early_handoff), Circle and NetBSD: enable
+		 * MEM_ENABLE (outbound CPU->VL805) only pre-notify and defer
+		 * BUS_MASTER (inbound VL805->DRAM DMA) until after BAR0
+		 * program + post-notify settle. The mailbox handler
 		 * (RPI_FIRMWARE_NOTIFY_XHCI_RESET) churns bridge-side
-		 * registers. If BUS_MASTER is on during that churn, VL805
-		 * can issue inbound DMA reads that complete against stale
-		 * translations, leaving its internal DMA TLB inconsistent.
-		 * The classic symptom is HSE on the first R/S=1 (mode B in
-		 * our 10-cycle experiment) or "can't setup: -110"
-		 * (raspberrypi/firmware#1617 — same error code).
-		 *
-		 * The original justification for setting BUS_MASTER first
-		 * (BME-after-mailbox -> 0xdead capability reads) was a
-		 * misdiagnosis: 0xdead came from the bridge-translation
-		 * invalidation bug, not from BUS_MASTER ordering. That bug
-		 * is fixed separately via the dev-0-only PCIe scan +
-		 * keep-alive mmap.
+		 * registers; with BUS_MASTER on during that churn VL805 can
+		 * issue inbound DMA against stale translations and leave its
+		 * DMA TLB inconsistent (HSE on first R/S=1, or -110).
 		 *
 		 * Stage 1 (here): MEM_ENABLE only; explicitly clear
 		 * BUS_MASTER so any stale value can't bias the mailbox.
@@ -1179,36 +1161,17 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 					bar_lo, bar_hi, want_lo, want_hi);
 			}
 		}
-		/* TD-USB diag 2026-05-16: read xhci CAPLENGTH + HCIVERSION
-		 * directly through the outbound window. Confirms the path
-		 * CPU PA 0x600000000 -> PCIe bus 0xf8000000 -> VL805 BAR0
-		 * works.
-		 *
-		 * KEPT-ALIVE 2026-05-17: do NOT munmap. The BCM2711 PCIe
-		 * bridge appears to invalidate its outbound translation
-		 * entry when the kernel removes the user mapping. Leaving
-		 * this mmap in place keeps the bridge translation warm so
-		 * xhci's subsequent mmap of the same PA reads valid
-		 * registers (otherwise the second mmap sees 0xdead).
-		 */
 		{
-			/* Hand off the xhci MMIO mapping to xhci_init via the
-			 * bcm2711_pcie_getXhciMmio() accessor. Historically this was
-			 * a "keepalive" against a bridge-translation invalidation
-			 * bug (where xhci's own later mmap of the outbound CPU PA
-			 * read 0xdead); that turned out to be a side effect of
-			 * pcie_scanBus probing dev 1..31 on bus 1 and is fixed by
-			 * the dev-0-only sweep there. Pre-creating the mapping
-			 * here is still useful because it avoids a redundant
-			 * MAP_DEVICE mmap inside xhci_init. */
-			/* Map the VL805 MMIO with MAP_UNCACHED in addition to
-			 * MAP_DEVICE so the page uses Device-nGnRnE (strongly ordered,
-			 * MAIR_IDX_S_ORDERED) rather than Device-nGnRE. nGnRnE is the
-			 * correct, strongest ordering for PCIe device registers and
-			 * matches the known-good lwip-port 'X' mapping of the same BAR.
-			 * (Tested as a candidate for the usb-hcd "event writes never
-			 * land" gap; it is NOT the fix, but the alignment is kept as a
-			 * correctness improvement.) */
+			/* Pre-create the VL805 MMIO mapping here and hand it to
+			 * xhci_init via the bcm2711_pcie_getXhciMmio() accessor,
+			 * so xhci_init does not have to redo the MAP_DEVICE mmap.
+			 *
+			 * Map with MAP_UNCACHED in addition to MAP_DEVICE so the
+			 * page uses Device-nGnRnE (strongly ordered,
+			 * MAIR_IDX_S_ORDERED) rather than Device-nGnRE: nGnRnE is
+			 * the strongest, correct ordering for PCIe device
+			 * registers and matches the known-good lwip-port 'X'
+			 * mapping of the same BAR. */
 			volatile uint8_t *xhci_mmio = mmap(NULL,
 				bcm2711_pcie_getXhciMmioSize(),
 				PROT_READ | PROT_WRITE,
@@ -1225,14 +1188,11 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 #endif
 
 	/*
-	 * Enable Memory Space and Bus Master.
-	 *
-	 * The previous form `if (!(cmd & (MSE|MASTER)))` only enabled the bits
-	 * when BOTH were already clear; if exactly one was set, the other was
-	 * never enabled. On the BCM2711 root + VL805, this manifested as MMIO
-	 * writes to operational xHCI registers (DCBAAP, CRCR, CONFIG) being
-	 * silently dropped after HCRST while capability reads still worked.
-	 * Always set both bits and only write back if anything changed.
+	 * Enable Memory Space and Bus Master. Both bits must be set: on the
+	 * BCM2711 root + VL805, leaving BUS_MASTER clear lets MMIO writes to
+	 * operational xHCI registers (DCBAAP, CRCR, CONFIG) be silently
+	 * dropped after HCRST while capability reads still work. Set both
+	 * bits and only write back if anything changed.
 	 */
 	{
 		uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
@@ -1466,21 +1426,11 @@ int bcm2711_pcie_initVL805(void)
 			bcm2711_pcie_lastCtx = bcm;
 		}
 
-		/* Post-re-program settling window. Empirical hardware sweep
-		 * across cold boots of the BCM2711 bridge after mailbox-notify:
-		 *
-		 *   wait | rc=-19 (poison) | rc=-110 (reset timeout)
-		 *   -----|-----------------|------------------------
-		 *     0  | 1/3             | 2/3
-		 *    50  | 1/3             | 2/3
-		 *   200  | 3/3             | 0/3  (worse — bridge drifted)
-		 *   500  | (anticipated) similarly bad
-		 *
-		 * 50 ms is the sweet spot: the bridge translation has time to
-		 * propagate but doesn't have enough idle time to be invalidated
-		 * by something else (the start4.elf firmware periodically
-		 * touches PCIe; we see "PCI0 reset" again at firmware-time
-		 * ~41.8 s on every boot). Keep at 50 ms. */
+		/* Post-re-program settling window: 50 ms is the empirical
+		 * sweet spot. The bridge translation needs time to propagate,
+		 * but a longer idle window lets start4.elf re-touch PCIe (it
+		 * periodically re-runs "PCI0 reset") and invalidate the
+		 * translation again. Keep at 50 ms. */
 		usleep(50000);
 	}
 #endif

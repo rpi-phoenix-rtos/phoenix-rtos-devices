@@ -125,7 +125,7 @@ static ssize_t sdcard_readCb(uint64_t offs, void *buff, size_t len, cache_devCtx
 	uint32_t lba = offs / SDCARD_BLOCKLEN;
 	len = min(len, SDCARD_MAX_TRANSFER);
 
-	/* TODO(#120): CMD18 (READ_MULTIPLE_BLOCK) is unproven on this controller --
+	/* TODO: CMD18 (READ_MULTIPLE_BLOCK) is unproven on this controller --
 	 * the ext2 mount's 2-block reads returned -EIO while the single-block CMD17
 	 * path (validated by the boot-time MBR read) works. The multi-block transfer
 	 * path (block-count / auto-CMD12 setup) is NOT yet fixed; force single-block
@@ -157,7 +157,7 @@ static ssize_t sdcard_writeCb(uint64_t offs, const void *buff, size_t len, cache
 	uint32_t lba = offs / SDCARD_BLOCKLEN;
 	len = min(len, SDCARD_MAX_TRANSFER);
 
-	/* TODO(#120): force single-block CMD24 writes, mirroring the read sidestep --
+	/* TODO: force single-block CMD24 writes, mirroring the read sidestep --
 	 * multi-block CMD25 (WRITE_MULTIPLE_BLOCK) uses the same unproven multi-block
 	 * path that returned -EIO for reads. Remove once multi-block is fixed. */
 	for (size_t done = 0; done < len; done += SDCARD_BLOCKLEN) {

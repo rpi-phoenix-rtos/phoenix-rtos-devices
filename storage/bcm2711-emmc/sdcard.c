@@ -25,7 +25,7 @@
 #include <sys/interrupt.h>
 
 #include "sdhost_defs.h"
-/* TODO(rpi4b-emmc): sdcard.c/sdhost_defs.h/sdstorage_*.c are copied verbatim from
+/* TODO: sdcard.c/sdhost_defs.h/sdstorage_*.c are copied verbatim from
  * storage/zynq7000-sdcard (generic SDHCI core). De-duplicate into a shared lib
  * (neutralize this platform include) before upstreaming. */
 #include "bcm2711-sdio.h"

@@ -185,14 +185,12 @@ static void pl011_fbcon_drawChar(pl011_t *uart, uint16_t col, uint16_t row, unsi
 }
 
 
-/* TD-15 Stage 4: 64-bit BG fill primitive. With kernel D-cache disabled
- * (Stage 1 parked, see TD-16-cache-enable), every framebuffer write
- * goes straight to DDR and pays a per-store penalty. Switching from
- * per-pixel uint32_t stores to 64-bit stores roughly halves the
- * instruction count and lets the compiler emit STP pairs for inner
- * loops. The full-screen clear is still observably slow on HDMI (the
- * line-by-line wipe the user reported is the cache-off cost), but
- * this halves it. */
+/* 64-bit BG fill primitive. The framebuffer is mapped Normal
+ * Non-Cacheable (it is VC4 scanout DRAM, not cacheable memory), so
+ * every store goes straight to DDR. Using 64-bit stores instead of
+ * per-pixel uint32_t stores halves the instruction count and lets the
+ * compiler emit STP pairs for the inner loop, doubling fill
+ * throughput on the non-cacheable mapping. */
 static inline void pl011_fbcon_fill64(volatile uint32_t *base, size_t bytes, uint32_t color)
 {
 	volatile uint64_t *p = (volatile uint64_t *)base;
@@ -484,21 +482,14 @@ static int pl011_fbcon_init(pl011_t *uart)
 	}
 
 	uart->fbmemsz = (pctl.task.graphmode.pitch * pctl.task.graphmode.height + _PAGE_SIZE - 1u) & ~(_PAGE_SIZE - 1u);
-	/* TD-15 Stage 4 phase 1d: drop MAP_DEVICE so the framebuffer is
-	 * mapped Normal Non-Cacheable (MAIR_IDX_NONCACHED) instead of
-	 * Strongly-Ordered (MAIR_IDX_S_ORDERED, MAIR_DEV_nGnRnE). With
-	 * S-Ordered memory every store must complete before the next can
-	 * issue — no write combining, no buffering. On real Pi 4 with
-	 * caches disabled (Stage 1 parked) the full-fbmemsz clear in
-	 * pl011_fbcon_clearAll never completed within the 600s netboot
-	 * capture window: the brown firmware splash was visible
-	 * progressively shrinking line by line for 10+ minutes. Normal
-	 * NC allows write combining, which on AArch64 lets adjacent
-	 * stores merge into burst writes — typically an order of
-	 * magnitude faster for sequential framebuffer fills. The
-	 * framebuffer is not a peripheral register, it is plain DRAM
-	 * accessed via the VC4 scanout engine, so Normal NC is the
-	 * architecturally correct attribute. */
+	/* Map the framebuffer Normal Non-Cacheable (MAP_UNCACHED /
+	 * MAIR_IDX_NONCACHED) rather than Device/Strongly-Ordered: it is
+	 * plain DRAM scanned out by the VC4 engine, not a peripheral
+	 * register window, so Normal NC is the architecturally correct
+	 * attribute. Normal NC also permits write combining, letting
+	 * adjacent stores merge into burst writes for fast sequential
+	 * fills, whereas a Device/S-Ordered mapping would serialise every
+	 * store. */
 	uart->fbaddr = mmap(NULL, uart->fbmemsz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_UNCACHED | MAP_ANONYMOUS | MAP_PHYSMEM, -1, pctl.task.graphmode.framebuffer);
 	if (uart->fbaddr == MAP_FAILED) {
 		uart->fbaddr = NULL;
