@@ -238,6 +238,13 @@ static int _sdio_cmdExecutionWait(sdcard_hostData_t *host, uint32_t flags, time_
 		}
 		doResetCmd = (val & SDHOST_INTR_CMD_ERRORS) != 0;
 		doResetDat = (val & SDHOST_INTR_DAT_ERRORS) != 0;
+		/* TODO(#120): a genuine bus error (CRC / end-bit / index / data) can wedge
+		 * BOTH the command and data lines; reset both so the next command (e.g. a
+		 * single-block read-retry) is not rejected with -EBUSY by a stuck inhibit. */
+		if (ret == -EIO) {
+			doResetCmd = true;
+			doResetDat = true;
+		}
 		*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_ERROR_REASONS;
 		/* Under QEMU it is important to zero out this register if an incomplete transfer happens */
 		*(host->base + SDHOST_REG_TRANSFER_BLOCK) = 0;
@@ -356,17 +363,30 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 		return -EINVAL;
 	}
 
-	val = *(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_BUSY_FLAGS;
-	if (val != 0) {
-		TRACE("busy %x", val);
-		return -EBUSY;
+	/* Wait (bounded, ~100 ms) for the controller/card to leave the busy state
+	 * before issuing a new command. This previously returned -EBUSY immediately,
+	 * which defeated single-block read-retry after a data error (#120): the
+	 * post-error card holds DAT0 busy briefly, so every retry insta-failed with
+	 * -EBUSY. The fast path (not busy) takes the first iteration with no sleep. */
+	{
+		unsigned int i;
+		for (i = 0; i < 1000u; i++) {
+			if ((*(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_BUSY_FLAGS) == 0u) {
+				break;
+			}
+			usleep(100);
+		}
+		val = *(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_BUSY_FLAGS;
+		if (val != 0) {
+			TRACE("busy %x", val);
+			return -EBUSY;
+		}
 	}
 
-	val = *(host->base + SDHOST_REG_INTR_STATUS) & (SDHOST_INTR_TRANSFER_DONE | SDHOST_INTR_CMD_DONE);
-	if (val != 0) {
-		TRACE("intr bits %x", val);
-		return -EBUSY;
-	}
+	/* Clear any stale command/transfer-complete bits left by a prior op rather
+	 * than bailing with -EBUSY -- a leftover DONE bit must not block the new
+	 * command (the upcoming wait consumes the fresh completion). */
+	*(host->base + SDHOST_REG_INTR_STATUS) = (SDHOST_INTR_TRANSFER_DONE | SDHOST_INTR_CMD_DONE);
 
 	cmdFrame.commandIdx = cmd;
 	cmdFrame.commandMeta = sdCmdMetadata[cmd].bitsWhenSending;
@@ -446,13 +466,20 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 
 		if (dataType != CMD_NO_DATA) {
 			/* PIO data transfer over the BUFFER_DATA FIFO (SDMA is unusable here —
-			 * see the dmaEnable=0 note above). The read/write-ready bits are NOT in
-			 * AWAITABLE_INTRS, so poll INTR_STATUS per block rather than wait on the
-			 * cond. The buffer is the uncached DMA buffer; the caller memcpy's it. */
+			 * see the dmaEnable=0 note above). The buffer is the uncached DMA buffer;
+			 * the caller memcpy's it.
+			 *
+			 * Gate each block's drain on the PRES_STATE Buffer-Read/Write-Enable
+			 * LEVEL bit (the Linux sdhci_transfer_pio pattern), NOT the latched
+			 * RW_READ_READY interrupt + per-block write-1-clear. The latched-bit
+			 * approach raced the FIFO at 50 MHz high-speed and produced a
+			 * Data-CRC / End-Bit error on ~every block (#120). The level bit
+			 * reflects the true buffer state, so we only touch the FIFO when the
+			 * controller says a block is actually available. */
 			uint32_t pioBlockLen = (dataType == CMD_READ8) ? 8u : ((dataType == CMD_READ64) ? 64u : SDCARD_BLOCKLEN);
 			uint32_t pioWords = pioBlockLen / 4u;
 			bool pioRead = (dataType == CMD_READ) || (dataType == CMD_READ_MULTI) || (dataType == CMD_READ8) || (dataType == CMD_READ64);
-			uint32_t pioReady = pioRead ? SDHOST_INTR_RW_READ_READY : SDHOST_INTR_RW_WRITE_READY;
+			uint32_t pioReadyLevel = pioRead ? PRES_STATE_BUFFER_READ_ENABLE : PRES_STATE_BUFFER_WRITE_ENABLE;
 			volatile uint32_t *pioFifo = host->base + SDHOST_REG_BUFFER_DATA;
 			uint8_t *pioBuf = (uint8_t *)host->dmaBuffer;
 			int pioErr = 0;
@@ -462,7 +489,10 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 				long spin;
 				for (spin = 0; spin < 2000000; spin++) {
 					st = *(host->base + SDHOST_REG_INTR_STATUS);
-					if ((st & (pioReady | SDHOST_ERROR_REASONS)) != 0u) {
+					if ((st & SDHOST_ERROR_REASONS) != 0u) {
+						break;
+					}
+					if ((*(host->base + SDHOST_REG_PRES_STATE) & pioReadyLevel) != 0u) {
 						break;
 					}
 				}
@@ -472,11 +502,10 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 					pioErr = -EIO;
 					break;
 				}
-				if ((st & pioReady) == 0u) {
+				if ((*(host->base + SDHOST_REG_PRES_STATE) & pioReadyLevel) == 0u) {
 					pioErr = -ETIME;
 					break;
 				}
-				*(host->base + SDHOST_REG_INTR_STATUS) = pioReady; /* write-1-to-clear */
 				uint32_t *pioW = (uint32_t *)(pioBuf + (size_t)pioBlk * pioBlockLen);
 				if (pioRead) {
 					for (uint32_t i = 0; i < pioWords; i++) {
@@ -491,6 +520,7 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 			}
 			if (pioErr != 0) {
 				mutexUnlock(host->eventLock);
+				sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
 				sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
 				return pioErr;
 			}

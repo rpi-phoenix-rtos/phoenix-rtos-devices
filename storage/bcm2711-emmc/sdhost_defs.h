@@ -116,6 +116,8 @@ enum SDHOST_REG {
 enum REG_STATE {
 	PRES_STATE_CMD_BUSY = (1UL << 0),
 	PRES_STATE_DAT_BUSY = (1UL << 1),
+	PRES_STATE_BUFFER_WRITE_ENABLE = (1UL << 10), /* SDHCI: space available to write a block in PIO */
+	PRES_STATE_BUFFER_READ_ENABLE = (1UL << 11),  /* SDHCI: a block is available to read in PIO */
 	PRES_STATE_CARD_INSERTED = (1UL << 16),
 	PRES_STATE_CARD_DET_STABLE = (1UL << 17),
 	PRES_STATE_CARD_DET_PIN = (1UL << 18),

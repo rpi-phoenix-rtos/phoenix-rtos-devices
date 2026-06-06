@@ -45,6 +45,7 @@
 #define BLK_CACHE_SECSIZE   (2 * SDCARD_BLOCKLEN) /* Size of cache sector (must be multiple of SDCARD_BLOCKLEN) */
 #define BLK_CACHE_SECNUM    16                    /* Maximum number of cached sectors in a region */
 #define MTD_DEFAULT_ERASESZ 0x10000
+#define SDCARD_READ_RETRIES 5 /* TODO(#120): bounded retry of transient single-block read errors */
 
 #define MTD_DEV_FORMAT   "mmcmtd%u"
 #define BLOCK_DEV_FORMAT "mmcblk%u"
@@ -132,10 +133,30 @@ static ssize_t sdcard_readCb(uint64_t offs, void *buff, size_t len, cache_devCtx
 	 * reads so the filesystem comes up. Remove this loop and use a single
 	 * sdcard_transferBlocks(len) once multi-block CMD18 is fixed and validated. */
 	for (size_t done = 0; done < len; done += SDCARD_BLOCKLEN) {
-		int ret = sdcard_transferBlocks(ctx->id, sdio_read,
-			lba + (uint32_t)(done / SDCARD_BLOCKLEN),
-			(uint8_t *)buff + done, SDCARD_BLOCKLEN);
+		uint32_t blkLba = lba + (uint32_t)(done / SDCARD_BLOCKLEN);
+		int ret = -EIO;
+		int attempt;
+		/* TODO(#120 diag+fix): retry transient read errors. The sustained-read
+		 * Data-CRC/End-Bit failures (a binary load fails where a directory listing
+		 * passes) may be transient signal-margin errors; the PIO error path resets
+		 * the DAT line, so re-issuing CMD17 is clean. Retry a bounded number of
+		 * times and log how many retries a block needed (or an outright failure) to
+		 * distinguish transient errors (recovered by retry) from a deterministic
+		 * bad-block / controller bug. */
+		for (attempt = 0; attempt < SDCARD_READ_RETRIES; attempt++) {
+			ret = sdcard_transferBlocks(ctx->id, sdio_read, blkLba,
+				(uint8_t *)buff + done, SDCARD_BLOCKLEN);
+			if (ret >= 0) {
+				break;
+			}
+		}
+		if ((ret >= 0) && (attempt > 0)) {
+			fprintf(stderr, "sdstorage diag(#120): lba=%u recovered after %d retr%s\n",
+				(unsigned)blkLba, attempt, (attempt == 1) ? "y" : "ies");
+		}
 		if (ret < 0) {
+			fprintf(stderr, "sdstorage diag(#120): lba=%u FAILED after %d attempts, ret=%d\n",
+				(unsigned)blkLba, attempt, ret);
 			return ret;
 		}
 	}
