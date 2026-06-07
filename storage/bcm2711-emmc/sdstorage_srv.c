@@ -418,14 +418,16 @@ int main(int argc, char *argv[])
 
 	kill(getppid(), SIGUSR1);
 
-	/* Single fs request thread (#120/#151): the ext2 object cache is shared
-	 * across storage_run worker threads; with >1 thread its LRU bookkeeping can
-	 * be raced when the (uniquely slow, CRC-retry-laden) SD reads hold an object
-	 * in flight long enough to widen the window -> lib_listRemove on an unlisted
-	 * node -> Data Abort. Other ext2 users that are single-threaded (virtio-blk
-	 * storage_run(1)) never hit it. Run one thread here too; the single-block PIO
-	 * SD path is the throughput bottleneck anyway, so 1 vs 2 threads is moot. */
-	storage_run(1, 2 * _PAGE_SIZE);
+	/* #120/#151 experiment: keep full multithreading (2 workers + caller) but
+	 * give each pool thread a larger stack. The SD-boot crash (Data Abort in
+	 * ext2_obj_get -> lib_listRemove on a corrupted node) is concurrency-
+	 * triggered memory corruption, yet both the SD driver's shared dmaBuffer
+	 * (host->cmdLock) and ext2's object cache (fs->objs->lock) are correctly
+	 * locked -- so the leading remaining cause is a pool-thread STACK OVERFLOW:
+	 * storage_run carves the worker stacks as adjacent slices of one malloc, so
+	 * a thread exceeding the default 2*_PAGE_SIZE (8 KB) clobbers its neighbour.
+	 * 16*_PAGE_SIZE (64 KB) tests that hypothesis while preserving concurrency. */
+	storage_run(2, 16 * _PAGE_SIZE);
 
 	return 0;
 }
