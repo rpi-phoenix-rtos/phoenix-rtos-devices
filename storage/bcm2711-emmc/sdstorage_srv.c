@@ -418,7 +418,14 @@ int main(int argc, char *argv[])
 
 	kill(getppid(), SIGUSR1);
 
-	storage_run(2, 2 * _PAGE_SIZE);
+	/* Single fs request thread (#120/#151): the ext2 object cache is shared
+	 * across storage_run worker threads; with >1 thread its LRU bookkeeping can
+	 * be raced when the (uniquely slow, CRC-retry-laden) SD reads hold an object
+	 * in flight long enough to widen the window -> lib_listRemove on an unlisted
+	 * node -> Data Abort. Other ext2 users that are single-threaded (virtio-blk
+	 * storage_run(1)) never hit it. Run one thread here too; the single-block PIO
+	 * SD path is the throughput bottleneck anyway, so 1 vs 2 threads is moot. */
+	storage_run(1, 2 * _PAGE_SIZE);
 
 	return 0;
 }
