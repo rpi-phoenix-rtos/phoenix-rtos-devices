@@ -56,6 +56,7 @@
  * runs (power-domain-on alone leaves MMIO reads returning the BCM2711 0xdeadbeef
  * bus-error sentinel). Clock id 5 = V3D in the firmware clock-id list. */
 #define VC_PROP_SET_CLOCK_STATE  0x00038001u
+#define VC_PROP_GET_CLOCK_RATE   0x00030002u
 #define VC_PROP_GET_MAX_CLK_RATE 0x00030004u
 #define VC_PROP_SET_CLOCK_RATE   0x00038002u
 #define RPI_CLOCK_V3D            5u
@@ -152,7 +153,7 @@ int main(void)
 {
 	volatile uint32_t *v3d;
 	void *v3d_page;
-	uint32_t powerState, clkState, clkMax, clkSet;
+	uint32_t powerState, clkState, clkMax, clkSet, clkCur0, clkCur1;
 	int i;
 
 	/* Tier 3 step 1: power on the V3D domain (gated until asked). */
@@ -162,14 +163,24 @@ int main(void)
 
 	/* Tier 3 step 1b: enable + set the V3D core clock. Power-domain-on alone
 	 * leaves the V3D MMIO returning 0xdeadbeef (bus error); the core needs its
-	 * clock running. Enable the clock, query its max rate, then set it. */
+	 * clock running. Each result on its OWN line (a single long line was getting
+	 * truncated by concurrent smp: prints on the shared UART). */
 	clkState = v3d_mboxProp2(VC_PROP_SET_CLOCK_STATE, RPI_CLOCK_V3D, 1u);
+	printf("rpi4-v3d-scout: SET_CLOCK_STATE(5,on) -> 0x%08x\n", clkState);
+	usleep(3000);
+	clkCur0 = v3d_mboxProp2(VC_PROP_GET_CLOCK_RATE, RPI_CLOCK_V3D, 0u);
+	printf("rpi4-v3d-scout: GET_CLOCK_RATE(5) before = %u\n", clkCur0);
+	usleep(3000);
 	clkMax = v3d_mboxProp2(VC_PROP_GET_MAX_CLK_RATE, RPI_CLOCK_V3D, 0u);
+	printf("rpi4-v3d-scout: GET_MAX_CLK_RATE(5) = %u\n", clkMax);
+	usleep(3000);
 	clkSet = (clkMax != MBOX_FAIL && clkMax != 0u)
 		? v3d_mboxProp2(VC_PROP_SET_CLOCK_RATE, RPI_CLOCK_V3D, clkMax)
 		: MBOX_FAIL;
-	printf("rpi4-v3d-scout: V3D clk(id=%u) state->0x%08x maxRate=%u setRate->%u\n",
-		RPI_CLOCK_V3D, clkState, clkMax, clkSet);
+	printf("rpi4-v3d-scout: SET_CLOCK_RATE(5,%u) -> %u\n", clkMax, clkSet);
+	usleep(3000);
+	clkCur1 = v3d_mboxProp2(VC_PROP_GET_CLOCK_RATE, RPI_CLOCK_V3D, 0u);
+	printf("rpi4-v3d-scout: GET_CLOCK_RATE(5) after = %u\n", clkCur1);
 
 	/* Brief settle for the domain + clock to come up before the first MMIO access. */
 	usleep(50000);
