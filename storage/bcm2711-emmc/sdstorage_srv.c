@@ -418,16 +418,13 @@ int main(int argc, char *argv[])
 
 	kill(getppid(), SIGUSR1);
 
-	/* #120/#151 experiment: keep full multithreading (2 workers + caller) but
-	 * give each pool thread a larger stack. The SD-boot crash (Data Abort in
-	 * ext2_obj_get -> lib_listRemove on a corrupted node) is concurrency-
-	 * triggered memory corruption, yet both the SD driver's shared dmaBuffer
-	 * (host->cmdLock) and ext2's object cache (fs->objs->lock) are correctly
-	 * locked -- so the leading remaining cause is a pool-thread STACK OVERFLOW:
-	 * storage_run carves the worker stacks as adjacent slices of one malloc, so
-	 * a thread exceeding the default 2*_PAGE_SIZE (8 KB) clobbers its neighbour.
-	 * 16*_PAGE_SIZE (64 KB) tests that hypothesis while preserving concurrency. */
-	storage_run(2, 16 * _PAGE_SIZE);
+	/* #120: keep full multithreading (2 workers + caller) but give each pool
+	 * thread a deep-fs stack. The SD-boot crash (Data Abort in ext2_obj_get ->
+	 * lib_listRemove on a corrupted node) was a pool-thread STACK OVERFLOW:
+	 * storage_run carves the worker stacks as adjacent slices of one malloc with
+	 * no guard page, so a thread exceeding the bare 2*_PAGE_SIZE (8 KB) default
+	 * silently clobbered its neighbour on the ext2-over-SD chain. */
+	storage_run(2, STORAGE_DEEPFS_STACKSZ);
 
 	return 0;
 }
