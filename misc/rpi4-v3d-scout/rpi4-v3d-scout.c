@@ -48,6 +48,13 @@
 #define MBOX_FAIL               0xffffffffu
 #define MBOX_SPINS              4000000u
 
+/* Firmware "set QPU/V3D enabled" tag (0x00030012). Per the Pi forum thread
+ * t=346267, THIS is what makes the V3D HUB/CORE MMIO answer on BCM2711 — it does
+ * the full V3D power-up (domain + clock + AXI bridge + reset). The separate
+ * power-domain / clock calls below alone leave the registers reading 0xdeadbeef.
+ * On success V3D core IDENT0 reads 0x02443356 ("V3D" + generation). */
+#define VC_PROP_SET_QPU_ENABLE   0x00030012u
+
 /* Firmware power-domain control (Linux raspberrypi-power.c / firmware mailbox). */
 #define VC_PROP_SET_DOMAIN_STATE 0x00038030u
 #define RPI_POWER_DOMAIN_V3D     10u
@@ -77,7 +84,12 @@
  * 1in1out: device-mapped uncached mailbox window + uncached, contiguous,
  * physically-pinned property buffer (no explicit clean/invalidate needed).
  */
-static uint32_t v3d_mboxProp2(uint32_t tag, uint32_t w0, uint32_t w1)
+/* Generic property call with `nw` value words (1 or 2). Returns the LAST value
+ * word of the response (msg[5] for nw=1, msg[6] for nw=2) — i.e. the result for
+ * 1-word tags like set-qpu-enable, and the second word (state/rate) for 2-word
+ * tags like set-domain/clock. Critically, valbuf size = nw*4 must match the
+ * tag's expectation or the firmware ignores it. */
+static uint32_t v3d_mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 {
 	addr_t pa_base = (addr_t)RPI_MAILBOX_BASE & ~(addr_t)(_PAGE_SIZE - 1);
 	addr_t pa_offs = (addr_t)RPI_MAILBOX_BASE & (addr_t)(_PAGE_SIZE - 1);
@@ -105,15 +117,17 @@ static uint32_t v3d_mboxProp2(uint32_t tag, uint32_t w0, uint32_t w1)
 	}
 	msg = msg_page;
 
-	/* [size, REQUEST, tag, valbuf=8, req=0, w0, w1, END]. */
-	msg[0] = 32;
+	/* [size, REQUEST, tag, valbuf=nw*4, req=0, w0[, w1], END]. */
+	msg[0] = (uint32_t)(6 + nw) * 4u;
 	msg[1] = 0;
 	msg[2] = tag;
-	msg[3] = 8;
+	msg[3] = (uint32_t)nw * 4u;
 	msg[4] = 0;
 	msg[5] = w0;
-	msg[6] = w1;
-	msg[7] = 0;
+	if (nw > 1) {
+		msg[6] = w1;
+	}
+	msg[5 + nw] = 0; /* END tag */
 
 	msg_pa = (uintptr_t)va2pa(msg);
 	if (msg_pa == (uintptr_t)-1) {
@@ -140,7 +154,7 @@ static uint32_t v3d_mboxProp2(uint32_t tag, uint32_t w0, uint32_t w1)
 		}
 	}
 	if (spins != 0u && msg[1] == VC_MBOX_RESP_OK) {
-		result = msg[6];
+		result = msg[5 + nw - 1];
 	}
 
 	munmap(msg_page, _PAGE_SIZE);
@@ -156,8 +170,17 @@ int main(void)
 	uint32_t powerState, clkState, clkMax, clkSet, clkCur0, clkCur1;
 	int i;
 
+	/* Tier 3 step 0 (the key step, per Pi forum t=346267): "set QPU enabled" —
+	 * the firmware brings the whole V3D up (domain+clock+AXI bridge+reset). Without
+	 * this the V3D MMIO reads 0xdeadbeef even with the domain/clock calls below. */
+	{
+		uint32_t qpuEn = v3d_mboxProp(VC_PROP_SET_QPU_ENABLE, 1, 1u, 0u);
+		printf("rpi4-v3d-scout: SET_QPU_ENABLE(1) -> 0x%08x%s\n", qpuEn,
+			(qpuEn == MBOX_FAIL) ? " (mbox FAIL)" : "");
+	}
+
 	/* Tier 3 step 1: power on the V3D domain (gated until asked). */
-	powerState = v3d_mboxProp2(VC_PROP_SET_DOMAIN_STATE, RPI_POWER_DOMAIN_V3D, 1u);
+	powerState = v3d_mboxProp(VC_PROP_SET_DOMAIN_STATE, 2, RPI_POWER_DOMAIN_V3D, 1u);
 	printf("rpi4-v3d-scout: SET_DOMAIN_STATE(V3D=%u, on) -> 0x%08x%s\n",
 		RPI_POWER_DOMAIN_V3D, powerState, (powerState == MBOX_FAIL) ? " (mbox FAIL)" : "");
 
@@ -165,21 +188,21 @@ int main(void)
 	 * leaves the V3D MMIO returning 0xdeadbeef (bus error); the core needs its
 	 * clock running. Each result on its OWN line (a single long line was getting
 	 * truncated by concurrent smp: prints on the shared UART). */
-	clkState = v3d_mboxProp2(VC_PROP_SET_CLOCK_STATE, RPI_CLOCK_V3D, 1u);
+	clkState = v3d_mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 1u);
 	printf("rpi4-v3d-scout: SET_CLOCK_STATE(5,on) -> 0x%08x\n", clkState);
 	usleep(3000);
-	clkCur0 = v3d_mboxProp2(VC_PROP_GET_CLOCK_RATE, RPI_CLOCK_V3D, 0u);
+	clkCur0 = v3d_mboxProp(VC_PROP_GET_CLOCK_RATE, 2, RPI_CLOCK_V3D, 0u);
 	printf("rpi4-v3d-scout: GET_CLOCK_RATE(5) before = %u\n", clkCur0);
 	usleep(3000);
-	clkMax = v3d_mboxProp2(VC_PROP_GET_MAX_CLK_RATE, RPI_CLOCK_V3D, 0u);
+	clkMax = v3d_mboxProp(VC_PROP_GET_MAX_CLK_RATE, 2, RPI_CLOCK_V3D, 0u);
 	printf("rpi4-v3d-scout: GET_MAX_CLK_RATE(5) = %u\n", clkMax);
 	usleep(3000);
 	clkSet = (clkMax != MBOX_FAIL && clkMax != 0u)
-		? v3d_mboxProp2(VC_PROP_SET_CLOCK_RATE, RPI_CLOCK_V3D, clkMax)
+		? v3d_mboxProp(VC_PROP_SET_CLOCK_RATE, 2, RPI_CLOCK_V3D, clkMax)
 		: MBOX_FAIL;
 	printf("rpi4-v3d-scout: SET_CLOCK_RATE(5,%u) -> %u\n", clkMax, clkSet);
 	usleep(3000);
-	clkCur1 = v3d_mboxProp2(VC_PROP_GET_CLOCK_RATE, RPI_CLOCK_V3D, 0u);
+	clkCur1 = v3d_mboxProp(VC_PROP_GET_CLOCK_RATE, 2, RPI_CLOCK_V3D, 0u);
 	printf("rpi4-v3d-scout: GET_CLOCK_RATE(5) after = %u\n", clkCur1);
 
 	/* Brief settle for the domain + clock to come up before the first MMIO access. */
