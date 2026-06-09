@@ -101,7 +101,13 @@ typedef struct {
 
 
 static struct {
-	char msgstack[USBMOUSE_N_MSG_THREADS][1024] __attribute__((aligned(8)));
+	/* 8 KB (#121): the msg thread submits URBs through the deep
+	 * usblibdrv_urbTransferAsync -> xhci_cmdExec chain; the old 1 KB stack could
+	 * overflow into adjacent .bss (the usbkbd twin's 1 KB stack overflowed into
+	 * hub_common.events — same pattern, root-caused via the Route-A watchpoint,
+	 * see docs/inprogress/2026-06-09-usb-hid-attach-abort-localized.md). No guard
+	 * page, so keep generous margin. */
+	char msgstack[USBMOUSE_N_MSG_THREADS][8192] __attribute__((aligned(8)));
 	idtree_t devices;
 	unsigned int msgport;
 	handle_t lock;

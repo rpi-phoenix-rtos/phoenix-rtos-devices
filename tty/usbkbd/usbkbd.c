@@ -109,7 +109,15 @@ typedef struct {
 
 
 static struct {
-	char msgstack[USBKBD_N_MSG_THREADS][1024] __attribute__((aligned(8)));
+	/* 8 KB (#121): the msg thread submits URBs for the interrupt-IN pipe, which
+	 * descends usblibdrv_urbTransferAsync -> xhci_cmdExec -> xhci_enterRunState
+	 * (a deep, ~1 KB+ frame chain). The old 1 KB stack overflowed ~64 B past its
+	 * base into the adjacent .bss (hub_common.events), writing a saved return
+	 * address there and surfacing later as a bogus lib_listRemove crash in the
+	 * USB daemon (the intermittent HID-attach Data Abort). Caught with the Route-A
+	 * watchpoint; see docs/inprogress/2026-06-09-usb-hid-attach-abort-localized.md.
+	 * These stacks have no guard page, so keep generous margin. */
+	char msgstack[USBKBD_N_MSG_THREADS][8192] __attribute__((aligned(8)));
 	idtree_t devices;
 	unsigned int msgport;
 	handle_t lock;
