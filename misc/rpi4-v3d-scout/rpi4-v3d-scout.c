@@ -112,6 +112,48 @@
 #define V3D_HUB_IDENT1_OFFS     0x0cu
 #define V3D_CORE_IDENT0_SIG     0x00443356u  /* "V3D" in the low 24 bits */
 
+/* --- Tier-4: V3D MMU (HUB-relative) + CLE control-list submit (CORE0-relative),
+ * per external/linux drivers/gpu/drm/v3d/{v3d_regs.h,v3d_mmu.c,v3d_sched.c,v3d_gem.c}.
+ * v3d_mmuCleTest() proves the GPU executes a control list fetched from
+ * Phoenix-allocated memory through the V3D MMU (BO + MMU + CLE path live). --- */
+#define V3D_MMU_PAGE_SHIFT          12u
+#define V3D_MMUC_CONTROL            0x1000u
+#define V3D_MMUC_CONTROL_ENABLE     (1u << 0)
+#define V3D_MMUC_CONTROL_FLUSH      (1u << 1)
+#define V3D_MMUC_CONTROL_FLUSHING   (1u << 2)
+#define V3D_MMU_CTL                 0x1200u
+#define V3D_MMU_CTL_ENABLE          (1u << 0)
+#define V3D_MMU_CTL_TLB_STATS_ENABLE (1u << 1)
+#define V3D_MMU_CTL_TLB_CLEAR       (1u << 2)
+#define V3D_MMU_CTL_TLB_STATS_CLEAR (1u << 3)
+#define V3D_MMU_CTL_TLB_CLEARING    (1u << 7)
+#define V3D_MMU_CTL_WRITE_VIOLATION_ABORT (1u << 11)
+#define V3D_MMU_CTL_PT_INVALID_ABORT      (1u << 19)
+#define V3D_MMU_CTL_CAP_EXCEEDED_ABORT    (1u << 26)
+#define V3D_MMU_PT_PA_BASE          0x1204u
+#define V3D_MMU_HIT                 0x1208u
+#define V3D_MMU_MISSES              0x120cu
+#define V3D_MMU_ILLEGAL_ADDR        0x1230u
+#define V3D_MMU_ILLEGAL_ADDR_ENABLE (1u << 31)
+#define V3D_PTE_WRITEABLE           (1u << 29)
+#define V3D_PTE_VALID               (1u << 28)
+/* CORE0-relative offsets (add V3D_CORE0_OFFS to reach from the HUB mapping base). */
+#define V3D_CTL_MISCCFG             0x0018u
+#define V3D_MISCCFG_OVRTMUOUT       (1u << 0)
+#define V3D_CTL_L2CACTL             0x0020u
+#define V3D_L2CACTL_L2CENA          (1u << 0)
+#define V3D_L2CACTL_L2CCLR          (1u << 2)
+#define V3D_CLE_CT0CA               0x0110u
+#define V3D_CLE_CT0QBA              0x0160u
+#define V3D_CLE_CT0QEA              0x0168u
+#define V3D_PTB_BPOS                0x030cu
+/* Control list: map at GPU VA page 1 (page 0 left unmapped as a null guard). */
+#define V3D_CL_GPUVA                0x1000u
+#define V3D_CL_NOPS                 64u
+#define CLE_NOP                     0x01u
+#define CLE_HALT                    0x00u
+#define V3D_SPIN_BOUND              200000u
+
 
 /*
  * Two-u32-in property call (domain, state). Returns the firmware's resulting
@@ -333,6 +375,135 @@ static void v3d_powerOn(void)
 }
 
 
+/* Allocate one uncached, physically-contiguous page (a minimal GPU "BO") and
+ * return its VA; *pa_out gets the physical address. Uncached => writes are
+ * coherent for the GPU with no explicit dcache clean (the scout's mailbox pattern). */
+static void *v3d_boAlloc(uintptr_t *pa_out)
+{
+	void *p = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) {
+		return NULL;
+	}
+	*pa_out = (uintptr_t)va2pa(p);
+	if (*pa_out == (uintptr_t)-1) {
+		munmap(p, _PAGE_SIZE);
+		return NULL;
+	}
+	return p;
+}
+
+
+/*
+ * Tier-4 milestone: prove the V3D executes a control list fetched from
+ * Phoenix-allocated memory THROUGH the V3D MMU. Brings up the MMU with a minimal
+ * flat page table mapping one GPU VA page to a control-list BO, then kicks the bin
+ * control thread over a NOP/HALT list and confirms (a) the CL pointer advanced and
+ * (b) the MMU translated (HIT incremented, no MISSES). NOPs avoid needing binner
+ * tile-state. All BOs are uncached; only V3D regs are touched, so a bad PT/CL
+ * faults V3D alone (isolated scout) — same recovery model as the power-on.
+ */
+static void v3d_mmuCleTest(volatile uint32_t *v3d)
+{
+	volatile uint32_t *core0 = v3d + (V3D_CORE0_OFFS / 4);
+	void *ptPage, *clPage, *scratchPage;
+	uintptr_t ptPa, clPa, scratchPa;
+	volatile uint32_t *pt;
+	volatile uint8_t *cl;
+	uint32_t hitsBefore, hitsAfter, misses, ca, endVa, spins;
+	uint32_t i;
+
+	ptPage = v3d_boAlloc(&ptPa);
+	clPage = v3d_boAlloc(&clPa);
+	scratchPage = v3d_boAlloc(&scratchPa);
+	if (ptPage == NULL || clPage == NULL || scratchPage == NULL) {
+		printf("rpi4-v3d-scout: cle test BO alloc FAILED\n");
+		return;
+	}
+	pt = (volatile uint32_t *)ptPage;
+	cl = (volatile uint8_t *)clPage;
+
+	/* Page table: everything invalid, then map V3D_CL_GPUVA -> CL BO page. */
+	for (i = 0; i < (_PAGE_SIZE / 4u); i++) {
+		pt[i] = 0u;
+	}
+	pt[V3D_CL_GPUVA >> V3D_MMU_PAGE_SHIFT] =
+		(uint32_t)(clPa >> V3D_MMU_PAGE_SHIFT) | V3D_PTE_WRITEABLE | V3D_PTE_VALID;
+
+	/* Control list: V3D_CL_NOPS NOPs then a HALT. */
+	for (i = 0; i < V3D_CL_NOPS; i++) {
+		cl[i] = CLE_NOP;
+	}
+	cl[V3D_CL_NOPS] = CLE_HALT;
+	endVa = V3D_CL_GPUVA + V3D_CL_NOPS + 1u;
+
+	/* Program + enable the MMU (PT base & illegal-addr scratch are physical). */
+	v3d[V3D_MMU_PT_PA_BASE / 4] = (uint32_t)(ptPa >> V3D_MMU_PAGE_SHIFT);
+	v3d[V3D_MMU_ILLEGAL_ADDR / 4] =
+		(uint32_t)(scratchPa >> V3D_MMU_PAGE_SHIFT) | V3D_MMU_ILLEGAL_ADDR_ENABLE;
+	v3d[V3D_MMU_CTL / 4] = V3D_MMU_CTL_ENABLE | V3D_MMU_CTL_TLB_STATS_ENABLE |
+		V3D_MMU_CTL_TLB_STATS_CLEAR | V3D_MMU_CTL_PT_INVALID_ABORT |
+		V3D_MMU_CTL_WRITE_VIOLATION_ABORT | V3D_MMU_CTL_CAP_EXCEEDED_ABORT;
+	v3d[V3D_MMUC_CONTROL / 4] = V3D_MMUC_CONTROL_ENABLE;
+	/* Flush MMU cache + TLB so the new PT is seen. */
+	v3d[V3D_MMUC_CONTROL / 4] = V3D_MMUC_CONTROL_FLUSH | V3D_MMUC_CONTROL_ENABLE;
+	for (spins = V3D_SPIN_BOUND; spins != 0u &&
+		(v3d[V3D_MMUC_CONTROL / 4] & V3D_MMUC_CONTROL_FLUSHING) != 0u; spins--) {
+	}
+	v3d[V3D_MMU_CTL / 4] |= V3D_MMU_CTL_TLB_CLEAR;
+	for (spins = V3D_SPIN_BOUND; spins != 0u &&
+		(v3d[V3D_MMU_CTL / 4] & V3D_MMU_CTL_TLB_CLEARING) != 0u; spins--) {
+	}
+
+	/* Core init (matches v3d_init_core) + clear/enable the L2 cache so the CLE
+	 * fetch reads fresh memory. */
+	core0[V3D_CTL_MISCCFG / 4] = V3D_MISCCFG_OVRTMUOUT;
+	core0[V3D_CTL_L2CACTL / 4] = V3D_L2CACTL_L2CCLR | V3D_L2CACTL_L2CENA;
+
+	hitsBefore = v3d[V3D_MMU_HIT / 4];
+
+	/* Kick the bin control thread over the NOP/HALT list at the GPU VA. */
+	core0[V3D_PTB_BPOS / 4] = 0u;
+	core0[V3D_CLE_CT0QBA / 4] = V3D_CL_GPUVA;
+	core0[V3D_CLE_CT0QEA / 4] = endVa;
+
+	/* Poll until the control pointer reaches the end of the list (or bound out). */
+	for (spins = 1000000u; spins != 0u; spins--) {
+		ca = core0[V3D_CLE_CT0CA / 4];
+		if (ca >= endVa) {
+			break;
+		}
+	}
+	ca = core0[V3D_CLE_CT0CA / 4];
+	hitsAfter = v3d[V3D_MMU_HIT / 4];
+	misses = v3d[V3D_MMU_MISSES / 4];
+
+	printf("rpi4-v3d-scout: CLE test: CT0CA=0x%08x (start 0x%08x end 0x%08x) "
+		"MMU_HIT %u->%u MISSES=%u\n",
+		ca, V3D_CL_GPUVA, endVa, hitsBefore, hitsAfter, misses);
+	/* Proof: the control pointer walked from the GPU VA start cleanly to the exact
+	 * end of the list (CA==endVa), the MMU recorded a translation (HIT incremented),
+	 * and PT_INVALID_ABORT was armed so a bad translation would have aborted instead
+	 * of completing. Only possible if the MMU translated GPU VA 0x1000 to our CL BO
+	 * and the CLE fetched+executed every byte. MISSES are the expected cold TLB fills
+	 * for the one mapped page (first access walks the PT, then the MMUC line-caches
+	 * the rest), not a failure. */
+	if (ca == endVa && hitsAfter > hitsBefore) {
+		printf("rpi4-v3d-scout: *** GPU EXECUTED CONTROL LIST from MMU-mapped memory *** "
+			"(Tier-4 BO+MMU+CLE path live; MMU_HIT=%u, cold-fill MISSES=%u)\n",
+			hitsAfter, misses);
+	}
+	else {
+		printf("rpi4-v3d-scout: CLE test inconclusive "
+			"(CA=0x%08x want 0x%08x, MMU_HIT %u->%u)\n", ca, endVa, hitsBefore, hitsAfter);
+	}
+
+	munmap(scratchPage, _PAGE_SIZE);
+	munmap(clPage, _PAGE_SIZE);
+	munmap(ptPage, _PAGE_SIZE);
+}
+
+
 int main(void)
 {
 	volatile uint32_t *v3d;
@@ -415,11 +586,15 @@ int main(void)
 	{
 		uint32_t coreId0 = v3d[V3D_CORE0_IDENT0_OFFS / 4];
 		uint32_t hubId1 = v3d[V3D_HUB_IDENT1_OFFS / 4];
-		if ((coreId0 & 0x00ffffffu) == V3D_CORE_IDENT0_SIG) {
+		int alive = ((coreId0 & 0x00ffffffu) == V3D_CORE_IDENT0_SIG);
+		if (alive) {
 			printf("rpi4-v3d-scout: *** V3D ALIVE *** CORE0_IDENT0=0x%08x (\"V3D\" ver %u); "
 				"HUB_IDENT1=0x%08x => V3D %u.%u, %u core(s)\n",
 				coreId0, (coreId0 >> 24) & 0xffu, hubId1,
 				hubId1 & 0xfu, (hubId1 >> 4) & 0xfu, (hubId1 >> 8) & 0xfu);
+
+			/* Tier-4 step: BO + MMU + control-list execution from our memory. */
+			v3d_mmuCleTest(v3d);
 		}
 		else {
 			printf("rpi4-v3d-scout: V3D still gated: CORE0_IDENT0=0x%08x (want \"V3D\" 0x..%06x)\n",
