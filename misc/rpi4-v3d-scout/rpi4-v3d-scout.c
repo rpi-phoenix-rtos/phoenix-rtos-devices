@@ -99,6 +99,18 @@
 #define ASB_V3D_M_CTRL          0x0cu
 #define ASB_REQ_STOP            (1u << 0)
 #define ASB_ACK                 (1u << 1)
+#define PM_PASSWORD             0x5a000000u  /* top-byte key; PM/ASB ignore writes without it */
+#define ASB_ACK_SPINS           100000u      /* bounded poll (Linux uses 100us); never infinite */
+
+/* V3D identity registers (external/linux drivers/gpu/drm/v3d/v3d_regs.h). While
+ * V3D is gated every read returns the 0xdeadbeef bus-error sentinel; once alive:
+ *   CORE0 V3D_CTL_IDENT0 (CORE0 + 0x00): low 24 bits = 'V','3','D' (0x443356),
+ *     top byte = tech version (HW reads 0x04 on the Pi4 V3D 4.2 core).
+ *   HUB   V3D_HUB_IDENT0 (HUB + 0x08): ASCII "VHUB" (0x42554856).
+ *   HUB   V3D_HUB_IDENT1 (HUB + 0x0c): TVER (3:0) . REV (7:4) => 4.2 on Pi4. */
+#define V3D_CORE0_IDENT0_OFFS   (V3D_CORE0_OFFS + 0x00u)
+#define V3D_HUB_IDENT1_OFFS     0x0cu
+#define V3D_CORE_IDENT0_SIG     0x00443356u  /* "V3D" in the low 24 bits */
 
 
 /*
@@ -238,6 +250,89 @@ static void v3d_reconPmAsb(void)
 }
 
 
+/*
+ * Enable one V3D ASB async-AXI bridge (master or slave): clear ASB_REQ_STOP and
+ * poll until the controller drops ASB_ACK (bridge running). Mirrors the canonical
+ * bcm2835_asb_control(enable=true). Bounded spin — never blocks forever.
+ */
+static int v3d_asbEnable(volatile uint32_t *asb, uint32_t reg)
+{
+	uint32_t val = asb[reg / 4] & ~ASB_REQ_STOP;
+	uint32_t spins;
+
+	asb[reg / 4] = PM_PASSWORD | val;
+	for (spins = ASB_ACK_SPINS; spins != 0u; spins--) {
+		if ((asb[reg / 4] & ASB_ACK) == 0u) {
+			return 0;
+		}
+	}
+	return -1;
+}
+
+
+/*
+ * Direct V3D power-on, the canonical BCM2711 path (external/linux
+ * drivers/pmdomain/bcm/bcm2835-power.c bcm2835_asb_power_on for GRAFX_V3D). On
+ * BCM2711 the PM power-island POWUP sequence is a NO-OP ("We don't run this on
+ * BCM2711"); the real bring-up is: clock-toggle around a reset-deassert, then
+ * enable the V3D master + slave async-AXI bridges. The Linux clk_{en,dis}able
+ * maps to the firmware mailbox SET_CLOCK_STATE the scout already drives.
+ *
+ * Only ONE PM write (set PM_V3DRSTN in PM_GRAFX) + two rpivid_asb writes, each
+ * keyed with PM_PASSWORD and bounded; recon already proved both regions are real.
+ */
+static void v3d_powerOn(void)
+{
+	volatile uint32_t *pm, *asb;
+	void *pm_page, *asb_page;
+	uint32_t grafx;
+	int rcM, rcS;
+
+	pm_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (addr_t)PM_BASE);
+	if (pm_page == MAP_FAILED) {
+		printf("rpi4-v3d-scout: powerOn mmap(PM) FAILED\n");
+		return;
+	}
+	pm = (volatile uint32_t *)pm_page;
+
+	asb_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (addr_t)RPIVID_ASB_BASE);
+	if (asb_page == MAP_FAILED) {
+		printf("rpi4-v3d-scout: powerOn mmap(rpivid_asb) FAILED\n");
+		munmap(pm_page, _PAGE_SIZE);
+		return;
+	}
+	asb = (volatile uint32_t *)asb_page;
+
+	/* clk on -> wait 32 clocks for reset to propagate -> clk off (canonical). */
+	(void)v3d_mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 1u);
+	usleep(50);
+	(void)v3d_mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 0u);
+
+	/* Deassert the V3D reset (the only PM write), with the clock off. */
+	grafx = pm[PM_GRAFX / 4];
+	pm[PM_GRAFX / 4] = PM_PASSWORD | (grafx | PM_V3DRSTN);
+	printf("rpi4-v3d-scout: powerOn PM_GRAFX 0x%08x -> deassert V3DRSTN -> 0x%08x\n",
+		grafx, pm[PM_GRAFX / 4]);
+
+	/* clk back on, then re-assert the rate (gate-off may have dropped it). */
+	(void)v3d_mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 1u);
+	usleep(50);
+
+	/* Enable the V3D master then slave async-AXI bridges. */
+	rcM = v3d_asbEnable(asb, ASB_V3D_M_CTRL);
+	rcS = v3d_asbEnable(asb, ASB_V3D_S_CTRL);
+	printf("rpi4-v3d-scout: powerOn asb_enable M=%s S=%s; M_CTRL=0x%08x S_CTRL=0x%08x\n",
+		(rcM == 0) ? "ok" : "TIMEOUT", (rcS == 0) ? "ok" : "TIMEOUT",
+		asb[ASB_V3D_M_CTRL / 4], asb[ASB_V3D_S_CTRL / 4]);
+
+	usleep(2000);
+	munmap(asb_page, _PAGE_SIZE);
+	munmap(pm_page, _PAGE_SIZE);
+}
+
+
 int main(void)
 {
 	volatile uint32_t *v3d;
@@ -289,6 +384,12 @@ int main(void)
 	 * load-bearing (GRAFX island already up? V3D already de-reset?). */
 	v3d_reconPmAsb();
 
+	/* Tier 3 step 1d (WRITE): direct V3D power-on via PM_V3DRSTN deassert + the
+	 * V3D async-AXI bridges (canonical BCM2711 bcm2835-power path). Recon proved
+	 * the regions real + the bridges stopped + V3D in reset, so this is the
+	 * load-bearing step the firmware/overlay didn't do. */
+	v3d_powerOn();
+
 	/* Tier 3 step 2: map the V3D MMIO and raw-dump the HUB identity region.
 	 * Mapped uncached/device so reads hit the hardware directly. */
 	v3d_page = mmap(NULL, V3D_MMIO_LEN, PROT_READ | PROT_WRITE,
@@ -311,7 +412,21 @@ int main(void)
 	for (i = 0; i < 16; i++) {
 		printf("rpi4-v3d-scout:   core0[0x%02x] = 0x%08x\n", i * 4, v3d[(V3D_CORE0_OFFS / 4) + i]);
 	}
-	printf("rpi4-v3d-scout: done (non-zero IDENT words => V3D alive)\n");
+	{
+		uint32_t coreId0 = v3d[V3D_CORE0_IDENT0_OFFS / 4];
+		uint32_t hubId1 = v3d[V3D_HUB_IDENT1_OFFS / 4];
+		if ((coreId0 & 0x00ffffffu) == V3D_CORE_IDENT0_SIG) {
+			printf("rpi4-v3d-scout: *** V3D ALIVE *** CORE0_IDENT0=0x%08x (\"V3D\" ver %u); "
+				"HUB_IDENT1=0x%08x => V3D %u.%u, %u core(s)\n",
+				coreId0, (coreId0 >> 24) & 0xffu, hubId1,
+				hubId1 & 0xfu, (hubId1 >> 4) & 0xfu, (hubId1 >> 8) & 0xfu);
+		}
+		else {
+			printf("rpi4-v3d-scout: V3D still gated: CORE0_IDENT0=0x%08x (want \"V3D\" 0x..%06x)\n",
+				coreId0, V3D_CORE_IDENT0_SIG);
+		}
+	}
+	printf("rpi4-v3d-scout: done\n");
 
 	munmap(v3d_page, V3D_MMIO_LEN);
 
