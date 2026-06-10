@@ -35,6 +35,18 @@
 #include <sys/mman.h>
 #include <sys/threads.h>
 
+/* Mesa-ported V3D 4.2 control-list packers (generated from external/mesa
+ * cle/v3d_packet.xml; see v3d_gen.h shim). Lets us emit CLE packets through
+ * Mesa's authoritative *_pack() functions instead of hand-encoding bytes. */
+#include "v3d_packet_v42_pack.h"
+
+/* cl_emit-style helper: declare a zero/header-initialised packet struct, run the
+ * field-setup block, then pack it at byte cursor `p` (uint8_t*) and advance p. */
+#define CL_EMIT(p, PKT, name) \
+	for (struct V3D42_##PKT name = { V3D42_##PKT##_header }, *_cldone = (void *)0; \
+		_cldone == (void *)0; \
+		(V3D42_##PKT##_pack(NULL, (p), &name), (p) += V3D42_##PKT##_length, _cldone = (void *)1))
+
 
 /* VideoCore property mailbox (carried over from rpi4-thermal). */
 #define RPI_MAILBOX_BASE        0xfe00b880u
@@ -169,7 +181,8 @@
 #define CLE_TILE_BINNING_MODE_CFG   120u
 #define CLE_START_TILE_BINNING      6u
 #define CLE_FLUSH                   4u
-#define V3D_INTERNAL_BPP_32         0u          /* RGBA8 */
+/* V3D_INTERNAL_BPP_32 / _TYPE_8 / _MEMORY_FORMAT_RASTER / _OUTPUT_IMAGE_FORMAT_RGBA8
+ * come from the Mesa pack header's enums (v3d_packet_v42_pack.h). */
 /* GPU VA layout (distinct windows; page 0 left unmapped as a null guard). */
 #define V3D_BIN_CL_VA               0x1000u     /* 1 page */
 #define V3D_TILEALLOC_VA            0x10000u    /* 4 pages (16 KiB) */
@@ -182,6 +195,11 @@
 #define V3D_CLE_CT1CA               0x0114u
 #define V3D_CLE_CT1QBA              0x0164u
 #define V3D_CLE_CT1QEA              0x016cu
+#define V3D_CTL_INT_STS             0x0050u   /* CORE-relative */
+#define V3D_CTL_INT_CLR             0x0058u
+#define V3D_INT_FRDONE              (1u << 0) /* render/frame done */
+#define V3D_INT_FLDONE              (1u << 1) /* binner/flush done */
+#define V3D_INT_OUTOMEM             (1u << 2) /* binner out of tile-alloc memory */
 #define CLE_TRM_CFG                 121u  /* Tile Rendering Mode Cfg; sub_id discriminates */
 #define CLE_MULTICORE_SUPERTILE_CFG 122u
 #define CLE_MULTICORE_TILE_LIST_BASE 123u
@@ -200,9 +218,6 @@
 #define TRM_SUBID_COMMON            0u
 #define TRM_SUBID_COLOR             1u
 #define TRM_SUBID_CLEARCOL1         3u
-#define V3D_INTERNAL_TYPE_8         2u   /* RGBA8 unorm */
-#define V3D_MEMORY_FORMAT_RASTER    0u
-#define V3D_OUTPUT_IMAGE_FORMAT_RGBA8 27u
 #define V3D_BUFFER_RT0              0u
 #define V3D_BUFFER_NONE             8u
 #define V3D_RCL_VA                  0x30000u  /* main RCL (offset 0) + sub-list (offset 0x800) */
@@ -738,8 +753,9 @@ static __attribute__((unused)) void v3d_binTest(volatile uint32_t *v3d)
 }
 
 
-/* Little-endian u32 store into a CL byte buffer. */
-static void v3d_put32(volatile uint8_t *b, uint32_t off, uint32_t v)
+/* Little-endian u32 store into a CL byte buffer (retained helper; the render CL
+ * now emits via Mesa packers, the bin CL is still hand-built). */
+static __attribute__((unused)) void v3d_put32(volatile uint8_t *b, uint32_t off, uint32_t v)
 {
 	b[off + 0] = (uint8_t)v;
 	b[off + 1] = (uint8_t)(v >> 8);
@@ -763,9 +779,10 @@ static __attribute__((unused)) void v3d_renderClearTest(volatile uint32_t *v3d)
 	void *ptPage, *binPage, *allocPage, *statePage, *rclPage, *rtPage, *scratchPage;
 	uintptr_t ptPa, binPa, allocPa, statePa, rclPa, rtPa, scratchPa;
 	volatile uint32_t *pt;
-	volatile uint8_t *bin, *m, *s;
+	volatile uint8_t *bin;
+	uint8_t *m, *s, *mp, *sp;
 	volatile uint32_t *rt;
-	uint32_t i, n, mi, si, binEnd, rclEnd, sublistVa, ca, spins;
+	uint32_t i, n, binEnd, rclEnd, sublistVa, sublen, ca, spins;
 	uint32_t px0, pxN, okpix;
 
 	ptPage = v3d_boAllocN(1, &ptPa);
@@ -782,8 +799,8 @@ static __attribute__((unused)) void v3d_renderClearTest(volatile uint32_t *v3d)
 	}
 	pt = (volatile uint32_t *)ptPage;
 	bin = (volatile uint8_t *)binPage;
-	m = (volatile uint8_t *)rclPage;             /* main RCL at offset 0 */
-	s = (volatile uint8_t *)rclPage + V3D_SUBLIST_OFFS; /* per-tile sub-list */
+	m = (uint8_t *)rclPage;                       /* main RCL at offset 0 */
+	s = (uint8_t *)rclPage + V3D_SUBLIST_OFFS;    /* per-tile sub-list */
 	rt = (volatile uint32_t *)rtPage;
 	sublistVa = V3D_RCL_VA + V3D_SUBLIST_OFFS;
 
@@ -817,127 +834,125 @@ static __attribute__((unused)) void v3d_renderClearTest(volatile uint32_t *v3d)
 	bin[n++] = CLE_FLUSH;
 	binEnd = V3D_BIN_CL_VA + n;
 
-	/* --- Per-tile generic sub-list (at V3D_RCL_VA + 0x800). --- */
-	si = 0u;
-	s[si++] = CLE_TILE_COORDINATES_IMPL;
-	s[si++] = CLE_END_OF_LOADS;
-	/* Clear the tile buffer to the configured clear color, then store it. */
-	s[si++] = CLE_CLEAR_TILE_BUFFERS;
-	s[si++] = (uint8_t)((0u << 1) | 1u);          /* clear_z=0, clear_all_render_targets=1 */
-	s[si++] = CLE_STORE_GENERAL;                  /* 13 bytes */
-	s[si++] = (uint8_t)((0u << 7) | (V3D_MEMORY_FORMAT_RASTER << 4) | V3D_BUFFER_RT0);
-	s[si++] = (uint8_t)((V3D_OUTPUT_IMAGE_FORMAT_RGBA8 << 4) & 0xffu); /* low bits of fmt + decimate/dither 0 */
-	s[si++] = (uint8_t)((V3D_OUTPUT_IMAGE_FORMAT_RGBA8 >> 4) & 0x3u);  /* fmt high bits; rbswap/chrev/clear=0 */
-	/* height_in_ub_or_stride (raster row stride = 64*4=256), field at bits 4..23 of cl[4..6] */
-	{
-		uint32_t stride = V3D_RT_W * 4u;          /* 256 */
-		uint32_t f = stride << 4;                 /* field starts at bit 4 */
-		s[si++] = (uint8_t)(f & 0xffu);
-		s[si++] = (uint8_t)((f >> 8) & 0xffu);
-		s[si++] = (uint8_t)((f >> 16) & 0xffu);
+	/* --- Per-tile generic sub-list (at V3D_RCL_VA + 0x800), emitted via Mesa packers. --- */
+	sp = s;
+	/* Mirrors mesa v3d_rcl_emit_generic_per_tile_list (clear is done by the main
+	 * RCL's initial-clear dance; the per-tile list stores the cleared TLB). */
+	CL_EMIT(sp, TILE_COORDINATES_IMPLICIT, c) { (void)c; }
+	CL_EMIT(sp, END_OF_LOADS, c) { (void)c; }
+	CL_EMIT(sp, PRIM_LIST_FORMAT, c) { c.primitive_type = LIST_TRIANGLES; }
+	CL_EMIT(sp, SET_INSTANCEID, c) { c.instance_id = 0; }
+	CL_EMIT(sp, BRANCH_TO_IMPLICIT_TILE_LIST, c) { c.tile_list_set_number = 0; }
+	CL_EMIT(sp, STORE_TILE_BUFFER_GENERAL, c) {
+		c.buffer_to_store = V3D_BUFFER_RT0;
+		c.memory_format = V3D_MEMORY_FORMAT_RASTER;
+		c.output_image_format = V3D_OUTPUT_IMAGE_FORMAT_RGBA8;
+		c.height_in_ub_or_stride = V3D_RT_W * 4u;     /* raster row stride (bytes) */
+		c.height = V3D_RT_H;
+		c.address.offset = V3D_RT_VA;
 	}
-	s[si++] = (uint8_t)(V3D_RT_H & 0xffu);        /* height lo */
-	s[si++] = (uint8_t)((V3D_RT_H >> 8) & 0xffu); /* height hi */
-	v3d_put32(s, si, V3D_RT_VA); si += 4u;        /* RT address */
-	s[si++] = CLE_END_OF_TILE_MARKER;
-	s[si++] = CLE_RETURN_FROM_SUB_LIST;
+	CL_EMIT(sp, END_OF_TILE_MARKER, c) { (void)c; }
+	CL_EMIT(sp, RETURN_FROM_SUB_LIST, c) { (void)c; }
+	sublen = (uint32_t)(sp - s);
 
-	/* --- Main RCL. --- */
-	mi = 0u;
-	/* Tile Rendering Mode Cfg (Common). */
-	m[mi++] = CLE_TRM_CFG;
-	m[mi++] = (uint8_t)(((1u - 1u) << 4) | TRM_SUBID_COMMON);  /* numRT=1, sub_id=0 */
-	m[mi++] = (uint8_t)((V3D_RT_W) & 0xffu);
-	m[mi++] = (uint8_t)(((V3D_RT_W) >> 8) & 0xffu);
-	m[mi++] = (uint8_t)((V3D_RT_H) & 0xffu);
-	m[mi++] = (uint8_t)(((V3D_RT_H) >> 8) & 0xffu);
-	m[mi++] = (uint8_t)((1u << 6) | V3D_INTERNAL_BPP_32);      /* early_z_disable=1, max_bpp=32 */
-	m[mi++] = 0u;
-	m[mi++] = 0u;
-	/* Tile Rendering Mode Cfg (Color). */
-	m[mi++] = CLE_TRM_CFG;
-	m[mi++] = (uint8_t)((V3D_INTERNAL_TYPE_8 << 6) | (V3D_INTERNAL_BPP_32 << 4) | TRM_SUBID_COLOR);
-	m[mi++] = (uint8_t)((V3D_INTERNAL_TYPE_8 >> 2) & 0x3u);    /* rt0 type high bits */
-	m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
-	/* Tile Rendering Mode Cfg (Clear Colors Part1). */
-	m[mi++] = CLE_TRM_CFG;
-	m[mi++] = (uint8_t)((0u << 4) | TRM_SUBID_CLEARCOL1);      /* rt_number=0, sub_id=3 */
-	v3d_put32(m, mi, V3D_CLEAR_COLOR); mi += 4u;               /* clear_color_low_32 */
-	m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;                  /* next_24 = 0 */
-	/* Multicore Rendering Tile List Set Base = tile_alloc. */
-	m[mi++] = CLE_MULTICORE_TILE_LIST_BASE;
-	m[mi++] = (uint8_t)((V3D_TILEALLOC_VA & 0xffu) | 0u);      /* addr lo | set_number=0 */
-	m[mi++] = (uint8_t)((V3D_TILEALLOC_VA >> 8) & 0xffu);
-	m[mi++] = (uint8_t)((V3D_TILEALLOC_VA >> 16) & 0xffu);
-	m[mi++] = (uint8_t)((V3D_TILEALLOC_VA >> 24) & 0xffu);
-	/* Multicore Rendering Supertile Cfg (1x1 tile frame, 1 supertile). */
-	m[mi++] = CLE_MULTICORE_SUPERTILE_CFG;
-	m[mi++] = 0u;                 /* supertile_w-1 = 0 */
-	m[mi++] = 0u;                 /* supertile_h-1 = 0 */
-	m[mi++] = 1u;                 /* frame_w_in_supertiles = 1 */
-	m[mi++] = 1u;                 /* frame_h_in_supertiles = 1 */
-	m[mi++] = 1u;                 /* frame_w_in_tiles (12b) = 1 */
-	m[mi++] = (uint8_t)((1u << 4) | 0u); /* frame_h_in_tiles (bits 4-15) = 1, frame_w hi = 0 */
-	m[mi++] = 0u;                 /* frame_h_in_tiles hi */
-	m[mi++] = 0u;                 /* numBinTileLists-1=0, raster_order=0, multicore=0 */
-	/* GFXH-1742 initial clear dance: TILE_COORDINATES(0,0) then 2x stores; clear on i==0. */
-	m[mi++] = CLE_TILE_COORDINATES; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
+	/* --- Main RCL, emitted via Mesa packers. --- */
+	mp = m;
+	CL_EMIT(mp, TILE_RENDERING_MODE_CFG_COMMON, c) {
+		c.number_of_render_targets = 1;
+		c.image_width_pixels = V3D_RT_W;
+		c.image_height_pixels = V3D_RT_H;
+		c.maximum_bpp_of_all_render_targets = V3D_INTERNAL_BPP_32;
+		c.early_z_disable = true;
+	}
+	CL_EMIT(mp, TILE_RENDERING_MODE_CFG_COLOR, c) {
+		c.render_target_0_internal_type = V3D_INTERNAL_TYPE_8;
+		c.render_target_0_internal_bpp = V3D_INTERNAL_BPP_32;
+	}
+	CL_EMIT(mp, TILE_RENDERING_MODE_CFG_CLEAR_COLORS_PART1, c) {
+		c.render_target_number = 0;
+		c.clear_color_low_32_bits = V3D_CLEAR_COLOR;
+		c.clear_color_next_24_bits = 0;
+	}
+	CL_EMIT(mp, MULTICORE_RENDERING_TILE_LIST_SET_BASE, c) {
+		c.address.offset = V3D_TILEALLOC_VA;
+		c.tile_list_set_number = 0;
+	}
+	CL_EMIT(mp, MULTICORE_RENDERING_SUPERTILE_CFG, c) {
+		c.number_of_bin_tile_lists = 1;
+		c.total_frame_width_in_tiles = 1;
+		c.total_frame_height_in_tiles = 1;
+		c.supertile_width_in_tiles = 1;
+		c.supertile_height_in_tiles = 1;
+		c.total_frame_width_in_supertiles = 1;
+		c.total_frame_height_in_supertiles = 1;
+	}
+	/* GFXH-1742 initial-clear dance: clear on the first of two dummy stores. */
+	CL_EMIT(mp, TILE_COORDINATES, c) { c.tile_column_number = 0; c.tile_row_number = 0; }
 	for (i = 0; i < 2u; i++) {
 		if (i > 0u) {
-			m[mi++] = CLE_TILE_COORDINATES; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
+			CL_EMIT(mp, TILE_COORDINATES, c) { c.tile_column_number = 0; c.tile_row_number = 0; }
 		}
-		m[mi++] = CLE_END_OF_LOADS;
-		m[mi++] = CLE_STORE_GENERAL;     /* dummy store, buffer_to_store = NONE */
-		m[mi++] = (uint8_t)((0u << 4) | V3D_BUFFER_NONE);
-		m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
-		m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
+		CL_EMIT(mp, END_OF_LOADS, c) { (void)c; }
+		CL_EMIT(mp, STORE_TILE_BUFFER_GENERAL, c) { c.buffer_to_store = V3D_BUFFER_NONE; }
 		if (i == 0u) {
-			m[mi++] = CLE_CLEAR_TILE_BUFFERS;
-			m[mi++] = (uint8_t)((0u << 1) | 1u);
+			CL_EMIT(mp, CLEAR_TILE_BUFFERS, c) { c.clear_all_render_targets = true; }
 		}
-		m[mi++] = CLE_END_OF_TILE_MARKER;
+		CL_EMIT(mp, END_OF_TILE_MARKER, c) { (void)c; }
 	}
-	m[mi++] = CLE_FLUSH_VCD_CACHE;
-	/* Start Address of Generic Tile List (start..end of the sub-list). */
-	m[mi++] = CLE_START_ADDR_GENERIC;
-	v3d_put32(m, mi, sublistVa); mi += 4u;
-	v3d_put32(m, mi, sublistVa + si); mi += 4u;
-	/* Supertile coordinates (0,0) -> runs the per-tile list for the one tile. */
-	m[mi++] = CLE_SUPERTILE_COORDINATES; m[mi++] = 0u; m[mi++] = 0u;
-	m[mi++] = CLE_END_OF_RENDERING;
-	rclEnd = V3D_RCL_VA + mi;
+	CL_EMIT(mp, FLUSH_VCD_CACHE, c) { (void)c; }
+	CL_EMIT(mp, START_ADDRESS_OF_GENERIC_TILE_LIST, c) {
+		c.start.offset = sublistVa;
+		c.end.offset = sublistVa + sublen;
+	}
+	CL_EMIT(mp, SUPERTILE_COORDINATES, c) {
+		c.column_number_in_supertiles = 0;
+		c.row_number_in_supertiles = 0;
+	}
+	CL_EMIT(mp, END_OF_RENDERING, c) { (void)c; }
+	rclEnd = V3D_RCL_VA + (uint32_t)(mp - m);
 
 	/* Enable MMU + core init. */
 	v3d_mmuEnable(v3d, ptPa, scratchPa);
 	core0[V3D_CTL_MISCCFG / 4] = V3D_MISCCFG_OVRTMUOUT;
 	v3d_invalidateCaches(core0);
 
-	/* --- Run the bin job on CT0. --- */
+	/* --- Run the bin job on CT0, then WAIT for the binner-done flag (FLDONE) —
+	 * not just the control pointer — before kicking render (the render pipeline
+	 * stalls if it starts before the binner has published tile lists). --- */
+	core0[V3D_CTL_INT_CLR / 4] = V3D_INT_FLDONE | V3D_INT_FRDONE | V3D_INT_OUTOMEM;
 	core0[V3D_PTB_BPOS / 4] = 0u;
 	core0[V3D_CLE_CT0QMA / 4] = V3D_TILEALLOC_VA;
 	core0[V3D_CLE_CT0QMS / 4] = V3D_TILEALLOC_PAGES * _PAGE_SIZE;
 	core0[V3D_CLE_CT0QTS / 4] = V3D_CLE_CT0QTS_ENABLE | V3D_TILESTATE_VA;
 	core0[V3D_CLE_CT0QBA / 4] = V3D_BIN_CL_VA;
 	core0[V3D_CLE_CT0QEA / 4] = binEnd;
-	for (spins = 2000000u; spins != 0u; spins--) {
-		if (core0[V3D_CLE_CT0CA / 4] >= binEnd) {
+	for (spins = 8000000u; spins != 0u; spins--) {
+		if ((core0[V3D_CTL_INT_STS / 4] & (V3D_INT_FLDONE | V3D_INT_OUTOMEM)) != 0u) {
 			break;
 		}
 	}
 	{
-		uint32_t binCa = core0[V3D_CLE_CT0CA / 4];
-		printf("rpi4-v3d-scout: render: bin CT0CA=0x%08x (end 0x%08x)\n", binCa, binEnd);
+		uint32_t bs = core0[V3D_CTL_INT_STS / 4];
+		printf("rpi4-v3d-scout: render: bin CT0CA=0x%08x INT_STS=0x%08x (FLDONE=%u OUTOMEM=%u)\n",
+			core0[V3D_CLE_CT0CA / 4], bs, !!(bs & V3D_INT_FLDONE), !!(bs & V3D_INT_OUTOMEM));
 	}
+	core0[V3D_CTL_INT_CLR / 4] = V3D_INT_FLDONE | V3D_INT_FRDONE | V3D_INT_OUTOMEM;
 
 	/* Flush caches between bin and render so the renderer sees fresh tile state. */
 	v3d_invalidateCaches(core0);
 
-	/* --- Run the render job on CT1. The control pointer branches into the
-	 * higher-addressed sub-list, so CA is not monotonic vs rclEnd; just settle a
-	 * generous interval (a single 64x64 tile renders in well under 1 ms). --- */
+	/* --- Run the render job on CT1; wait for render-done (FRDONE). --- */
 	core0[V3D_CLE_CT1QBA / 4] = V3D_RCL_VA;
 	core0[V3D_CLE_CT1QEA / 4] = rclEnd;
-	usleep(100000);
+	for (spins = 16000000u; spins != 0u; spins--) {
+		if ((core0[V3D_CTL_INT_STS / 4] & V3D_INT_FRDONE) != 0u) {
+			break;
+		}
+	}
+	{
+		uint32_t rs = core0[V3D_CTL_INT_STS / 4];
+		printf("rpi4-v3d-scout: render: INT_STS=0x%08x (FRDONE=%u)\n", rs, !!(rs & V3D_INT_FRDONE));
+	}
 	ca = core0[V3D_CLE_CT1CA / 4];
 
 	/* Read back the RT: count pixels matching the clear color. */
@@ -1071,10 +1086,10 @@ int main(void)
 			 */
 
 			/* Tier-4 4b-1 (GREEN, manifested): bin pass inits tile state. The 4b-2
-			 * render clear (v3d_renderClearTest) is WIP — its hand-encoded
-			 * STORE_TILE_BUFFER_GENERAL stalls the render thread (CT1CA parks at the
-			 * store packet); being reworked to emit packets via ported Mesa packers
-			 * (gen_pack_header) rather than hand-written bytes. */
+			 * render clear (v3d_renderClearTest) now emits its CL via the ported Mesa
+			 * packers and bin/render sync via FLDONE/FRDONE; bin completes (FLDONE),
+			 * but the render thread parks at END_OF_LOADS in the per-tile list (FRDONE
+			 * never fires) — a render-pipeline semantics issue under investigation. */
 			v3d_binTest(v3d);
 		}
 		else {
