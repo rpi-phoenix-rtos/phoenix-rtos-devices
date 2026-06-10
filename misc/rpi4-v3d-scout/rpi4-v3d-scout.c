@@ -154,6 +154,28 @@
 #define CLE_HALT                    0x00u
 #define V3D_SPIN_BOUND              200000u
 
+/* --- Tier-4 4b-1: minimal BIN pass (binner runs over an empty 64x64 frame and
+ * initialises tile state in our memory). Packet/sizing values verified against
+ * external/mesa (cle/v3d_packet.xml gen_pack_header -> v42; common/v3d_util.c
+ * v3d_tile_alloc_sizes; common/v3d_limits.h) and external/linux v3d_sched.c
+ * (v3d_bin_job_run) / v3d_gem.c (v3d_invalidate_caches). --- */
+#define V3D_CLE_CT0QTS              0x015cu
+#define V3D_CLE_CT0QTS_ENABLE       (1u << 1)
+#define V3D_CLE_CT0QMA              0x0170u
+#define V3D_CLE_CT0QMS              0x0174u
+#define V3D_CTL_SLCACTL             0x0024u
+#define V3D_CTL_L2TCACTL            0x0030u
+#define V3D_L2TCACTL_L2TFLS         (1u << 0)   /* FLM_FLUSH=0 in bits 2:1 */
+#define CLE_TILE_BINNING_MODE_CFG   120u
+#define CLE_START_TILE_BINNING      6u
+#define CLE_FLUSH                   4u
+#define V3D_INTERNAL_BPP_32         0u          /* RGBA8 */
+/* GPU VA layout (distinct windows; page 0 left unmapped as a null guard). */
+#define V3D_BIN_CL_VA               0x1000u     /* 1 page */
+#define V3D_TILEALLOC_VA            0x10000u    /* 4 pages (16 KiB) */
+#define V3D_TILESTATE_VA            0x20000u    /* 1 page */
+#define V3D_TILEALLOC_PAGES         4u          /* v3d_tile_alloc_sizes(1,1,1,1)=16384 */
+
 
 /*
  * Two-u32-in property call (domain, state). Returns the firmware's resulting
@@ -395,15 +417,16 @@ static void *v3d_boAlloc(uintptr_t *pa_out)
 
 
 /*
- * Tier-4 milestone: prove the V3D executes a control list fetched from
- * Phoenix-allocated memory THROUGH the V3D MMU. Brings up the MMU with a minimal
- * flat page table mapping one GPU VA page to a control-list BO, then kicks the bin
- * control thread over a NOP/HALT list and confirms (a) the CL pointer advanced and
- * (b) the MMU translated (HIT incremented, no MISSES). NOPs avoid needing binner
- * tile-state. All BOs are uncached; only V3D regs are touched, so a bad PT/CL
- * faults V3D alone (isolated scout) — same recovery model as the power-on.
+ * Tier-4 minimal CLE probe (RETAINED, not called by default): proves the V3D
+ * executes a control list fetched from Phoenix-allocated memory THROUGH the V3D
+ * MMU, using a bare NOP/HALT list (no binner tile-state). It is the simplest
+ * standalone proof of the BO+MMU+CLE path (validated + manifested as
+ * 2026-06-10-v3d-mmu-cle-foundation). v3d_binTest() below subsumes it (a real bin
+ * job also exercises CT0 + the MMU), and only one CT0 job can run per boot without
+ * a control-thread reset, so main() runs the bin test instead. Kept (unused) as a
+ * documented fallback probe. All BOs uncached; only V3D regs touched.
  */
-static void v3d_mmuCleTest(volatile uint32_t *v3d)
+static __attribute__((unused)) void v3d_mmuCleTest(volatile uint32_t *v3d)
 {
 	volatile uint32_t *core0 = v3d + (V3D_CORE0_OFFS / 4);
 	void *ptPage, *clPage, *scratchPage;
@@ -504,6 +527,180 @@ static void v3d_mmuCleTest(volatile uint32_t *v3d)
 }
 
 
+/* Allocate N uncached, physically-contiguous pages (a multi-page GPU BO). */
+static void *v3d_boAllocN(uint32_t npages, uintptr_t *pa_out)
+{
+	void *p = mmap(NULL, (size_t)npages * _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) {
+		return NULL;
+	}
+	*pa_out = (uintptr_t)va2pa(p);
+	if (*pa_out == (uintptr_t)-1) {
+		munmap(p, (size_t)npages * _PAGE_SIZE);
+		return NULL;
+	}
+	return p;
+}
+
+
+/* Map npages of a BO at GPU VA `va` into the flat page table `pt`. */
+static void v3d_mapBo(volatile uint32_t *pt, uint32_t va, uintptr_t pa, uint32_t npages)
+{
+	uint32_t i;
+	for (i = 0; i < npages; i++) {
+		pt[(va >> V3D_MMU_PAGE_SHIFT) + i] =
+			(uint32_t)((pa >> V3D_MMU_PAGE_SHIFT) + i) | V3D_PTE_WRITEABLE | V3D_PTE_VALID;
+	}
+}
+
+
+/* Program + enable the V3D MMU over page table at ptPa, with scratchPa as the
+ * illegal-access landing page, then flush the MMU cache + TLB. */
+static void v3d_mmuEnable(volatile uint32_t *v3d, uintptr_t ptPa, uintptr_t scratchPa)
+{
+	uint32_t spins;
+
+	v3d[V3D_MMU_PT_PA_BASE / 4] = (uint32_t)(ptPa >> V3D_MMU_PAGE_SHIFT);
+	v3d[V3D_MMU_ILLEGAL_ADDR / 4] =
+		(uint32_t)(scratchPa >> V3D_MMU_PAGE_SHIFT) | V3D_MMU_ILLEGAL_ADDR_ENABLE;
+	v3d[V3D_MMU_CTL / 4] = V3D_MMU_CTL_ENABLE | V3D_MMU_CTL_TLB_STATS_ENABLE |
+		V3D_MMU_CTL_TLB_STATS_CLEAR | V3D_MMU_CTL_PT_INVALID_ABORT |
+		V3D_MMU_CTL_WRITE_VIOLATION_ABORT | V3D_MMU_CTL_CAP_EXCEEDED_ABORT;
+	v3d[V3D_MMUC_CONTROL / 4] = V3D_MMUC_CONTROL_ENABLE;
+	v3d[V3D_MMUC_CONTROL / 4] = V3D_MMUC_CONTROL_FLUSH | V3D_MMUC_CONTROL_ENABLE;
+	for (spins = V3D_SPIN_BOUND; spins != 0u &&
+		(v3d[V3D_MMUC_CONTROL / 4] & V3D_MMUC_CONTROL_FLUSHING) != 0u; spins--) {
+	}
+	v3d[V3D_MMU_CTL / 4] |= V3D_MMU_CTL_TLB_CLEAR;
+	for (spins = V3D_SPIN_BOUND; spins != 0u &&
+		(v3d[V3D_MMU_CTL / 4] & V3D_MMU_CTL_TLB_CLEARING) != 0u; spins--) {
+	}
+}
+
+
+/* Invalidate the V3D caches before a job (V3D 4.2: L2T flush + slices; the L2C
+ * invalidate is a no-op on >=v3.3 per v3d_invalidate_l2c). */
+static void v3d_invalidateCaches(volatile uint32_t *core0)
+{
+	core0[V3D_CTL_L2TCACTL / 4] = V3D_L2TCACTL_L2TFLS; /* FLM_FLUSH (0) in bits 2:1 */
+	core0[V3D_CTL_SLCACTL / 4] = 0x0f0f0f0fu;          /* invalidate TVCCS/TDCCS/UCC/ICC */
+}
+
+
+/*
+ * Tier-4 4b-1: minimal BIN pass. Build a bin control list (Tile Binning Mode Cfg
+ * for a 64x64 1-RT frame + Start Tile Binning + Flush), hand the binner its
+ * tile-allocation + tile-state memory (CT0QMA/QMS/QTS), kick the bin control
+ * thread, and check it ran to completion. Also reports whether the binner wrote
+ * the (pre-zeroed) tile_state BO — answering the open question of whether an
+ * empty frame initialises tile state. All BOs uncached; only V3D regs touched.
+ */
+static void v3d_binTest(volatile uint32_t *v3d)
+{
+	volatile uint32_t *core0 = v3d + (V3D_CORE0_OFFS / 4);
+	void *ptPage, *clPage, *allocPage, *statePage, *scratchPage;
+	uintptr_t ptPa, clPa, allocPa, statePa, scratchPa;
+	volatile uint32_t *pt;
+	volatile uint8_t *cl;
+	volatile uint8_t *state;
+	uint32_t ca, spins, endVa, nonzero, hitsBefore, hitsAfter, misses, i, n;
+
+	ptPage = v3d_boAllocN(1, &ptPa);
+	clPage = v3d_boAllocN(1, &clPa);
+	allocPage = v3d_boAllocN(V3D_TILEALLOC_PAGES, &allocPa);
+	statePage = v3d_boAllocN(1, &statePa);
+	scratchPage = v3d_boAllocN(1, &scratchPa);
+	if (ptPage == NULL || clPage == NULL || allocPage == NULL ||
+		statePage == NULL || scratchPage == NULL) {
+		printf("rpi4-v3d-scout: bin test BO alloc FAILED\n");
+		return;
+	}
+	pt = (volatile uint32_t *)ptPage;
+	cl = (volatile uint8_t *)clPage;
+	state = (volatile uint8_t *)statePage;
+
+	/* Zero the PT and the tile_state BO (so binner writes are detectable). */
+	for (i = 0; i < (_PAGE_SIZE / 4u); i++) {
+		pt[i] = 0u;
+	}
+	for (i = 0; i < _PAGE_SIZE; i++) {
+		state[i] = 0u;
+	}
+
+	/* Map the three BOs at their GPU VAs. */
+	v3d_mapBo(pt, V3D_BIN_CL_VA, clPa, 1u);
+	v3d_mapBo(pt, V3D_TILEALLOC_VA, allocPa, V3D_TILEALLOC_PAGES);
+	v3d_mapBo(pt, V3D_TILESTATE_VA, statePa, 1u);
+
+	/* Build the bin control list. */
+	n = 0u;
+	cl[n++] = CLE_TILE_BINNING_MODE_CFG;
+	cl[n++] = (uint8_t)((0u << 4) | (1u << 2));      /* overflow block 64b(0), initial 128b(1) */
+	cl[n++] = (uint8_t)((V3D_INTERNAL_BPP_32 << 4) | ((1u - 1u) & 0xfu)); /* bpp32, 1 RT */
+	cl[n++] = 0u;
+	cl[n++] = 0u;
+	cl[n++] = (uint8_t)((64u - 1u) & 0xffu);         /* width-1 lo */
+	cl[n++] = (uint8_t)(((64u - 1u) >> 8) & 0xffu);  /* width-1 hi */
+	cl[n++] = (uint8_t)((64u - 1u) & 0xffu);         /* height-1 lo */
+	cl[n++] = (uint8_t)(((64u - 1u) >> 8) & 0xffu);  /* height-1 hi */
+	cl[n++] = CLE_START_TILE_BINNING;
+	cl[n++] = CLE_FLUSH;
+	endVa = V3D_BIN_CL_VA + n;
+
+	v3d_mmuEnable(v3d, ptPa, scratchPa);
+
+	core0[V3D_CTL_MISCCFG / 4] = V3D_MISCCFG_OVRTMUOUT;
+	v3d_invalidateCaches(core0);
+
+	hitsBefore = v3d[V3D_MMU_HIT / 4];
+
+	/* Kick the bin control thread (writing CT0QEA starts it). */
+	core0[V3D_PTB_BPOS / 4] = 0u;
+	core0[V3D_CLE_CT0QMA / 4] = V3D_TILEALLOC_VA;
+	core0[V3D_CLE_CT0QMS / 4] = V3D_TILEALLOC_PAGES * _PAGE_SIZE;
+	core0[V3D_CLE_CT0QTS / 4] = V3D_CLE_CT0QTS_ENABLE | V3D_TILESTATE_VA;
+	core0[V3D_CLE_CT0QBA / 4] = V3D_BIN_CL_VA;
+	core0[V3D_CLE_CT0QEA / 4] = endVa;
+
+	for (spins = 2000000u; spins != 0u; spins--) {
+		ca = core0[V3D_CLE_CT0CA / 4];
+		if (ca >= endVa) {
+			break;
+		}
+	}
+	ca = core0[V3D_CLE_CT0CA / 4];
+	hitsAfter = v3d[V3D_MMU_HIT / 4];
+	misses = v3d[V3D_MMU_MISSES / 4];
+
+	nonzero = 0u;
+	for (i = 0; i < _PAGE_SIZE; i++) {
+		if (state[i] != 0u) {
+			nonzero++;
+		}
+	}
+
+	printf("rpi4-v3d-scout: BIN test: CT0CA=0x%08x (end 0x%08x) tile_state nonzero=%u/%u "
+		"MMU_HIT %u->%u MISSES=%u\n",
+		ca, endVa, nonzero, (uint32_t)_PAGE_SIZE, hitsBefore, hitsAfter, misses);
+	if (ca == endVa && hitsAfter > hitsBefore) {
+		printf("rpi4-v3d-scout: *** BIN PASS EXECUTED *** (binner ran the CL; tile_state %s)\n",
+			(nonzero > 0u) ? "written -> empty-frame DOES init tile state" :
+			"unchanged -> empty frame does not write tile state (needs a primitive)");
+	}
+	else {
+		printf("rpi4-v3d-scout: BIN test inconclusive (CA=0x%08x want 0x%08x, MMU_HIT %u->%u)\n",
+			ca, endVa, hitsBefore, hitsAfter);
+	}
+
+	munmap(scratchPage, _PAGE_SIZE);
+	munmap(statePage, _PAGE_SIZE);
+	munmap(allocPage, (size_t)V3D_TILEALLOC_PAGES * _PAGE_SIZE);
+	munmap(clPage, _PAGE_SIZE);
+	munmap(ptPage, _PAGE_SIZE);
+}
+
+
 int main(void)
 {
 	volatile uint32_t *v3d;
@@ -593,8 +790,15 @@ int main(void)
 				coreId0, (coreId0 >> 24) & 0xffu, hubId1,
 				hubId1 & 0xfu, (hubId1 >> 4) & 0xfu, (hubId1 >> 8) & 0xfu);
 
-			/* Tier-4 step: BO + MMU + control-list execution from our memory. */
-			v3d_mmuCleTest(v3d);
+			/* Tier-4 BO+MMU+CLE proof is committed/manifested
+			 * (2026-06-10-v3d-mmu-cle-foundation); skip re-running it here because a
+			 * second CT0 job in the same boot won't re-arm without a control-thread
+			 * reset. The bin pass below subsumes it (also exercises CT0 + the MMU).
+			 *   v3d_mmuCleTest(v3d);
+			 */
+
+			/* Tier-4 4b-1: minimal bin pass (binner runs over an empty frame). */
+			v3d_binTest(v3d);
 		}
 		else {
 			printf("rpi4-v3d-scout: V3D still gated: CORE0_IDENT0=0x%08x (want \"V3D\" 0x..%06x)\n",
