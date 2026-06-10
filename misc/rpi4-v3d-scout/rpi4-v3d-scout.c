@@ -176,6 +176,43 @@
 #define V3D_TILESTATE_VA            0x20000u    /* 1 page */
 #define V3D_TILEALLOC_PAGES         4u          /* v3d_tile_alloc_sizes(1,1,1,1)=16384 */
 
+/* --- Tier-4 4b-2: render clear-to-color on CT1 (a 64x64 RGBA8 RT). Opcodes,
+ * byte layouts, enums and sub_ids verified via the v42 gen_pack_header output and
+ * external/mesa v3dx_rcl.c emit order. --- */
+#define V3D_CLE_CT1CA               0x0114u
+#define V3D_CLE_CT1QBA              0x0164u
+#define V3D_CLE_CT1QEA              0x016cu
+#define CLE_TRM_CFG                 121u  /* Tile Rendering Mode Cfg; sub_id discriminates */
+#define CLE_MULTICORE_SUPERTILE_CFG 122u
+#define CLE_MULTICORE_TILE_LIST_BASE 123u
+#define CLE_TILE_COORDINATES        124u
+#define CLE_TILE_COORDINATES_IMPL   125u
+#define CLE_CLEAR_TILE_BUFFERS      25u
+#define CLE_END_OF_LOADS            26u
+#define CLE_END_OF_TILE_MARKER      27u
+#define CLE_STORE_GENERAL           29u
+#define CLE_FLUSH_VCD_CACHE         19u
+#define CLE_BRANCH_TO_IMPLICIT      21u
+#define CLE_SUPERTILE_COORDINATES   23u
+#define CLE_END_OF_RENDERING        13u
+#define CLE_START_ADDR_GENERIC      20u
+#define CLE_RETURN_FROM_SUB_LIST    18u
+#define TRM_SUBID_COMMON            0u
+#define TRM_SUBID_COLOR             1u
+#define TRM_SUBID_CLEARCOL1         3u
+#define V3D_INTERNAL_TYPE_8         2u   /* RGBA8 unorm */
+#define V3D_MEMORY_FORMAT_RASTER    0u
+#define V3D_OUTPUT_IMAGE_FORMAT_RGBA8 27u
+#define V3D_BUFFER_RT0              0u
+#define V3D_BUFFER_NONE             8u
+#define V3D_RCL_VA                  0x30000u  /* main RCL (offset 0) + sub-list (offset 0x800) */
+#define V3D_SUBLIST_OFFS            0x800u
+#define V3D_RT_VA                   0x40000u  /* render-target BO */
+#define V3D_RT_W                    64u
+#define V3D_RT_H                    64u
+#define V3D_RT_PAGES                4u   /* 64*64*4 = 16384 */
+#define V3D_CLEAR_COLOR             0x11223344u
+
 
 /*
  * Two-u32-in property call (domain, state). Returns the firmware's resulting
@@ -596,7 +633,7 @@ static void v3d_invalidateCaches(volatile uint32_t *core0)
  * the (pre-zeroed) tile_state BO — answering the open question of whether an
  * empty frame initialises tile state. All BOs uncached; only V3D regs touched.
  */
-static void v3d_binTest(volatile uint32_t *v3d)
+static __attribute__((unused)) void v3d_binTest(volatile uint32_t *v3d)
 {
 	volatile uint32_t *core0 = v3d + (V3D_CORE0_OFFS / 4);
 	void *ptPage, *clPage, *allocPage, *statePage, *scratchPage;
@@ -701,6 +738,242 @@ static void v3d_binTest(volatile uint32_t *v3d)
 }
 
 
+/* Little-endian u32 store into a CL byte buffer. */
+static void v3d_put32(volatile uint8_t *b, uint32_t off, uint32_t v)
+{
+	b[off + 0] = (uint8_t)v;
+	b[off + 1] = (uint8_t)(v >> 8);
+	b[off + 2] = (uint8_t)(v >> 16);
+	b[off + 3] = (uint8_t)(v >> 24);
+}
+
+
+/*
+ * Tier-4 4b-2: clear a 64x64 RGBA8 render-target BO to a known color via the V3D
+ * render pipeline, then read it back. Runs a minimal bin pass (CT0) to init tile
+ * state, then a render control list (CT1): Tile Rendering Mode Cfg (common/color/
+ * clear-colors) -> tile-list base -> supertile cfg -> GFXH-1742 initial-clear dance
+ * -> generic per-tile sub-list (implicit coords + store RT0) -> supertile coords ->
+ * end of rendering. Verified by reading the RT BO back on the ARM side. All BOs
+ * uncached; only V3D regs touched (isolated scout).
+ */
+static __attribute__((unused)) void v3d_renderClearTest(volatile uint32_t *v3d)
+{
+	volatile uint32_t *core0 = v3d + (V3D_CORE0_OFFS / 4);
+	void *ptPage, *binPage, *allocPage, *statePage, *rclPage, *rtPage, *scratchPage;
+	uintptr_t ptPa, binPa, allocPa, statePa, rclPa, rtPa, scratchPa;
+	volatile uint32_t *pt;
+	volatile uint8_t *bin, *m, *s;
+	volatile uint32_t *rt;
+	uint32_t i, n, mi, si, binEnd, rclEnd, sublistVa, ca, spins;
+	uint32_t px0, pxN, okpix;
+
+	ptPage = v3d_boAllocN(1, &ptPa);
+	binPage = v3d_boAllocN(1, &binPa);
+	allocPage = v3d_boAllocN(V3D_TILEALLOC_PAGES, &allocPa);
+	statePage = v3d_boAllocN(1, &statePa);
+	rclPage = v3d_boAllocN(1, &rclPa);
+	rtPage = v3d_boAllocN(V3D_RT_PAGES, &rtPa);
+	scratchPage = v3d_boAllocN(1, &scratchPa);
+	if (ptPage == NULL || binPage == NULL || allocPage == NULL || statePage == NULL ||
+		rclPage == NULL || rtPage == NULL || scratchPage == NULL) {
+		printf("rpi4-v3d-scout: render test BO alloc FAILED\n");
+		return;
+	}
+	pt = (volatile uint32_t *)ptPage;
+	bin = (volatile uint8_t *)binPage;
+	m = (volatile uint8_t *)rclPage;             /* main RCL at offset 0 */
+	s = (volatile uint8_t *)rclPage + V3D_SUBLIST_OFFS; /* per-tile sub-list */
+	rt = (volatile uint32_t *)rtPage;
+	sublistVa = V3D_RCL_VA + V3D_SUBLIST_OFFS;
+
+	/* Page table: invalid, then map all BOs. */
+	for (i = 0; i < (_PAGE_SIZE / 4u); i++) {
+		pt[i] = 0u;
+	}
+	v3d_mapBo(pt, V3D_BIN_CL_VA, binPa, 1u);
+	v3d_mapBo(pt, V3D_TILEALLOC_VA, allocPa, V3D_TILEALLOC_PAGES);
+	v3d_mapBo(pt, V3D_TILESTATE_VA, statePa, 1u);
+	v3d_mapBo(pt, V3D_RCL_VA, rclPa, 1u);
+	v3d_mapBo(pt, V3D_RT_VA, rtPa, V3D_RT_PAGES);
+
+	/* Pre-fill the RT with a sentinel so a successful clear is unambiguous. */
+	for (i = 0; i < (V3D_RT_PAGES * _PAGE_SIZE) / 4u; i++) {
+		rt[i] = 0xa5a5a5a5u;
+	}
+
+	/* --- Bin CL (same as 4b-1): TILE_BINNING_MODE_CFG + START_TILE_BINNING + FLUSH. --- */
+	n = 0u;
+	bin[n++] = CLE_TILE_BINNING_MODE_CFG;
+	bin[n++] = (uint8_t)((0u << 4) | (1u << 2));
+	bin[n++] = (uint8_t)((V3D_INTERNAL_BPP_32 << 4) | 0u);
+	bin[n++] = 0u;
+	bin[n++] = 0u;
+	bin[n++] = (uint8_t)((V3D_RT_W - 1u) & 0xffu);
+	bin[n++] = (uint8_t)(((V3D_RT_W - 1u) >> 8) & 0xffu);
+	bin[n++] = (uint8_t)((V3D_RT_H - 1u) & 0xffu);
+	bin[n++] = (uint8_t)(((V3D_RT_H - 1u) >> 8) & 0xffu);
+	bin[n++] = CLE_START_TILE_BINNING;
+	bin[n++] = CLE_FLUSH;
+	binEnd = V3D_BIN_CL_VA + n;
+
+	/* --- Per-tile generic sub-list (at V3D_RCL_VA + 0x800). --- */
+	si = 0u;
+	s[si++] = CLE_TILE_COORDINATES_IMPL;
+	s[si++] = CLE_END_OF_LOADS;
+	/* Clear the tile buffer to the configured clear color, then store it. */
+	s[si++] = CLE_CLEAR_TILE_BUFFERS;
+	s[si++] = (uint8_t)((0u << 1) | 1u);          /* clear_z=0, clear_all_render_targets=1 */
+	s[si++] = CLE_STORE_GENERAL;                  /* 13 bytes */
+	s[si++] = (uint8_t)((0u << 7) | (V3D_MEMORY_FORMAT_RASTER << 4) | V3D_BUFFER_RT0);
+	s[si++] = (uint8_t)((V3D_OUTPUT_IMAGE_FORMAT_RGBA8 << 4) & 0xffu); /* low bits of fmt + decimate/dither 0 */
+	s[si++] = (uint8_t)((V3D_OUTPUT_IMAGE_FORMAT_RGBA8 >> 4) & 0x3u);  /* fmt high bits; rbswap/chrev/clear=0 */
+	/* height_in_ub_or_stride (raster row stride = 64*4=256), field at bits 4..23 of cl[4..6] */
+	{
+		uint32_t stride = V3D_RT_W * 4u;          /* 256 */
+		uint32_t f = stride << 4;                 /* field starts at bit 4 */
+		s[si++] = (uint8_t)(f & 0xffu);
+		s[si++] = (uint8_t)((f >> 8) & 0xffu);
+		s[si++] = (uint8_t)((f >> 16) & 0xffu);
+	}
+	s[si++] = (uint8_t)(V3D_RT_H & 0xffu);        /* height lo */
+	s[si++] = (uint8_t)((V3D_RT_H >> 8) & 0xffu); /* height hi */
+	v3d_put32(s, si, V3D_RT_VA); si += 4u;        /* RT address */
+	s[si++] = CLE_END_OF_TILE_MARKER;
+	s[si++] = CLE_RETURN_FROM_SUB_LIST;
+
+	/* --- Main RCL. --- */
+	mi = 0u;
+	/* Tile Rendering Mode Cfg (Common). */
+	m[mi++] = CLE_TRM_CFG;
+	m[mi++] = (uint8_t)(((1u - 1u) << 4) | TRM_SUBID_COMMON);  /* numRT=1, sub_id=0 */
+	m[mi++] = (uint8_t)((V3D_RT_W) & 0xffu);
+	m[mi++] = (uint8_t)(((V3D_RT_W) >> 8) & 0xffu);
+	m[mi++] = (uint8_t)((V3D_RT_H) & 0xffu);
+	m[mi++] = (uint8_t)(((V3D_RT_H) >> 8) & 0xffu);
+	m[mi++] = (uint8_t)((1u << 6) | V3D_INTERNAL_BPP_32);      /* early_z_disable=1, max_bpp=32 */
+	m[mi++] = 0u;
+	m[mi++] = 0u;
+	/* Tile Rendering Mode Cfg (Color). */
+	m[mi++] = CLE_TRM_CFG;
+	m[mi++] = (uint8_t)((V3D_INTERNAL_TYPE_8 << 6) | (V3D_INTERNAL_BPP_32 << 4) | TRM_SUBID_COLOR);
+	m[mi++] = (uint8_t)((V3D_INTERNAL_TYPE_8 >> 2) & 0x3u);    /* rt0 type high bits */
+	m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
+	/* Tile Rendering Mode Cfg (Clear Colors Part1). */
+	m[mi++] = CLE_TRM_CFG;
+	m[mi++] = (uint8_t)((0u << 4) | TRM_SUBID_CLEARCOL1);      /* rt_number=0, sub_id=3 */
+	v3d_put32(m, mi, V3D_CLEAR_COLOR); mi += 4u;               /* clear_color_low_32 */
+	m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;                  /* next_24 = 0 */
+	/* Multicore Rendering Tile List Set Base = tile_alloc. */
+	m[mi++] = CLE_MULTICORE_TILE_LIST_BASE;
+	m[mi++] = (uint8_t)((V3D_TILEALLOC_VA & 0xffu) | 0u);      /* addr lo | set_number=0 */
+	m[mi++] = (uint8_t)((V3D_TILEALLOC_VA >> 8) & 0xffu);
+	m[mi++] = (uint8_t)((V3D_TILEALLOC_VA >> 16) & 0xffu);
+	m[mi++] = (uint8_t)((V3D_TILEALLOC_VA >> 24) & 0xffu);
+	/* Multicore Rendering Supertile Cfg (1x1 tile frame, 1 supertile). */
+	m[mi++] = CLE_MULTICORE_SUPERTILE_CFG;
+	m[mi++] = 0u;                 /* supertile_w-1 = 0 */
+	m[mi++] = 0u;                 /* supertile_h-1 = 0 */
+	m[mi++] = 1u;                 /* frame_w_in_supertiles = 1 */
+	m[mi++] = 1u;                 /* frame_h_in_supertiles = 1 */
+	m[mi++] = 1u;                 /* frame_w_in_tiles (12b) = 1 */
+	m[mi++] = (uint8_t)((1u << 4) | 0u); /* frame_h_in_tiles (bits 4-15) = 1, frame_w hi = 0 */
+	m[mi++] = 0u;                 /* frame_h_in_tiles hi */
+	m[mi++] = 0u;                 /* numBinTileLists-1=0, raster_order=0, multicore=0 */
+	/* GFXH-1742 initial clear dance: TILE_COORDINATES(0,0) then 2x stores; clear on i==0. */
+	m[mi++] = CLE_TILE_COORDINATES; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
+	for (i = 0; i < 2u; i++) {
+		if (i > 0u) {
+			m[mi++] = CLE_TILE_COORDINATES; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
+		}
+		m[mi++] = CLE_END_OF_LOADS;
+		m[mi++] = CLE_STORE_GENERAL;     /* dummy store, buffer_to_store = NONE */
+		m[mi++] = (uint8_t)((0u << 4) | V3D_BUFFER_NONE);
+		m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
+		m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u; m[mi++] = 0u;
+		if (i == 0u) {
+			m[mi++] = CLE_CLEAR_TILE_BUFFERS;
+			m[mi++] = (uint8_t)((0u << 1) | 1u);
+		}
+		m[mi++] = CLE_END_OF_TILE_MARKER;
+	}
+	m[mi++] = CLE_FLUSH_VCD_CACHE;
+	/* Start Address of Generic Tile List (start..end of the sub-list). */
+	m[mi++] = CLE_START_ADDR_GENERIC;
+	v3d_put32(m, mi, sublistVa); mi += 4u;
+	v3d_put32(m, mi, sublistVa + si); mi += 4u;
+	/* Supertile coordinates (0,0) -> runs the per-tile list for the one tile. */
+	m[mi++] = CLE_SUPERTILE_COORDINATES; m[mi++] = 0u; m[mi++] = 0u;
+	m[mi++] = CLE_END_OF_RENDERING;
+	rclEnd = V3D_RCL_VA + mi;
+
+	/* Enable MMU + core init. */
+	v3d_mmuEnable(v3d, ptPa, scratchPa);
+	core0[V3D_CTL_MISCCFG / 4] = V3D_MISCCFG_OVRTMUOUT;
+	v3d_invalidateCaches(core0);
+
+	/* --- Run the bin job on CT0. --- */
+	core0[V3D_PTB_BPOS / 4] = 0u;
+	core0[V3D_CLE_CT0QMA / 4] = V3D_TILEALLOC_VA;
+	core0[V3D_CLE_CT0QMS / 4] = V3D_TILEALLOC_PAGES * _PAGE_SIZE;
+	core0[V3D_CLE_CT0QTS / 4] = V3D_CLE_CT0QTS_ENABLE | V3D_TILESTATE_VA;
+	core0[V3D_CLE_CT0QBA / 4] = V3D_BIN_CL_VA;
+	core0[V3D_CLE_CT0QEA / 4] = binEnd;
+	for (spins = 2000000u; spins != 0u; spins--) {
+		if (core0[V3D_CLE_CT0CA / 4] >= binEnd) {
+			break;
+		}
+	}
+	{
+		uint32_t binCa = core0[V3D_CLE_CT0CA / 4];
+		printf("rpi4-v3d-scout: render: bin CT0CA=0x%08x (end 0x%08x)\n", binCa, binEnd);
+	}
+
+	/* Flush caches between bin and render so the renderer sees fresh tile state. */
+	v3d_invalidateCaches(core0);
+
+	/* --- Run the render job on CT1. The control pointer branches into the
+	 * higher-addressed sub-list, so CA is not monotonic vs rclEnd; just settle a
+	 * generous interval (a single 64x64 tile renders in well under 1 ms). --- */
+	core0[V3D_CLE_CT1QBA / 4] = V3D_RCL_VA;
+	core0[V3D_CLE_CT1QEA / 4] = rclEnd;
+	usleep(100000);
+	ca = core0[V3D_CLE_CT1CA / 4];
+
+	/* Read back the RT: count pixels matching the clear color. */
+	px0 = rt[0];
+	pxN = rt[(V3D_RT_W * V3D_RT_H) - 1u];
+	okpix = 0u;
+	for (i = 0; i < (V3D_RT_W * V3D_RT_H); i++) {
+		if (rt[i] == V3D_CLEAR_COLOR) {
+			okpix++;
+		}
+	}
+
+	printf("rpi4-v3d-scout: RENDER test: CT1CA=0x%08x (end 0x%08x) RT[0]=0x%08x RT[last]=0x%08x "
+		"match=%u/%u (want 0x%08x)\n",
+		ca, rclEnd, px0, pxN, okpix, V3D_RT_W * V3D_RT_H, V3D_CLEAR_COLOR);
+	if (okpix == V3D_RT_W * V3D_RT_H) {
+		printf("rpi4-v3d-scout: *** GPU CLEARED THE RENDER TARGET *** "
+			"(Tier-4 4b-2 render pipeline live; full triangle next)\n");
+	}
+	else if (okpix > 0u) {
+		printf("rpi4-v3d-scout: render PARTIAL: %u px cleared (CL/format close; tune store/tiling)\n", okpix);
+	}
+	else {
+		printf("rpi4-v3d-scout: render test inconclusive (no cleared pixels; CT1CA vs end + store cfg)\n");
+	}
+
+	munmap(scratchPage, _PAGE_SIZE);
+	munmap(rtPage, (size_t)V3D_RT_PAGES * _PAGE_SIZE);
+	munmap(rclPage, _PAGE_SIZE);
+	munmap(statePage, _PAGE_SIZE);
+	munmap(allocPage, (size_t)V3D_TILEALLOC_PAGES * _PAGE_SIZE);
+	munmap(binPage, _PAGE_SIZE);
+	munmap(ptPage, _PAGE_SIZE);
+}
+
+
 int main(void)
 {
 	volatile uint32_t *v3d;
@@ -797,7 +1070,11 @@ int main(void)
 			 *   v3d_mmuCleTest(v3d);
 			 */
 
-			/* Tier-4 4b-1: minimal bin pass (binner runs over an empty frame). */
+			/* Tier-4 4b-1 (GREEN, manifested): bin pass inits tile state. The 4b-2
+			 * render clear (v3d_renderClearTest) is WIP — its hand-encoded
+			 * STORE_TILE_BUFFER_GENERAL stalls the render thread (CT1CA parks at the
+			 * store packet); being reworked to emit packets via ported Mesa packers
+			 * (gen_pack_header) rather than hand-written bytes. */
 			v3d_binTest(v3d);
 		}
 		else {
