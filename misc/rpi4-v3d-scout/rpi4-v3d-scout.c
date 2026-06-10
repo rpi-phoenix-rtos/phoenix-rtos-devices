@@ -77,6 +77,29 @@
 #define V3D_MMIO_LEN            0x10000u
 #define V3D_CORE0_OFFS          0x4000u
 
+/* BCM2711 PM (power management) + V3D ASB (async bridge) — the registers the
+ * Linux bcm2835-power driver pokes to power/reset V3D (the firmware mailbox above
+ * is the WRONG layer for BCM2711; STEP-0 recon proved the overlay leaves V3D
+ * asleep). On BCM2711 the V3D async bridge is the SEPARATE rpivid_asb region, NOT
+ * the legacy ASB. ARM-side, from the DTB watchdog@7e100000 reg-names pm/asb/
+ * rpivid_asb:  pm 0x7e100000 -> 0xfe100000,  rpivid_asb 0x7ec11000 -> 0xfec11000
+ * (legacy asb 0x7e00a000 -> 0xfe00a000 drives ISP/H264, not V3D).
+ * This block is currently used by the READ-ONLY recon only (no writes yet). */
+#define PM_BASE                 0xfe100000u
+#define RPIVID_ASB_BASE         0xfec11000u
+#define PM_GRAFX                0x10cu       /* GRAFX power island = V3D's parent domain */
+#define PM_POWUP                (1u << 0)
+#define PM_POWOK                (1u << 1)
+#define PM_ISPOW                (1u << 2)
+#define PM_MEMREP               (1u << 3)
+#define PM_MRDONE               (1u << 4)
+#define PM_ISFUNC               (1u << 5)
+#define PM_V3DRSTN              (1u << 6)    /* V3D reset-deassert bit in PM_GRAFX */
+#define ASB_V3D_S_CTRL          0x08u        /* offsets within rpivid_asb */
+#define ASB_V3D_M_CTRL          0x0cu
+#define ASB_REQ_STOP            (1u << 0)
+#define ASB_ACK                 (1u << 1)
+
 
 /*
  * Two-u32-in property call (domain, state). Returns the firmware's resulting
@@ -163,6 +186,58 @@ static uint32_t v3d_mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 }
 
 
+/*
+ * READ-ONLY recon of the PM + rpivid_asb registers a direct V3D power-on would
+ * poke. Advisor-gated zero-risk step before any write build: confirms the regions
+ * are real (not the 0xdeadbeef bus-error sentinel that the V3D MMIO returns),
+ * reveals whether the GRAFX power island is already up (PM_POWUP/POWOK/ISFUNC) and
+ * V3D already out of reset (PM_V3DRSTN) — i.e. which half of the bring-up sequence
+ * is load-bearing — and validates that the V3D ASB ctrl regs read ASB-shaped
+ * values (REQ_STOP/ACK) at the rpivid_asb 0x08/0x0c offsets. No writes: a faulting
+ * read just kills this isolated scout and the rest of the system keeps booting.
+ */
+static void v3d_reconPmAsb(void)
+{
+	volatile uint32_t *pm, *asb;
+	void *pm_page, *asb_page;
+	uint32_t grafx, sctrl, mctrl;
+
+	pm_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (addr_t)PM_BASE);
+	if (pm_page == MAP_FAILED) {
+		printf("rpi4-v3d-scout: recon mmap(PM 0x%08x) FAILED\n", PM_BASE);
+		return;
+	}
+	pm = (volatile uint32_t *)pm_page;
+
+	asb_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (addr_t)RPIVID_ASB_BASE);
+	if (asb_page == MAP_FAILED) {
+		printf("rpi4-v3d-scout: recon mmap(rpivid_asb 0x%08x) FAILED\n", RPIVID_ASB_BASE);
+		munmap(pm_page, _PAGE_SIZE);
+		return;
+	}
+	asb = (volatile uint32_t *)asb_page;
+
+	grafx = pm[PM_GRAFX / 4];
+	printf("rpi4-v3d-scout: PM_GRAFX (0x%08x+0x%03x) = 0x%08x\n", PM_BASE, PM_GRAFX, grafx);
+	printf("rpi4-v3d-scout:   POWUP=%u POWOK=%u ISPOW=%u MEMREP=%u MRDONE=%u ISFUNC=%u V3DRSTN=%u\n",
+		!!(grafx & PM_POWUP), !!(grafx & PM_POWOK), !!(grafx & PM_ISPOW),
+		!!(grafx & PM_MEMREP), !!(grafx & PM_MRDONE), !!(grafx & PM_ISFUNC),
+		!!(grafx & PM_V3DRSTN));
+
+	sctrl = asb[ASB_V3D_S_CTRL / 4];
+	mctrl = asb[ASB_V3D_M_CTRL / 4];
+	printf("rpi4-v3d-scout: ASB_V3D_S_CTRL (rpivid+0x%02x) = 0x%08x (REQ_STOP=%u ACK=%u)\n",
+		ASB_V3D_S_CTRL, sctrl, !!(sctrl & ASB_REQ_STOP), !!(sctrl & ASB_ACK));
+	printf("rpi4-v3d-scout: ASB_V3D_M_CTRL (rpivid+0x%02x) = 0x%08x (REQ_STOP=%u ACK=%u)\n",
+		ASB_V3D_M_CTRL, mctrl, !!(mctrl & ASB_REQ_STOP), !!(mctrl & ASB_ACK));
+
+	munmap(asb_page, _PAGE_SIZE);
+	munmap(pm_page, _PAGE_SIZE);
+}
+
+
 int main(void)
 {
 	volatile uint32_t *v3d;
@@ -207,6 +282,12 @@ int main(void)
 
 	/* Brief settle for the domain + clock to come up before the first MMIO access. */
 	usleep(50000);
+
+	/* Tier 3 step 1c (READ-ONLY recon): read the PM + rpivid_asb registers that a
+	 * direct bcm2835-power-style V3D power-on would poke, BEFORE attempting any
+	 * write. Tells us the regions are real and which half of the sequence is
+	 * load-bearing (GRAFX island already up? V3D already de-reset?). */
+	v3d_reconPmAsb();
 
 	/* Tier 3 step 2: map the V3D MMIO and raw-dump the HUB identity region.
 	 * Mapped uncached/device so reads hit the hardware directly. */
