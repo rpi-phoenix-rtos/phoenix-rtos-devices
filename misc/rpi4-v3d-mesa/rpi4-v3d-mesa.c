@@ -117,6 +117,12 @@ int main(void)
 	void *cso_rs = pctx->create_rasterizer_state(pctx, &rs);
 	pctx->bind_rasterizer_state(pctx, cso_rs);
 
+	/* depth-stencil-alpha: default (all disabled). v3d_emit_state derefs v3d->zsa
+	 * (v3dx_emit.c:350) — leaving it unbound faults NULL+8 at draw. */
+	struct pipe_depth_stencil_alpha_state dsa = { 0 };
+	void *cso_dsa = pctx->create_depth_stencil_alpha_state(pctx, &dsa);
+	pctx->bind_depth_stencil_alpha_state(pctx, cso_dsa);
+
 	struct pipe_viewport_state vp = { 0 };
 	vp.scale[0] = 128.0f; vp.scale[1] = 128.0f; vp.scale[2] = 0.5f;
 	vp.translate[0] = 128.0f; vp.translate[1] = 128.0f; vp.translate[2] = 0.5f;
