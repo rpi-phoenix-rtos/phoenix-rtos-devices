@@ -31,7 +31,11 @@ int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	printf("rpi4-v3d-mesa: entering v3d_screen_create\n");
-	struct pipe_screen *pscreen = v3d_screen_create(0, NULL, NULL);
+	/* Pass a zeroed pipe_screen_config (NOT NULL): v3d_screen_create dereferences
+	 * config->options_info for driParseConfigFiles; NULL config faults at far=0x8.
+	 * Zeroed -> options/options_info NULL, which our driconf stubs accept. */
+	struct pipe_screen_config cfg = { 0 };
+	struct pipe_screen *pscreen = v3d_screen_create(0, &cfg, NULL);
 	if (pscreen == NULL) {
 		printf("rpi4-v3d-mesa: v3d_screen_create returned NULL\n");
 		return 1;
