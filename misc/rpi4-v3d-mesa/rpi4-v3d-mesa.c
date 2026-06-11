@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "pipe/p_screen.h"
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
@@ -174,6 +176,24 @@ int main(void)
 		printf("rpi4-v3d-mesa: TRI readback center=0x%08x topleft=0x%08x "
 		       "midbottom=0x%08x (center should be the triangle, corner black)\n",
 		       px[128 * 256 + 128], px[4 * 256 + 4], px[200 * 256 + 128]);
+
+		/* Blit the 256x256 RT to /dev/fb0 (1024x768x32, pitch 4096) at top-left so
+		 * the Mesa-rendered triangle is VISIBLE on HDMI. The pl011-tty console shares
+		 * the surface and redraws over us, so loop ~25 s to land in an auto-snapshot. */
+		int fbfd = open("/dev/fb0", O_WRONLY);
+		if (fbfd >= 0) {
+			for (int rep = 0; rep < 35; rep++) {
+				for (int row = 0; row < 256; row++) {
+					lseek(fbfd, (off_t)row * 4096, SEEK_SET);
+					write(fbfd, (const uint8_t *)map + (size_t)row * 256 * 4, 256 * 4);
+				}
+				usleep(700000);
+			}
+			close(fbfd);
+			printf("rpi4-v3d-mesa: blitted triangle to /dev/fb0 (HDMI top-left)\n");
+		} else {
+			printf("rpi4-v3d-mesa: open /dev/fb0 failed\n");
+		}
 		pctx->texture_unmap(pctx, xfer);
 	} else {
 		printf("rpi4-v3d-mesa: texture_map NULL\n");
