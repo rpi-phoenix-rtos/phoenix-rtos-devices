@@ -17,6 +17,7 @@
  */
 #include <stdio.h>
 #include "pipe/p_screen.h"
+#include "pipe/p_context.h"
 #include "pipe/p_defines.h"
 
 /* Forward-declare rather than #include "v3d_screen.h" (drags c11/time.h timespec
@@ -43,7 +44,22 @@ int main(void)
 	const char *name = pscreen->get_name ? pscreen->get_name(pscreen) : "(no get_name)";
 	const char *vendor = pscreen->get_vendor ? pscreen->get_vendor(pscreen) : "(no vendor)";
 	printf("rpi4-v3d-mesa: pipe_screen OK name=%s vendor=%s\n", name, vendor);
-	pscreen->destroy(pscreen);
 	printf("rpi4-v3d-mesa: SCREEN-CREATE PASS (Mesa v3d driver initialized on HW)\n");
+
+	/* Increment 2: create a pipe_context. Exercises v3d_context_create — the
+	 * blitter (util_blitter_create), u_upload_mgr, CSO cache, fence init, and our
+	 * mtx_/syncobj stubs. No GPU submit yet (that's the clear/draw increment). */
+	printf("rpi4-v3d-mesa: entering context_create\n");
+	struct pipe_context *pctx = pscreen->context_create(pscreen, NULL, 0);
+	if (pctx == NULL) {
+		printf("rpi4-v3d-mesa: context_create returned NULL\n");
+		pscreen->destroy(pscreen);
+		return 1;
+	}
+	printf("rpi4-v3d-mesa: CONTEXT-CREATE PASS (pipe_context up)\n");
+	pctx->destroy(pctx);
+
+	pscreen->destroy(pscreen);
+	printf("rpi4-v3d-mesa: done\n");
 	return 0;
 }
