@@ -33,7 +33,15 @@ DEFAULT_COMPONENTS += rpi4-v3d-scout
 # driver (libv3d-phoenix.a) + runs v3d_screen_create on HW. Boot-launched in the
 # netboot variant (see user.plo.yaml). Large (~11 MB: it pulls in the Mesa
 # compiler/NIR). Requires /tmp/libv3d-phoenix.a (tools/v3d-driver-port build).
-DEFAULT_COMPONENTS += rpi4-v3d-mesa
+# rpi4-v3d-mesa dropped from the bundle while validating the GL frontend: both
+# harnesses together (~11+18 MB) would overflow loader.disk. Re-add to compare.
+# DEFAULT_COMPONENTS += rpi4-v3d-mesa
+# Mesa OpenGL glClear harness (GLQuake Path C, Phase 4): links the ported Mesa GL
+# frontend (libGL-phoenix.a) + v3d driver (libv3d-phoenix.a) and drives a glClear
+# through the OpenGL API on HW. Boot-launched in the netboot variant (see
+# user.plo.yaml). Large (~18 MB: full Mesa GL stack + GLSL compiler). Requires
+# /tmp/libGL-phoenix.a + /tmp/libv3d-phoenix.a (tools/v3d-driver-port build).
+DEFAULT_COMPONENTS += rpi4-glclear
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
