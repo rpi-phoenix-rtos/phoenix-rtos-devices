@@ -16,9 +16,12 @@
  * Copyright 2026 Phoenix Systems  %LICENSE%
  */
 #include <stdio.h>
+#include <stdint.h>
 #include "pipe/p_screen.h"
 #include "pipe/p_context.h"
+#include "pipe/p_state.h"
 #include "pipe/p_defines.h"
+#include "util/box.h"
 
 /* Forward-declare rather than #include "v3d_screen.h" (drags c11/time.h timespec
  * clashes); the prototype is stable. */
@@ -57,8 +60,54 @@ int main(void)
 		return 1;
 	}
 	printf("rpi4-v3d-mesa: CONTEXT-CREATE PASS (pipe_context up)\n");
-	pctx->destroy(pctx);
 
+	/* Increment 3: clear a small RT to green via the real Mesa driver. This is the
+	 * FIRST GPU submit through the port — clear builds the TLB/RCL job, flush issues
+	 * SUBMIT_CL -> the winsys CT0/CT1 path -> the V3D. Then read the RT back. Small
+	 * RT (256x256) since the winsys MMU PT is one page (4 MiB GPU VA). */
+	struct pipe_resource templ = { 0 };
+	templ.target = PIPE_TEXTURE_2D;
+	templ.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+	templ.width0 = 256; templ.height0 = 256; templ.depth0 = 1; templ.array_size = 1;
+	templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+	struct pipe_resource *rt = pscreen->resource_create(pscreen, &templ);
+	if (rt == NULL) {
+		printf("rpi4-v3d-mesa: resource_create NULL\n");
+		goto out;
+	}
+	printf("rpi4-v3d-mesa: RT 256x256 created\n");
+
+	struct pipe_framebuffer_state fb = { 0 };
+	fb.width = 256; fb.height = 256; fb.nr_cbufs = 1;
+	fb.cbufs[0].texture = rt;
+	fb.cbufs[0].format = templ.format;
+	pctx->set_framebuffer_state(pctx, &fb);
+	printf("rpi4-v3d-mesa: framebuffer set\n");
+
+	union pipe_color_union color;
+	color.f[0] = 0.0f; color.f[1] = 1.0f; color.f[2] = 0.0f; color.f[3] = 1.0f; /* green */
+	pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0, 0, NULL, &color, 0.0, 0);
+	printf("rpi4-v3d-mesa: clear issued\n");
+	pctx->flush(pctx, NULL, 0);
+	printf("rpi4-v3d-mesa: flush done (SUBMIT_CL submitted)\n");
+
+	struct pipe_box box = { 0 };
+	box.width = 256; box.height = 256; box.depth = 1;
+	struct pipe_transfer *xfer = NULL;
+	void *map = pctx->texture_map(pctx, rt, 0, PIPE_MAP_READ, &box, &xfer);
+	if (map != NULL) {
+		uint32_t px0 = ((volatile uint32_t *)map)[0];
+		uint32_t pxN = ((volatile uint32_t *)map)[128 * 256 + 128]; /* center */
+		printf("rpi4-v3d-mesa: CLEAR readback first_px=0x%08x center_px=0x%08x "
+		       "(expect green 0xff00ff00)\n", px0, pxN);
+		pctx->texture_unmap(pctx, xfer);
+	} else {
+		printf("rpi4-v3d-mesa: texture_map NULL\n");
+	}
+	printf("rpi4-v3d-mesa: CLEAR-PASS (first Mesa-generated V3D render)\n");
+
+out:
+	pctx->destroy(pctx);
 	pscreen->destroy(pscreen);
 	printf("rpi4-v3d-mesa: done\n");
 	return 0;
