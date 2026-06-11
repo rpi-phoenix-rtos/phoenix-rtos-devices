@@ -1,0 +1,203 @@
+/*
+ * rpi4-glcube.c — GLQuake Path-C Phase-4: an ANIMATED spinning, depth-tested,
+ * perspective-projected colored cube drawn through the Mesa OpenGL frontend on the
+ * real V3D (boot-launched), held + animated on the HDMI screen. This is the
+ * "glgears-or-similar" rung: it demonstrates basic OpenGL animation working,
+ * GPU-accelerated, on hardware.
+ *
+ *   st_create_context -> _mesa_make_current(NULL,NULL) (surfaceless)
+ *   -> FBO (RGBA8 color + DEPTH24) -> glFrustum perspective + GL_DEPTH_TEST
+ *   -> per frame: clear, glRotatef(angle++), glBegin(GL_QUADS) 6 colored faces glEnd,
+ *      glReadPixels -> upscale 3x (y-flipped to screen orientation) -> blit /dev/fb0.
+ *
+ * Renders at 256x256 (a 1024x768 RT currently comes back all-zero -- a V3D tile-state
+ * sizing limit in the winsys, TODO for fullscreen) and upscales to a centered 768x768
+ * region on a grey 1024x768 framebuffer. Continuous per-frame re-blit so the animation
+ * wins against fbcon's klog mirror on the shared /dev/fb0.
+ *
+ * Links libGL-phoenix.a + libv3d-phoenix.a.
+ *
+ * Copyright 2026 Phoenix Systems
+ * Author: Witold Bołt
+ */
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include "pipe/p_screen.h"
+#include "pipe/p_context.h"
+#include "pipe/p_state.h"
+#include "main/menums.h"
+#include "frontend/api.h"
+#include "main/mtypes.h"
+#include "state_tracker/st_context.h"
+#ifndef GL_GLEXT_PROTOTYPES
+#define GL_GLEXT_PROTOTYPES 1
+#endif
+#include "GL/gl.h"
+#include "GL/glext.h"
+
+struct pipe_screen_config;
+struct renderonly;
+struct pipe_screen *v3d_screen_create(int fd, const struct pipe_screen_config *config, struct renderonly *ro);
+extern unsigned char _mesa_make_current(struct gl_context *ctx,
+                                        struct gl_framebuffer *drawFb,
+                                        struct gl_framebuffer *readFb);
+
+#define W 256
+#define H 256
+#define FB_W 1024
+#define FB_H 768
+#define SCALE 3
+#define OFF_X ((FB_W - W * SCALE) / 2)
+#define OFF_Y ((FB_H - H * SCALE) / 2)
+
+static void chk(const char *where)
+{
+	GLenum e = glGetError();
+	if (e != GL_NO_ERROR)
+		printf("glcube: GL error 0x%x after %s\n", e, where);
+}
+
+/* one cube face: 4 vertices (a quad). */
+static void face(const float n[3], const float v0[3], const float v1[3],
+                 const float v2[3], const float v3[3], float r, float g, float b)
+{
+	(void)n;
+	glColor3f(r, g, b);
+	glVertex3fv(v0); glVertex3fv(v1); glVertex3fv(v2); glVertex3fv(v3);
+}
+
+static void draw_cube(void)
+{
+	/* 8 corners of a unit cube centered at origin. */
+	static const float p[8][3] = {
+		{-1,-1,-1}, { 1,-1,-1}, { 1, 1,-1}, {-1, 1,-1},
+		{-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}, {-1, 1, 1},
+	};
+	static const float nz[3] = {0,0,0};
+	glBegin(GL_QUADS);
+	face(nz, p[4], p[5], p[6], p[7], 1.0f, 0.0f, 0.0f);  /* +Z red    */
+	face(nz, p[1], p[0], p[3], p[2], 0.0f, 1.0f, 0.0f);  /* -Z green  */
+	face(nz, p[5], p[1], p[2], p[6], 0.0f, 0.0f, 1.0f);  /* +X blue   */
+	face(nz, p[0], p[4], p[7], p[3], 1.0f, 1.0f, 0.0f);  /* -X yellow */
+	face(nz, p[7], p[6], p[2], p[3], 1.0f, 0.0f, 1.0f);  /* +Y magenta*/
+	face(nz, p[0], p[1], p[5], p[4], 0.0f, 1.0f, 1.0f);  /* -Y cyan   */
+	glEnd();
+}
+
+int main(void)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	printf("glcube: START (animated spinning cube via the GL frontend)\n");
+
+	struct pipe_screen_config cfg;
+	memset(&cfg, 0, sizeof(cfg));
+	struct pipe_screen *pscreen = v3d_screen_create(0, &cfg, NULL);
+	if (!pscreen) { printf("glcube: pipe_screen NULL\n"); return 1; }
+	struct pipe_context *pipe = pscreen->context_create(pscreen, NULL, 0);
+	if (!pipe) { printf("glcube: pipe_context NULL\n"); return 1; }
+
+	struct gl_config visual;
+	struct st_config_options opts;
+	memset(&visual, 0, sizeof(visual));
+	memset(&opts, 0, sizeof(opts));
+	struct st_context *st = st_create_context(API_OPENGL_COMPAT, pipe, &visual,
+	                                          NULL, &opts, 0, 0);
+	if (!st) { printf("glcube: st_create_context NULL\n"); return 1; }
+	_mesa_make_current(st->ctx, NULL, NULL);
+	printf("glcube: GL up; %s / %s\n",
+	       (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER));
+
+	GLuint fbo = 0, rbColor = 0, rbDepth = 0;
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glGenRenderbuffers(1, &rbColor);
+	glBindRenderbuffer(GL_RENDERBUFFER, rbColor);
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, W, H);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbColor);
+	glGenRenderbuffers(1, &rbDepth);
+	glBindRenderbuffer(GL_RENDERBUFFER, rbDepth);
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, W, H);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbDepth);
+	GLenum fbs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	printf("glcube: FBO status=0x%x (complete=0x%x)\n", fbs, GL_FRAMEBUFFER_COMPLETE);
+
+	glEnable(GL_DEPTH_TEST);
+	glViewport(0, 0, W, H);
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	glFrustum(-1.0, 1.0, -1.0, 1.0, 2.0, 20.0);  /* fovy ~53 deg, aspect 1 */
+	glMatrixMode(GL_MODELVIEW);
+	chk("setup");
+
+	uint32_t *px = malloc((size_t)W * H * 4);
+	uint32_t *fbimg = malloc((size_t)FB_W * FB_H * 4);
+	int fb = open("/dev/fb0", O_WRONLY);
+	if (fb < 0) printf("glcube: /dev/fb0 open failed (will still render)\n");
+	printf("glcube: entering animation loop (per-frame render -> upscale -> /dev/fb0)\n");
+
+	float angle = 0.0f;
+	unsigned long frame = 0;
+	for (;;) {
+		glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glLoadIdentity();
+		glTranslatef(0.0f, 0.0f, -4.5f);   /* closer -> larger on screen */
+		glRotatef(angle, 1.0f, 0.0f, 0.0f);
+		glRotatef(angle * 0.7f, 0.0f, 1.0f, 0.0f);
+		draw_cube();
+		glFinish();
+
+		glReadBuffer(GL_COLOR_ATTACHMENT0);
+		glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+		if (frame == 0) {
+			chk("first frame");
+			printf("glcube: frame0 center=0x%08x (cube face color, not clear 0xff1f1a1a)\n",
+			       px[(H / 2) * W + (W / 2)]);
+		}
+
+		/* upscale to centered region on grey, y-flipped (GL y-up -> screen y-down). */
+		for (size_t i = 0; i < (size_t)FB_W * FB_H; i++)
+			fbimg[i] = 0xff1f1a1a;
+		for (int sy = 0; sy < H; sy++) {
+			const uint32_t *srow = px + (size_t)(H - 1 - sy) * W;  /* flip */
+			for (int sx = 0; sx < W; sx++) {
+				uint32_t c = srow[sx];
+				for (int dy = 0; dy < SCALE; dy++) {
+					uint32_t *drow = fbimg + (size_t)(OFF_Y + sy * SCALE + dy) * FB_W + OFF_X + sx * SCALE;
+					for (int dx = 0; dx < SCALE; dx++)
+						drow[dx] = c;
+				}
+			}
+		}
+		if (fb >= 0) {
+			lseek(fb, 0, SEEK_SET);
+			(void)write(fb, fbimg, (size_t)FB_W * FB_H * 4);
+		}
+		if (frame == 0)
+			printf("glcube: ANIMATING (cube rendering+spinning on /dev/fb0)\n");
+		if ((frame % 120) == 0) {
+			/* sample 5 points of the render to see actual face colors (0xAABBGGRR):
+			 * a black face here => glColor/FF-color bug; clear (0xff1f1a1a) => off-cube. */
+			printf("glcube: frame=%lu angle=%d px[c]=0x%08x [q1]=0x%08x [q2]=0x%08x [q3]=0x%08x [q4]=0x%08x\n",
+			       frame, (int)angle,
+			       px[(H / 2) * W + (W / 2)],
+			       px[(H / 4) * W + (W / 4)], px[(H / 4) * W + (3 * W / 4)],
+			       px[(3 * H / 4) * W + (W / 4)], px[(3 * H / 4) * W + (3 * W / 4)]);
+		}
+
+		angle += 2.0f;
+		if (angle >= 360.0f)
+			angle -= 360.0f;
+		frame++;
+		usleep(33000);  /* ~30 fps target */
+	}
+	close(fb);
+	free(fbimg);
+	free(px);
+	return 0;
+}
