@@ -41,7 +41,13 @@ DEFAULT_COMPONENTS += rpi4-v3d-scout
 # through the OpenGL API on HW. Boot-launched in the netboot variant (see
 # user.plo.yaml). Large (~18 MB: full Mesa GL stack + GLSL compiler). Requires
 # /tmp/libGL-phoenix.a + /tmp/libv3d-phoenix.a (tools/v3d-driver-port build).
-DEFAULT_COMPONENTS += rpi4-glclear
+# glclear validated (renders green); swapped out for the next rung (gldraw) to
+# stay under the loader.disk cap. Re-add to re-run the clear.
+# DEFAULT_COMPONENTS += rpi4-glclear
+# Mesa OpenGL textured/depth-tested glDrawArrays triangle (GLQuake Path C, Phase 4):
+# the rung between glClear and glgears -- exercises the GL frontend's vertex-submission
+# + fixed-function shader generation + v3d_compile-at-draw path. Same libs as glclear.
+DEFAULT_COMPONENTS += rpi4-gldraw
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
