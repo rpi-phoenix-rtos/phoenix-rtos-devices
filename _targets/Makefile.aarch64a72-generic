@@ -29,6 +29,11 @@ DEFAULT_COMPONENTS += rpi4-gpio
 # V3D GPU scout (Tier 3, GLQuake roadmap): powers on the V3D domain via the
 # mailbox + raw-dumps the V3D MMIO identity region to confirm the core is alive.
 DEFAULT_COMPONENTS += rpi4-v3d-scout
+# Mesa v3d driver harness (GLQuake Path C): links the ported Mesa v3d gallium
+# driver (libv3d-phoenix.a) + runs v3d_screen_create on HW. Boot-launched in the
+# netboot variant (see user.plo.yaml). Large (~11 MB: it pulls in the Mesa
+# compiler/NIR). Requires /tmp/libv3d-phoenix.a (tools/v3d-driver-port build).
+DEFAULT_COMPONENTS += rpi4-v3d-mesa
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so

@@ -21,14 +21,21 @@ V3D_COORD := /home/houp/phoenix-rpi
 V3D_MESA := $(V3D_COORD)/external/mesa
 V3D_GEN := /tmp/mesa-v3d-build/src
 V3D_LIB := /tmp/libv3d-phoenix.a
+V3D_COMPAT := $(V3D_COORD)/tools/v3d-driver-port/phoenix_mesa_compat.h
 
-LOCAL_CFLAGS := -I$(V3D_MESA)/src -I$(V3D_MESA)/include \
+# Force-include the libc/libm compat shim (lrintf/etc.) like every Mesa TU.
+# -Wno-error: Mesa headers use undefined-macro-as-0 (#if DETECT_ARCH_X86 ...) and
+# other idioms the project's -Werror=undef/etc. reject; this is external code.
+LOCAL_CFLAGS := -include $(V3D_COMPAT) -Wno-error -Wno-undef \
+	-I$(V3D_MESA)/src -I$(V3D_MESA)/include \
 	-I$(V3D_MESA)/src/gallium/include -I$(V3D_MESA)/src/gallium/auxiliary \
 	-I$(V3D_MESA)/src/util -I$(V3D_GEN) \
 	-DUTIL_ARCH_LITTLE_ENDIAN=1 -DUTIL_ARCH_BIG_ENDIAN=0
 
-# The driver lib has internal cross-references -> group it. -lm for the C99 math
-# the compiler/format code uses. binary.mk already adds --gc-sections.
-LOCAL_LDFLAGS := -Wl,--start-group $(V3D_LIB) -Wl,--end-group -lm
+# Use LOCAL_LDLIBS (placed AFTER the objects in the link line) so the archive
+# resolves main.o's references; LOCAL_LDFLAGS lands before the objects and would
+# be discarded. Group the lib (internal cross-refs). -lm for the compiler's C99
+# math. binary.mk already adds --gc-sections.
+LOCAL_LDLIBS := -Wl,--start-group $(V3D_LIB) -Wl,--end-group -lm
 
 include $(binary.mk)
