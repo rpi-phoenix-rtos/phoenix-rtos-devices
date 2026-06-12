@@ -173,6 +173,43 @@ int main(void)
 			       px[(H / 2) * W + (W / 2)]);
 		}
 
+		/* Correctness diagnostic (25ay): the scene is flat-colored (no lighting/blend/
+		 * texture). Earlier exact-32-bit bucketing reported 100% "other" — but the bytes
+		 * decode (LE RGBA = R|G<<8|B<<16|A<<24) to a DIM red +Z face (R~0x84 G=0 B~0x11,
+		 * broken alpha) at frame 0, i.e. geometry is CORRECT and the defect is color
+		 * intensity + alpha. So: (a) dump a raw 5x5 grid of pixel values, and (b) bucket
+		 * with alpha MASKED and an RGB tolerance, classifying each pixel by nearest of
+		 * {clear, 6 faces} within +-0x40 per channel. coverage% = pixels within tolerance
+		 * of SOME palette entry; that should be ~100% if geometry+rough-color are right. */
+		if ((frame % 120) == 0) {
+			static const uint32_t pal[7] = {
+				0x001f1a1au,  /* clear (rgb only) */
+				0x000000ffu, 0x0000ff00u, 0x00ff0000u,
+				0x0000ffffu, 0x00ff00ffu, 0x00ffff00u
+			};
+			size_t cover = 0; size_t tot = (size_t)W * H;
+			for (size_t i = 0; i < tot; i++) {
+				uint32_t c = px[i] & 0x00ffffffu;
+				int r = c & 0xff, g = (c >> 8) & 0xff, b = (c >> 16) & 0xff;
+				for (int k = 0; k < 7; k++) {
+					int pr = pal[k] & 0xff, pg = (pal[k] >> 8) & 0xff, pb = (pal[k] >> 16) & 0xff;
+					int dr = r - pr, dg = g - pg, db = b - pb;
+					if (dr < 0) dr = -dr; if (dg < 0) dg = -dg; if (db < 0) db = -db;
+					if (dr <= 0x40 && dg <= 0x40 && db <= 0x40) { cover++; break; }
+				}
+			}
+			printf("glcube: COVER frame=%lu within-tol=%zu%% (of %zu) center=0x%08x\n",
+			       frame, cover * 100 / tot, tot, px[(H / 2) * W + (W / 2)]);
+			printf("glcube: GRID5x5 (raw RGBA):\n");
+			for (int gy = 0; gy < 5; gy++) {
+				int yy = (H - 1) * gy / 4;
+				printf("glcube:  %08x %08x %08x %08x %08x\n",
+				       px[yy * W + (W - 1) * 0 / 4], px[yy * W + (W - 1) * 1 / 4],
+				       px[yy * W + (W - 1) * 2 / 4], px[yy * W + (W - 1) * 3 / 4],
+				       px[yy * W + (W - 1) * 4 / 4]);
+			}
+		}
+
 		/* upscale to centered region on grey, y-flipped (GL y-up -> screen y-down). */
 		for (size_t i = 0; i < (size_t)FB_W * FB_H; i++)
 			fbimg[i] = 0xff1f1a1a;
