@@ -46,13 +46,18 @@ extern unsigned char _mesa_make_current(struct gl_context *ctx,
                                         struct gl_framebuffer *drawFb,
                                         struct gl_framebuffer *readFb);
 
-#define W 256
-#define H 256
+/* Render at native framebuffer resolution now that the winsys MMU page table is
+ * large enough to map a fullscreen color+depth target (was capped at a 4 MiB GPU VA
+ * window -> 1024x768 RT came back all-zero; grown to 128 MiB, 25az). SCALE=1 => the
+ * upscale loop is a straight 1:1 copy, so no blocky edges. */
+#define W 1024
+#define H 768
 #define FB_W 1024
 #define FB_H 768
-#define SCALE 3
+#define SCALE 1
 #define OFF_X ((FB_W - W * SCALE) / 2)
 #define OFF_Y ((FB_H - H * SCALE) / 2)
+#define ASPECT ((float)W / (float)H)   /* 4:3 */
 
 static void chk(const char *where)
 {
@@ -129,7 +134,7 @@ int main(void)
 	glViewport(0, 0, W, H);
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
-	glFrustum(-1.0, 1.0, -1.0, 1.0, 2.0, 20.0);  /* fovy ~53 deg, aspect 1 */
+	glFrustum(-ASPECT, ASPECT, -1.0, 1.0, 2.0, 20.0);  /* fovy ~53 deg, 4:3 aspect */
 	glMatrixMode(GL_MODELVIEW);
 	chk("setup");
 
