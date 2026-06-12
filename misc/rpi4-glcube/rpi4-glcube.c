@@ -151,13 +151,16 @@ int main(void)
 		 * SLCACTL uniform-cache fix made per-frame transforms work -- see UPDATE 25ak/25al).
 		 * Using an animated translate (slide) as the working demo until the rotation
 		 * render path is debugged. */
-		/* spin about the Y axis (single rotate -- the HW-proven working config). */
+		/* full multi-axis tumble (depth-tested) -- works now that early-Z is disabled
+		 * in the v3d driver (the EZ-on path hung on tilted depth-tested polys, 25aw). */
 		float ay = (float)(frame % 360);
+		float ax = (float)((frame * 7 / 10) % 360);
 		glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glLoadIdentity();
 		glTranslatef(0.0f, 0.0f, -5.0f);
 		glRotatef(ay, 0.0f, 1.0f, 0.0f);
+		glRotatef(ax, 1.0f, 0.0f, 0.0f);
 		draw_cube();
 		glFinish();
 
