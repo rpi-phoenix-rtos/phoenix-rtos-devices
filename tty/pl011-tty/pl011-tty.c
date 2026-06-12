@@ -16,10 +16,12 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include <board_config.h>
+#include <phoenix/fbcon.h>
 #include <posix/utils.h>
 #include <sys/file.h>
 #include <sys/mman.h>
@@ -129,6 +131,17 @@ typedef struct {
 	uint16_t fbrow;
 	uint16_t fbpitch;
 
+	/* DOS-style "text mode <-> graphics mode" switch for full-screen apps
+	 * (FBCONSETMODE/FBCONGETMODE ioctls). When DISABLED, a full-screen GPU app
+	 * (e.g. rpi4-quake) owns the real framebuffer; the console keeps drawing into
+	 * an off-screen shadow so klog/psh text is never lost, and on re-ENABLE the
+	 * shadow is blitted back so the user sees the console with everything that was
+	 * printed while it was hidden. fbdraw is the live draw target: fbaddr when
+	 * enabled, fbshadow when disabled. */
+	int fbmode;                          /* FBCON_ENABLED / FBCON_DISABLED / FBCON_UNSUPPORTED */
+	volatile uint32_t *volatile fbdraw;  /* current draw target (fbaddr or fbshadow) */
+	uint32_t *fbshadow;                  /* off-screen console image (lazily allocated) */
+
 	/* TD-15 Stage 4: VT100/ANSI parser state. */
 	pl011_fbcon_escState_t fbescState;
 	uint16_t fbescParams[PL011_FBCON_ESC_MAX_PARAMS];
@@ -163,7 +176,7 @@ static inline void pl011_write(pl011_t *uart, unsigned int reg, uint32_t val)
 #if defined(__CPU_GENERIC)
 static inline void pl011_fbcon_drawPixel(pl011_t *uart, uint16_t x, uint16_t y, uint32_t color)
 {
-	*(volatile uint32_t *)((char *)uart->fbaddr + y * uart->fbpitch + x * sizeof(uint32_t)) = color;
+	*(volatile uint32_t *)((char *)uart->fbdraw + y * uart->fbpitch + x * sizeof(uint32_t)) = color;
 }
 
 
@@ -216,7 +229,7 @@ static void pl011_fbcon_clearRow(pl011_t *uart, uint16_t row)
 	size_t rowBytes = (size_t)uart->fbcols * (size_t)TTYPC_FBFONT_W * sizeof(uint32_t);
 
 	for (y = row * TTYPC_FBFONT_H; y < (row + 1u) * TTYPC_FBFONT_H; ++y) {
-		volatile uint32_t *line = (volatile uint32_t *)((char *)uart->fbaddr + y * uart->fbpitch);
+		volatile uint32_t *line = (volatile uint32_t *)((char *)uart->fbdraw + y * uart->fbpitch);
 		pl011_fbcon_fill64(line, rowBytes, PL011_FBCON_BG);
 	}
 }
@@ -227,7 +240,7 @@ static void pl011_fbcon_clearRow(pl011_t *uart, uint16_t row)
  * per-pixel clearRow loop. */
 static void pl011_fbcon_clearAll(pl011_t *uart)
 {
-	pl011_fbcon_fill64(uart->fbaddr, uart->fbmemsz, PL011_FBCON_BG);
+	pl011_fbcon_fill64(uart->fbdraw, uart->fbmemsz, PL011_FBCON_BG);
 	uart->fbcol = 0u;
 	uart->fbrow = 0u;
 }
@@ -238,7 +251,7 @@ static void pl011_fbcon_scroll(pl011_t *uart)
 	size_t rowsz = uart->fbpitch * TTYPC_FBFONT_H;
 	size_t visible = uart->fbpitch * uart->fbrows * TTYPC_FBFONT_H;
 
-	memmove((void *)uart->fbaddr, (const char *)uart->fbaddr + rowsz, visible - rowsz);
+	memmove((void *)uart->fbdraw, (const char *)uart->fbdraw + rowsz, visible - rowsz);
 	uart->fbrow = uart->fbrows - 1u;
 	pl011_fbcon_clearRow(uart, uart->fbrow);
 }
@@ -466,6 +479,57 @@ static void pl011_fbcon_write(pl011_t *uart, const char *data, size_t size)
 }
 
 
+/* FBCONSETMODE: switch the HDMI console between text mode (FBCON_ENABLED, drawing to the
+ * real framebuffer) and "graphics mode" (FBCON_DISABLED, where a full-screen app owns the
+ * framebuffer and console output is diverted to an off-screen shadow). The DOS-style
+ * round-trip: on DISABLE we snapshot the current screen into the shadow and keep rendering
+ * klog/psh text there (nothing is lost); on ENABLE we blit the shadow back, so the user
+ * returns to the text console with all output that arrived while it was hidden. */
+static int pl011_fbcon_setmode(pl011_t *uart, int mode)
+{
+	if (uart->fbaddr == NULL) {
+		return -ENODEV;
+	}
+	if ((mode != FBCON_ENABLED) && (mode != FBCON_DISABLED)) {
+		return -EINVAL;
+	}
+
+	mutexLock(uart->fbLock);
+
+	if (mode == uart->fbmode) {
+		mutexUnlock(uart->fbLock);
+		return EOK;
+	}
+
+	if (mode == FBCON_DISABLED) {
+		if (uart->fbshadow == NULL) {
+			uart->fbshadow = malloc(uart->fbmemsz);
+			if (uart->fbshadow == NULL) {
+				mutexUnlock(uart->fbLock);
+				return -ENOMEM;
+			}
+		}
+		/* Seed the shadow with what is currently on screen so continued output
+		 * appends to the visible console rather than to a blank surface. */
+		memcpy(uart->fbshadow, (const void *)uart->fbaddr, uart->fbmemsz);
+		uart->fbdraw = (volatile uint32_t *volatile)uart->fbshadow;
+		uart->fbmode = FBCON_DISABLED;
+	}
+	else {
+		/* Restore the accumulated console image to the real framebuffer and resume
+		 * drawing directly to it. */
+		if (uart->fbshadow != NULL) {
+			memcpy((void *)uart->fbaddr, uart->fbshadow, uart->fbmemsz);
+		}
+		uart->fbdraw = uart->fbaddr;
+		uart->fbmode = FBCON_ENABLED;
+	}
+
+	mutexUnlock(uart->fbLock);
+	return EOK;
+}
+
+
 static int pl011_fbcon_init(pl011_t *uart)
 {
 	platformctl_t pctl = { .action = pctl_get, .type = pctl_graphmode };
@@ -499,6 +563,11 @@ static int pl011_fbcon_init(pl011_t *uart)
 	uart->fbpitch = pctl.task.graphmode.pitch;
 	uart->fbcols = pctl.task.graphmode.width / TTYPC_FBFONT_W;
 	uart->fbrows = pctl.task.graphmode.height / TTYPC_FBFONT_H;
+
+	/* Console starts in text mode, drawing directly to the real framebuffer. */
+	uart->fbmode = FBCON_ENABLED;
+	uart->fbdraw = uart->fbaddr;
+	uart->fbshadow = NULL;
 
 	/* 2026-05-17: restored full-framebuffer clear at init now that
 	 * caches are operational (armstub fix 1319367 + L2CTLR_EL1).
@@ -783,6 +852,11 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 		return -ENOMEM;
 	}
 
+	/* No HDMI console until fbcon_init succeeds (it sets FBCON_ENABLED). */
+	uart->fbmode = FBCON_UNSUPPORTED;
+	uart->fbdraw = NULL;
+	uart->fbshadow = NULL;
+
 	uart->base = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (off_t)PL011_TTY_BASE);
 	if (uart->base == MAP_FAILED) {
 		return -ENOMEM;
@@ -821,6 +895,15 @@ static void pl011_ioctl(unsigned int port, msg_t *msg)
 		libklog_enable((int)(intptr_t)idata);
 		err = EOK;
 	}
+#if defined(__CPU_GENERIC)
+	else if (req == FBCONSETMODE) {
+		err = pl011_fbcon_setmode(&pl011_common.uart, (int)(intptr_t)idata);
+	}
+	else if (req == FBCONGETMODE) {
+		odata = (const void *)&pl011_common.uart.fbmode;
+		err = EOK;
+	}
+#endif
 	else {
 		err = libtty_ioctl(&pl011_common.uart.tty, ioctl_getSenderPid(msg), req, idata, &odata);
 	}
