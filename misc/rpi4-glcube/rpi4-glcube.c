@@ -139,15 +139,23 @@ int main(void)
 	if (fb < 0) printf("glcube: /dev/fb0 open failed (will still render)\n");
 	printf("glcube: entering animation loop (per-frame render -> upscale -> /dev/fb0)\n");
 
-	float angle = 0.0f;
 	unsigned long frame = 0;
 	for (;;) {
+		/* DIAG (25aa): test whether PER-FRAME matrix updates reach the shader at all,
+		 * using an animated glTranslatef with PURE LINEAR math (no sin/cos -- so this
+		 * isolates "matrix re-upload dead" from "rotation/sincos broken"). If the cube
+		 * slides horizontally across frames, per-frame translate works => the earlier
+		 * frozen rotation is rotation/sincos-specific. If it stays put => the whole
+		 * NOTE: a glRotatef-based spin currently renders garbage + hangs the render
+		 * (rotation-specific, distinct from this proven-clean translate path; the
+		 * SLCACTL uniform-cache fix made per-frame transforms work -- see UPDATE 25ak/25al).
+		 * Using an animated translate (slide) as the working demo until the rotation
+		 * render path is debugged. */
+		float tx = (float)((int)((frame / 20) % 5) - 2) * 0.7f;  /* -1.4..+1.4 slide */
 		glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glLoadIdentity();
-		glTranslatef(0.0f, 0.0f, -4.5f);   /* closer -> larger on screen */
-		glRotatef(angle, 1.0f, 0.0f, 0.0f);
-		glRotatef(angle * 0.7f, 0.0f, 1.0f, 0.0f);
+		glTranslatef(tx, 0.0f, -4.5f);
 		draw_cube();
 		glFinish();
 
@@ -179,20 +187,11 @@ int main(void)
 			(void)write(fb, fbimg, (size_t)FB_W * FB_H * 4);
 		}
 		if (frame == 0)
-			printf("glcube: ANIMATING (cube rendering+spinning on /dev/fb0)\n");
-		if ((frame % 120) == 0) {
-			/* sample 5 points of the render to see actual face colors (0xAABBGGRR):
-			 * a black face here => glColor/FF-color bug; clear (0xff1f1a1a) => off-cube. */
-			printf("glcube: frame=%lu angle=%d px[c]=0x%08x [q1]=0x%08x [q2]=0x%08x [q3]=0x%08x [q4]=0x%08x\n",
-			       frame, (int)angle,
-			       px[(H / 2) * W + (W / 2)],
-			       px[(H / 4) * W + (W / 4)], px[(H / 4) * W + (3 * W / 4)],
-			       px[(3 * H / 4) * W + (W / 4)], px[(3 * H / 4) * W + (3 * W / 4)]);
-		}
+			printf("glcube: ANIMATING (sliding cube on /dev/fb0)\n");
+		if ((frame % 120) == 0)
+			printf("glcube: frame=%lu tx10=%d center=0x%08x\n",
+			       frame, (int)(tx * 10.0f), px[(H / 2) * W + (W / 2)]);
 
-		angle += 2.0f;
-		if (angle >= 360.0f)
-			angle -= 360.0f;
 		frame++;
 		usleep(33000);  /* ~30 fps target */
 	}
