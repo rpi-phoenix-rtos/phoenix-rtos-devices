@@ -151,11 +151,13 @@ int main(void)
 		 * SLCACTL uniform-cache fix made per-frame transforms work -- see UPDATE 25ak/25al).
 		 * Using an animated translate (slide) as the working demo until the rotation
 		 * render path is debugged. */
-		float tx = (float)((int)((frame / 20) % 5) - 2) * 0.7f;  /* -1.4..+1.4 slide */
+		/* spin about the Y axis (single rotate -- the HW-proven working config). */
+		float ay = (float)(frame % 360);
 		glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glLoadIdentity();
-		glTranslatef(tx, 0.0f, -4.5f);
+		glTranslatef(0.0f, 0.0f, -5.0f);
+		glRotatef(ay, 0.0f, 1.0f, 0.0f);
 		draw_cube();
 		glFinish();
 
@@ -187,10 +189,10 @@ int main(void)
 			(void)write(fb, fbimg, (size_t)FB_W * FB_H * 4);
 		}
 		if (frame == 0)
-			printf("glcube: ANIMATING (sliding cube on /dev/fb0)\n");
+			printf("glcube: ANIMATING (spinning cube on /dev/fb0)\n");
 		if ((frame % 120) == 0)
-			printf("glcube: frame=%lu tx10=%d center=0x%08x\n",
-			       frame, (int)(tx * 10.0f), px[(H / 2) * W + (W / 2)]);
+			printf("glcube: frame=%lu rot=%d center=0x%08x\n",
+			       frame, (int)ay, px[(H / 2) * W + (W / 2)]);
 
 		frame++;
 		usleep(33000);  /* ~30 fps target */
