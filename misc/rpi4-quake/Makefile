@@ -21,6 +21,9 @@ QS_LIB := /tmp/libquakespasm.a
 V3D_GL_LIB := /tmp/libGL-phoenix.a
 V3D_LIB := /tmp/libv3d-phoenix.a
 
-LOCAL_LDLIBS := -Wl,--start-group $(QS_LIB) $(V3D_GL_LIB) $(V3D_LIB) -Wl,--end-group -lstdc++ -lm
+# -z stack-size sets PT_GNU_STACK p_memsz -> the kernel (process.c) uses it as the
+# MAIN-thread stack size. Quake runs Host on the main thread (for correct TLS-based
+# GL dispatch) and needs a large stack (big frames + recursive renderers): 32 MB.
+LOCAL_LDLIBS := -Wl,-z,stack-size=33554432 -Wl,--start-group $(QS_LIB) $(V3D_GL_LIB) $(V3D_LIB) -Wl,--end-group -lstdc++ -lm
 
 include $(binary.mk)
