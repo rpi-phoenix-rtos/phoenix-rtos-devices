@@ -52,7 +52,14 @@ DEFAULT_COMPONENTS += rpi4-v3d-scout
 # Mesa OpenGL animated spinning-cube demo (GLQuake Path C, Phase 4): the "glgears-or-
 # similar" rung -- perspective + depth-tested + per-frame glRotatef animation, held on
 # /dev/fb0. Demonstrates basic OpenGL animation on the V3D. Same libs as glclear/gldraw.
-DEFAULT_COMPONENTS += rpi4-glcube
+# rpi4-glcube swapped out for rpi4-quake (the Quakespasm capstone) to stay under the
+# loader.disk cap (only one ~18 MB GL binary fits). Re-add to re-run the cube.
+# DEFAULT_COMPONENTS += rpi4-glcube
+# Quakespasm (GLQuake capstone): the full engine + Phoenix platform shims, pre-built
+# into /tmp/libquakespasm.a (tools/quakespasm-port/build-quakespasm-phoenix.py),
+# linked against libGL-phoenix + libv3d-phoenix and bundled into loader.disk
+# (boot-launched). ~19 MB; can't be NFS-exec'd, hence the bundle.
+DEFAULT_COMPONENTS += rpi4-quake
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
