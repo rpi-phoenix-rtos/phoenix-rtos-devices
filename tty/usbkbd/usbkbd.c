@@ -105,6 +105,13 @@ typedef struct {
 	int rxState;
 
 	unsigned int capsLock;
+
+	/* When set, the fifo carries raw 8-byte HID boot-keyboard reports (packet-
+	 * aligned) instead of the cooked ASCII/ANSI stream. A client (e.g. a game that
+	 * needs key-up + held-key state, which a cooked stream cannot express) requests
+	 * this by writing a single byte to the device: 1 = raw, 0 = cooked (default).
+	 * The psh console bridge never writes, so it keeps the cooked stream. */
+	int rawMode;
 } usbkbd_dev_t;
 
 
@@ -222,6 +229,28 @@ static void usbkbd_fifoPush(usbkbd_dev_t *dev, const char *data, size_t len)
 		}
 
 		fifo_push(dev->fifo, (uint8_t)data[i]);
+	}
+	condSignal(dev->cond);
+	mutexUnlock(dev->lock);
+}
+
+
+/* Raw-mode push: forward a whole HID report, preserving usbkbd_reportSize framing
+ * (drop the oldest whole report(s) on overflow rather than a single byte, which
+ * would desync the reader). Mirrors the usbmouse raw passthrough. */
+static void usbkbd_fifoPushRaw(usbkbd_dev_t *dev, const uint8_t *data, size_t len)
+{
+	size_t i;
+	size_t k;
+
+	mutexLock(dev->lock);
+	while ((fifo_freespace(dev->fifo) < len) && !fifo_is_empty(dev->fifo)) {
+		for (k = 0u; (k < len) && !fifo_is_empty(dev->fifo); ++k) {
+			(void)fifo_pop_back(dev->fifo);
+		}
+	}
+	for (i = 0u; i < len; ++i) {
+		fifo_push(dev->fifo, data[i]);
 	}
 	condSignal(dev->cond);
 	mutexUnlock(dev->lock);
@@ -379,6 +408,14 @@ static void usbkbd_handleReport(usbkbd_dev_t *dev, const uint8_t *report, size_t
 		return;
 	}
 
+	/* Raw mode: forward the whole 8-byte HID report so the client can derive
+	 * key-down AND key-up (and held state) by diffing successive reports. */
+	if (dev->rawMode != 0) {
+		usbkbd_fifoPushRaw(dev, report, usbkbd_reportSize);
+		memcpy(dev->prevReport, report, usbkbd_reportSize);
+		return;
+	}
+
 	modifiers = report[0];
 	for (i = 2; i < usbkbd_reportSize; ++i) {
 		if ((report[i] == 0u) || (usbkbd_isPressed(dev->prevReport, report[i]) != 0)) {
@@ -461,21 +498,19 @@ static int _usbkbd_urbsAlloc(usbkbd_dev_t *dev)
 
 static void _usbkbd_close(usbkbd_dev_t *dev)
 {
-	int i;
-
-	for (i = 0; i < USBKBD_N_URBS; ++i) {
-		if (dev->urbIntIn[i] >= 0) {
-			usb_urbFree(dev->drv, dev->pipeIntIn, dev->urbIntIn[i]);
-			dev->urbIntIn[i] = -1;
-		}
-	}
-
+	/* Keep the interrupt URBs armed and rxState running across a client close, so
+	 * the device can be handed off (console bridge -> full-screen game) and re-opened
+	 * WITHOUT re-submitting URBs — the Pi 4 xHCI HCD's per-slot interrupt pipe cannot
+	 * reliably re-arm mid-life, which made a re-open fail with -EIO. The URBs are
+	 * self-sustaining (the completion handler re-arms while rxRunning) and are
+	 * abandoned with the pipe when the device is removed (handleDeletion). Only the
+	 * per-client state is dropped here. */
 	fifo_remove_all(dev->fifo);
 	memset(dev->prevReport, 0, sizeof(dev->prevReport));
 	dev->capsLock = 0u;
 	dev->flags = 0;
 	dev->clientpid = 0;
-	dev->rxState = usbkbd_rxStopped;
+	dev->rawMode = 0;
 }
 
 
@@ -489,13 +524,26 @@ static int _usbkbd_open(usbkbd_dev_t *dev, int flags, pid_t pid)
 		return -EPERM;
 	}
 
-	if (_usbkbd_urbsAlloc(dev) < 0) {
-		return -ENOMEM;
-	}
+	/* Set up the interrupt URBs only on the first open; later opens (e.g. after the
+	 * console bridge handed the keyboard to a full-screen app) reuse the already-armed
+	 * URBs, avoiding a mid-life re-submit that the xHCI HCD rejects with -EIO. */
+	if (dev->rxState != usbkbd_rxRunning) {
+		int i;
 
-	if (_usbkbd_start(dev) < 0) {
-		_usbkbd_close(dev);
-		return -EIO;
+		if (_usbkbd_urbsAlloc(dev) < 0) {
+			return -ENOMEM;
+		}
+
+		if (_usbkbd_start(dev) < 0) {
+			for (i = 0; i < USBKBD_N_URBS; ++i) {
+				if (dev->urbIntIn[i] >= 0) {
+					usb_urbFree(dev->drv, dev->pipeIntIn, dev->urbIntIn[i]);
+					dev->urbIntIn[i] = -1;
+				}
+			}
+			dev->rxState = usbkbd_rxStopped;
+			return -EIO;
+		}
 	}
 
 	dev->flags = flags;
@@ -588,7 +636,20 @@ static void usbkbd_msgthr(void *arg)
 				break;
 
 			case mtWrite:
-				msg.o.err = -ENOSYS;
+				/* Mode-control channel (the keyboard is otherwise read-only): a
+				 * 1-byte write selects the report format for this client —
+				 * non-zero = raw 8-byte HID reports, zero = cooked ASCII. */
+				if ((msg.i.data != NULL) && (msg.i.size >= 1u)) {
+					mutexLock(dev->lock);
+					dev->rawMode = (((const uint8_t *)msg.i.data)[0] != 0u) ? 1 : 0;
+					fifo_remove_all(dev->fifo);
+					memset(dev->prevReport, 0, sizeof(dev->prevReport));
+					mutexUnlock(dev->lock);
+					msg.o.err = (int)msg.i.size;
+				}
+				else {
+					msg.o.err = -EINVAL;
+				}
 				break;
 
 			case mtGetAttr:

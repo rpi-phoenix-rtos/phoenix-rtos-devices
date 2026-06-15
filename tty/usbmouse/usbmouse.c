@@ -290,19 +290,14 @@ static int _usbmouse_urbsAlloc(usbmouse_dev_t *dev)
 
 static void _usbmouse_close(usbmouse_dev_t *dev)
 {
-	int i;
-
-	for (i = 0; i < USBMOUSE_N_URBS; ++i) {
-		if (dev->urbIntIn[i] >= 0) {
-			usb_urbFree(dev->drv, dev->pipeIntIn, dev->urbIntIn[i]);
-			dev->urbIntIn[i] = -1;
-		}
-	}
-
+	/* Keep the interrupt URBs armed and rxState running across a client close so the
+	 * device can be handed off (console diagnostic reader -> full-screen game) and
+	 * re-opened WITHOUT re-submitting URBs, which the Pi 4 xHCI HCD's per-slot
+	 * interrupt pipe cannot reliably do mid-life (re-open would fail -EIO). The URBs
+	 * are abandoned with the pipe at device removal. Only client state is dropped. */
 	fifo_remove_all(dev->fifo);
 	dev->flags = 0;
 	dev->clientpid = 0;
-	dev->rxState = usbmouse_rxStopped;
 }
 
 
@@ -316,13 +311,25 @@ static int _usbmouse_open(usbmouse_dev_t *dev, int flags, pid_t pid)
 		return -EPERM;
 	}
 
-	if (_usbmouse_urbsAlloc(dev) < 0) {
-		return -ENOMEM;
-	}
+	/* Arm the interrupt URBs only on the first open; later opens reuse the armed URBs
+	 * (see _usbmouse_close) to avoid a mid-life re-submit the xHCI HCD rejects. */
+	if (dev->rxState != usbmouse_rxRunning) {
+		int i;
 
-	if (_usbmouse_start(dev) < 0) {
-		_usbmouse_close(dev);
-		return -EIO;
+		if (_usbmouse_urbsAlloc(dev) < 0) {
+			return -ENOMEM;
+		}
+
+		if (_usbmouse_start(dev) < 0) {
+			for (i = 0; i < USBMOUSE_N_URBS; ++i) {
+				if (dev->urbIntIn[i] >= 0) {
+					usb_urbFree(dev->drv, dev->pipeIntIn, dev->urbIntIn[i]);
+					dev->urbIntIn[i] = -1;
+				}
+			}
+			dev->rxState = usbmouse_rxStopped;
+			return -EIO;
+		}
 	}
 
 	dev->flags = flags;

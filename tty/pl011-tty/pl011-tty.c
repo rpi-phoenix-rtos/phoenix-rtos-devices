@@ -66,6 +66,13 @@
 #define PL011_TTY_KBD_RETRY_US 500000
 #endif
 
+/* Poll cadence for the non-blocking kbd bridge read: small enough that typing feels
+ * instant, large enough to stay off the CPU when idle, and bounds how fast the bridge
+ * reacts to kbdReleased (release/reacquire of /dev/kbd0). */
+#ifndef PL011_TTY_KBD_POLL_US
+#define PL011_TTY_KBD_POLL_US 8000
+#endif
+
 #ifndef PL011_TTY_MOUSE_PATH
 #define PL011_TTY_MOUSE_PATH ((const char *)NULL)
 #endif
@@ -141,6 +148,12 @@ typedef struct {
 	int fbmode;                          /* FBCON_ENABLED / FBCON_DISABLED / FBCON_UNSUPPORTED */
 	volatile uint32_t *volatile fbdraw;  /* current draw target (fbaddr or fbshadow) */
 	uint32_t *fbshadow;                  /* off-screen console image (lazily allocated) */
+
+	/* When a full-screen app takes the HDMI console into graphics mode
+	 * (FBCONSETMODE(FBCON_DISABLED)) it also owns the USB keyboard, so the kbd
+	 * bridge releases /dev/kbd0 (single-opener usbkbd) for the app to open. Set on
+	 * DISABLE, cleared on ENABLE; the kbd bridge thread polls it. */
+	volatile int kbdReleased;
 
 	/* TD-15 Stage 4: VT100/ANSI parser state. */
 	pl011_fbcon_escState_t fbescState;
@@ -524,6 +537,11 @@ static int pl011_fbcon_setmode(pl011_t *uart, int mode)
 		uart->fbdraw = uart->fbaddr;
 		uart->fbmode = FBCON_ENABLED;
 	}
+
+	/* Hand the USB keyboard to the full-screen app on DISABLE; take it back on
+	 * ENABLE. The kbd bridge thread (pl011_kbdthr) observes this and closes/reopens
+	 * /dev/kbd0 so the single-opener usbkbd device can be claimed by the app. */
+	uart->kbdReleased = (uart->fbmode == FBCON_DISABLED) ? 1 : 0;
 
 	mutexUnlock(uart->fbLock);
 	return EOK;
@@ -1086,49 +1104,65 @@ static void pl011_kbdthr(void *arg)
 		endthread();
 	}
 
+	fd = -1;
 	for (;;) {
-		fd = open(path, O_RDONLY);
-		if (fd < 0) {
-			usleep(PL011_TTY_KBD_RETRY_US);
+		int wake_reader = 0;
+		size_t i;
+
+		/* A full-screen app owns the keyboard: release /dev/kbd0 (single-opener
+		 * usbkbd) so it can open it, and stop reopening until the console returns. */
+		if (uart->kbdReleased != 0) {
+			if (fd >= 0) {
+				close(fd);
+				fd = -1;
+			}
+			usleep(PL011_TTY_KBD_POLL_US);
 			continue;
 		}
 
-		/* TODO(#127): bring-up observability — the open succeeding both starts
-		 * the keyboard's URB polling (usbkbd opens on first client) and marks
-		 * when the USB keyboard became usable relative to boot. */
-		fprintf(stderr, "pl011-tty: kbd bridge opened %s\n", path);
-
-		for (;;) {
-			int wake_reader = 0;
-			size_t i;
-
-			len = read(fd, buf, sizeof(buf));
-			if (len == 0) {
-				break;
+		if (fd < 0) {
+			/* O_NONBLOCK so this thread stays responsive to kbdReleased rather than
+			 * blocking forever in read() (which a Phoenix msg-read can't be
+			 * interrupted out of). */
+			fd = open(path, O_RDONLY | O_NONBLOCK);
+			if (fd < 0) {
+				usleep(PL011_TTY_KBD_RETRY_US);
+				continue;
 			}
-			if (len < 0) {
-				if (errno == EINTR) {
-					continue;
-				}
-				break;
-			}
-
-			libtty_putchar_lock(&uart->tty);
-			for (i = 0u; i < (size_t)len; ++i) {
-				int woke = 0;
-
-				(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &wake_reader);
-				wake_reader |= woke;
-			}
-			libtty_putchar_unlock(&uart->tty);
-
-			if (wake_reader != 0) {
-				libtty_wake_reader(&uart->tty);
-			}
+			/* TODO(#127): bring-up observability — the open succeeding both starts
+			 * the keyboard's URB polling (usbkbd opens on first client) and marks
+			 * when the USB keyboard became usable relative to boot. */
+			fprintf(stderr, "pl011-tty: kbd bridge opened %s\n", path);
 		}
 
-		close(fd);
-		usleep(PL011_TTY_KBD_RETRY_US);
+		len = read(fd, buf, sizeof(buf));
+		if (len < 0) {
+			if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) {
+				usleep(PL011_TTY_KBD_POLL_US);   /* no data this tick */
+				continue;
+			}
+			close(fd);   /* real error (e.g. device gone) — reopen */
+			fd = -1;
+			usleep(PL011_TTY_KBD_RETRY_US);
+			continue;
+		}
+		if (len == 0) {
+			usleep(PL011_TTY_KBD_POLL_US);
+			continue;
+		}
+
+		libtty_putchar_lock(&uart->tty);
+		for (i = 0u; i < (size_t)len; ++i) {
+			int woke = 0;
+
+			(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &wake_reader);
+			wake_reader |= woke;
+		}
+		libtty_putchar_unlock(&uart->tty);
+
+		if (wake_reader != 0) {
+			libtty_wake_reader(&uart->tty);
+		}
 	}
 }
 
@@ -1140,46 +1174,60 @@ static void pl011_kbdthr(void *arg)
  * can be validated. Remove once a real pointer consumer exists. */
 static void pl011_mousethr(void *arg)
 {
+	pl011_t *uart = (pl011_t *)arg;
 	const char *path = PL011_TTY_MOUSE_PATH;
 	uint8_t buf[64];
 	ssize_t len;
 	int fd;
 	size_t i;
 
-	(void)arg;
 	if (path == NULL) {
 		endthread();
 	}
 
+	fd = -1;
 	for (;;) {
-		fd = open(path, O_RDONLY);
-		if (fd < 0) {
-			usleep(PL011_TTY_KBD_RETRY_US);
+		/* A full-screen app owns the pointer in graphics mode: release /dev/mouse0
+		 * (single-opener usbmouse) so it can open it. Same release/reacquire +
+		 * O_NONBLOCK-poll discipline as the keyboard bridge. */
+		if (uart->kbdReleased != 0) {
+			if (fd >= 0) {
+				close(fd);
+				fd = -1;
+			}
+			usleep(PL011_TTY_KBD_POLL_US);
 			continue;
 		}
 
-		fprintf(stderr, "pl011-tty: mouse reader opened %s\n", path);
-
-		for (;;) {
-			len = read(fd, buf, sizeof(buf));
-			if (len == 0) {
-				break;
+		if (fd < 0) {
+			fd = open(path, O_RDONLY | O_NONBLOCK);
+			if (fd < 0) {
+				usleep(PL011_TTY_KBD_RETRY_US);
+				continue;
 			}
-			if (len < 0) {
-				if (errno == EINTR) {
-					continue;
-				}
-				break;
-			}
-
-			for (i = 0u; (i + 4u) <= (size_t)len; i += 4u) {
-				fprintf(stderr, "mouse: btn=0x%02x x=%d y=%d wheel=%d\n",
-					buf[i], (int)(int8_t)buf[i + 1u], (int)(int8_t)buf[i + 2u], (int)(int8_t)buf[i + 3u]);
-			}
+			fprintf(stderr, "pl011-tty: mouse reader opened %s\n", path);
 		}
 
-		close(fd);
-		usleep(PL011_TTY_KBD_RETRY_US);
+		len = read(fd, buf, sizeof(buf));
+		if (len < 0) {
+			if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) {
+				usleep(PL011_TTY_KBD_POLL_US);
+				continue;
+			}
+			close(fd);
+			fd = -1;
+			usleep(PL011_TTY_KBD_RETRY_US);
+			continue;
+		}
+		if (len == 0) {
+			usleep(PL011_TTY_KBD_POLL_US);
+			continue;
+		}
+
+		for (i = 0u; (i + 4u) <= (size_t)len; i += 4u) {
+			fprintf(stderr, "mouse: btn=0x%02x x=%d y=%d wheel=%d\n",
+				buf[i], (int)(int8_t)buf[i + 1u], (int)(int8_t)buf[i + 2u], (int)(int8_t)buf[i + 3u]);
+		}
 	}
 }
 
