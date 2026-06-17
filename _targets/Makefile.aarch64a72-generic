@@ -71,8 +71,8 @@ DEFAULT_COMPONENTS += rpi4-quake
 # Vulkan V3DV Tier-1 boot harness: vkCreateInstance/EnumeratePhysicalDevices/
 # CreateDevice on real HW. Links libv3dv-phoenix.a + libv3d-phoenix.a. Swap IN for
 # rpi4-quake (loader.disk fits only one large GL/VK binary) to continue Vulkan
-# bring-up. STATUS: vkCreateInstance works on HW; vkEnumeratePhysicalDevices hangs
-# (Tier-1 debug — instrument the winsys ioctl path to localize).
+# bring-up. STATUS: instance + enumerate(count=1) + the device-create instruction
+# abort all cleared; vkCreateDevice now HANGS (needs v3dv_CreateDevice instrumentation).
 # DEFAULT_COMPONENTS += rpi4-v3dv-tier0
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
