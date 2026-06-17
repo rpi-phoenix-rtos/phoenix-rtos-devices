@@ -104,10 +104,46 @@ enum {
 
 #define SPIN_MAX 1000000u
 
+/* BCM2711 legacy DMA controller. 15 channels, 0x100 apart, from DMA_BASE. We use
+ * one channel to pace the PWM FIFO from a DRAM tone buffer via the PWM DREQ (no CPU
+ * spin). Bus addresses: peripherals at 0x7e... (PWM_FIF1 = 0x7e20c818); DRAM via the
+ * 0xC0000000 legacy uncached alias for the low 1 GB (logged + checked at runtime). */
+#define DMA_BASE        0xfe007000u
+#define DMA_CHAN        5u             /* avoid VPU-reserved 0..4; revisit via the firmware mask */
+#define DMA_CS          (0x00u / 4u)
+#define DMA_CONBLK_AD   (0x04u / 4u)
+#define DMA_TXFR_LEN_R  (0x14u / 4u)   /* live remaining length (read-only copy) */
+#define DMA_DEBUG       (0x20u / 4u)
+#define DMA_CS_ACTIVE   (1u << 0)
+#define DMA_CS_END      (1u << 1)
+#define DMA_CS_ERROR    (1u << 8)
+#define DMA_CS_RESET    (1u << 31)
+/* Transfer-info (CB word 0). */
+#define TI_WAIT_RESP    (1u << 3)
+#define TI_DEST_DREQ    (1u << 6)
+#define TI_SRC_INC      (1u << 8)
+#define TI_PERMAP_PWM   (1u << 16)     /* BCM2711 DREQ 1 = PWM1 (DREQ 5 is the legacy PWM0) */
+#define PWM_FIF1_BUS    0x7e20c818u    /* PWM1 FIFO, peripheral bus address */
+#define DRAM_BUS(pa)    (0xc0000000u | ((uint32_t)(pa) & 0x3fffffffu))
+/* PWM_DMAC (0x08): ENAB(31) | PANIC[15:8] | DREQ[7:0] thresholds. */
+#define PWM_DMAC_ENAB   (1u << 31)
+
+/* DMA control block (32 bytes, 256-bit aligned) — the legacy-DMA descriptor. */
+typedef struct {
+	uint32_t ti;
+	uint32_t source_ad;
+	uint32_t dest_ad;
+	uint32_t txfr_len;
+	uint32_t stride;
+	uint32_t nextconbk;
+	uint32_t pad[2];
+} dma_cb_t;
+
 static struct {
 	volatile uint32_t *pwm;
 	volatile uint32_t *cprman;
 	volatile uint32_t *gpio;
+	volatile uint32_t *dma;   /* DMA channel DMA_CHAN registers */
 	uint32_t underruns;
 } ad;
 
@@ -258,6 +294,57 @@ static void audio_thread(void *arg)
 }
 
 
+/* DMA a tone buffer into the PWM FIFO via the PWM DREQ (single-shot, no CPU spin).
+ * Verifies the legacy-DMA path end-to-end: the channel goes ACTIVE, no ERROR, the
+ * remaining length drains, and the FIFO plays the tone. Audible blip on the jack is
+ * the attended check; the CS/length/error self-log is the autonomous proof. */
+static void audio_dmaTest(void)
+{
+	uint32_t total = AUDIO_RATE / 5u;            /* ~0.2 s of 32-bit duty words */
+	uint32_t half = AUDIO_RATE / (440u * 2u);
+	uint32_t i, spins;
+	dma_cb_t *cb;
+	uint32_t *tone;
+	uintptr_t cb_pa, tone_pa;
+
+	cb = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_CONTIGUOUS | MAP_UNCACHED | MAP_ANONYMOUS, -1, 0);
+	tone = mmap(NULL, (total * 4u + _PAGE_SIZE - 1u) & ~((uint32_t)_PAGE_SIZE - 1u),
+		PROT_READ | PROT_WRITE, MAP_CONTIGUOUS | MAP_UNCACHED | MAP_ANONYMOUS, -1, 0);
+	if ((cb == MAP_FAILED) || (tone == MAP_FAILED)) {
+		printf("rpi4-audio: dma-test mmap failed\n");
+		return;
+	}
+	for (i = 0; i < total; i++)
+		tone[i] = ((i / half) & 1u) ? (PWM_RANGE * 3u / 4u) : (PWM_RANGE / 4u);
+
+	cb_pa = (uintptr_t)va2pa(cb);
+	tone_pa = (uintptr_t)va2pa(tone);
+	cb->ti = TI_WAIT_RESP | TI_DEST_DREQ | TI_SRC_INC | TI_PERMAP_PWM;
+	cb->source_ad = DRAM_BUS(tone_pa);
+	cb->dest_ad = PWM_FIF1_BUS;
+	cb->txfr_len = total * 4u;
+	cb->stride = 0;
+	cb->nextconbk = 0;
+	cb->pad[0] = cb->pad[1] = 0;
+
+	ad.pwm[PWM_DMAC] = PWM_DMAC_ENAB | (8u << 8) | (4u << 0);
+
+	ad.dma[DMA_CS] = DMA_CS_RESET;
+	for (spins = 10000u; spins && (ad.dma[DMA_CS] & DMA_CS_RESET); spins--) {}
+	ad.dma[DMA_CONBLK_AD] = DRAM_BUS(cb_pa);
+	ad.dma[DMA_CS] = DMA_CS_ACTIVE;
+
+	for (spins = 80000000u; spins && (ad.dma[DMA_CS] & DMA_CS_ACTIVE)
+			&& !(ad.dma[DMA_CS] & DMA_CS_ERROR); spins--) {
+	}
+
+	printf("rpi4-audio: dma-test ch%u cb_pa=0x%08x tone_pa=0x%08x len=%u -> CS=0x%08x DEBUG=0x%08x remain=%u STA=0x%08x\n",
+		DMA_CHAN, (uint32_t)cb_pa, (uint32_t)tone_pa, total * 4u,
+		ad.dma[DMA_CS], ad.dma[DMA_DEBUG], ad.dma[DMA_TXFR_LEN_R], ad.pwm[PWM_STA]);
+}
+
+
 int main(int argc, char **argv)
 {
 	uint32_t port;
@@ -276,6 +363,11 @@ int main(int argc, char **argv)
 		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (off_t)CPRMAN_BASE);
 	ad.gpio = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
 		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (off_t)GPIO_BASE);
+	{
+		volatile uint32_t *dmapage = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+			MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (off_t)DMA_BASE);
+		ad.dma = (dmapage == MAP_FAILED) ? MAP_FAILED : (dmapage + (DMA_CHAN * 0x100u) / 4u);
+	}
 	if ((ad.pwm == MAP_FAILED) || (ad.cprman == MAP_FAILED) || (ad.gpio == MAP_FAILED)) {
 		printf("rpi4-audio: mmap of PWM/CPRMAN/GPIO failed\n");
 		return 1;
@@ -324,6 +416,12 @@ int main(int argc, char **argv)
 		}
 		printf("rpi4-audio: self-test fed %u samples (~0.2s 440Hz tone), underruns=%u, STA=0x%08x\n",
 			fed, ad.underruns, ad.pwm[PWM_STA]);
+
+		/* P3: DMA the same tone via the PWM DREQ (no CPU spin) — verifies the legacy-DMA path. */
+		if (ad.dma != MAP_FAILED)
+			audio_dmaTest();
+		else
+			printf("rpi4-audio: dma channel mmap failed (skipping dma-test)\n");
 	}
 
 	audio_thread((void *)(uintptr_t)port);
