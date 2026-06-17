@@ -30,6 +30,9 @@ DEFAULT_COMPONENTS += rpi4-gpio
 # PWM clock ~44.1kHz, mark/space + FIFO. write() = s16 PCM -> FIFO (PIO). Clock/PWM
 # bring-up is self-logged; audible sign-off + DMA streaming are follow-ups.
 DEFAULT_COMPONENTS += rpi4-audio
+# Boot system-info banner: build stamp, uptime, a hardware-RNG entropy sample, and a
+# Pi 4 device-node inventory. Bounded/non-blocking (stat/getentropy/clock); "alive" touch.
+DEFAULT_COMPONENTS += rpi4-sysinfo
 # rpi4-ipcprobe: one-shot userspace-API readiness probe (misc/rpi4-ipcprobe/) — AF_UNIX
 # (socketpair + named bind/listen/accept/connect/send/recv) + libc entropy (getrandom/
 # getentropy). NOT a default component (re-add here + to user.plo.yaml to re-run).
