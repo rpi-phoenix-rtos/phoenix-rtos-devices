@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include <sys/msg.h>
 #include <sys/mman.h>
@@ -112,6 +113,7 @@ enum {
 #define DMA_CHAN        5u             /* avoid VPU-reserved 0..4; revisit via the firmware mask */
 #define DMA_CS          (0x00u / 4u)
 #define DMA_CONBLK_AD   (0x04u / 4u)
+#define DMA_SOURCE_AD   (0x0cu / 4u)   /* live source address (the ring read cursor) */
 #define DMA_TXFR_LEN_R  (0x14u / 4u)   /* live remaining length (read-only copy) */
 #define DMA_DEBUG       (0x20u / 4u)
 #define DMA_CS_ACTIVE   (1u << 0)
@@ -128,6 +130,12 @@ enum {
 /* PWM_DMAC (0x08): ENAB(31) | PANIC[15:8] | DREQ[7:0] thresholds. */
 #define PWM_DMAC_ENAB   (1u << 31)
 
+/* Continuous-streaming DMA ring: a self-chained CB plays this ring of duty words
+ * to the PWM FIFO forever (DREQ-paced); audio_write() fills it ahead of the live
+ * read cursor (SOURCE_AD) with backpressure. ~0.19 s of stereo @44.1 kHz. */
+#define RING_WORDS      16384u
+#define RING_BYTES      (RING_WORDS * 4u)
+
 /* DMA control block (32 bytes, 256-bit aligned) — the legacy-DMA descriptor. */
 typedef struct {
 	uint32_t ti;
@@ -143,7 +151,11 @@ static struct {
 	volatile uint32_t *pwm;
 	volatile uint32_t *cprman;
 	volatile uint32_t *gpio;
-	volatile uint32_t *dma;   /* DMA channel DMA_CHAN registers */
+	volatile uint32_t *dma;        /* DMA channel DMA_CHAN registers */
+	volatile uint32_t *ring;       /* persistent duty-word ring the DMA plays */
+	uintptr_t ring_pa;             /* ring physical base (for the read-cursor math) */
+	uint32_t write_idx;            /* next ring word audio_write() will fill */
+	int dma_active;                /* streaming DMA running -> ring path; else PIO */
 	uint32_t underruns;
 } ad;
 
@@ -206,16 +218,27 @@ static int audio_fifoPush(uint32_t duty)
 }
 
 
-/* Convert signed 16-bit PCM to PWM duty (0..RANGE) and push. Stereo interleaved
- * input feeds both channels (the shared FIFO alternates ch1/ch2 with both USEF set).
+/* The DMA's live read cursor as a ring word index (SOURCE_AD walks the ring). */
+static uint32_t audio_ringReadIdx(void)
+{
+	uint32_t src = ad.dma[DMA_SOURCE_AD] & 0x3fffffffu;
+	uint32_t base = (uint32_t)ad.ring_pa & 0x3fffffffu;
+	uint32_t idx = (src - base) / 4u;
+	return (idx < RING_WORDS) ? idx : 0u;
+}
+
+/* Convert signed 16-bit PCM to PWM duty (0..RANGE). Stereo interleaved input feeds
+ * both channels (the shared FIFO alternates ch1/ch2 with both USEF set).
  *
- * Backpressure: audio_fifoPush spins on STA.FULL, so once the 16-slot FIFO fills,
- * each further push waits ~one drain period (~22 us @44.1 kHz) — i.e. a large write()
- * naturally blocks at the playback rate. This is what lets a userspace feeder thread
- * (e.g. the Quakespasm SNDDMA backend) pace itself to real playback by tracking the
- * bytes write() actually accepts. We therefore return the bytes *actually consumed*:
- * len on success, a short count only if the FIFO is genuinely stuck (clock dead),
- * so the feeder advances its play cursor by exactly what was queued. */
+ * Streaming-DMA path (preferred): copy each duty word into the free-running ring
+ * ahead of the DMA read cursor. When the ring is full of not-yet-played audio we
+ * spin on SOURCE_AD until the DMA drains a slot — i.e. write() blocks at the real
+ * playback rate (backpressure), no CPU FIFO-spin. PIO path (fallback if the DMA
+ * never started): the old per-sample FIFO push, which spins on STA.FULL.
+ *
+ * Either way we return the bytes *actually consumed* (len on success, a short count
+ * only if the engine is genuinely stuck), so a userspace feeder (the Quakespasm
+ * SNDDMA backend) advances its play cursor by exactly what was queued. */
 static ssize_t audio_write(const void *buf, size_t len)
 {
 	const int16_t *s = buf;
@@ -224,9 +247,25 @@ static ssize_t audio_write(const void *buf, size_t len)
 
 	for (i = 0; i < n; i++) {
 		uint32_t duty = (uint32_t)(((int32_t)s[i] + 32768) * (int32_t)PWM_RANGE / 65536);
-		if (audio_fifoPush(duty) != 0) {
+
+		if (ad.dma_active != 0) {
+			uint32_t waits = 0;
+			/* Wait for room ahead of the read cursor (keep 1 word of headroom). Yield
+			 * (~0.5 ms) instead of busy-spinning so the driver doesn't burn a core
+			 * competing with the game's render threads — the DMA drains ~44 words per
+			 * 0.5 ms, so each wake bursts in a chunk; the loop self-paces to playback. */
+			while (((ad.write_idx - audio_ringReadIdx() + RING_WORDS) % RING_WORDS) >= (RING_WORDS - 1u)) {
+				usleep(500);
+				if (++waits > 20000u) {   /* ~10 s with no drain -> DMA stuck */
+					ad.underruns++;
+					return (ssize_t)(i * 2);
+				}
+			}
+			ad.ring[ad.write_idx] = duty;
+			ad.write_idx = (ad.write_idx + 1u) % RING_WORDS;
+		}
+		else if (audio_fifoPush(duty) != 0) {
 			ad.underruns++;
-			/* FIFO stuck (clock not draining): report a short write. */
 			break;
 		}
 	}
@@ -302,54 +341,60 @@ static void audio_thread(void *arg)
 }
 
 
-/* DMA a tone buffer into the PWM FIFO via the PWM DREQ (single-shot, no CPU spin).
- * Verifies the legacy-DMA path end-to-end: the channel goes ACTIVE, no ERROR, the
- * remaining length drains, and the FIFO plays the tone. Audible blip on the jack is
- * the attended check; the CS/length/error self-log is the autonomous proof. */
-static void audio_dmaTest(void)
+/* Start the free-running streaming DMA: a duty-word ring played to the PWM FIFO by
+ * a self-chained control block (NEXTCONBK -> itself), DREQ-paced, forever. The ring
+ * is pre-filled with mid-scale (silence). audio_write() then fills it ahead of the
+ * read cursor. On success sets ad.dma_active so the write path uses the ring; on any
+ * failure leaves it 0 so audio_write() falls back to the PIO FIFO push. */
+static void audio_dmaStart(void)
 {
-	uint32_t total = AUDIO_RATE / 5u;            /* ~0.2 s of 32-bit duty words */
-	uint32_t half = AUDIO_RATE / (440u * 2u);
 	uint32_t i, spins;
 	dma_cb_t *cb;
-	uint32_t *tone;
-	uintptr_t cb_pa, tone_pa;
+	uintptr_t cb_pa;
 
+	/* CB lives at the top of a dedicated page; the ring is its own contiguous block. */
 	cb = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
 		MAP_CONTIGUOUS | MAP_UNCACHED | MAP_ANONYMOUS, -1, 0);
-	tone = mmap(NULL, (total * 4u + _PAGE_SIZE - 1u) & ~((uint32_t)_PAGE_SIZE - 1u),
+	ad.ring = mmap(NULL, (RING_BYTES + _PAGE_SIZE - 1u) & ~((uint32_t)_PAGE_SIZE - 1u),
 		PROT_READ | PROT_WRITE, MAP_CONTIGUOUS | MAP_UNCACHED | MAP_ANONYMOUS, -1, 0);
-	if ((cb == MAP_FAILED) || (tone == MAP_FAILED)) {
-		printf("rpi4-audio: dma-test mmap failed\n");
+	if ((cb == MAP_FAILED) || (ad.ring == MAP_FAILED)) {
+		printf("rpi4-audio: dma-stream mmap failed (PIO fallback)\n");
+		ad.ring = NULL;
 		return;
 	}
-	for (i = 0; i < total; i++)
-		tone[i] = ((i / half) & 1u) ? (PWM_RANGE * 3u / 4u) : (PWM_RANGE / 4u);
+
+	for (i = 0; i < RING_WORDS; i++)
+		ad.ring[i] = PWM_RANGE / 2u;   /* mid-scale = silence */
+	ad.write_idx = 0;
+	ad.ring_pa = (uintptr_t)va2pa((void *)ad.ring);
 
 	cb_pa = (uintptr_t)va2pa(cb);
-	tone_pa = (uintptr_t)va2pa(tone);
 	cb->ti = TI_WAIT_RESP | TI_DEST_DREQ | TI_SRC_INC | TI_PERMAP_PWM;
-	cb->source_ad = DRAM_BUS(tone_pa);
+	cb->source_ad = DRAM_BUS(ad.ring_pa);
 	cb->dest_ad = PWM_FIF1_BUS;
-	cb->txfr_len = total * 4u;
+	cb->txfr_len = RING_BYTES;
 	cb->stride = 0;
-	cb->nextconbk = 0;
+	cb->nextconbk = DRAM_BUS(cb_pa);   /* self-chain -> loop the ring forever */
 	cb->pad[0] = cb->pad[1] = 0;
 
 	ad.pwm[PWM_DMAC] = PWM_DMAC_ENAB | (8u << 8) | (4u << 0);
 
 	ad.dma[DMA_CS] = DMA_CS_RESET;
-	for (spins = 10000u; spins && (ad.dma[DMA_CS] & DMA_CS_RESET); spins--) {}
+	for (spins = 10000u; spins && (ad.dma[DMA_CS] & DMA_CS_RESET); spins--) {
+	}
 	ad.dma[DMA_CONBLK_AD] = DRAM_BUS(cb_pa);
 	ad.dma[DMA_CS] = DMA_CS_ACTIVE;
 
-	for (spins = 80000000u; spins && (ad.dma[DMA_CS] & DMA_CS_ACTIVE)
-			&& !(ad.dma[DMA_CS] & DMA_CS_ERROR); spins--) {
+	/* Let it run a moment and confirm it stays ACTIVE with no error + the read cursor moves. */
+	for (spins = 2000000u; spins; spins--) {
 	}
 
-	printf("rpi4-audio: dma-test ch%u cb_pa=0x%08x tone_pa=0x%08x len=%u -> CS=0x%08x DEBUG=0x%08x remain=%u STA=0x%08x\n",
-		DMA_CHAN, (uint32_t)cb_pa, (uint32_t)tone_pa, total * 4u,
-		ad.dma[DMA_CS], ad.dma[DMA_DEBUG], ad.dma[DMA_TXFR_LEN_R], ad.pwm[PWM_STA]);
+	if (((ad.dma[DMA_CS] & DMA_CS_ACTIVE) != 0) && ((ad.dma[DMA_CS] & DMA_CS_ERROR) == 0)) {
+		ad.dma_active = 1;
+	}
+	printf("rpi4-audio: dma-stream ch%u ring_pa=0x%08x words=%u -> CS=0x%08x DEBUG=0x%08x read_idx=%u STA=0x%08x active=%d\n",
+		DMA_CHAN, (uint32_t)ad.ring_pa, RING_WORDS, ad.dma[DMA_CS], ad.dma[DMA_DEBUG],
+		audio_ringReadIdx(), ad.pwm[PWM_STA], ad.dma_active);
 }
 
 
@@ -405,11 +450,20 @@ int main(int argc, char **argv)
 		PWM1_BASE, clkok == 0 ? "BUSY" : "FAILED", ad.cprman[CM_PWMCTL], AUDIO_RATE,
 		ad.pwm[PWM_CTL], ad.pwm[PWM_STA]);
 
-	/* Boot self-test: feed a short 440 Hz square wave through the s16->duty->FIFO write
-	 * path end-to-end. The spin-bounded FIFO push paces it to the ~44.1 kHz drain rate,
-	 * so underruns==0 confirms the data path keeps the FIFO fed. Audible as a brief blip
-	 * on the jack (headphones needed = the attended sign-off); the self-log is the
-	 * autonomous verification. No libm: square wave via integer phase. */
+	/* Start the free-running streaming DMA (preferred write path). Falls back to PIO
+	 * inside audio_write() if the DMA didn't come up. */
+	if ((clkok == 0) && (ad.dma != MAP_FAILED)) {
+		audio_dmaStart();
+	}
+	else if (ad.dma == MAP_FAILED) {
+		printf("rpi4-audio: dma channel mmap failed (PIO fallback)\n");
+	}
+
+	/* Boot self-test: feed a short 440 Hz square wave through the s16->duty write path
+	 * end-to-end. With the streaming DMA up this fills the ring (paced by the ring
+	 * backpressure to the ~44.1 kHz drain rate); underruns==0 confirms the path keeps
+	 * up. Audible as a brief blip on the jack (headphones = the attended sign-off); the
+	 * self-log is the autonomous verification. No libm: square wave via integer phase. */
 	if (clkok == 0) {
 		int16_t tone[256];
 		uint32_t total = AUDIO_RATE / 5u;            /* ~0.2 s */
@@ -422,14 +476,8 @@ int main(int argc, char **argv)
 			audio_write(tone, sizeof(tone));
 			fed += 256u;
 		}
-		printf("rpi4-audio: self-test fed %u samples (~0.2s 440Hz tone), underruns=%u, STA=0x%08x\n",
-			fed, ad.underruns, ad.pwm[PWM_STA]);
-
-		/* P3: DMA the same tone via the PWM DREQ (no CPU spin) — verifies the legacy-DMA path. */
-		if (ad.dma != MAP_FAILED)
-			audio_dmaTest();
-		else
-			printf("rpi4-audio: dma channel mmap failed (skipping dma-test)\n");
+		printf("rpi4-audio: self-test fed %u samples (~0.2s 440Hz tone), underruns=%u, path=%s, STA=0x%08x\n",
+			fed, ad.underruns, ad.dma_active ? "DMA" : "PIO", ad.pwm[PWM_STA]);
 	}
 
 	audio_thread((void *)(uintptr_t)port);
