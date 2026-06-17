@@ -27,6 +27,8 @@ LOCAL_CFLAGS := -Wno-error -I$(V3D_COORD)/external/mesa/include
 # --allow-multiple-definition: a few V3D-4.2 version-specific helpers (v3d42_*) are
 # compiled into BOTH the V3DV front-end and the gallium back-end; with libv3dv first
 # the linker binds V3DV's copy (correct), matching the build-v3dv-phoenix.py link.
-LOCAL_LDLIBS := -Wl,--allow-multiple-definition -Wl,--start-group $(V3DV_LIB) $(V3D_LIB) -Wl,--end-group -lstdc++ -lm
+# --build-id: V3DV's init_uuids() walks the ELF for a build-id note (pipeline-cache
+# UUID); without it create_physical_device fails "Failed to find build-id".
+LOCAL_LDLIBS := -Wl,--build-id -Wl,--allow-multiple-definition -Wl,--start-group $(V3DV_LIB) $(V3D_LIB) -Wl,--end-group -lstdc++ -lm
 
 include $(binary.mk)
