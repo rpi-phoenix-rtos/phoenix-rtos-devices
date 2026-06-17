@@ -207,7 +207,15 @@ static int audio_fifoPush(uint32_t duty)
 
 
 /* Convert signed 16-bit PCM to PWM duty (0..RANGE) and push. Stereo interleaved
- * input feeds both channels; mono duplicates. Returns bytes consumed. */
+ * input feeds both channels (the shared FIFO alternates ch1/ch2 with both USEF set).
+ *
+ * Backpressure: audio_fifoPush spins on STA.FULL, so once the 16-slot FIFO fills,
+ * each further push waits ~one drain period (~22 us @44.1 kHz) — i.e. a large write()
+ * naturally blocks at the playback rate. This is what lets a userspace feeder thread
+ * (e.g. the Quakespasm SNDDMA backend) pace itself to real playback by tracking the
+ * bytes write() actually accepts. We therefore return the bytes *actually consumed*:
+ * len on success, a short count only if the FIFO is genuinely stuck (clock dead),
+ * so the feeder advances its play cursor by exactly what was queued. */
 static ssize_t audio_write(const void *buf, size_t len)
 {
 	const int16_t *s = buf;
@@ -218,11 +226,11 @@ static ssize_t audio_write(const void *buf, size_t len)
 		uint32_t duty = (uint32_t)(((int32_t)s[i] + 32768) * (int32_t)PWM_RANGE / 65536);
 		if (audio_fifoPush(duty) != 0) {
 			ad.underruns++;
-			/* FIFO full: drop the remainder of this write (no blocking in PIO). */
+			/* FIFO stuck (clock not draining): report a short write. */
 			break;
 		}
 	}
-	return (ssize_t)len;
+	return (ssize_t)(i * 2);
 }
 
 
