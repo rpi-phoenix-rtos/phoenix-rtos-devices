@@ -305,6 +305,27 @@ int main(int argc, char **argv)
 		PWM1_BASE, clkok == 0 ? "BUSY" : "FAILED", ad.cprman[CM_PWMCTL], AUDIO_RATE,
 		ad.pwm[PWM_CTL], ad.pwm[PWM_STA]);
 
+	/* Boot self-test: feed a short 440 Hz square wave through the s16->duty->FIFO write
+	 * path end-to-end. The spin-bounded FIFO push paces it to the ~44.1 kHz drain rate,
+	 * so underruns==0 confirms the data path keeps the FIFO fed. Audible as a brief blip
+	 * on the jack (headphones needed = the attended sign-off); the self-log is the
+	 * autonomous verification. No libm: square wave via integer phase. */
+	if (clkok == 0) {
+		int16_t tone[256];
+		uint32_t total = AUDIO_RATE / 5u;            /* ~0.2 s */
+		uint32_t half = AUDIO_RATE / (440u * 2u);    /* samples per half-period (~50) */
+		uint32_t phase = 0, fed = 0, c, i;
+		ad.underruns = 0;
+		for (c = 0; c < total; c += 256u) {
+			for (i = 0; i < 256u; i++, phase++)
+				tone[i] = ((phase / half) & 1u) ? (int16_t)8000 : (int16_t)-8000;
+			audio_write(tone, sizeof(tone));
+			fed += 256u;
+		}
+		printf("rpi4-audio: self-test fed %u samples (~0.2s 440Hz tone), underruns=%u, STA=0x%08x\n",
+			fed, ad.underruns, ad.pwm[PWM_STA]);
+	}
+
 	audio_thread((void *)(uintptr_t)port);
 	return 0;
 }
