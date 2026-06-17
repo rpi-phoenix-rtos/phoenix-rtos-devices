@@ -26,6 +26,10 @@ DEFAULT_COMPONENTS += rpi4-fb
 # BCM2711 GPIO observer (/dev/gpio @ 0xfe200000): read-only register snapshot +
 # per-pin {fsel,level,pull} devctl. Outputs deferred to an attended bench session.
 DEFAULT_COMPONENTS += rpi4-gpio
+# BCM2711 PWM audio (/dev/audio0): 3.5mm jack via PWM1 on GPIO40/41 (ALT0), CPRMAN
+# PWM clock ~44.1kHz, mark/space + FIFO. write() = s16 PCM -> FIFO (PIO). Clock/PWM
+# bring-up is self-logged; audible sign-off + DMA streaming are follow-ups.
+DEFAULT_COMPONENTS += rpi4-audio
 # V3D GPU scout (Tier 3, GLQuake roadmap): powers on the V3D domain via the
 # mailbox + raw-dumps the V3D MMIO identity region to confirm the core is alive.
 DEFAULT_COMPONENTS += rpi4-v3d-scout
