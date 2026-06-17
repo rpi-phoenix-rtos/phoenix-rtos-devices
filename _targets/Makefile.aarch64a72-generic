@@ -30,10 +30,11 @@ DEFAULT_COMPONENTS += rpi4-gpio
 # PWM clock ~44.1kHz, mark/space + FIFO. write() = s16 PCM -> FIFO (PIO). Clock/PWM
 # bring-up is self-logged; audible sign-off + DMA streaming are follow-ups.
 DEFAULT_COMPONENTS += rpi4-audio
-# rpi4-ipcprobe (AF_UNIX X11 Phase-1 gate) is intentionally NOT a default component:
-# it is a one-shot bring-up probe (misc/rpi4-ipcprobe/), kept in-tree for re-running
-# the AF_UNIX socket check (add it back here + to user.plo.yaml). Verdict 2026-06-17:
-# socketpair + named bind/listen/accept/connect/send/recv all PASS -> AF_UNIX READY.
+# rpi4-ipcprobe: one-shot userspace-API readiness probe (misc/rpi4-ipcprobe/) — AF_UNIX
+# (socketpair + named bind/listen/accept/connect/send/recv) + libc entropy (getrandom/
+# getentropy). NOT a default component (re-add here + to user.plo.yaml to re-run).
+# Verdict 2026-06-17: AF_UNIX READY + getrandom/getentropy READY (HW-verified).
+# DEFAULT_COMPONENTS += rpi4-ipcprobe
 # V3D GPU scout (Tier 3, GLQuake roadmap): powers on the V3D domain via the
 # mailbox + raw-dumps the V3D MMIO identity region to confirm the core is alive.
 DEFAULT_COMPONENTS += rpi4-v3d-scout

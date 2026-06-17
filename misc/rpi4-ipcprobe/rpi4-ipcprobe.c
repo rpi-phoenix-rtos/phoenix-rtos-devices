@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/random.h>
 
 #define SOCK_PATH "/tmp/.x11probe"
 
@@ -170,19 +171,46 @@ static int probe_named(void)
 	return -1;
 }
 
+/* getentropy/getrandom: confirm the libc entropy API fills a buffer (backed by
+ * /dev/urandom -> the hardware RNG). Two independent draws should differ in most
+ * bytes; all-equal would mean a stuck/zero source. */
+static int probe_entropy(void)
+{
+	unsigned char a[32], b[32];
+	int i, diff = 0;
+
+	if (getentropy(a, sizeof(a)) != 0) {
+		printf("rpi4-ipcprobe: entropy FAIL: getentropy errno=%d\n", errno);
+		return -1;
+	}
+	if (getrandom(b, sizeof(b), 0) != (ssize_t)sizeof(b)) {
+		printf("rpi4-ipcprobe: entropy FAIL: getrandom errno=%d\n", errno);
+		return -1;
+	}
+	for (i = 0; i < (int)sizeof(a); i++) {
+		if (a[i] != b[i]) {
+			diff++;
+		}
+	}
+	printf("rpi4-ipcprobe: entropy %s (getentropy+getrandom ok; %d/32 bytes differ between draws)\n",
+		(diff > 0) ? "PASS" : "FAIL", diff);
+	return (diff > 0) ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
-	int sp, nm;
+	int sp, nm, en;
 	(void)argc;
 	(void)argv;
 
-	printf("rpi4-ipcprobe: AF_UNIX readiness probe (X11 Phase-1 gate)\n");
+	printf("rpi4-ipcprobe: userspace-API readiness probe (AF_UNIX + libc entropy)\n");
 	sp = probe_socketpair();
 	nm = probe_named();
+	en = probe_entropy();
 
-	printf("rpi4-ipcprobe: VERDICT socketpair=%s named=%s -> AF_UNIX %s for X11\n",
-		(sp == 0) ? "PASS" : "FAIL", (nm == 0) ? "PASS" : "FAIL",
-		(sp == 0 && nm == 0) ? "READY" : "NOT-READY");
+	printf("rpi4-ipcprobe: VERDICT socketpair=%s named=%s entropy=%s -> AF_UNIX %s for X11; getrandom/getentropy %s\n",
+		(sp == 0) ? "PASS" : "FAIL", (nm == 0) ? "PASS" : "FAIL", (en == 0) ? "PASS" : "FAIL",
+		(sp == 0 && nm == 0) ? "READY" : "NOT-READY", (en == 0) ? "READY" : "NOT-READY");
 
 	/* One-shot probe: done. */
 	return 0;
