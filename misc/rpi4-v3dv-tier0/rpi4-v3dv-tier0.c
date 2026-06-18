@@ -20,6 +20,11 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <vulkan/vulkan.h>
 
 /* The one symbol the loader-less client needs; vk_icd_link.c aliases it to
@@ -229,6 +234,68 @@ int main(void)
 	if (r != VK_SUCCESS)
 		return 14;
 
+	/* --- Tier 4a: a VISIBLE-on-HDMI clear. Back a fullscreen image's memory with the HDMI scanout
+	 * surface (winsys one-shot v3d_phoenix_set_next_scanout) so the GPU's clear paints the actual
+	 * screen — verified via the HDMI auto-snapshot. Best-effort: if /dev/fb0 isn't available the
+	 * offscreen Tier-3 clear above still stands. --- */
+	extern void v3d_phoenix_set_scanout(uint32_t pa, uint32_t bytes);
+	extern void v3d_phoenix_set_next_scanout(void);
+	typedef struct {
+		unsigned short width, height, bpp, pitch;
+		unsigned long long smemlen, framebuffer;
+	} rpi4fb_mode_h;
+	VkImage scimg = VK_NULL_HANDLE;
+	VkDeviceMemory scmem = VK_NULL_HANDLE;
+	int fbfd = open("/dev/fb0", O_WRONLY);
+	rpi4fb_mode_h fbmode;
+	memset(&fbmode, 0, sizeof(fbmode));
+	if (fbfd >= 0 && ioctl(fbfd, _IOR('g', 1, rpi4fb_mode_h), &fbmode) == 0 && fbmode.framebuffer != 0) {
+		printf("v3dv-harness: fb0 %ux%u pitch=%u pa=0x%llx size=%llu\n",
+		       fbmode.width, fbmode.height, fbmode.pitch,
+		       (unsigned long long)fbmode.framebuffer, (unsigned long long)fbmode.smemlen);
+		v3d_phoenix_set_scanout((uint32_t)fbmode.framebuffer, (uint32_t)fbmode.smemlen);
+		VkImageCreateInfo sci = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+			.imageType = VK_IMAGE_TYPE_2D,
+			.format = VK_FORMAT_R8G8B8A8_UNORM,
+			.extent = { fbmode.width, fbmode.height, 1 },
+			.mipLevels = 1,
+			.arrayLayers = 1,
+			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.tiling = VK_IMAGE_TILING_LINEAR,
+			.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		};
+		if (v3dv_CreateImage(dev, &sci, NULL, &scimg) == VK_SUCCESS) {
+			VkMemoryRequirements scmreq;
+			memset(&scmreq, 0, sizeof(scmreq));
+			vk_common_GetImageMemoryRequirements(dev, scimg, &scmreq);
+			VkMemoryAllocateInfo scmai = {
+				.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+				.allocationSize = scmreq.size ? scmreq.size : (uint32_t)fbmode.smemlen,
+				.memoryTypeIndex = memType,
+			};
+			v3d_phoenix_set_next_scanout();   /* the NEXT BO (this image's memory) backs the scanout */
+			if (v3dv_AllocateMemory(dev, &scmai, NULL, &scmem) == VK_SUCCESS &&
+			    vk_common_BindImageMemory(dev, scimg, scmem, 0) == VK_SUCCESS) {
+				printf("v3dv-harness: scanout image %ux%u bound (mem=%u)\n",
+				       fbmode.width, fbmode.height, (unsigned)scmreq.size);
+			}
+			else {
+				scimg = VK_NULL_HANDLE;
+				printf("v3dv-harness: scanout image alloc/bind FAILED\n");
+			}
+		}
+		else {
+			printf("v3dv-harness: scanout vkCreateImage FAILED\n");
+		}
+	}
+	else {
+		printf("v3dv-harness: fb0 GETMODE unavailable (offscreen clear only)\n");
+	}
+	if (fbfd >= 0)
+		close(fbfd);
+
 	VkCommandBufferBeginInfo bbi = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -247,6 +314,11 @@ int main(void)
 		.layerCount = 1,
 	};
 	v3dv_CmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &range);
+	if (scimg != VK_NULL_HANDLE) {
+		/* Visible clear to the scanout-backed image -> paints the HDMI screen. */
+		VkClearColorValue scColor = { .float32 = { 1.0f, 0.0f, 0.5f, 1.0f } }; /* bright magenta — obvious on screen */
+		v3dv_CmdClearColorImage(cmd, scimg, VK_IMAGE_LAYOUT_GENERAL, &scColor, 1, &range);
+	}
 	r = pEnd(cmd);
 	printf("v3dv-harness: record clear cmd buffer -> %d\n", (int)r);
 	if (r != VK_SUCCESS)
@@ -283,6 +355,22 @@ int main(void)
 		printf("v3dv-harness: clear readback skipped (vkMapMemory -> %d)\n", (int)r);
 	}
 
-	printf("v3dv-harness: PASS (instance+phys+device+clear-image submit+readback) -- Tier 3\n");
+	/* Tier 4a verification (deterministic, independent of fbcon overdraw / snapshot timing): read the
+	 * LIVE scanout framebuffer's physical memory. If the GPU's scanout clear landed, pixel 0 holds the
+	 * magenta clear {1,0,0.5,1} = bytes ff 00 80 ff (R8G8B8A8). The HDMI auto-snapshot may also show it. */
+	if (scimg != VK_NULL_HANDLE && fbmode.framebuffer != 0) {
+		volatile unsigned char *fb = mmap(NULL, 4096, PROT_READ,
+			MAP_PHYSMEM | MAP_UNCACHED | MAP_ANONYMOUS, -1, (off_t)fbmode.framebuffer);
+		if (fb != MAP_FAILED) {
+			printf("v3dv-harness: scanout fb px0 = %02x %02x %02x %02x (magenta clear -> expect ff 00 80 ff)\n",
+			       fb[0], fb[1], fb[2], fb[3]);
+			munmap((void *)fb, 4096);
+		}
+		else {
+			printf("v3dv-harness: scanout fb readback mmap failed\n");
+		}
+	}
+
+	printf("v3dv-harness: PASS (instance+phys+device+clear+readback; +scanout clear+fb-readback if fb0) -- Tier 3/4a\n");
 	return 0;
 }
