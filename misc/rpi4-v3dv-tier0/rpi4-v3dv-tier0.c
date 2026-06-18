@@ -107,6 +107,84 @@ int main(void)
 	if (r != VK_SUCCESS)
 		return 6;
 
-	printf("v3dv-harness: PASS (instance+phys+device created)\n");
+	printf("v3dv-harness: device created OK\n");
+
+	/* --- Tier 2: a real queue submit (empty primary command buffer). This exercises the
+	 * V3DV queue -> winsys submit path (ioc_submit_cl, the same synchronous bin/render path
+	 * Quake renders through) + the synchronous syncobj/fence stubs (work is done when
+	 * ioc_submit_cl returns, so vkQueueWaitIdle returns immediately). Device-level procs
+	 * resolve through vkGetDeviceProcAddr (NOT vkGetInstanceProcAddr: in a loader-less
+	 * ICD link the latter hands back trampolines that deref a NULL device-dispatch slot
+	 * -> pc=0 instruction-abort; GetDeviceProcAddr returns the real device entrypoint). --- */
+	PFN_vkGetDeviceProcAddr pGDPA = GIPA(inst, vkGetDeviceProcAddr);
+	if (!pGDPA) {
+		printf("v3dv-harness: PASS (device created); no vkGetDeviceProcAddr\n");
+		return 0;
+	}
+#define GDPA(d, name) ((PFN_##name)pGDPA((d), #name))
+	PFN_vkGetDeviceQueue pGetQueue = GDPA(dev, vkGetDeviceQueue);
+	PFN_vkCreateCommandPool pCreatePool = GDPA(dev, vkCreateCommandPool);
+	PFN_vkAllocateCommandBuffers pAllocCmd = GDPA(dev, vkAllocateCommandBuffers);
+	PFN_vkBeginCommandBuffer pBegin = GDPA(dev, vkBeginCommandBuffer);
+	PFN_vkEndCommandBuffer pEnd = GDPA(dev, vkEndCommandBuffer);
+	PFN_vkQueueSubmit pSubmit = GDPA(dev, vkQueueSubmit);
+	PFN_vkQueueWaitIdle pWaitIdle = GDPA(dev, vkQueueWaitIdle);
+	if (!pGetQueue || !pCreatePool || !pAllocCmd || !pBegin || !pEnd || !pSubmit || !pWaitIdle) {
+		printf("v3dv-harness: PASS (device created); Tier-2 submit procs missing\n");
+		return 0;
+	}
+
+	VkQueue queue = VK_NULL_HANDLE;
+	pGetQueue(dev, 0, 0, &queue);
+
+	VkCommandPoolCreateInfo pci = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		.queueFamilyIndex = 0,
+	};
+	VkCommandPool pool = VK_NULL_HANDLE;
+	r = pCreatePool(dev, &pci, NULL, &pool);
+	printf("v3dv-harness: vkCreateCommandPool -> %d\n", (int)r);
+	if (r != VK_SUCCESS)
+		return 7;
+
+	VkCommandBufferAllocateInfo cbai = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.commandPool = pool,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1,
+	};
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	r = pAllocCmd(dev, &cbai, &cmd);
+	printf("v3dv-harness: vkAllocateCommandBuffers -> %d\n", (int)r);
+	if (r != VK_SUCCESS)
+		return 8;
+
+	VkCommandBufferBeginInfo bbi = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	r = pBegin(cmd, &bbi);
+	if (r == VK_SUCCESS)
+		r = pEnd(cmd);
+	printf("v3dv-harness: record empty cmd buffer -> %d\n", (int)r);
+	if (r != VK_SUCCESS)
+		return 9;
+
+	VkSubmitInfo si = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &cmd,
+	};
+	r = pSubmit(queue, 1, &si, VK_NULL_HANDLE);
+	printf("v3dv-harness: vkQueueSubmit -> %d\n", (int)r);
+	if (r != VK_SUCCESS)
+		return 10;
+
+	r = pWaitIdle(queue);
+	printf("v3dv-harness: vkQueueWaitIdle -> %d\n", (int)r);
+	if (r != VK_SUCCESS)
+		return 11;
+
+	printf("v3dv-harness: PASS (instance+phys+device+queue submit)\n");
 	return 0;
 }
