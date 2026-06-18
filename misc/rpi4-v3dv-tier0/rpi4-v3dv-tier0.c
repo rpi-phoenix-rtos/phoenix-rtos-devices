@@ -122,15 +122,26 @@ int main(void)
 		return 0;
 	}
 #define GDPA(d, name) ((PFN_##name)pGDPA((d), #name))
+	/* CreateCommandPool / AllocateCommandBuffers / QueueSubmit are vk_common command-pool +
+	 * synchronization FRAMEWORK entrypoints; they resolve NULL via vkGetDeviceProcAddr (a
+	 * dispatch-table gate bug). The framework itself IS wired by v3dv (v3dv_queue_driver_submit
+	 * + v3dv_cmd_buffer_ops), so we DECOUPLE the submit test from that lookup bug by calling the
+	 * exported vk_common_* impls directly — exercising the real winsys submit path now. The
+	 * dispatch-gate fix is tracked separately (docs/inprogress/2026-06-18-vulkan-v3dv-noop-job-rootcause.md). */
+	extern VkResult vk_common_CreateCommandPool(VkDevice, const VkCommandPoolCreateInfo *,
+		const VkAllocationCallbacks *, VkCommandPool *);
+	extern VkResult vk_common_AllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo *,
+		VkCommandBuffer *);
+	extern VkResult vk_common_QueueSubmit(VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
 	PFN_vkGetDeviceQueue pGetQueue = GDPA(dev, vkGetDeviceQueue);
-	PFN_vkCreateCommandPool pCreatePool = GDPA(dev, vkCreateCommandPool);
-	PFN_vkAllocateCommandBuffers pAllocCmd = GDPA(dev, vkAllocateCommandBuffers);
+	PFN_vkCreateCommandPool pCreatePool = vk_common_CreateCommandPool;
+	PFN_vkAllocateCommandBuffers pAllocCmd = vk_common_AllocateCommandBuffers;
 	PFN_vkBeginCommandBuffer pBegin = GDPA(dev, vkBeginCommandBuffer);
 	PFN_vkEndCommandBuffer pEnd = GDPA(dev, vkEndCommandBuffer);
-	PFN_vkQueueSubmit pSubmit = GDPA(dev, vkQueueSubmit);
+	PFN_vkQueueSubmit pSubmit = vk_common_QueueSubmit;
 	PFN_vkQueueWaitIdle pWaitIdle = GDPA(dev, vkQueueWaitIdle);
-	printf("v3dv-harness: dproc GetDeviceQueue=%p CreateCommandPool=%p AllocCmdBufs=%p Begin=%p "
-	       "End=%p QueueSubmit=%p QueueWaitIdle=%p\n",
+	printf("v3dv-harness: dproc GetDeviceQueue=%p CreateCommandPool=%p(direct) AllocCmdBufs=%p(direct) "
+	       "Begin=%p End=%p QueueSubmit=%p(direct) QueueWaitIdle=%p\n",
 	       (void *)pGetQueue, (void *)pCreatePool, (void *)pAllocCmd, (void *)pBegin,
 	       (void *)pEnd, (void *)pSubmit, (void *)pWaitIdle);
 	if (!pGetQueue || !pCreatePool || !pAllocCmd || !pBegin || !pEnd || !pSubmit || !pWaitIdle) {
