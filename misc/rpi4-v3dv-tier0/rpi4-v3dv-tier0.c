@@ -129,8 +129,12 @@ int main(void)
 	PFN_vkEndCommandBuffer pEnd = GDPA(dev, vkEndCommandBuffer);
 	PFN_vkQueueSubmit pSubmit = GDPA(dev, vkQueueSubmit);
 	PFN_vkQueueWaitIdle pWaitIdle = GDPA(dev, vkQueueWaitIdle);
+	printf("v3dv-harness: dproc GetDeviceQueue=%p CreateCommandPool=%p AllocCmdBufs=%p Begin=%p "
+	       "End=%p QueueSubmit=%p QueueWaitIdle=%p\n",
+	       (void *)pGetQueue, (void *)pCreatePool, (void *)pAllocCmd, (void *)pBegin,
+	       (void *)pEnd, (void *)pSubmit, (void *)pWaitIdle);
 	if (!pGetQueue || !pCreatePool || !pAllocCmd || !pBegin || !pEnd || !pSubmit || !pWaitIdle) {
-		printf("v3dv-harness: PASS (device created); Tier-2 submit procs missing\n");
+		printf("v3dv-harness: PASS (device created); a Tier-2 device proc is NULL (see line above)\n");
 		return 0;
 	}
 
