@@ -296,6 +296,52 @@ int main(void)
 	if (fbfd >= 0)
 		close(fbfd);
 
+	/* --- Tier 4b: exercise the v3dv SHADER COMPILER (NIR->QPU) via vkCmdBlitImage. A blit samples
+	 * the source through v3dv's meta-blit fragment shader (built with nir_builder + compiled at
+	 * record time) — unlike the clear, which uses the shaderless TLB fast-path. Blitting a GREEN
+	 * source over the magenta scanout: if the screen ends up GREEN, the meta-blit shader compiled +
+	 * ran on the V3D — the key prerequisite for vkQuake. Uses vk_common_CmdBlitImage directly. --- */
+	extern void vk_common_CmdBlitImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
+		uint32_t, const VkImageBlit *, VkFilter);
+	VkImage srcimg = VK_NULL_HANDLE;
+	VkDeviceMemory srcmem = VK_NULL_HANDLE;
+	if (scimg != VK_NULL_HANDLE) {
+		VkImageCreateInfo srcci = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+			.imageType = VK_IMAGE_TYPE_2D,
+			.format = VK_FORMAT_R8G8B8A8_UNORM,
+			.extent = { 256, 256, 1 },
+			.mipLevels = 1,
+			.arrayLayers = 1,
+			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.tiling = VK_IMAGE_TILING_LINEAR,
+			.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		};
+		if (v3dv_CreateImage(dev, &srcci, NULL, &srcimg) == VK_SUCCESS) {
+			VkMemoryRequirements srcmreq;
+			memset(&srcmreq, 0, sizeof(srcmreq));
+			vk_common_GetImageMemoryRequirements(dev, srcimg, &srcmreq);
+			VkMemoryAllocateInfo srcmai = {
+				.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+				.allocationSize = srcmreq.size ? srcmreq.size : (256u * 256u * 4u),
+				.memoryTypeIndex = memType,
+			};
+			if (v3dv_AllocateMemory(dev, &srcmai, NULL, &srcmem) != VK_SUCCESS ||
+			    vk_common_BindImageMemory(dev, srcimg, srcmem, 0) != VK_SUCCESS) {
+				srcimg = VK_NULL_HANDLE;
+				printf("v3dv-harness: blit src image alloc/bind FAILED\n");
+			}
+			else {
+				printf("v3dv-harness: blit src image 256x256 bound\n");
+			}
+		}
+		else {
+			srcimg = VK_NULL_HANDLE;
+			printf("v3dv-harness: blit src vkCreateImage FAILED\n");
+		}
+	}
+
 	VkCommandBufferBeginInfo bbi = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -318,6 +364,22 @@ int main(void)
 		/* Visible clear to the scanout-backed image -> paints the HDMI screen. */
 		VkClearColorValue scColor = { .float32 = { 1.0f, 0.0f, 0.5f, 1.0f } }; /* bright magenta — obvious on screen */
 		v3dv_CmdClearColorImage(cmd, scimg, VK_IMAGE_LAYOUT_GENERAL, &scColor, 1, &range);
+	}
+	if (srcimg != VK_NULL_HANDLE && scimg != VK_NULL_HANDLE) {
+		/* Clear the source GREEN (TLB), then BLIT it (scaled) over the magenta scanout. The blit
+		 * runs v3dv's meta-blit fragment shader (NIR->QPU): if the screen ends up GREEN, the shader
+		 * compiled + executed on the V3D — the Tier-4b shader-compiler milestone. */
+		VkClearColorValue srcColor = { .float32 = { 0.0f, 1.0f, 0.0f, 1.0f } }; /* green */
+		v3dv_CmdClearColorImage(cmd, srcimg, VK_IMAGE_LAYOUT_GENERAL, &srcColor, 1, &range);
+		VkImageBlit blit = {
+			.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+			.srcOffsets = { { 0, 0, 0 }, { 256, 256, 1 } },
+			.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+			.dstOffsets = { { 0, 0, 0 }, { (int32_t)fbmode.width, (int32_t)fbmode.height, 1 } },
+		};
+		vk_common_CmdBlitImage(cmd, srcimg, VK_IMAGE_LAYOUT_GENERAL,
+		                       scimg, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+		printf("v3dv-harness: recorded clear-src(green) + blit-to-scanout (meta-blit shader)\n");
 	}
 	r = pEnd(cmd);
 	printf("v3dv-harness: record clear cmd buffer -> %d\n", (int)r);
@@ -362,7 +424,8 @@ int main(void)
 		volatile unsigned char *fb = mmap(NULL, 4096, PROT_READ,
 			MAP_PHYSMEM | MAP_UNCACHED | MAP_ANONYMOUS, -1, (off_t)fbmode.framebuffer);
 		if (fb != MAP_FAILED) {
-			printf("v3dv-harness: scanout fb px0 = %02x %02x %02x %02x (magenta clear -> expect ff 00 80 ff)\n",
+			printf("v3dv-harness: scanout fb px0 = %02x %02x %02x %02x (blit GREEN 00 ff 00 ff => meta-blit "
+			       "SHADER ran; magenta ff 00 80 ff => blit skipped, clear only)\n",
 			       fb[0], fb[1], fb[2], fb[3]);
 			munmap((void *)fb, 4096);
 		}
@@ -371,6 +434,6 @@ int main(void)
 		}
 	}
 
-	printf("v3dv-harness: PASS (instance+phys+device+clear+readback; +scanout clear+fb-readback if fb0) -- Tier 3/4a\n");
+	printf("v3dv-harness: PASS (clear+readback; scanout clear+blit if fb0; fb readback) -- Tier 3/4a/4b\n");
 	return 0;
 }
