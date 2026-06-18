@@ -9,8 +9,12 @@
  * ~44.1 kHz sample class), muxes the jack GPIOs, enables PWM1 channels 1+2 in
  * mark/space + FIFO mode, and exposes a streaming char device:
  *
- *   write()  - 16-bit signed mono/stereo PCM, converted to PWM duty and pushed
- *              to the PWM FIFO (PIO; polls STA.FULL). DMA streaming is a later tier.
+ *   write()  - 16-bit signed mono/stereo PCM, converted to PWM duty words and fed
+ *              to the jack by a continuous, self-chained DMA ring (DREQ-paced to
+ *              PWM1): audio_write() fills the ring ahead of the live DMA read
+ *              cursor (SOURCE_AD) and applies backpressure so the caller blocks at
+ *              playback rate. Falls back to PIO (poll STA.FULL) if the DMA ring
+ *              cannot be brought up.
  *   RPI4AUDIO_GETSTATE devctl - {clock busy, PWEN, STA, underruns} for the scout.
  *
  * Userspace MMIO driver in the rpi4-thermal/rpi4-gpio idiom (mmap MAP_PHYSMEM
