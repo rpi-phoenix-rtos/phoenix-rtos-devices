@@ -174,14 +174,81 @@ int main(void)
 	if (r != VK_SUCCESS)
 		return 8;
 
+	/* --- Tier 3: record a REAL render command (vkCmdClearColorImage) so the submit executes
+	 * actual GPU work (a clear) — not just the noop job. Image/memory/clear go via the exported
+	 * v3dv_/vk_common_ impls directly (same decouple as Tier 2, bypassing the dispatch gate). --- */
+	extern VkResult v3dv_CreateImage(VkDevice, const VkImageCreateInfo *, const VkAllocationCallbacks *, VkImage *);
+	extern void vk_common_GetImageMemoryRequirements(VkDevice, VkImage, VkMemoryRequirements *);
+	extern VkResult v3dv_AllocateMemory(VkDevice, const VkMemoryAllocateInfo *, const VkAllocationCallbacks *, VkDeviceMemory *);
+	extern VkResult vk_common_BindImageMemory(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
+	extern void v3dv_CmdClearColorImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue *, uint32_t, const VkImageSubresourceRange *);
+
+	VkImageCreateInfo imgci = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = VK_FORMAT_R8G8B8A8_UNORM,
+		.extent = { 64, 64, 1 },
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.tiling = VK_IMAGE_TILING_LINEAR,
+		.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	VkImage image = VK_NULL_HANDLE;
+	r = v3dv_CreateImage(dev, &imgci, NULL, &image);
+	printf("v3dv-harness: vkCreateImage -> %d\n", (int)r);
+	if (r != VK_SUCCESS)
+		return 12;
+
+	VkMemoryRequirements mreq;
+	memset(&mreq, 0, sizeof(mreq));
+	vk_common_GetImageMemoryRequirements(dev, image, &mreq);
+	printf("v3dv-harness: image mem size=%u typeBits=0x%x\n",
+	       (unsigned)mreq.size, (unsigned)mreq.memoryTypeBits);
+
+	uint32_t memType = 0;
+	for (uint32_t i = 0; i < 32; i++) {
+		if (mreq.memoryTypeBits & (1u << i)) {
+			memType = i;
+			break;
+		}
+	}
+	VkMemoryAllocateInfo mai = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize = mreq.size ? mreq.size : (64u * 64u * 4u),
+		.memoryTypeIndex = memType,
+	};
+	VkDeviceMemory mem = VK_NULL_HANDLE;
+	r = v3dv_AllocateMemory(dev, &mai, NULL, &mem);
+	printf("v3dv-harness: vkAllocateMemory -> %d\n", (int)r);
+	if (r != VK_SUCCESS)
+		return 13;
+	r = vk_common_BindImageMemory(dev, image, mem, 0);
+	printf("v3dv-harness: vkBindImageMemory -> %d\n", (int)r);
+	if (r != VK_SUCCESS)
+		return 14;
+
 	VkCommandBufferBeginInfo bbi = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
 	r = pBegin(cmd, &bbi);
-	if (r == VK_SUCCESS)
-		r = pEnd(cmd);
-	printf("v3dv-harness: record empty cmd buffer -> %d\n", (int)r);
+	if (r != VK_SUCCESS) {
+		printf("v3dv-harness: vkBeginCommandBuffer -> %d\n", (int)r);
+		return 9;
+	}
+	VkClearColorValue clearColor = { .float32 = { 0.0f, 0.5f, 1.0f, 1.0f } };
+	VkImageSubresourceRange range = {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.baseMipLevel = 0,
+		.levelCount = 1,
+		.baseArrayLayer = 0,
+		.layerCount = 1,
+	};
+	v3dv_CmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &range);
+	r = pEnd(cmd);
+	printf("v3dv-harness: record clear cmd buffer -> %d\n", (int)r);
 	if (r != VK_SUCCESS)
 		return 9;
 
@@ -200,6 +267,6 @@ int main(void)
 	if (r != VK_SUCCESS)
 		return 11;
 
-	printf("v3dv-harness: PASS (instance+phys+device+queue submit)\n");
+	printf("v3dv-harness: PASS (instance+phys+device+clear-image submit) -- Tier 3\n");
 	return 0;
 }
