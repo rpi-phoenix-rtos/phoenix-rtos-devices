@@ -53,10 +53,14 @@ extern unsigned char _mesa_make_current(struct gl_context *ctx,
 
 /* winsys-exported render-timeout counter (incremented on each CT1 spin-timeout). */
 extern volatile unsigned v3d_phoenix_render_timeouts;
+/* winsys-exported TRUE reset: hold-in-reset + power-on + re-apply core regs over the
+ * surviving page table. Re-creates the cold first-frame-after-power-on condition per call,
+ * so each loop iteration becomes an independent trial of the intermittent render stall. */
+extern void v3d_phoenix_harness_reset(void);
 
 #define FBW 1920
 #define FBH 1088          /* tile-aligned 1080 (the size Quake render-to-scanout used) */
-#define ITERS 300
+#define ITERS 60          /* each iter = true GPU reset + render; stalled iters are slow */
 
 /* Render one frame: clear + a single triangle (exercises binner tiling + QPU shaders). */
 static void render_frame(int i)
@@ -111,23 +115,34 @@ int main(void)
 	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbd);
 	printf("stalltest: FBO %dx%d status=0x%x\n", FBW, FBH, glCheckFramebufferStatus(GL_FRAMEBUFFER));
 
-	unsigned first_stall_iter = 0;   /* 0 = none */
-	unsigned prev = v3d_phoenix_render_timeouts;
+	/* Warm-up frame: forces winsys_init (power-on, MMU, L2C) before the reset loop. */
+	render_frame(0);
+	printf("stalltest: warm-up frame done (timeouts=%u); starting reset loop\n",
+	       v3d_phoenix_render_timeouts);
+
+	/* Each iteration: TRUE V3D reset -> cold first-frame -> render. An iteration "stalled"
+	 * if the render-timeout counter advanced during it (the in-submit reset+retry may then
+	 * recover it; we count the stall regardless, to measure the raw cold-frame stall rate). */
+	unsigned stalled_iters = 0;
 	for (int i = 0; i < ITERS; i++) {
-		render_frame(i);
-		unsigned now = v3d_phoenix_render_timeouts;
-		if (now != prev) {
-			if (first_stall_iter == 0)
-				first_stall_iter = (unsigned)(i + 1);
-			printf("stalltest: STALL at iter %d (total timeouts=%u)\n", i + 1, now);
-			prev = now;
+		unsigned before = v3d_phoenix_render_timeouts;
+		v3d_phoenix_harness_reset();   /* re-roll the power-on lottery */
+		render_frame(i + 1);
+		unsigned delta = v3d_phoenix_render_timeouts - before;
+		if (delta != 0) {
+			stalled_iters++;
+			printf("stalltest: iter %d STALLED (+%u timeouts; stalled_iters=%u/%d)\n",
+			       i + 1, delta, stalled_iters, i + 1);
 		}
-		if (((i + 1) % 25) == 0)
-			printf("stalltest: %d/%d done, stalls so far=%u\n", i + 1, ITERS, v3d_phoenix_render_timeouts);
+		if (((i + 1) % 10) == 0)
+			printf("stalltest: %d/%d done, stalled_iters=%u total_timeouts=%u\n",
+			       i + 1, ITERS, stalled_iters, v3d_phoenix_render_timeouts);
 	}
 
-	printf("stalltest: RESULT iters=%d total_render_timeouts=%u first_stall_iter=%u\n",
-	       ITERS, v3d_phoenix_render_timeouts, first_stall_iter);
+	printf("stalltest: RESULT iters=%d stalled_iters=%u total_render_timeouts=%u\n",
+	       ITERS, stalled_iters, v3d_phoenix_render_timeouts);
+	printf("stalltest: (stalled_iters>0 => true-reset reproduces the stall = fast repro; "
+	       "==0 => state is reset-immune, power-on-settle only)\n");
 	printf("stalltest: DONE\n");
 	for (;;)
 		sleep(5);
