@@ -72,6 +72,9 @@ DEFAULT_COMPONENTS += rpi4-v3d-scout
 # linked against libGL-phoenix + libv3d-phoenix and bundled into loader.disk
 # (boot-launched). ~19 MB; can't be NFS-exec'd, hence the bundle.
 DEFAULT_COMPONENTS += rpi4-quake
+# rpi4-v3d-stalltest: render-stall repro harness (large-FBO render loop + timeout counter).
+# Swap IN for rpi4-quake (loader.disk fits one large GL binary) when reproducing the stall.
+# DEFAULT_COMPONENTS += rpi4-v3d-stalltest
 # Vulkan V3DV Tier-1 boot harness: vkCreateInstance/EnumeratePhysicalDevices/
 # CreateDevice on real HW. Links libv3dv-phoenix.a + libv3d-phoenix.a. Swap IN for
 # rpi4-quake (loader.disk fits only one large GL/VK binary) to continue Vulkan
