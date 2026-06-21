@@ -51,8 +51,11 @@ extern unsigned char _mesa_make_current(struct gl_context *ctx,
                                         struct gl_framebuffer *drawFb,
                                         struct gl_framebuffer *readFb);
 
-/* winsys-exported render-timeout counter (incremented on each CT1 spin-timeout). */
+/* winsys-exported counters. render_timeouts increments on each CT1 render spin-timeout;
+ * render_recoveries increments on EVERY wedge (bin or render) handled by the drop-frame
+ * mitigation, so it is the total-wedge count. */
 extern volatile unsigned v3d_phoenix_render_timeouts;
+extern volatile unsigned v3d_phoenix_render_recoveries;
 /* winsys-exported TRUE reset: hold-in-reset + power-on + re-apply core regs over the
  * surviving page table. Re-creates the cold first-frame-after-power-on condition per call,
  * so each loop iteration becomes an independent trial of the intermittent render stall. */
@@ -60,22 +63,52 @@ extern void v3d_phoenix_harness_reset(void);
 
 #define FBW 1920
 #define FBH 1088          /* tile-aligned 1080 (the size Quake render-to-scanout used) */
-#define ITERS 60          /* each iter = true GPU reset + render; stalled iters are slow */
+#define FRAMES 3000       /* continuous frames (NO reset between) — mimics sustained Quake play */
 
-/* Render one frame: clear + a single triangle (exercises binner tiling + QPU shaders). */
+/* Render one COMPLEX, depth-tested, perspective frame: a dense field of steeply-tilted triangles
+ * with heavy overdraw and per-frame rotation. This reproduces the conditions under which Quake
+ * wedges (the Phoenix EZ note: "steeply-tilted polygons / steep screen-space Z gradient hang"),
+ * exercising the binner + the fragment/DEPTH-output pipeline that fdbgs localised the stall to.
+ * Crucially this renders to the harness FBO (a tiled/RASTER render target in normal DRAM), NOT
+ * the scanout HDMI framebuffer — so if it wedges, the stall is reproducible WITHOUT
+ * render-to-scanout (the rework would not help); if it never wedges across many complex frames,
+ * the scanout-fb path is required to trigger it (the rework is justified). */
 static void render_frame(int i)
 {
 	glViewport(0, 0, FBW, FBH);
-	/* vary the clear colour per iteration so nothing can be optimised to a no-op */
-	glClearColor((float)(i & 7) / 7.0f, 1.0f, 0.25f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT);
+	glClearColor((float)(i & 7) / 7.0f, 0.2f, 0.4f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-	/* immediate-mode triangle -> Mesa compiles a fixed-function shader -> QPU execution */
-	glBegin(GL_TRIANGLES);
-	glColor3f(1.0f, 0.0f, 0.0f); glVertex3f(-0.8f, -0.8f, 0.0f);
-	glColor3f(0.0f, 1.0f, 0.0f); glVertex3f( 0.8f, -0.8f, 0.0f);
-	glColor3f(0.0f, 0.0f, 1.0f); glVertex3f( 0.0f,  0.8f, 0.0f);
-	glEnd();
+	glEnable(GL_DEPTH_TEST);
+	glDepthFunc(GL_LESS);
+
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	glFrustum(-1.0, 1.0, -0.5625, 0.5625, 1.0, 60.0);   /* perspective -> steep screen-space Z */
+
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+	glTranslatef(0.0f, 0.0f, -8.0f);
+	float a = (float)i * 1.7f;
+	glRotatef(a,        1.0f, 0.0f, 0.0f);   /* tilt toward edge-on (steep Z gradient) */
+	glRotatef(a * 0.7f, 0.0f, 1.0f, 0.0f);
+	glRotatef(a * 0.3f, 0.0f, 0.0f, 1.0f);
+
+	/* Dense grid of depth-tested tilted triangles across depth (12*12*8 = 1152 tris/frame). */
+	for (int gz = 0; gz < 12; gz++) {
+		float z = -2.0f - (float)gz * 0.4f;
+		for (int gx = -6; gx < 6; gx++) {
+			for (int gy = -4; gy < 4; gy++) {
+				float x = (float)gx * 0.5f, y = (float)gy * 0.5f;
+				glBegin(GL_TRIANGLES);
+				glColor3f((float)(gx + 6) / 12.0f, (float)(gy + 4) / 8.0f, (float)gz / 12.0f);
+				glVertex3f(x - 0.3f, y - 0.3f, z);
+				glVertex3f(x + 0.3f, y - 0.3f, z + 0.5f);   /* tilted in Z */
+				glVertex3f(x,        y + 0.3f, z - 0.3f);
+				glEnd();
+			}
+		}
+	}
 
 	glFinish();   /* synchronously submit + render -> winsys ioc_submit_cl (CT0 bin, CT1 render) */
 }
@@ -83,7 +116,7 @@ static void render_frame(int i)
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	printf("stalltest: START (V3D render-stall repro, %dx%d x %d iters)\n", FBW, FBH, ITERS);
+	printf("stalltest: START (V3D render-stall repro, %dx%d x %d continuous frames)\n", FBW, FBH, FRAMES);
 
 	struct pipe_screen_config cfg;
 	memset(&cfg, 0, sizeof(cfg));
@@ -115,34 +148,35 @@ int main(void)
 	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbd);
 	printf("stalltest: FBO %dx%d status=0x%x\n", FBW, FBH, glCheckFramebufferStatus(GL_FRAMEBUFFER));
 
-	/* Warm-up frame: forces winsys_init (power-on, MMU, L2C) before the reset loop. */
+	/* Warm-up frame: forces winsys_init (power-on, MMU, L2C) before the measured loop. */
 	render_frame(0);
-	printf("stalltest: warm-up frame done (timeouts=%u); starting reset loop\n",
-	       v3d_phoenix_render_timeouts);
+	printf("stalltest: warm-up frame done (wedges=%u); starting continuous render loop\n",
+	       v3d_phoenix_render_recoveries);
 
-	/* Each iteration: TRUE V3D reset -> cold first-frame -> render. An iteration "stalled"
-	 * if the render-timeout counter advanced during it (the in-submit reset+retry may then
-	 * recover it; we count the stall regardless, to measure the raw cold-frame stall rate). */
-	unsigned stalled_iters = 0;
-	for (int i = 0; i < ITERS; i++) {
-		unsigned before = v3d_phoenix_render_timeouts;
-		v3d_phoenix_harness_reset();   /* re-roll the power-on lottery */
+	/* Render FRAMES complex depth-tested frames CONTINUOUSLY (no reset between) — the workload
+	 * profile under which Quake wedges. A frame "wedged" if the total-wedge counter advanced
+	 * during it (the drop-frame mitigation then resets+drops it; we count it regardless). */
+	unsigned wedged_frames = 0;
+	for (int i = 0; i < FRAMES; i++) {
+		unsigned before = v3d_phoenix_render_recoveries;
 		render_frame(i + 1);
-		unsigned delta = v3d_phoenix_render_timeouts - before;
+		unsigned delta = v3d_phoenix_render_recoveries - before;
 		if (delta != 0) {
-			stalled_iters++;
-			printf("stalltest: iter %d STALLED (+%u timeouts; stalled_iters=%u/%d)\n",
-			       i + 1, delta, stalled_iters, i + 1);
+			wedged_frames++;
+			printf("stalltest: frame %d WEDGED (+%u; wedged_frames=%u/%d)\n",
+			       i + 1, delta, wedged_frames, i + 1);
 		}
-		if (((i + 1) % 10) == 0)
-			printf("stalltest: %d/%d done, stalled_iters=%u total_timeouts=%u\n",
-			       i + 1, ITERS, stalled_iters, v3d_phoenix_render_timeouts);
+		if (((i + 1) % 200) == 0)
+			printf("stalltest: %d/%d frames, wedged_frames=%u total_wedges=%u render_timeouts=%u\n",
+			       i + 1, FRAMES, wedged_frames, v3d_phoenix_render_recoveries,
+			       v3d_phoenix_render_timeouts);
 	}
 
-	printf("stalltest: RESULT iters=%d stalled_iters=%u total_render_timeouts=%u\n",
-	       ITERS, stalled_iters, v3d_phoenix_render_timeouts);
-	printf("stalltest: (stalled_iters>0 => true-reset reproduces the stall = fast repro; "
-	       "==0 => state is reset-immune, power-on-settle only)\n");
+	printf("stalltest: RESULT frames=%d wedged_frames=%u total_wedges=%u render_timeouts=%u\n",
+	       FRAMES, wedged_frames, v3d_phoenix_render_recoveries, v3d_phoenix_render_timeouts);
+	printf("stalltest: (wedged_frames>0 => complex depth geometry on a tiled/RASTER NON-scanout RT "
+	       "reproduces the stall -> render-to-scanout NOT required; ==0 over %d frames => the "
+	       "scanout-fb path is required to trigger it -> the rework is justified)\n", FRAMES);
 	printf("stalltest: DONE\n");
 	for (;;)
 		sleep(5);
