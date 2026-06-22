@@ -134,6 +134,8 @@ int main(void)
 	_mesa_make_current(st->ctx, NULL, NULL);
 	printf("stalltest: GL up; %s / %s\n",
 	       (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER));
+	/* Early-Z is now enabled by default in the v3d driver (the EZ hang was the since-fixed L2T
+	 * flush race), so this harness's tilted depth-tested geometry exercises the EZ path directly. */
 
 	GLuint rb = 0, rbd = 0, fbo = 0;
 	glGenFramebuffers(1, &fbo);
