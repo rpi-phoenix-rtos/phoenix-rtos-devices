@@ -20,7 +20,9 @@ V3DV_LIB := /tmp/libv3dv-phoenix.a
 V3D_LIB := /tmp/libv3d-phoenix.a
 
 # The harness is a clean loader-less Vulkan client: it only needs <vulkan/vulkan.h>.
-LOCAL_CFLAGS := -Wno-error -I$(V3D_COORD)/external/mesa/include
+# The -Itools/v3d-driver-port path resolves the generated triangle_spirv.h (the Tier-4b
+# vertexless-triangle VS/FS), keeping a single copy shared with the host link-test harness.
+LOCAL_CFLAGS := -Wno-error -I$(V3D_COORD)/external/mesa/include -I$(V3D_COORD)/tools/v3d-driver-port
 
 # libv3dv FIRST (binds V3DV's copy of any symbol shared with the back-end), grouped
 # for the cross-archive refs; -lstdc++ for the Mesa compiler C++ TUs; -lm for math.

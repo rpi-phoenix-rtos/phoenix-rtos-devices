@@ -76,10 +76,13 @@ DEFAULT_COMPONENTS += rpi4-quake
 # Vulkan V3DV Tier-1 boot harness: vkCreateInstance/EnumeratePhysicalDevices/
 # CreateDevice on real HW. Links libv3dv-phoenix.a + libv3d-phoenix.a. Swap IN for
 # rpi4-quake (loader.disk fits only one large GL/VK binary) to continue Vulkan
-# bring-up. STATUS: instance + enumerate(count=1) + vkCreateDevice all PASS on real HW
-# (2026-06-18: the noop-job BO-alloc fix linked the real Phoenix winsys + Phoenix-direct
-# BO map — external/mesa 3995663795a + coord 131c825). Next swap-in continues to Tier 2
-# (a queue submit / clear). See docs/inprogress/2026-06-18-vulkan-v3dv-noop-job-rootcause.md.
+# bring-up. STATUS: Tier 4b DONE on real HW (2026-06-23) — a graphics pipeline built from
+# hand-authored SPIR-V VS+FS (compiled spirv_to_nir -> v3d_compile NIR->QPU), a render pass
+# (loadOp=CLEAR, storeOp=STORE to the scanout image) + vertexless vkCmdDraw(3): all of
+# vkCreateGraphicsPipelines / QueueSubmit / QueueWaitIdle return 0, no fault, and the scanout
+# px0 readback = ff 00 80 ff (render-pass STORE landed). First user-shader GPU render through
+# Vulkan on Phoenix = the vkQuake prerequisite. Earlier: instance+enumerate+CreateDevice PASS
+# (2026-06-18 noop-job BO-alloc fix, external/mesa 3995663795a + coord 131c825). Next: vkQuake.
 # DEFAULT_COMPONENTS += rpi4-v3dv-tier0
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
