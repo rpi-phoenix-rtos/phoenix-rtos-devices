@@ -37,16 +37,7 @@
 /* interrupts = <GIC_SPI 126 IRQ_TYPE_LEVEL_HIGH>; GIC SPIs start at 32. */
 #define BCM2711_EMMC2_IRQ  (32 + 126)
 
-/* VideoCore mailbox (Pi 4). Mirrors the proven sequence in
- * phoenix-rtos-lwip/port/diag-udp.c. */
-#define RPI_PI4_MAILBOX_BASE  0xfe00b880u
-#define VC_MBOX_READ          0x00u
-#define VC_MBOX_STATUS        0x18u
-#define VC_MBOX_WRITE         0x20u
-#define VC_MBOX_STATUS_FULL   0x80000000u
-#define VC_MBOX_STATUS_EMPTY  0x40000000u
-#define VC_MBOX_RESP_OK       0x80000000u
-#define VC_MBOX_PROP_CHANNEL  8u
+#include <libvcmbox.h>
 
 #define VC_PROP_GET_CLOCK_RATE 0x00030002u
 #define VC_PROP_SET_CLOCK_RATE 0x00038002u
@@ -58,84 +49,27 @@
 #define BCM2711_EMMC2_DEFAULT_HZ (100u * 1000u * 1000u)
 
 
-/* One mailbox property transaction carrying a single tag. payload[] holds the
- * tag value buffer (in/out); payloadWords is its u32 count. Returns 0 on an
- * OK response, -EIO otherwise. */
+/* One mailbox property transaction carrying a single tag, routed through the
+ * serializing rpi4-vcmbox server (/dev/vcmbox) — the BCM2711 mailbox FIFO has
+ * no hardware arbitration, so every user must go through the server rather than
+ * drive the FIFO directly. payload[] holds the tag value buffer (in/out);
+ * payloadWords is its u32 count. Returns 0 on an OK response, negative errno
+ * otherwise.
+ *
+ * Pre-bind hazard: in the sd variant the SD driver runs BEFORE `bind devfs
+ * /dev`, so a plain `/dev/vcmbox` path lookup would not resolve. libvcmbox
+ * handles this internally — it falls back to resolving the node through the
+ * `devfs` named port, and its lookup is bounded, so if the server is somehow
+ * absent this returns an error (the caller then uses the default clock rate)
+ * rather than hanging the sd-boot path. */
 static int sdio_mboxProperty(uint32_t tag, uint32_t *payload, unsigned int payloadWords)
 {
-	addr_t pa_base = (addr_t)RPI_PI4_MAILBOX_BASE & ~(addr_t)(_PAGE_SIZE - 1);
-	addr_t pa_offs = (addr_t)RPI_PI4_MAILBOX_BASE & (addr_t)(_PAGE_SIZE - 1);
-	volatile uint32_t *mbox;
-	uint32_t *msg;
-	uintptr_t msg_pa;
-	uint32_t request;
-	unsigned int i;
-	int ret = -EIO;
-	void *mbox_page;
-	void *msg_page;
-	/* header(5) + payload + end-tag(1), rounded to 16 bytes. */
-	unsigned int hdrWords = 5;
-	unsigned int totalWords = hdrWords + payloadWords + 1;
-
-	if (((totalWords * sizeof(uint32_t)) > _PAGE_SIZE) || (payload == NULL)) {
+	if (payload == NULL) {
 		return -EINVAL;
 	}
 
-	mbox_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
-		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, pa_base);
-	if (mbox_page == MAP_FAILED) {
-		return -ENOMEM;
-	}
-	mbox = (volatile uint32_t *)((volatile uint8_t *)mbox_page + pa_offs);
-
-	msg_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
-		MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
-	if (msg_page == MAP_FAILED) {
-		munmap(mbox_page, _PAGE_SIZE);
-		return -ENOMEM;
-	}
-	msg = msg_page;
-
-	msg[0] = totalWords * sizeof(uint32_t); /* total size in bytes */
-	msg[1] = 0;                             /* request */
-	msg[2] = tag;
-	msg[3] = payloadWords * sizeof(uint32_t); /* value buffer size */
-	msg[4] = 0;                             /* tag request code */
-	for (i = 0; i < payloadWords; i++) {
-		msg[hdrWords + i] = payload[i];
-	}
-	msg[hdrWords + payloadWords] = 0; /* end tag */
-
-	msg_pa = (uintptr_t)va2pa(msg);
-	if (msg_pa == (uintptr_t)-1) {
-		munmap(msg_page, _PAGE_SIZE);
-		munmap(mbox_page, _PAGE_SIZE);
-		return -EIO;
-	}
-	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
-
-	while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u) {
-	}
-	mbox[VC_MBOX_WRITE / 4] = request;
-
-	for (;;) {
-		while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) != 0u) {
-		}
-		if (mbox[VC_MBOX_READ / 4] == request) {
-			break;
-		}
-	}
-
-	if (msg[1] == VC_MBOX_RESP_OK) {
-		for (i = 0; i < payloadWords; i++) {
-			payload[i] = msg[hdrWords + i];
-		}
-		ret = 0;
-	}
-
-	munmap(msg_page, _PAGE_SIZE);
-	munmap(mbox_page, _PAGE_SIZE);
-	return ret;
+	return vcmbox_call(tag, payloadWords * (uint32_t)sizeof(uint32_t),
+		payload, payloadWords, payload, payloadWords);
 }
 
 

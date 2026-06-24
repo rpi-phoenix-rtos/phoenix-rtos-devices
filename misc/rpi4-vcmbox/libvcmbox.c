@@ -26,7 +26,7 @@
 #include "libvcmbox.h"
 
 
-/* Cached server node. lookup() is retried until the server registers; once
+/* Cached server node. Resolution is retried with a bounded budget; once
  * resolved the oid is reused for the lifetime of the calling process. */
 static struct {
 	oid_t oid;
@@ -34,23 +34,77 @@ static struct {
 } vcmbox_common;
 
 
-/* Block until /dev/vcmbox is registered. The server is launched first among the
- * device apps (see user.plo.yaml), but a client may still race its registration,
- * so this is an unbounded retry-lookup (the standard Phoenix client pattern).
- * The mailbox is required infrastructure; there is no useful fallback if the
- * server never appears. */
+/* Resolve the vcmbox server node directly through the `devfs` named port,
+ * bypassing the `/dev/vcmbox` path. This is the pre-bind fallback: in the sd
+ * variant the SD driver runs BEFORE `bind devfs /dev`, so the `/dev/vcmbox`
+ * path does not yet resolve, but the device node already exists in the devfs
+ * server (the vcmbox daemon created it via create_dev, which itself talks to
+ * the `devfs` port). We mirror exactly what create_dev / the directory walk do:
+ * look up the `devfs` named port, send an mtLookup for "vcmbox" and take the
+ * returned device oid (devfs returns o->dev for a char-dev leaf node). */
+static int vcmbox_resolveViaDevfs(oid_t *out)
+{
+	oid_t devfs;
+	msg_t msg;
+
+	if (lookup("devfs", NULL, &devfs) < 0) {
+		return -ENOENT;
+	}
+
+	memset(&msg, 0, sizeof(msg));
+	msg.type = mtLookup;
+	msg.oid = devfs;
+	msg.i.data = (void *)"vcmbox";
+	msg.i.size = sizeof("vcmbox");
+
+	if (msgSend(devfs.port, &msg) < 0) {
+		return -EIO;
+	}
+	if (msg.o.err < 0) {
+		return msg.o.err;
+	}
+
+	*out = msg.o.lookup.dev;
+	return 0;
+}
+
+
+/* Resolve /dev/vcmbox with a bounded retry budget and a pre-bind fallback.
+ *
+ * The server is launched first among the device apps (see user.plo.yaml), but a
+ * client may still race its registration, so we retry. The budget (~5 s, the
+ * same shape sdstorage uses for its root mount) is generous enough not to
+ * reintroduce the cross-process registration race the old unbounded loop was
+ * guarding, while still letting a client degrade gracefully (rather than hang
+ * boot) if the server never appears — required for the boot-critical usb and
+ * early sdio callers.
+ *
+ * Each iteration tries the `/dev/vcmbox` path first (the common, post-`bind
+ * devfs /dev` case: thermal, genet, usb all hit this on iteration 0), then the
+ * `devfs`-port fallback for the pre-bind window (early sdio in the sd variant).
+ * A raw lookup() returns fast with -ENOENT pre-bind, so post-bind callers pay
+ * nothing for the fallback branch. */
 static int vcmbox_resolve(void)
 {
+	int tries;
+
 	if (vcmbox_common.resolved != 0) {
 		return 0;
 	}
 
-	while (lookup("/dev/vcmbox", NULL, &vcmbox_common.oid) < 0) {
-		usleep(10 * 1000);
+	for (tries = 0; tries < 50; tries++) {
+		if (lookup("/dev/vcmbox", NULL, &vcmbox_common.oid) == 0) {
+			vcmbox_common.resolved = 1;
+			return 0;
+		}
+		if (vcmbox_resolveViaDevfs(&vcmbox_common.oid) == 0) {
+			vcmbox_common.resolved = 1;
+			return 0;
+		}
+		usleep(100 * 1000);
 	}
 
-	vcmbox_common.resolved = 1;
-	return 0;
+	return -ETIMEDOUT;
 }
 
 

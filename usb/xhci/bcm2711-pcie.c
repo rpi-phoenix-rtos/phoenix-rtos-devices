@@ -238,87 +238,28 @@ static int pcie_cfgInitEcam(pcie_cfgio_t *cfgio)
 
 #if defined(RPI_MAILBOX_BASE_ADDRESS) && defined(XHCI_BCM2711_PCIE_BUS) && defined(XHCI_BCM2711_PCIE_SLOT) && defined(XHCI_BCM2711_PCIE_FUNC) && defined(XHCI_BCM2711_PCI_CLASS_CODE)
 
-#define RPI_MBOX_READ          0x00u
-#define RPI_MBOX_STATUS        0x18u
-#define RPI_MBOX_WRITE         0x20u
-#define RPI_MBOX_RESPONSE      0x80000000u
-#define RPI_MBOX_FULL          0x80000000u
-#define RPI_MBOX_EMPTY         0x40000000u
-#define RPI_MBOX_PROP_CHANNEL  8u
-#define RPI_PROP_REQUEST       0u
-#define RPI_PROP_END           0u
-#define RPI_PROP_NOTIFY_XHCI_RESET 0x00030058u
-#define RPI_PROP_NOTIFY_MSG_WORDS 7u
+#include <libvcmbox.h>
 
+#define RPI_PROP_NOTIFY_XHCI_RESET 0x00030058u
+
+/* Trigger the firmware's VL805 xHCI reset / firmware-reload handler over the
+ * VideoCore property mailbox. The single value word encodes the VL805's PCI
+ * address (bus/dev/fun) the same way Linux's quirk_usb_early_handoff does. The
+ * call is routed through the serializing rpi4-vcmbox server (/dev/vcmbox): the
+ * BCM2711 mailbox FIFO has no hardware arbitration, so every user must go
+ * through the server. The usb daemon launches after `bind devfs /dev`, so the
+ * lookup resolves; libvcmbox uses a bounded retry, so a missing server returns
+ * an error here (degrading exactly as the old raw reader did on failure) rather
+ * than hanging this boot-critical bring-up path. Only the mailbox transport
+ * changes — the enumeration / xHCI bring-up logic is untouched. */
 static int bcm2711NotifyXhciReset(uint8_t bus, uint8_t dev, uint8_t fun)
 {
-	volatile uint8_t *mailbox_page;
-	volatile uint32_t *mailbox;
-	uint32_t *msgbuf;
-	uint32_t msg;
-	uintptr_t msgaddr;
-	uintptr_t mailbox_pa_base;
-	uintptr_t mailbox_pa_offs;
-	int ret;
+	uint32_t bdf = ((uint32_t)bus << 20) | ((uint32_t)dev << 15) | ((uint32_t)fun << 12);
+	int ret = vcmbox_call(RPI_PROP_NOTIFY_XHCI_RESET, sizeof(uint32_t), &bdf, 1u, NULL, 0u);
 
-	/* The BCM2711 mailbox MMIO sits at PA 0xfe00b880 — NOT page-aligned.
-	 * Phoenix's mmap rejects a non-page-aligned `off` argument with
-	 * MAP_FAILED (vm_pageAlloc for a contiguous device mapping refuses
-	 * to map a partial page). Round the PA down to a page boundary and
-	 * fix up the offset within the page after mmap returns. */
-	mailbox_pa_base = (uintptr_t)RPI_MAILBOX_BASE_ADDRESS & ~(uintptr_t)(_PAGE_SIZE - 1U);
-	mailbox_pa_offs = (uintptr_t)RPI_MAILBOX_BASE_ADDRESS & (uintptr_t)(_PAGE_SIZE - 1U);
-
-	mailbox_page = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, mailbox_pa_base);
-	if (mailbox_page == MAP_FAILED) {
-		debug("pcie: notifyXhciReset mailbox mmap FAILED\n");
-		return -ENOMEM;
+	if (ret != 0) {
+		fprintf(stderr, "pcie: notifyXhciReset failed: ret=%d\n", ret);
 	}
-	mailbox = (volatile uint32_t *)(mailbox_page + mailbox_pa_offs);
-
-	msgbuf = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
-	if (msgbuf == MAP_FAILED) {
-		debug("pcie: notifyXhciReset MAP_CONTIGUOUS mmap FAILED\n");
-		munmap((void *)mailbox_page, _PAGE_SIZE);
-		return -ENOMEM;
-	}
-
-	msgbuf[0] = RPI_PROP_NOTIFY_MSG_WORDS * sizeof(uint32_t);
-	msgbuf[1] = RPI_PROP_REQUEST;
-	msgbuf[2] = RPI_PROP_NOTIFY_XHCI_RESET;
-	msgbuf[3] = sizeof(uint32_t);
-	msgbuf[4] = sizeof(uint32_t);
-	msgbuf[5] = ((uint32_t)bus << 20) | ((uint32_t)dev << 15) | ((uint32_t)fun << 12);
-	msgbuf[6] = RPI_PROP_END;
-
-	msgaddr = va2pa(msgbuf);
-	if (msgaddr == (uintptr_t)-1) {
-		munmap(msgbuf, _PAGE_SIZE);
-		munmap((void *)mailbox_page, _PAGE_SIZE);
-		return -EFAULT;
-	}
-	msg = ((uint32_t)msgaddr & ~0xfu) | RPI_MBOX_PROP_CHANNEL;
-	while ((*(mailbox + (RPI_MBOX_STATUS / sizeof(uint32_t))) & RPI_MBOX_FULL) != 0u) {
-	}
-
-	*(mailbox + (RPI_MBOX_WRITE / sizeof(uint32_t))) = msg;
-
-	for (;;) {
-		while ((*(mailbox + (RPI_MBOX_STATUS / sizeof(uint32_t))) & RPI_MBOX_EMPTY) != 0u) {
-		}
-
-		if (*(mailbox + (RPI_MBOX_READ / sizeof(uint32_t))) == msg) {
-			break;
-		}
-	}
-
-	ret = (msgbuf[1] == RPI_MBOX_RESPONSE) ? EOK : -EIO;
-	if (ret != EOK) {
-		fprintf(stderr, "pcie: notifyXhciReset failed: ret=%d resp=%08x\n", ret, msgbuf[1]);
-	}
-
-	munmap(msgbuf, _PAGE_SIZE);
-	munmap((void *)mailbox_page, _PAGE_SIZE);
 
 	return ret;
 }
