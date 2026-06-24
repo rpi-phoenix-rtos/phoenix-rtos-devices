@@ -211,16 +211,29 @@ static void usbmouse_fifoPush(usbmouse_dev_t *dev, const uint8_t *data, size_t l
 }
 
 
+/* HID boot-mouse minimum report = 3 bytes (buttons, dX, dY); the 4th wheel byte is
+ * an optional extension, not part of the boot-protocol minimum (HID 1.11 App. B.2). */
+#define USBMOUSE_BOOT_MIN 3u
+
 static void usbmouse_handleReport(usbmouse_dev_t *dev, const uint8_t *report, size_t len)
 {
-	if (len < usbmouse_reportSize) {
+	uint8_t pkt[usbmouse_reportSize];
+
+	/* Accept 3- or 4-byte boot reports and normalise to the 4-byte /dev/mouseN
+	 * framing, padding a missing wheel byte with 0. #24: the PIXART 093a:2510 (and
+	 * other 3-byte boot mice) send 3-byte reports — the controller completes the
+	 * 4-byte interrupt request as SHORT_PACKET with len=3 — so the old `len < 4`
+	 * check dropped EVERY report and /dev/mouse0 delivered nothing despite movement.
+	 * Raw passthrough: SET_IDLE(0) means each report is a real movement/button event. */
+	if (len < USBMOUSE_BOOT_MIN) {
 		return;
 	}
-
-	/* Raw passthrough: a boot mouse with SET_IDLE(0) reports only on change, so
-	 * every report is a meaningful event (movement and/or button transition).
-	 * Userspace consumes /dev/mouseN as a stream of 4-byte packets. */
-	usbmouse_fifoPush(dev, report, usbmouse_reportSize);
+	if (len > (size_t)usbmouse_reportSize) {
+		len = (size_t)usbmouse_reportSize;
+	}
+	memset(pkt, 0, sizeof(pkt));
+	memcpy(pkt, report, len);
+	usbmouse_fifoPush(dev, pkt, usbmouse_reportSize);
 }
 
 
