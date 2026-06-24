@@ -14,6 +14,12 @@
  * (~85 C max, reported via GET_MAX_TEMPERATURE), so this driver is telemetry
  * only - no trip configuration or throttling governor.
  *
+ * The mailbox FIFO is a single, hardware-arbitration-free shared peripheral, so
+ * this driver does NOT drive it directly: every property call is routed through
+ * the rpi4-vcmbox server (/dev/vcmbox) via libvcmbox, which owns the FIFO and
+ * serializes all callers (see misc/rpi4-vcmbox/). That kills the cross-process
+ * race that used to surface as transient mailbox read failures.
+ *
  * Copyright 2026 Phoenix Systems
  * Author: Witold Bołt
  *
@@ -29,156 +35,52 @@
 #include <errno.h>
 
 #include <sys/msg.h>
-#include <sys/mman.h>
 #include <sys/types.h>
 #include <posix/utils.h>
 
+#include <libvcmbox.h>
 
-/* VideoCore property mailbox (see BCM2711 ARM peripherals + plo video.c). */
-#define RPI_MAILBOX_BASE        0xfe00b880u
 
-#define VC_MBOX_STATUS          0x18u
-#define VC_MBOX_WRITE           0x20u
-#define VC_MBOX_READ            0x00u
-#define VC_MBOX_STATUS_FULL     0x80000000u
-#define VC_MBOX_STATUS_EMPTY    0x40000000u
-#define VC_MBOX_RESP_OK         0x80000000u
-#define VC_MBOX_PROP_CHANNEL    8u
-
+/* VideoCore property tags this driver reads (BCM2711 firmware mailbox). */
 #define VC_PROP_GET_TEMPERATURE 0x00030006u
 #define VC_PROP_GET_MAX_TEMP    0x0003000au
 #define VC_PROP_GET_THROTTLED   0x00030046u
-
-#define MBOX_FAIL               0xffffffffu
-
-/* Bounded mailbox-wait spin cap. The VideoCore mailbox is a single shared
- * peripheral with no cross-process lock (this driver and diag-udp can both
- * drive it); a response raced/consumed by another client must not hang us
- * forever. The happy path completes in microseconds, far under this. */
-#define MBOX_SPINS              4000000u
 
 /* Device node ids (one port, two nodes). */
 #define DEV_THERMAL_ID          0
 #define DEV_THROTTLED_ID        1
 
 
-/*
- * Single-u32-in / single-u32-out property call. The protocol and cache
- * discipline (device-mapped uncached mailbox window + uncached, contiguous,
- * physically-pinned property buffer) are carried over verbatim from the
- * validated diag-udp scout (phoenix-rtos-lwip/port/diag-udp.c). The buffer
- * is mapped uncached, so no explicit clean/invalidate is needed around the
- * firmware round-trip. Returns the firmware response word, or MBOX_FAIL.
- */
-static uint32_t rpi4_mboxProp1in1out(uint32_t tag, uint32_t arg_in)
+/* SoC temperature, milli-Celsius (sensor 0). Negative errno on failure. */
+static int thermal_temp(uint32_t *out)
 {
-	addr_t pa_base = (addr_t)RPI_MAILBOX_BASE & ~(addr_t)(_PAGE_SIZE - 1);
-	addr_t pa_offs = (addr_t)RPI_MAILBOX_BASE & (addr_t)(_PAGE_SIZE - 1);
-	volatile uint32_t *mbox;
-	uint32_t *msg;
-	uintptr_t msg_pa;
-	uint32_t request;
-	uint32_t result = MBOX_FAIL;
-	uint32_t spins;
-	void *mbox_page;
-	void *msg_page;
-
-	mbox_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
-		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
-		-1, pa_base);
-	if (mbox_page == MAP_FAILED) {
-		return MBOX_FAIL;
-	}
-	mbox = (volatile uint32_t *)((volatile uint8_t *)mbox_page + pa_offs);
-
-	msg_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
-		MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
-	if (msg_page == MAP_FAILED) {
-		munmap(mbox_page, _PAGE_SIZE);
-		return MBOX_FAIL;
-	}
-	msg = msg_page;
-
-	/* tag layout: [size, REQUEST, tag, valbuf_size=8, req=0, arg_in, out, END]. */
-	msg[0] = 32;
-	msg[1] = 0;
-	msg[2] = tag;
-	msg[3] = 8;
-	msg[4] = 0;
-	msg[5] = arg_in;
-	msg[6] = 0;
-	msg[7] = 0;
-
-	msg_pa = (uintptr_t)va2pa(msg);
-	if (msg_pa == (uintptr_t)-1) {
-		munmap(msg_page, _PAGE_SIZE);
-		munmap(mbox_page, _PAGE_SIZE);
-		return MBOX_FAIL;
-	}
-	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
-
-	for (spins = MBOX_SPINS; (mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u; spins--) {
-		if (spins == 0u) {
-			munmap(msg_page, _PAGE_SIZE);
-			munmap(mbox_page, _PAGE_SIZE);
-			return MBOX_FAIL;
-		}
-	}
-	mbox[VC_MBOX_WRITE / 4] = request;
-
-	for (spins = MBOX_SPINS; spins != 0u; spins--) {
-		if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u) {
-			/* Reading MBOX0 consumes the entry; only ours matches `request`. */
-			if (mbox[VC_MBOX_READ / 4] == request) {
-				break;
-			}
-		}
-	}
-	if (spins == 0u) {
-		munmap(msg_page, _PAGE_SIZE);
-		munmap(mbox_page, _PAGE_SIZE);
-		return MBOX_FAIL;
-	}
-
-	if (msg[1] == VC_MBOX_RESP_OK) {
-		result = msg[6];
-	}
-
-	munmap(msg_page, _PAGE_SIZE);
-	munmap(mbox_page, _PAGE_SIZE);
-	return result;
-}
-
-
-/* SoC temperature, milli-Celsius (sensor 0). MBOX_FAIL on error. */
-static uint32_t thermal_temp(void)
-{
-	return rpi4_mboxProp1in1out(VC_PROP_GET_TEMPERATURE, 0);
+	return vcmbox_prop(VC_PROP_GET_TEMPERATURE, 0, out);
 }
 
 
 /* Firmware-enforced max temperature, milli-Celsius (sensor 0). */
-static uint32_t thermal_max(void)
+static int thermal_max(uint32_t *out)
 {
-	return rpi4_mboxProp1in1out(VC_PROP_GET_MAX_TEMP, 0);
+	return vcmbox_prop(VC_PROP_GET_MAX_TEMP, 0, out);
 }
 
 
 /* Throttle / under-voltage bitfield (sticky bits 16-19 = "since boot"). */
-static uint32_t thermal_throttled(void)
+static int thermal_throttled(uint32_t *out)
 {
-	return rpi4_mboxProp1in1out(VC_PROP_GET_THROTTLED, 0);
+	return vcmbox_prop(VC_PROP_GET_THROTTLED, 0, out);
 }
 
 
 /* Render the requested node's current value into buf. Returns the byte count,
  * or -EIO if the mailbox query failed (so read() reports an error rather than
- * formatting the MBOX_FAIL sentinel as a bogus value). */
+ * formatting a bogus value). */
 static int thermal_format(id_t id, char *buf, size_t size)
 {
-	uint32_t v = (id == DEV_THROTTLED_ID) ? thermal_throttled() : thermal_temp();
+	uint32_t v;
+	int rc = (id == DEV_THROTTLED_ID) ? thermal_throttled(&v) : thermal_temp(&v);
 
-	if (v == MBOX_FAIL) {
+	if (rc != 0) {
 		return -EIO;
 	}
 	if (id == DEV_THROTTLED_ID) {
@@ -238,18 +140,19 @@ int main(int argc, char **argv)
 {
 	uint32_t port;
 	oid_t dev;
-	uint32_t temp, max, throttle;
+	uint32_t temp = 0, max = 0, throttle = 0;
+	int haveTemp, haveMax, haveThrottle;
 
 	(void)argc;
 	(void)argv;
 
-	temp = thermal_temp();
-	if (temp == MBOX_FAIL) {
-		printf("rpi4-thermal: mailbox temperature read failed\n");
-		return 1;
-	}
-	max = thermal_max();
-	throttle = thermal_throttled();
+	/* Read the startup banner values through the serializing mailbox server.
+	 * A failure here is NOT fatal: the server retries internally, and on-demand
+	 * read()s go back through it, so we register the device nodes regardless and
+	 * just note which banner values were unavailable. */
+	haveTemp = (thermal_temp(&temp) == 0);
+	haveMax = (thermal_max(&max) == 0);
+	haveThrottle = (thermal_throttled(&throttle) == 0);
 
 	if (portCreate(&port) != EOK) {
 		printf("rpi4-thermal: portCreate failed\n");
@@ -270,8 +173,15 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
-	printf("rpi4-thermal: T=%u mC max=%u mC throttle=0x%08x; registered /dev/thermal /dev/throttled\n",
-		temp, max, throttle);
+	if (haveTemp && haveMax && haveThrottle) {
+		printf("rpi4-thermal: T=%u mC max=%u mC throttle=0x%08x; registered /dev/thermal /dev/throttled\n",
+			temp, max, throttle);
+	}
+	else {
+		printf("rpi4-thermal: registered /dev/thermal /dev/throttled (startup banner read incomplete: "
+			"temp=%d max=%d throttle=%d; on-demand reads retry via /dev/vcmbox)\n",
+			haveTemp, haveMax, haveThrottle);
+	}
 
 	thermal_thread((void *)(uintptr_t)port);
 

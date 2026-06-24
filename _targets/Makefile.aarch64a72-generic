@@ -15,8 +15,16 @@ DEFAULT_COMPONENTS := pl011-tty libusbxhci libusbdrv-usbkbd libusbdrv-usbmouse
 # BCM2711 EMMC2 SD-card block driver (rootfs storage). DEP_LIBS pulls in
 # libsdcard-bcm2711 (generic SDHCI core + bcm2711 platform layer).
 DEFAULT_COMPONENTS += bcm2711-emmc
+# VideoCore property-mailbox server (/dev/vcmbox) + its client lib (libvcmbox).
+# Owns the single, hardware-arbitration-free mailbox FIFO at 0xfe00b880 and
+# serializes every property call, so the multiple boot-time mailbox clients
+# (thermal, genet MAC read, VL805 bring-up, sdio, v3d power-on) no longer race
+# and destroy each other's responses. Must be listed (and launched) FIRST among
+# the mailbox users. The lib is pulled in via DEP_LIBS where it is consumed.
+DEFAULT_COMPONENTS += rpi4-vcmbox
 # SoC thermal / throttle telemetry via the VideoCore property mailbox
-# (/dev/thermal, /dev/throttled). Telemetry only - the firmware owns the trip.
+# (/dev/thermal, /dev/throttled), now routed through rpi4-vcmbox. Telemetry
+# only - the firmware owns the trip.
 DEFAULT_COMPONENTS += rpi4-thermal
 # Hardware RNG (BCM2711 iproc RNG200 @ 0xfe104000) -> /dev/hwrng entropy source.
 DEFAULT_COMPONENTS += rpi4-hwrng
@@ -84,6 +92,14 @@ DEFAULT_COMPONENTS += rpi4-quake
 # Vulkan on Phoenix = the vkQuake prerequisite. Earlier: instance+enumerate+CreateDevice PASS
 # (2026-06-18 noop-job BO-alloc fix, external/mesa 3995663795a + coord 131c825). Next: vkQuake.
 # DEFAULT_COMPONENTS += rpi4-v3dv-tier0
+# vkQuake (Vulkan QuakeSpasm capstone): the full engine + Phoenix platform shims,
+# pre-built into /tmp/libvkquake.a (tools/vkquake-port/build-vkquake-phoenix.py --link,
+# real SPIR-V shaders), linked against the V3DV ICD (libv3dv-phoenix.a) + v3d back-end
+# (libv3d-phoenix.a) and bundled into loader.disk (boot-launched), like rpi4-quake.
+# Swap IN for rpi4-quake (loader.disk fits only one large GL/VK binary per boot): comment
+# the rpi4-quake DEFAULT_COMPONENTS line above + uncomment this one (and the matching
+# user.plo.yaml launch lines). Default-off; rpi4-quake (GL) stays the bundled flagship.
+# DEFAULT_COMPONENTS += rpi4-vkquake
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
