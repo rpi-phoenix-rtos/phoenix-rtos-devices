@@ -785,6 +785,15 @@ static void signal_txready(void *arg)
 #define KLOG_OID_PORT 0u
 #define KLOG_OID_ID   0u
 
+/* Task #31 — logging build mode (defined in board_config.h; 0 if the board does
+ * not opt in). When 1 (USER mode) the klog drain below keeps reading the ring
+ * but does NOT paint it to the HDMI fbcon, so the verbose kernel log no longer
+ * floods the screen (rpi4-klogd captures it to /var/log/messages instead). At 0
+ * (DEBUG, default) the fbcon shows the full klog exactly as today. */
+#ifndef RPI4_LOG_TO_FILE
+#define RPI4_LOG_TO_FILE 0
+#endif
+
 static void pl011_klogthr(void *arg)
 {
 	pl011_t *uart = (pl011_t *)arg;
@@ -818,8 +827,15 @@ static void pl011_klogthr(void *arg)
 		}
 
 		if (msg.o.err > 0) {
-			/* fbcon-only: UART is covered by the kernel mirror. */
+#if !RPI4_LOG_TO_FILE
+			/* fbcon-only: UART is covered by the kernel mirror. In USER mode
+			 * (RPI4_LOG_TO_FILE) the klog is captured to /var/log/messages by
+			 * rpi4-klogd and is not painted to the HDMI console; we still drain
+			 * the ring (the read above) so the kernel reader does not back up. */
 			pl011_fbcon_write(uart, buf, (size_t)msg.o.err);
+#else
+			(void)uart;
+#endif
 		}
 		else if (msg.o.err < 0) {
 			/* -EPIPE: fell behind, ring wrapped; kernel reset us to head. */

@@ -41,6 +41,11 @@ DEFAULT_COMPONENTS += rpi4-audio
 # Boot system-info banner: build stamp, uptime, a hardware-RNG entropy sample, and a
 # Pi 4 device-node inventory. Bounded/non-blocking (stat/getentropy/clock); "alive" touch.
 DEFAULT_COMPONENTS += rpi4-sysinfo
+# Kernel-log capture daemon (task #31): reads the klog ring and appends it to
+# /var/log/messages. Always bundled (a few KB); only LAUNCHED in the USER logging
+# mode (RPI4_LOG_TO_FILE), where it is the file-capture half of suppressing the
+# verbose klog from the console. View the file with the `logread` psh builtin.
+DEFAULT_COMPONENTS += rpi4-klogd
 # rpi4-ipcprobe: one-shot userspace-API readiness probe (misc/rpi4-ipcprobe/) — AF_UNIX
 # (socketpair + named bind/listen/accept/connect/send/recv) + libc entropy (getrandom/
 # getentropy). NOT a default component (re-add here + to user.plo.yaml to re-run).
