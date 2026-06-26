@@ -51,52 +51,17 @@ DEFAULT_COMPONENTS += rpi4-klogd
 # getentropy). NOT a default component (re-add here + to user.plo.yaml to re-run).
 # Verdict 2026-06-17: AF_UNIX READY + getrandom/getentropy READY (HW-verified).
 # DEFAULT_COMPONENTS += rpi4-ipcprobe
-# V3D GPU scout (Tier 3, GLQuake roadmap): powers on the V3D domain via the
-# mailbox + raw-dumps the V3D MMIO identity region to confirm the core is alive.
-DEFAULT_COMPONENTS += rpi4-v3d-scout
-# Mesa v3d driver harness (GLQuake Path C): links the ported Mesa v3d gallium
-# driver (libv3d-phoenix.a) + runs v3d_screen_create on HW. Boot-launched in the
-# netboot variant (see user.plo.yaml). Large (~11 MB: it pulls in the Mesa
-# compiler/NIR). Requires /tmp/libv3d-phoenix.a (tools/v3d-driver-port build).
-# rpi4-v3d-mesa dropped from the bundle while validating the GL frontend: both
-# harnesses together (~11+18 MB) would overflow loader.disk. Re-add to compare.
-# DEFAULT_COMPONENTS += rpi4-v3d-mesa
-# Mesa OpenGL glClear harness (GLQuake Path C, Phase 4): links the ported Mesa GL
-# frontend (libGL-phoenix.a) + v3d driver (libv3d-phoenix.a) and drives a glClear
-# through the OpenGL API on HW. Boot-launched in the netboot variant (see
-# user.plo.yaml). Large (~18 MB: full Mesa GL stack + GLSL compiler). Requires
-# /tmp/libGL-phoenix.a + /tmp/libv3d-phoenix.a (tools/v3d-driver-port build).
-# glclear validated (renders green); swapped out for the next rung (gldraw) to
-# stay under the loader.disk cap. Re-add to re-run the clear.
-# DEFAULT_COMPONENTS += rpi4-glclear
-# Mesa OpenGL textured/depth-tested glDrawArrays triangle (GLQuake Path C, Phase 4):
-# the rung between glClear and glgears -- exercises the GL frontend's vertex-submission
-# + fixed-function shader generation + v3d_compile-at-draw path. Same libs as glclear.
-# gldraw validated (textured triangle visible on HDMI); swapped out for glcube.
-# DEFAULT_COMPONENTS += rpi4-gldraw
-# Mesa OpenGL animated spinning-cube demo (GLQuake Path C, Phase 4): the "glgears-or-
-# similar" rung -- perspective + depth-tested + per-frame glRotatef animation, held on
-# /dev/fb0. Demonstrates basic OpenGL animation on the V3D. Same libs as glclear/gldraw.
-# rpi4-glcube swapped out for rpi4-quake (the Quakespasm capstone) to stay under the
-# loader.disk cap (only one ~18 MB GL binary fits). Re-add to re-run the cube.
-# DEFAULT_COMPONENTS += rpi4-glcube
+# The V3D GPU bring-up diagnostics (rpi4-v3d-scout, rpi4-v3d-mesa, rpi4-v3d-stalltest,
+# rpi4-v3dv-tier0) and the GL demo rungs (rpi4-glclear, rpi4-gldraw, rpi4-glcube) were
+# removed: their hypotheses are resolved (V3D powers on, GL renders on HDMI, Vulkan
+# tier-4b renders a real pipeline) and the showcase capstone is rpi4-quake (now in
+# phoenix-rtos-project/_user/). Recoverable from git history if a future probe is needed.
+#
 # rpi4-quake (GLQuake capstone) + rpi4-vkquake are applications, not drivers: they
 # now live in phoenix-rtos-project/_user/ and are built by that project's
 # `make -C _user all install`, not here. The loader.disk bundle + the
 # `app -x rpi4-quake` launch in user.plo.yaml are unchanged (basename lookup out of
 # PREFIX_PROG_STRIPPED, which both repos populate identically).
-# DEFAULT_COMPONENTS += rpi4-v3d-stalltest  # render-stall repro harness (swap in to reproduce)
-# Vulkan V3DV Tier-1 boot harness: vkCreateInstance/EnumeratePhysicalDevices/
-# CreateDevice on real HW. Links libv3dv-phoenix.a + libv3d-phoenix.a. Swap IN for
-# rpi4-quake (loader.disk fits only one large GL/VK binary) to continue Vulkan
-# bring-up. STATUS: Tier 4b DONE on real HW (2026-06-23) — a graphics pipeline built from
-# hand-authored SPIR-V VS+FS (compiled spirv_to_nir -> v3d_compile NIR->QPU), a render pass
-# (loadOp=CLEAR, storeOp=STORE to the scanout image) + vertexless vkCmdDraw(3): all of
-# vkCreateGraphicsPipelines / QueueSubmit / QueueWaitIdle return 0, no fault, and the scanout
-# px0 readback = ff 00 80 ff (render-pass STORE landed). First user-shader GPU render through
-# Vulkan on Phoenix = the vkQuake prerequisite. Earlier: instance+enumerate+CreateDevice PASS
-# (2026-06-18 noop-job BO-alloc fix, external/mesa 3995663795a + coord 131c825). Next: vkQuake.
-# DEFAULT_COMPONENTS += rpi4-v3dv-tier0
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
