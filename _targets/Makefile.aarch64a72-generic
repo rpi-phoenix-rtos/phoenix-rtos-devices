@@ -80,11 +80,11 @@ DEFAULT_COMPONENTS += rpi4-v3d-scout
 # rpi4-glcube swapped out for rpi4-quake (the Quakespasm capstone) to stay under the
 # loader.disk cap (only one ~18 MB GL binary fits). Re-add to re-run the cube.
 # DEFAULT_COMPONENTS += rpi4-glcube
-# Quakespasm (GLQuake capstone): the full engine + Phoenix platform shims, pre-built
-# into /tmp/libquakespasm.a (tools/quakespasm-port/build-quakespasm-phoenix.py),
-# linked against libGL-phoenix + libv3d-phoenix and bundled into loader.disk
-# (boot-launched). ~19 MB; can't be NFS-exec'd, hence the bundle.
-DEFAULT_COMPONENTS += rpi4-quake
+# rpi4-quake (GLQuake capstone) + rpi4-vkquake are applications, not drivers: they
+# now live in phoenix-rtos-project/_user/ and are built by that project's
+# `make -C _user all install`, not here. The loader.disk bundle + the
+# `app -x rpi4-quake` launch in user.plo.yaml are unchanged (basename lookup out of
+# PREFIX_PROG_STRIPPED, which both repos populate identically).
 # DEFAULT_COMPONENTS += rpi4-v3d-stalltest  # render-stall repro harness (swap in to reproduce)
 # Vulkan V3DV Tier-1 boot harness: vkCreateInstance/EnumeratePhysicalDevices/
 # CreateDevice on real HW. Links libv3dv-phoenix.a + libv3d-phoenix.a. Swap IN for
