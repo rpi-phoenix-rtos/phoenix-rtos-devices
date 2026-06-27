@@ -96,6 +96,7 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_REG_OP_USBCMD_HSEE  (1u << 3)
 #define XHCI_REG_OP_USBSTS_HCH   (1u << 0)
 #define XHCI_REG_OP_USBSTS_HSE   (1u << 2)
+#define XHCI_REG_OP_USBSTS_EINT  (1u << 3)
 #define XHCI_REG_OP_USBSTS_CNR   (1u << 11)
 #define XHCI_REG_OP_USBSTS_HCE   (1u << 12)
 #define XHCI_REG_OP_PAGESIZE_4K  (1u << 0)
@@ -2331,6 +2332,13 @@ static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
 		return NULL;
 	}
 
+	/* Two-step addressing (BSR=1 context-only, then BSR=0 assign) — see the
+	 * root-port path in xhci_handlePipeTransfer for the rationale (#129). */
+	*err = xhci_cmdAddressDevice(xhci, slot, 0);
+	if (*err < 0) {
+		return NULL;
+	}
+
 	*err = xhci_cmdAddressDevice(xhci, slot, 1);
 	if (*err < 0) {
 		return NULL;
@@ -3380,6 +3388,21 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 			}
 
 			err = xhci_prepareAddressContext(xhci, xhci->cur, pipe->dev);
+			if (err < 0) {
+				return err;
+			}
+
+			/* Two-step addressing (Linux xhci_setup_device scheme, #129). BSR=1
+			 * (setAddress==0) sets up the slot + ep0 context WITHOUT issuing
+			 * SET_ADDRESS on the wire — it reads the input context only. BSR=0
+			 * (setAddress==1) then assigns the address. The single-step BSR=0 form
+			 * intermittently never completes on the Pi4 VL805 (~3/4 cold boots);
+			 * the controller dequeues EnableSlot fine but the BSR=0 AddressDevice
+			 * produces no completion at all. Splitting it isolates the wire step
+			 * from the context read and matches what Linux does to be deterministic.
+			 * Safe here: the ep0 ring was just initialised and no ep0 transfer has
+			 * happened yet, so the BSR=0 step's trDequeuePtr (re)load is a no-op. */
+			err = xhci_cmdAddressDevice(xhci, xhci->cur, 0);
 			if (err < 0) {
 				return err;
 			}
