@@ -92,6 +92,16 @@ enum { cr_uarten = 1 << 0, cr_txe = 1 << 8, cr_rxe = 1 << 9 };
 #define PL011_FBCON_BG 0xff000000u
 #define PL011_FBCON_FG 0xffffffffu
 
+/* 16-colour ANSI palette (SGR, #49), ARGB8888 with opaque alpha. Indices 0-7 are
+ * the normal colours (SGR 30-37 / 40-47), 8-15 the bright ones (SGR 90-97 /
+ * 100-107, or 0-7 with bold). */
+static const uint32_t pl011_fbcon_palette[16] = {
+	0xff000000u, 0xffaa0000u, 0xff00aa00u, 0xffaa5500u, /* blk red grn yel  */
+	0xff0000aau, 0xffaa00aau, 0xff00aaaau, 0xffaaaaaau, /* blu mag cyn wht  */
+	0xff555555u, 0xffff5555u, 0xff55ff55u, 0xffffff55u, /* bright black-yel */
+	0xff5555ffu, 0xffff55ffu, 0xff55ffffu, 0xffffffffu, /* bright blu-white */
+};
+
 
 /* TD-15 Stage 4: minimal VT100/ANSI parser state for the HDMI fbcon
  * path. Without this the literal escape bytes from psh / klog
@@ -157,6 +167,14 @@ typedef struct {
 	uint8_t fbescNumParams;
 	uint8_t fbescPad;
 
+	/* ANSI SGR colour state (#49) + text cursor (#50). */
+	uint32_t fbfg;      /* current foreground colour */
+	uint32_t fbbg;      /* current background colour */
+	uint8_t fbbold;     /* SGR 1 (bold) -> brighten the 30-37 foreground */
+	uint8_t fbcurShown; /* an XOR cursor is currently applied at fbcurCol/Row */
+	uint16_t fbcurCol;  /* where that cursor was drawn */
+	uint16_t fbcurRow;
+
 	char stack[4096] __attribute__((aligned(8)));
 	char kbdstack[4096] __attribute__((aligned(8)));
 	char klogstack[4096] __attribute__((aligned(8)));
@@ -198,10 +216,30 @@ static void pl011_fbcon_drawChar(pl011_t *uart, uint16_t col, uint16_t row, unsi
 
 	for (charPixY = y; charPixY < (y + TTYPC_FBFONT_H); ++charPixY) {
 		for (i = 0u; i < 8u; ++i) {
-			pl011_fbcon_drawPixel(uart, x + (7u - i), charPixY, ((*data & (1u << i)) != 0u) ? PL011_FBCON_FG : PL011_FBCON_BG);
+			pl011_fbcon_drawPixel(uart, x + (7u - i), charPixY, ((*data & (1u << i)) != 0u) ? uart->fbfg : uart->fbbg);
 		}
 
 		data += TTYPC_FBFONT_W_BYTES;
+	}
+}
+
+
+/* Text cursor (#50): invert (XOR) every pixel of one character cell. XOR is its
+ * own inverse, so the same call both draws and erases the cursor and the glyph
+ * underneath survives (shown in reverse video) — an empty cell becomes a solid
+ * block. Drawn after each console write at the live position and erased before
+ * the next, so it tracks the prompt without leaving artefacts. */
+static void pl011_fbcon_xorCursor(pl011_t *uart, uint16_t col, uint16_t row)
+{
+	uint16_t x0 = col * TTYPC_FBFONT_W;
+	uint16_t y0 = row * TTYPC_FBFONT_H;
+	uint16_t x, y;
+
+	for (y = y0; y < (y0 + TTYPC_FBFONT_H); ++y) {
+		volatile uint32_t *line = (volatile uint32_t *)((char *)uart->fbdraw + y * uart->fbpitch);
+		for (x = x0; x < (x0 + TTYPC_FBFONT_W); ++x) {
+			line[x] ^= 0x00ffffffu;
+		}
 	}
 }
 
@@ -355,9 +393,52 @@ static void pl011_fbcon_dispatchCsi(pl011_t *uart, unsigned char final)
 			uart->fbcol = (uart->fbcol > step) ? (uart->fbcol - step) : 0u;
 			break;
 
-		case 'm':
-			/* SGR — ignored; fbcon is BG/FG only. */
+		case 'm': {
+			/* SGR (#49): set foreground/background colour + bold. ESC[m with
+			 * no params == reset. Iterate every parameter so compound
+			 * sequences like ESC[1;32m (bold + green) apply in order. */
+			uint8_t np = (uart->fbescNumParams > 0u) ? uart->fbescNumParams : 1u;
+			uint8_t k;
+			for (k = 0u; k < np; ++k) {
+				uint16_t p = (k < uart->fbescNumParams) ? uart->fbescParams[k] : 0u;
+				if (p == 0u) { /* reset */
+					uart->fbfg = PL011_FBCON_FG;
+					uart->fbbg = PL011_FBCON_BG;
+					uart->fbbold = 0u;
+				}
+				else if (p == 1u) { /* bold -> brighten fg */
+					uart->fbbold = 1u;
+				}
+				else if (p == 22u) { /* normal intensity */
+					uart->fbbold = 0u;
+				}
+				else if (p == 7u) { /* reverse video: swap fg/bg */
+					uint32_t t = uart->fbfg;
+					uart->fbfg = uart->fbbg;
+					uart->fbbg = t;
+				}
+				else if ((p >= 30u) && (p <= 37u)) {
+					uart->fbfg = pl011_fbcon_palette[(p - 30u) + (uart->fbbold ? 8u : 0u)];
+				}
+				else if (p == 39u) { /* default fg */
+					uart->fbfg = PL011_FBCON_FG;
+				}
+				else if ((p >= 40u) && (p <= 47u)) {
+					uart->fbbg = pl011_fbcon_palette[p - 40u];
+				}
+				else if (p == 49u) { /* default bg */
+					uart->fbbg = PL011_FBCON_BG;
+				}
+				else if ((p >= 90u) && (p <= 97u)) {
+					uart->fbfg = pl011_fbcon_palette[(p - 90u) + 8u];
+				}
+				else if ((p >= 100u) && (p <= 107u)) {
+					uart->fbbg = pl011_fbcon_palette[(p - 100u) + 8u];
+				}
+				/* 38/48 (256-colour / truecolour) + others: consumed. */
+			}
 			break;
+		}
 
 		default:
 			/* Unsupported final char — drop silently. */
@@ -480,9 +561,19 @@ static void pl011_fbcon_write(pl011_t *uart, const char *data, size_t size)
 	}
 
 	mutexLock(uart->fbLock);
+	/* Erase the old cursor before drawing so output never fights the XOR (#50). */
+	if (uart->fbcurShown != 0u) {
+		pl011_fbcon_xorCursor(uart, uart->fbcurCol, uart->fbcurRow);
+		uart->fbcurShown = 0u;
+	}
 	for (i = 0u; i < size; ++i) {
 		pl011_fbcon_putc(uart, (unsigned char)data[i]);
 	}
+	/* Redraw the cursor at the new live position. */
+	uart->fbcurCol = uart->fbcol;
+	uart->fbcurRow = uart->fbrow;
+	pl011_fbcon_xorCursor(uart, uart->fbcurCol, uart->fbcurRow);
+	uart->fbcurShown = 1u;
 	mutexUnlock(uart->fbLock);
 }
 
@@ -591,6 +682,12 @@ static int pl011_fbcon_init(pl011_t *uart)
 	 * text rendering begins. */
 	uart->fbescState = pl011_fbcon_esc_normal;
 	uart->fbescNumParams = 0u;
+	/* Default colours + no cursor yet (the struct is zero-initialised, so the
+	 * fg/bg MUST be set here or drawChar would render black-on-black). */
+	uart->fbfg = PL011_FBCON_FG;
+	uart->fbbg = PL011_FBCON_BG;
+	uart->fbbold = 0u;
+	uart->fbcurShown = 0u;
 	uart->fbcol = 0u;
 	uart->fbrow = 0u;
 	pl011_fbcon_clearAll(uart);
