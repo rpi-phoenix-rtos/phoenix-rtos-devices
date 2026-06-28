@@ -763,6 +763,47 @@ static void signal_txready(void *arg)
 #define RPI4_LOG_TO_FILE 0
 #endif
 
+/* The klog ring carries line-oriented kernel/boot text terminated with a bare
+ * '\n' (LF). Unlike the psh/program path it does NOT pass through libtty's
+ * OPOST/ONLCR output processing, so no carriage return is added. teken —
+ * correctly — treats LF as line-feed only (cursor down, SAME column), relying on
+ * the host's ONLCR to supply the CR. Painting raw klog through teken therefore
+ * staircases every boot line (each starts where the previous ended). Apply the
+ * ONLCR equivalent HERE, on the klog path only: translate '\n' -> '\r\n' (unless
+ * a '\r' already precedes it). This is deliberately NOT done in the shared
+ * pl011_fbcon_write, because the libtty path feeds raw-mode full-screen apps
+ * (nano/mc) that emit bare LF for precise cursor control and must keep teken's
+ * standard LF semantics. */
+static void pl011_fbcon_writeKlog(pl011_t *uart, const char *data, size_t size)
+{
+	char cooked[256];
+	size_t n = 0u;
+	size_t i;
+	char prev = '\0';
+
+	for (i = 0u; i < size; ++i) {
+		char c = data[i];
+
+		if ((c == '\n') && (prev != '\r')) {
+			cooked[n++] = '\r';
+			if (n == sizeof(cooked)) {
+				pl011_fbcon_write(uart, cooked, n);
+				n = 0u;
+			}
+		}
+		cooked[n++] = c;
+		if (n == sizeof(cooked)) {
+			pl011_fbcon_write(uart, cooked, n);
+			n = 0u;
+		}
+		prev = c;
+	}
+
+	if (n > 0u) {
+		pl011_fbcon_write(uart, cooked, n);
+	}
+}
+
 static void pl011_klogthr(void *arg)
 {
 	pl011_t *uart = (pl011_t *)arg;
@@ -801,7 +842,7 @@ static void pl011_klogthr(void *arg)
 			 * (RPI4_LOG_TO_FILE) the klog is captured to /var/log/messages by
 			 * rpi4-klogd and is not painted to the HDMI console; we still drain
 			 * the ring (the read above) so the kernel reader does not back up. */
-			pl011_fbcon_write(uart, buf, (size_t)msg.o.err);
+			pl011_fbcon_writeKlog(uart, buf, (size_t)msg.o.err);
 #else
 			(void)uart;
 #endif
