@@ -7,6 +7,6 @@
 #
 
 NAME := pl011-tty
-LOCAL_SRCS := pl011-tty.c
+LOCAL_SRCS := pl011-tty.c teken/teken.c
 DEP_LIBS := libtty libklog
 include $(binary.mk)

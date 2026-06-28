@@ -37,6 +37,7 @@
 #if defined(__CPU_GENERIC)
 #include <phoenix/arch/aarch64/generic/generic.h>
 #include "../pc-tty/ttypc_fbfont.h"
+#include "teken/teken.h"
 #endif
 
 
@@ -103,20 +104,8 @@ static const uint32_t pl011_fbcon_palette[16] = {
 };
 
 
-/* TD-15 Stage 4: minimal VT100/ANSI parser state for the HDMI fbcon
- * path. Without this the literal escape bytes from psh / klog
- * (e.g. "\x1b[0J", "\x1b[2J", "\x1b[H", "\x1b[r;cH") show up on
- * screen as garbage characters ("?[0J(psh)%" in the user-captured
- * HDMI screenshot). PL011_FBCON_ESC_MAX_PARAMS bounds the parameter
- * list (max 8 params is well above the longest sequence psh
- * realistically emits). */
-#define PL011_FBCON_ESC_MAX_PARAMS 8u
-
-typedef enum {
-	pl011_fbcon_esc_normal = 0,
-	pl011_fbcon_esc_gotEsc,    /* received \x1b, waiting for the next char */
-	pl011_fbcon_esc_inCsi,     /* in a CSI (Control Sequence Introducer) sequence \x1b[ */
-} pl011_fbcon_escState_t;
+/* The HDMI fbcon VT/xterm emulation is provided by FreeBSD teken (#54);
+ * see teken/. The per-console teken_t lives in struct pl011_t below. */
 
 
 typedef struct {
@@ -161,18 +150,11 @@ typedef struct {
 	 * DISABLE, cleared on ENABLE; the kbd bridge thread polls it. */
 	volatile int kbdReleased;
 
-	/* TD-15 Stage 4: VT100/ANSI parser state. */
-	pl011_fbcon_escState_t fbescState;
-	uint16_t fbescParams[PL011_FBCON_ESC_MAX_PARAMS];
-	uint8_t fbescNumParams;
-	uint8_t fbescPad;
-
-	/* ANSI SGR colour state (#49) + text cursor (#50). */
-	uint32_t fbfg;      /* current foreground colour */
-	uint32_t fbbg;      /* current background colour */
-	uint8_t fbbold;     /* SGR 1 (bold) -> brighten the 30-37 foreground */
+	/* FreeBSD teken VT/xterm emulator (#54) + the XOR text cursor it positions
+	 * (the tf_cursor callback updates fbcol/fbrow). */
+	teken_t fbteken;
 	uint8_t fbcurShown; /* an XOR cursor is currently applied at fbcurCol/Row */
-	uint16_t fbcurCol;  /* where that cursor was drawn */
+	uint16_t fbcurCol;
 	uint16_t fbcurRow;
 
 	char stack[4096] __attribute__((aligned(8)));
@@ -206,22 +188,7 @@ static inline void pl011_fbcon_drawPixel(pl011_t *uart, uint16_t x, uint16_t y, 
 }
 
 
-static void pl011_fbcon_drawChar(pl011_t *uart, uint16_t col, uint16_t row, unsigned char c)
-{
-	uint16_t x = col * TTYPC_FBFONT_W;
-	uint16_t y = row * TTYPC_FBFONT_H;
-	uint8_t *data = ttypc_fbcon_fbfont + (TTYPC_FBFONT_BYTES_PER_GLYPH * c);
-	uint16_t charPixY;
-	size_t i;
-
-	for (charPixY = y; charPixY < (y + TTYPC_FBFONT_H); ++charPixY) {
-		for (i = 0u; i < 8u; ++i) {
-			pl011_fbcon_drawPixel(uart, x + (7u - i), charPixY, ((*data & (1u << i)) != 0u) ? uart->fbfg : uart->fbbg);
-		}
-
-		data += TTYPC_FBFONT_W_BYTES;
-	}
-}
+/* glyph rendering moved into the teken callback block below (pl011_fbcon_drawGlyph). */
 
 
 /* Text cursor (#50): invert (XOR) every pixel of one character cell. XOR is its
@@ -269,293 +236,200 @@ static inline void pl011_fbcon_fill64(volatile uint32_t *base, size_t bytes, uin
 }
 
 
-static void pl011_fbcon_clearRow(pl011_t *uart, uint16_t row)
-{
-	uint16_t y;
-	size_t rowBytes = (size_t)uart->fbcols * (size_t)TTYPC_FBFONT_W * sizeof(uint32_t);
-
-	for (y = row * TTYPC_FBFONT_H; y < (row + 1u) * TTYPC_FBFONT_H; ++y) {
-		volatile uint32_t *line = (volatile uint32_t *)((char *)uart->fbdraw + y * uart->fbpitch);
-		pl011_fbcon_fill64(line, rowBytes, PL011_FBCON_BG);
-	}
-}
-
-
-/* TD-15 Stage 4: clear the fbmemsz-bounded area to BG. Uses the
- * 64-bit fill primitive to halve instruction count vs the previous
- * per-pixel clearRow loop. */
+/* Clear the whole draw surface to the default background. */
 static void pl011_fbcon_clearAll(pl011_t *uart)
 {
 	pl011_fbcon_fill64(uart->fbdraw, uart->fbmemsz, PL011_FBCON_BG);
-	uart->fbcol = 0u;
-	uart->fbrow = 0u;
 }
 
 
-static void pl011_fbcon_scroll(pl011_t *uart)
-{
-	size_t rowsz = uart->fbpitch * TTYPC_FBFONT_H;
-	size_t visible = uart->fbpitch * uart->fbrows * TTYPC_FBFONT_H;
+/* ---- FreeBSD teken terminal-emulator callbacks (#54) -----------------------
+ * teken parses the byte stream (full VT100/xterm: control chars, CSI, SGR,
+ * scroll regions, insert/delete, charsets, ...) and calls these to paint. We
+ * map its 8-colour palette (+bold/reverse) onto the 16-colour ARGB palette and
+ * its DEC line-drawing Unicode output onto the CP437 glyphs of the built-in
+ * 8x16 font, so nano/mc frames + colours render on the bare HDMI console. */
 
-	memmove((void *)uart->fbdraw, (const char *)uart->fbdraw + rowsz, visible - rowsz);
-	uart->fbrow = uart->fbrows - 1u;
-	pl011_fbcon_clearRow(uart, uart->fbrow);
+static uint32_t pl011_teken_argb(teken_color_t c, int bright)
+{
+	unsigned idx = (unsigned)(c & 0x7u) + ((((c & TC_LIGHT) != 0u) || bright) ? 8u : 0u);
+	return pl011_fbcon_palette[idx & 0xfu];
 }
 
 
-/* TD-15 Stage 4: dispatch a CSI sequence (ESC [ params final).
- *
- * We support the small set of sequences psh and klog actually emit:
- *   J  - Erase in display.   0/missing: cursor to end. 2: entire screen.
- *   K  - Erase in line.      0/missing: cursor to EOL. 2: entire line.
- *   H  - Cursor position.    Optional row;col, defaulting to 1;1.
- *   f  - Cursor position.    Same as H.
- *   A  - Cursor up by N (default 1).
- *   B  - Cursor down by N.
- *   C  - Cursor forward by N.
- *   D  - Cursor back by N.
- *   m  - SGR (color/attr).   Consumed silently — fbcon is BG/FG only.
- *
- * Anything else is consumed silently. The cursor is row-clamped to
- * [0, fbrows) and column-clamped to [0, fbcols).
- */
-static void pl011_fbcon_dispatchCsi(pl011_t *uart, unsigned char final)
+/* Map a teken_char_t to a CP437 glyph index of the built-in font. ASCII passes
+ * through; teken's DEC line-drawing Unicode codepoints map to CP437 box glyphs;
+ * the Latin-1/CP437 high range passes through; anything else -> '?'. */
+static unsigned char pl011_teken_glyph(teken_char_t c)
 {
-	uint16_t param0 = (uart->fbescNumParams > 0u) ? uart->fbescParams[0] : 0u;
-	uint16_t param1 = (uart->fbescNumParams > 1u) ? uart->fbescParams[1] : 0u;
-	uint16_t row;
-	uint16_t col;
-	uint16_t step;
+	if (c >= 0x20u && c <= 0x7eu) {
+		return (unsigned char)c;
+	}
+	switch (c) {
+		case 0x2500u: return 0xc4u; /* horizontal      */
+		case 0x2502u: return 0xb3u; /* vertical        */
+		case 0x250cu: return 0xdau; /* upper-left      */
+		case 0x2510u: return 0xbfu; /* upper-right     */
+		case 0x2514u: return 0xc0u; /* lower-left      */
+		case 0x2518u: return 0xd9u; /* lower-right     */
+		case 0x251cu: return 0xc3u; /* left tee        */
+		case 0x2524u: return 0xb4u; /* right tee       */
+		case 0x252cu: return 0xc2u; /* top tee         */
+		case 0x2534u: return 0xc1u; /* bottom tee      */
+		case 0x253cu: return 0xc5u; /* cross           */
+		case 0x2592u: return 0xb1u; /* medium shade    */
+		case 0x25c6u: return 0x04u; /* diamond         */
+		case 0x00b0u: return 0xf8u; /* degree          */
+		case 0x00b1u: return 0xf1u; /* plus-minus      */
+		case 0x00b7u: return 0xfau; /* middle dot      */
+		case 0x2190u: return 0x1bu; /* left arrow      */
+		case 0x2191u: return 0x18u; /* up arrow        */
+		case 0x2192u: return 0x1au; /* right arrow     */
+		case 0x2193u: return 0x19u; /* down arrow      */
+		case 0x23bau: case 0x23bbu:
+		case 0x23bcu: case 0x23bdu: return 0xc4u; /* horizontal scan lines */
+		default: break;
+	}
+	if (c >= 0xa0u && c <= 0xffu) {
+		return (unsigned char)c;
+	}
+	return (unsigned char)'?';
+}
 
-	switch (final) {
-		case 'J':
-			/* 2026-05-17: restored real clear now caches are on.
-			 * param0=0 (default) = cursor-to-end-of-display;
-			 * param0=2 = entire screen. */
-			if (param0 == 2u) {
-				pl011_fbcon_clearAll(uart);
-			}
-			else {
-				/* Cursor-to-end: clear current row from cursor to
-				 * EOL, then all rows below. */
-				uint16_t r;
-				for (r = uart->fbrow; r < uart->fbrows; ++r) {
-					pl011_fbcon_clearRow(uart, r);
-				}
-			}
-			break;
 
-		case 'K':
-			/* 2026-05-17: restored real line clear now caches are on.
-			 * For simplicity we always clear the entire current row;
-			 * psh's typical \x1b[K means "to end of line" but the
-			 * cells past the cursor are already empty in practice. */
-			pl011_fbcon_clearRow(uart, uart->fbrow);
-			break;
+static void pl011_fbcon_drawGlyph(pl011_t *uart, uint16_t col, uint16_t row, unsigned char ch, uint32_t fg, uint32_t bg)
+{
+	uint16_t x = col * TTYPC_FBFONT_W;
+	uint16_t y = row * TTYPC_FBFONT_H;
+	const uint8_t *data = ttypc_fbcon_fbfont + ((size_t)TTYPC_FBFONT_BYTES_PER_GLYPH * ch);
+	uint16_t py;
+	size_t i;
 
-		case 'H':
-		case 'f':
-			row = (param0 > 0u) ? (param0 - 1u) : 0u;
-			col = (param1 > 0u) ? (param1 - 1u) : 0u;
-			if (row >= uart->fbrows) {
-				row = uart->fbrows - 1u;
-			}
-			if (col >= uart->fbcols) {
-				col = uart->fbcols - 1u;
-			}
-			uart->fbrow = row;
-			uart->fbcol = col;
-			break;
-
-		case 'A':
-			step = (param0 > 0u) ? param0 : 1u;
-			uart->fbrow = (uart->fbrow > step) ? (uart->fbrow - step) : 0u;
-			break;
-
-		case 'B':
-			step = (param0 > 0u) ? param0 : 1u;
-			uart->fbrow += step;
-			if (uart->fbrow >= uart->fbrows) {
-				uart->fbrow = uart->fbrows - 1u;
-			}
-			break;
-
-		case 'C':
-			step = (param0 > 0u) ? param0 : 1u;
-			uart->fbcol += step;
-			if (uart->fbcol >= uart->fbcols) {
-				uart->fbcol = uart->fbcols - 1u;
-			}
-			break;
-
-		case 'D':
-			step = (param0 > 0u) ? param0 : 1u;
-			uart->fbcol = (uart->fbcol > step) ? (uart->fbcol - step) : 0u;
-			break;
-
-		case 'm': {
-			/* SGR (#49): set foreground/background colour + bold. ESC[m with
-			 * no params == reset. Iterate every parameter so compound
-			 * sequences like ESC[1;32m (bold + green) apply in order. */
-			uint8_t np = (uart->fbescNumParams > 0u) ? uart->fbescNumParams : 1u;
-			uint8_t k;
-			for (k = 0u; k < np; ++k) {
-				uint16_t p = (k < uart->fbescNumParams) ? uart->fbescParams[k] : 0u;
-				if (p == 0u) { /* reset */
-					uart->fbfg = PL011_FBCON_FG;
-					uart->fbbg = PL011_FBCON_BG;
-					uart->fbbold = 0u;
-				}
-				else if (p == 1u) { /* bold -> brighten fg */
-					uart->fbbold = 1u;
-				}
-				else if (p == 22u) { /* normal intensity */
-					uart->fbbold = 0u;
-				}
-				else if (p == 7u) { /* reverse video: swap fg/bg */
-					uint32_t t = uart->fbfg;
-					uart->fbfg = uart->fbbg;
-					uart->fbbg = t;
-				}
-				else if ((p >= 30u) && (p <= 37u)) {
-					uart->fbfg = pl011_fbcon_palette[(p - 30u) + (uart->fbbold ? 8u : 0u)];
-				}
-				else if (p == 39u) { /* default fg */
-					uart->fbfg = PL011_FBCON_FG;
-				}
-				else if ((p >= 40u) && (p <= 47u)) {
-					uart->fbbg = pl011_fbcon_palette[p - 40u];
-				}
-				else if (p == 49u) { /* default bg */
-					uart->fbbg = PL011_FBCON_BG;
-				}
-				else if ((p >= 90u) && (p <= 97u)) {
-					uart->fbfg = pl011_fbcon_palette[(p - 90u) + 8u];
-				}
-				else if ((p >= 100u) && (p <= 107u)) {
-					uart->fbbg = pl011_fbcon_palette[(p - 100u) + 8u];
-				}
-				/* 38/48 (256-colour / truecolour) + others: consumed. */
-			}
-			break;
+	for (py = y; py < (y + TTYPC_FBFONT_H); ++py) {
+		for (i = 0u; i < 8u; ++i) {
+			pl011_fbcon_drawPixel(uart, x + (7u - i), py, ((*data & (1u << i)) != 0u) ? fg : bg);
 		}
-
-		default:
-			/* Unsupported final char — drop silently. */
-			break;
+		data += TTYPC_FBFONT_W_BYTES;
 	}
 }
 
 
-static void pl011_fbcon_putc(pl011_t *uart, unsigned char c)
+static void pl011_teken_bell(void *s)
 {
-	if (uart->fbaddr == NULL) {
+	(void)s;
+}
+
+
+static void pl011_teken_cursor(void *s, const teken_pos_t *p)
+{
+	pl011_t *uart = (pl011_t *)s;
+	uart->fbcol = p->tp_col;
+	uart->fbrow = p->tp_row;
+}
+
+
+static void pl011_teken_putchar(void *s, const teken_pos_t *p, teken_char_t c, const teken_attr_t *a)
+{
+	pl011_t *uart = (pl011_t *)s;
+	uint32_t fg = pl011_teken_argb(a->ta_fgcolor, (a->ta_format & TF_BOLD) != 0u);
+	uint32_t bg = pl011_teken_argb(a->ta_bgcolor, 0);
+
+	if ((a->ta_format & TF_REVERSE) != 0u) {
+		uint32_t t = fg;
+		fg = bg;
+		bg = t;
+	}
+	if (p->tp_col >= uart->fbcols || p->tp_row >= uart->fbrows) {
 		return;
 	}
+	pl011_fbcon_drawGlyph(uart, p->tp_col, p->tp_row, pl011_teken_glyph(c), fg, bg);
+}
 
-	/* TD-15 Stage 4: VT100/ANSI ESC parser. Without this the raw
-	 * escape bytes from psh / klog are rendered literally on HDMI. */
-	switch (uart->fbescState) {
-		case pl011_fbcon_esc_gotEsc:
-			if (c == '[') {
-				uart->fbescState = pl011_fbcon_esc_inCsi;
-				uart->fbescNumParams = 0u;
-				uart->fbescParams[0] = 0u;
-			}
-			else if (c == 'c') {
-				/* RIS — reset to initial state. */
-				pl011_fbcon_clearAll(uart);
-				uart->fbescState = pl011_fbcon_esc_normal;
-			}
-			else {
-				/* Two-byte non-CSI sequence we don't model — drop. */
-				uart->fbescState = pl011_fbcon_esc_normal;
-			}
-			return;
 
-		case pl011_fbcon_esc_inCsi:
-			if ((c >= '0') && (c <= '9')) {
-				if (uart->fbescNumParams == 0u) {
-					uart->fbescNumParams = 1u;
-				}
-				uart->fbescParams[uart->fbescNumParams - 1u] =
-					(uart->fbescParams[uart->fbescNumParams - 1u] * 10u) + (c - '0');
-				return;
-			}
-			else if (c == ';') {
-				if (uart->fbescNumParams < PL011_FBCON_ESC_MAX_PARAMS) {
-					uart->fbescNumParams++;
-					uart->fbescParams[uart->fbescNumParams - 1u] = 0u;
-				}
-				return;
-			}
-			else if ((c == '?') || (c == '>')) {
-				/* Private CSI introducer — consume but treat the rest
-				 * as standard. */
-				return;
-			}
-			else if ((c >= 0x40u) && (c <= 0x7eu)) {
-				pl011_fbcon_dispatchCsi(uart, c);
-				uart->fbescState = pl011_fbcon_esc_normal;
-				return;
-			}
-			else {
-				/* Out-of-spec byte inside CSI — abort the sequence. */
-				uart->fbescState = pl011_fbcon_esc_normal;
-				return;
-			}
-			/* unreachable */
+static void pl011_teken_fill(void *s, const teken_rect_t *r, teken_char_t c, const teken_attr_t *a)
+{
+	pl011_t *uart = (pl011_t *)s;
+	uint32_t fg = pl011_teken_argb(a->ta_fgcolor, (a->ta_format & TF_BOLD) != 0u);
+	uint32_t bg = pl011_teken_argb(a->ta_bgcolor, 0);
+	unsigned char g = pl011_teken_glyph(c);
+	teken_unit_t row, col;
 
-		case pl011_fbcon_esc_normal:
-		default:
-			if (c == 0x1bu) {
-				uart->fbescState = pl011_fbcon_esc_gotEsc;
-				return;
-			}
-			break;
+	if ((a->ta_format & TF_REVERSE) != 0u) {
+		uint32_t t = fg;
+		fg = bg;
+		bg = t;
 	}
-
-	switch (c) {
-		case '\r':
-			uart->fbcol = 0u;
-			return;
-
-		case '\n':
-			uart->fbcol = 0u;
-			uart->fbrow++;
-			break;
-
-		case '\b':
-			if (uart->fbcol > 0u) {
-				uart->fbcol--;
-				pl011_fbcon_drawChar(uart, uart->fbcol, uart->fbrow, ' ');
+	for (row = r->tr_begin.tp_row; row < r->tr_end.tp_row && row < uart->fbrows; ++row) {
+		if (g == (unsigned char)' ') {
+			/* Fast path: fill this cell-row's pixel span with the background. */
+			uint16_t x0 = r->tr_begin.tp_col * TTYPC_FBFONT_W;
+			size_t spanpx = (size_t)(r->tr_end.tp_col - r->tr_begin.tp_col) * TTYPC_FBFONT_W;
+			uint16_t y;
+			for (y = row * TTYPC_FBFONT_H; y < (row + 1u) * TTYPC_FBFONT_H; ++y) {
+				volatile uint32_t *line = (volatile uint32_t *)((char *)uart->fbdraw + y * uart->fbpitch);
+				pl011_fbcon_fill64(line + x0, spanpx * sizeof(uint32_t), bg);
 			}
-			return;
-
-		default:
-			if ((c < ' ') || (c > '~')) {
-				c = '?';
+		}
+		else {
+			for (col = r->tr_begin.tp_col; col < r->tr_end.tp_col && col < uart->fbcols; ++col) {
+				pl011_fbcon_drawGlyph(uart, col, row, g, fg, bg);
 			}
-
-			pl011_fbcon_drawChar(uart, uart->fbcol, uart->fbrow, c);
-			uart->fbcol++;
-			if (uart->fbcol >= uart->fbcols) {
-				uart->fbcol = 0u;
-				uart->fbrow++;
-			}
-			break;
-	}
-
-	if (uart->fbrow >= uart->fbrows) {
-		pl011_fbcon_scroll(uart);
+		}
 	}
 }
+
+
+static void pl011_teken_copy(void *s, const teken_rect_t *r, const teken_pos_t *d)
+{
+	pl011_t *uart = (pl011_t *)s;
+	int nrows = (int)r->tr_end.tp_row - (int)r->tr_begin.tp_row;
+	int srow = (int)r->tr_begin.tp_row;
+	int drow = (int)d->tp_row;
+	size_t scolB = (size_t)r->tr_begin.tp_col * TTYPC_FBFONT_W * sizeof(uint32_t);
+	size_t dcolB = (size_t)d->tp_col * TTYPC_FBFONT_W * sizeof(uint32_t);
+	size_t spanBytes = (size_t)((int)r->tr_end.tp_col - (int)r->tr_begin.tp_col) * TTYPC_FBFONT_W * sizeof(uint32_t);
+	int dir = (drow <= srow) ? 1 : -1;
+	int i, py;
+
+	for (i = (dir > 0) ? 0 : (nrows - 1); (dir > 0) ? (i < nrows) : (i >= 0); i += dir) {
+		for (py = 0; py < (int)TTYPC_FBFONT_H; ++py) {
+			char *src = (char *)uart->fbdraw + ((size_t)(srow + i) * TTYPC_FBFONT_H + (size_t)py) * uart->fbpitch + scolB;
+			char *dst = (char *)uart->fbdraw + ((size_t)(drow + i) * TTYPC_FBFONT_H + (size_t)py) * uart->fbpitch + dcolB;
+			memmove(dst, src, spanBytes);
+		}
+	}
+}
+
+
+static void pl011_teken_param(void *s, int param, unsigned int val)
+{
+	(void)s;
+	(void)param;
+	(void)val;
+}
+
+
+static void pl011_teken_respond(void *s, const void *buf, size_t len)
+{
+	(void)s;
+	(void)buf;
+	(void)len;
+}
+
+
+static const teken_funcs_t pl011_teken_funcs = {
+	.tf_bell = pl011_teken_bell,
+	.tf_cursor = pl011_teken_cursor,
+	.tf_putchar = pl011_teken_putchar,
+	.tf_fill = pl011_teken_fill,
+	.tf_copy = pl011_teken_copy,
+	.tf_param = pl011_teken_param,
+	.tf_respond = pl011_teken_respond,
+};
 
 
 static void pl011_fbcon_write(pl011_t *uart, const char *data, size_t size)
 {
-	size_t i;
-
 	if (uart->fbaddr == NULL) {
 		return;
 	}
@@ -566,9 +440,7 @@ static void pl011_fbcon_write(pl011_t *uart, const char *data, size_t size)
 		pl011_fbcon_xorCursor(uart, uart->fbcurCol, uart->fbcurRow);
 		uart->fbcurShown = 0u;
 	}
-	for (i = 0u; i < size; ++i) {
-		pl011_fbcon_putc(uart, (unsigned char)data[i]);
-	}
+	teken_input(&uart->fbteken, data, size);
 	/* Redraw the cursor at the new live position. */
 	uart->fbcurCol = uart->fbcol;
 	uart->fbcurRow = uart->fbrow;
@@ -680,13 +552,13 @@ static int pl011_fbcon_init(pl011_t *uart)
 	 * here matches the original Phoenix-RTOS pattern on other
 	 * platforms and removes the firmware splash background before
 	 * text rendering begins. */
-	uart->fbescState = pl011_fbcon_esc_normal;
-	uart->fbescNumParams = 0u;
-	/* Default colours + no cursor yet (the struct is zero-initialised, so the
-	 * fg/bg MUST be set here or drawChar would render black-on-black). */
-	uart->fbfg = PL011_FBCON_FG;
-	uart->fbbg = PL011_FBCON_BG;
-	uart->fbbold = 0u;
+	{
+		teken_pos_t ws;
+		teken_init(&uart->fbteken, &pl011_teken_funcs, uart);
+		ws.tp_row = uart->fbrows;
+		ws.tp_col = uart->fbcols;
+		teken_set_winsize(&uart->fbteken, &ws);
+	}
 	uart->fbcurShown = 0u;
 	uart->fbcol = 0u;
 	uart->fbrow = 0u;
