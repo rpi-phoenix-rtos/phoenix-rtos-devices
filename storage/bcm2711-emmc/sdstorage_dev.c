@@ -45,7 +45,8 @@
 #define BLK_CACHE_SECSIZE   (2 * SDCARD_BLOCKLEN) /* Size of cache sector (must be multiple of SDCARD_BLOCKLEN) */
 #define BLK_CACHE_SECNUM    16                    /* Maximum number of cached sectors in a region */
 #define MTD_DEFAULT_ERASESZ 0x10000
-#define SDCARD_READ_RETRIES 5 /* TODO(#120): bounded retry of transient single-block read errors */
+#define SDCARD_READ_RETRIES  5 /* TODO(#120): bounded retry of transient single-block read errors */
+#define SDCARD_WRITE_RETRIES 5 /* TODO(#120): same, for single-block CMD24 writes (idempotent on CRC reject) */
 
 #define MTD_DEV_FORMAT   "mmcmtd%u"
 #define BLOCK_DEV_FORMAT "mmcblk%u"
@@ -182,10 +183,29 @@ static ssize_t sdcard_writeCb(uint64_t offs, const void *buff, size_t len, cache
 	 * multi-block CMD25 (WRITE_MULTIPLE_BLOCK) uses the same unproven multi-block
 	 * path that returned -EIO for reads. Remove once multi-block is fixed. */
 	for (size_t done = 0; done < len; done += SDCARD_BLOCKLEN) {
-		int ret = sdcard_transferBlocks(ctx->id, sdio_write,
-			lba + (uint32_t)(done / SDCARD_BLOCKLEN),
-			(uint8_t *)buff + done, SDCARD_BLOCKLEN);
+		uint32_t blkLba = lba + (uint32_t)(done / SDCARD_BLOCKLEN);
+		int ret = -EIO;
+		int attempt;
+		/* Retry transient write errors, mirroring the read path (#120): at 50 MHz
+		 * the SD link throws occasional Data-CRC/End-Bit errors. On a write CRC
+		 * error the card rejects the block (not committed), so re-issuing the same
+		 * single-block CMD24 with the same data is idempotent and safe. Without
+		 * this, a transient error that reads recover from instead fails the write
+		 * (a silently-failed mkdir/cp / fs corruption). */
+		for (attempt = 0; attempt < SDCARD_WRITE_RETRIES; attempt++) {
+			ret = sdcard_transferBlocks(ctx->id, sdio_write, blkLba,
+				(uint8_t *)buff + done, SDCARD_BLOCKLEN);
+			if (ret >= 0) {
+				break;
+			}
+		}
+		if ((ret >= 0) && (attempt > 0)) {
+			fprintf(stderr, "sdstorage diag(#120): write lba=%u recovered after %d retr%s\n",
+				(unsigned)blkLba, attempt, (attempt == 1) ? "y" : "ies");
+		}
 		if (ret < 0) {
+			fprintf(stderr, "sdstorage diag(#120): write lba=%u FAILED after %d attempts, ret=%d\n",
+				(unsigned)blkLba, attempt, ret);
 			return ret;
 		}
 	}

@@ -36,6 +36,20 @@
 #define TRACE(str, ...)     do { if (0) fprintf(stderr, LOG_TAG " trace: " str "\n", ##__VA_ARGS__); } while (0)
 /* clang-format on */
 
+/* TODO(#154 diag): one-shot write/read self-test at end of card bring-up.
+ * Root cause is now FOUND (writes land but Transfer-Complete IRQ never fires for
+ * PIO writes; see docs/inprogress/2026-06-07-sd-write-completion-rootcause.md).
+ * The diagnostic code below is gated on this macro being DEFINED (#ifdef). It is
+ * intentionally left UNDEFINED so the diag compiles out (clean netboot/other
+ * builds); re-add `#define SDCARD_DIAG_CLOCKSWEEP 1` to validate the CMD13-poll
+ * write-completion fix. The reset-on-timeout fixes below are NOT gated and stay
+ * active. */
+
+
+/* #154: bound on the CMD13 SEND_STATUS busy-poll that detects write completion
+ * (mirrors Linux MMC_BLK_TIMEOUT_MS). The card normally returns to TRAN in well
+ * under a millisecond on these small single-block writes. */
+#define SDCARD_WRITE_BUSY_TIMEOUT_MS 1000u
 
 #define SDHOST_ERROR_REASONS ( \
 	SDHOST_INTR_CMD_ERRORS | \
@@ -277,6 +291,143 @@ static int _sdio_cmdExecutionWait(sdcard_hostData_t *host, uint32_t flags, time_
 }
 
 
+/* #154: issue a single raw CMD13 SEND_STATUS and return the card's R1 in *st.
+ *
+ * Must run with host->eventLock HELD (it uses _sdio_cmdExecutionWait, which
+ * condWaits on eventLock). It pokes the command registers directly rather than
+ * recursing through sdio_cmdSend()/_sdio_cmdSend() because:
+ *  - the caller already holds host->cmdLock (sdcard_transferBlocks) AND
+ *    host->eventLock, so a re-entrant high-level send would self-deadlock; and
+ *  - the high-level path runs the pre-command PRES_STATE_BUSY_FLAGS busy poll,
+ *    which would bail -EBUSY while the card holds DAT0 busy after a write —
+ *    exactly when we need to interrogate it. CMD13 is CMD-line-only and is legal
+ *    while the card is programming, so it bypasses that poll here.
+ * Returns 0 (R1 in *st) or <0 if the CMD13 itself failed (timeout / bus error). */
+static int _sdio_rawSendStatus(sdcard_hostData_t *host, uint32_t *st)
+{
+	sdhost_command_reg_t cmdFrame;
+	cmdFrame.raw = 0;
+	cmdFrame.commandIdx = SDIO_CMD13_SEND_STATUS;
+	cmdFrame.commandMeta = sdCmdMetadata[SDIO_CMD13_SEND_STATUS].bitsWhenSending;
+
+	/* No data phase for CMD13. */
+	*(host->base + SDHOST_REG_TRANSFER_BLOCK) = 0;
+	/* Drop any stale completion bits so the upcoming wait sees only this CMD. */
+	*(host->base + SDHOST_REG_INTR_STATUS) = (SDHOST_INTR_TRANSFER_DONE | SDHOST_INTR_CMD_DONE);
+	*(host->base + SDHOST_REG_CMD_ARGUMENT) = host->card.rca;
+	sdio_dataBarrier();
+	/* This register write starts command execution and must be done last. */
+	*(host->base + SDHOST_REG_CMD) = cmdFrame.raw;
+
+	int ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_CMD_DONE, 50 * 1000);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (st != NULL) {
+		*st = *(host->base + SDHOST_REG_RESPONSE_0);
+	}
+
+	return 0;
+}
+
+
+/* #154: poll CMD13 SEND_STATUS until the card reports it is back in the transfer
+ * state and ready for data (READY_FOR_DATA & CURRENT_STATE==TRAN) — the
+ * authoritative write-completion check Linux's MMC core performs for writes
+ * (mmc_blk_card_busy -> __mmc_poll_for_busy -> mmc_ready_for_data). We use it
+ * because this controller's Transfer-Complete IRQ never latches for PIO writes
+ * and its present-state busy bits are internally inconsistent on writes.
+ *
+ * Must run with host->eventLock HELD. Returns 0 when ready, -EIO if the card R1
+ * flags an error, -ETIME on timeout, or the CMD13 send error. Uses the same
+ * exponential backoff as the Linux poll. */
+static int _sdio_pollCardReady(sdcard_hostData_t *host, unsigned int timeoutMs)
+{
+	unsigned int us = 32u, total = 0u;
+	const unsigned int totalMax = timeoutMs * 1000u;
+
+	for (;;) {
+		uint32_t st = 0;
+		int ret = _sdio_rawSendStatus(host, &st);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if ((st & CARD_STATUS_ERRORS) != 0u) {
+			LOG_ERROR("write completion: card R1 error 0x%08x", (unsigned)st);
+			return -EIO;
+		}
+
+		if (((st & CARD_STATUS_READY_FOR_DATA) != 0u) &&
+				(CARD_STATUS_CURRENT_STATE(st) == CARD_STATUS_CURRENT_STATE_TRAN)) {
+			return 0;
+		}
+
+		if (total >= totalMax) {
+			return -ETIME;
+		}
+
+		usleep(us);
+		total += us;
+		if (us < 32768u) {
+			us *= 2u;
+		}
+	}
+}
+
+
+/* #154 large-read EIO diagnostic. On a read data-phase failure, the host
+ * INTR_STATUS data-end-bit and the card's own CMD13 R1 state are independent
+ * facts that classify the failure: if the card is in TRAN + READY_FOR_DATA the
+ * data left the card cleanly and the host mis-sampled it (HS50 margin → the fix
+ * is to drop the clock); if the card is stuck off-TRAN it is wedged (→ re-init).
+ * This is the discriminator §4.1 of the research doc needs from HW. Default-on
+ * (NOT gated by SDCARD_DIAG_CLOCKSWEEP) but capped at the first few occurrences
+ * so a sustained read failure can't flood the console. */
+static unsigned int sdcard_readDiagCount = 0;
+enum { SDCARD_READDIAG_MAX = 3u };
+
+static void sdcard_readDiagPrint(uint8_t cmd, uint32_t intr, int cmd13rc, uint32_t r1)
+{
+	printf("SDREADDIAG: cmd=%u intr=0x%08x cmd13rc=%d r1=0x%08x state=%u\n",
+		(unsigned)cmd, (unsigned)intr, cmd13rc, (unsigned)r1,
+		(unsigned)CARD_STATUS_CURRENT_STATE(r1));
+}
+
+
+/* Host-level read failure (_sdio_cmdSend returned <0): issue a fresh raw CMD13
+ * to learn the card's current state. Must be called with host->eventLock HELD
+ * (the raw CMD13 condWaits on eventLock). Does not change read behavior. */
+static void sdcard_readDiag(sdcard_hostData_t *host, uint8_t cmd, uint32_t intr)
+{
+	if (sdcard_readDiagCount >= SDCARD_READDIAG_MAX) {
+		return;
+	}
+	sdcard_readDiagCount++;
+
+	uint32_t st = 0;
+	int cmd13rc = _sdio_rawSendStatus(host, &st);
+	sdcard_readDiagPrint(cmd, intr, cmd13rc, st);
+}
+
+
+/* Card-flagged read failure (_sdio_cmdSend returned >=0 but the read command's
+ * R1 carries error bits — this is the field "transfer error 00400900" path).
+ * The R1 is already in hand, so no fresh CMD13 is issued (cmdLock is held by the
+ * caller; a high-level CMD13 here would self-deadlock). Logs the same line with
+ * cmd13rc=0 to mark "R1 from the failing command itself". */
+static void sdcard_readDiagR1(uint8_t cmd, uint32_t intr, uint32_t r1)
+{
+	if (sdcard_readDiagCount >= SDCARD_READDIAG_MAX) {
+		return;
+	}
+	sdcard_readDiagCount++;
+
+	sdcard_readDiagPrint(cmd, intr, 0, r1);
+}
+
+
 /* res is single u32 if isLongResponse == 0, array of 4 u32 otherwise */
 /* Completion path for R1b (response-with-busy, no data) commands such as CMD7
  * SELECT_CARD / CMD38 ERASE. On the BCM2711/Arasan EMMC2 controller the
@@ -352,7 +503,6 @@ static int _sdio_pollBusyCmd(sdcard_hostData_t *host, uint8_t cmd)
 static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uint32_t *res, uint16_t blockCount, bool isLongResponse)
 {
 	sdhost_command_reg_t cmdFrame;
-	uint32_t val;
 
 	if (cmd >= MAX_SD_COMMANDS) {
 		return -EINVAL;
@@ -367,8 +517,13 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 	 * before issuing a new command. This previously returned -EBUSY immediately,
 	 * which defeated single-block read-retry after a data error (#120): the
 	 * post-error card holds DAT0 busy briefly, so every retry insta-failed with
-	 * -EBUSY. The fast path (not busy) takes the first iteration with no sleep. */
-	{
+	 * -EBUSY. The fast path (not busy) takes the first iteration with no sleep.
+	 *
+	 * #154: CMD13 SEND_STATUS is explicitly legal while the card is programming
+	 * (DAT0 busy) and is exactly how a caller interrogates a still-busy card, so
+	 * it must skip this busy-wait — otherwise a status poll during a write's PRG
+	 * phase would bail -EBUSY before it could ever report completion. */
+	if (cmd != SDIO_CMD13_SEND_STATUS) {
 		unsigned int i;
 		for (i = 0; i < 1000u; i++) {
 			if ((*(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_BUSY_FLAGS) == 0u) {
@@ -376,7 +531,7 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 			}
 			usleep(100);
 		}
-		val = *(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_BUSY_FLAGS;
+		uint32_t val = *(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_BUSY_FLAGS;
 		if (val != 0) {
 			TRACE("busy %x", val);
 			return -EBUSY;
@@ -460,7 +615,17 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 		if (ret < 0) {
 			TRACE("error %d on cmd %d (cmd_done wait, pres=0x%08x)", ret, cmd,
 				(unsigned)*(host->base + SDHOST_REG_PRES_STATE));
+#ifdef SDCARD_DIAG_CLOCKSWEEP
+			printf("SDDIAG: cmd_done-timeout cmd=%u ret=%d pres=0x%08x intr=0x%08x\n", (unsigned)cmd, ret,
+				(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
+#endif
 			mutexUnlock(host->eventLock);
+			/* #154: a timed-out command leaves the CMD/DAT engine wedged; without
+			 * recovery every subsequent command also times out (a cascade that
+			 * e.g. turns one failed write into a failed MBR read). Mirror the
+			 * PIO-error recovery below. */
+			sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+			sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
 			return ret;
 		}
 
@@ -483,6 +648,7 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 			volatile uint32_t *pioFifo = host->base + SDHOST_REG_BUFFER_DATA;
 			uint8_t *pioBuf = (uint8_t *)host->dmaBuffer;
 			int pioErr = 0;
+			uint32_t pioErrIntr = 0; /* INTR_STATUS at the offending block (#154 read diag) */
 
 			for (uint32_t pioBlk = 0; pioBlk < (uint32_t)blockCount; pioBlk++) {
 				uint32_t st = 0;
@@ -498,11 +664,17 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 				}
 				if ((st & SDHOST_ERROR_REASONS) != 0u) {
 					LOG_ERROR("pio xfer error on cmd %d: intr=0x%08x", cmd, (unsigned)st);
+					pioErrIntr = st;
 					*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_ERROR_REASONS;
 					pioErr = -EIO;
 					break;
 				}
 				if ((*(host->base + SDHOST_REG_PRES_STATE) & pioReadyLevel) == 0u) {
+#ifdef SDCARD_DIAG_CLOCKSWEEP
+					printf("SDDIAG: pio-timeout cmd=%u blk=%u dir=%s readyLvl=0x%08x pres=0x%08x intr=0x%08x\n",
+						(unsigned)cmd, (unsigned)pioBlk, pioRead ? "rd" : "wr", (unsigned)pioReadyLevel,
+						(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
+#endif
 					pioErr = -ETIME;
 					break;
 				}
@@ -519,19 +691,73 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 				}
 			}
 			if (pioErr != 0) {
+				/* #154 read-bug diagnostic: on a read data-phase PIO failure log the
+				 * offending host INTR_STATUS together with the card's own CMD13 R1
+				 * state (issued raw with eventLock still held, BEFORE the reset).
+				 * See sdcard_readDiag. */
+				if (pioRead) {
+					sdcard_readDiag(host, cmd, pioErrIntr);
+				}
 				mutexUnlock(host->eventLock);
 				sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
 				sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
 				return pioErr;
 			}
 
-			/* data transfer: wait up to 1 s for Transfer Complete */
-			ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_TRANSFER_DONE, 1000 * 1000);
-			if (ret < 0) {
-				TRACE("error %d on cmd %d (data transfer_done wait, pres=0x%08x intr=0x%08x)", ret, cmd,
-					(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
-				mutexUnlock(host->eventLock);
-				return ret;
+			if (pioRead) {
+				/* Reads: the Transfer-Complete IRQ DOES latch (they never enter the
+				 * card's busy/PRG phase), so keep the proven IRQ-driven wait. */
+				ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_TRANSFER_DONE, 1000 * 1000);
+				if (ret < 0) {
+					TRACE("error %d on cmd %d (data transfer_done wait, pres=0x%08x intr=0x%08x)", ret, cmd,
+						(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
+#ifdef SDCARD_DIAG_CLOCKSWEEP
+					printf("SDDIAG: transfer_done-timeout cmd=%u ret=%d pres=0x%08x intr=0x%08x\n", (unsigned)cmd, ret,
+						(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
+#endif
+					/* #154 read-bug diagnostic (default-on, first few only): the
+					 * host data-end-bit interrupt vs. the card's own CMD13 R1 state
+					 * are different facts; log BOTH so the large-read EIO can be
+					 * classed as host sampling margin (card in TRAN+READY ⇒ drop
+					 * clock) vs. a card wedge (CMD13 not TRAN ⇒ re-init). CMD13 is
+					 * issued raw with eventLock still held (do NOT unlock first —
+					 * the raw send condWaits on eventLock). */
+					sdcard_readDiag(host, cmd, *(host->base + SDHOST_REG_INTR_STATUS));
+					mutexUnlock(host->eventLock);
+					/* #154: see the CMD_DONE-timeout note above — recover the DAT/CMD
+					 * engine so a single timed-out data phase can't wedge every
+					 * following command. */
+					sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+					sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+					return ret;
+				}
+			}
+			else {
+				/* Writes (#154): the Transfer-Complete IRQ never latches and the
+				 * present-state busy bits are inconsistent on this controller, so
+				 * do NOT wait on TRANSFER_DONE. Instead poll the card's own status
+				 * (CMD13) until it is back in TRAN + READY_FOR_DATA — exactly the
+				 * write-completion check the Linux MMC core does (mmc_blk_card_busy).
+				 * The PIO push already succeeded (pioErr == 0) when we reach here.
+				 * eventLock stays HELD across the poll (the raw CMD13 condWaits on
+				 * it); on success we fall through to the single tail unlock + R1
+				 * read below — that reads the final CMD13's R1 (TRAN+READY, no
+				 * error bits), which the caller's CARD_STATUS_ERRORS check accepts.
+				 * The poll returns <0 on any card R1 error, so an error status can
+				 * never fall through as success. */
+				ret = _sdio_pollCardReady(host, SDCARD_WRITE_BUSY_TIMEOUT_MS);
+				if (ret < 0) {
+					TRACE("error %d on cmd %d (write CMD13 completion poll, pres=0x%08x intr=0x%08x)", ret, cmd,
+						(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
+#ifdef SDCARD_DIAG_CLOCKSWEEP
+					printf("SDDIAG: write-completion-fail cmd=%u ret=%d pres=0x%08x intr=0x%08x\n", (unsigned)cmd, ret,
+						(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
+#endif
+					mutexUnlock(host->eventLock);
+					sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+					sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+					return ret;
+				}
 			}
 		}
 	}
@@ -671,6 +897,99 @@ static int sdcard_getCardSize(sdcard_hostData_t *host)
 }
 
 
+#ifdef SDCARD_DIAG_CLOCKSWEEP
+/* Partial reset of the CMD/DAT engines (clock + card selection preserved) so
+ * one failed attempt can't wedge the next — lets the sweep measure each clock
+ * independently instead of testing a controller already dead from mode 0. */
+static void sdcard_diagReset(sdcard_hostData_t *host)
+{
+	sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+	sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+}
+
+
+static void sdcard_diagClockSweep(sdcard_hostData_t *host, unsigned int slot)
+{
+	const uint32_t scratchLba = 100; /* unused MBR..p1 gap */
+	const uint32_t readLba = 0;      /* MBR — known to hold data */
+	const uint32_t dat0Level = (1u << 20); /* PRES_STATE DAT0 line level; low = card busy */
+	const int trials = 16;
+	uint8_t wbuf[SDCARD_BLOCKLEN];
+	uint8_t rbuf[SDCARD_BLOCKLEN];
+
+	uint32_t caps = *(host->base + SDHOST_REG_CAPABILITIES);
+	uint32_t cc = *(host->base + SDHOST_REG_CLOCK_CONTROL);
+	uint32_t hc = *(host->base + SDHOST_REG_HOST_CONTROL);
+	printf("SDDIAG: CAPS=0x%08x baseClk[15:8]=%uMHz CTRL1=0x%08x HOSTCTRL=0x%08x refclkMbox=%uHz (as-left N1/50MHz, no clock switching)\n",
+		caps, (unsigned)((caps >> 8) & 0xff), cc, hc, (unsigned)host->refclkFrequency);
+
+	/* Reads at the operational 50 MHz config (reset between each attempt). */
+	int rdOk = 0;
+	for (int t = 0; t < trials; t++) {
+		sdcard_diagReset(host);
+		if (sdcard_transferBlocks(slot, sdio_read, readLba, rbuf, SDCARD_BLOCKLEN) == 0) {
+			rdOk++;
+		}
+	}
+	printf("SDDIAG: read LBA%u x%d: readOk=%d/%d\n", (unsigned)readLba, trials, rdOk, trials);
+
+	/* Isolated single-block WRITES at the SAME 50 MHz config — no clock
+	 * switching (sdcard_diagSetDivisor was found to wedge the controller).
+	 * Reset between each attempt; verify by read-back. Decisive test of
+	 * whether writes work at the operational clock once recovery is correct. */
+	int wrOk = 0;
+	int matchOk = 0;
+	for (int t = 0; t < trials; t++) {
+		for (size_t b = 0; b < SDCARD_BLOCKLEN; b++) {
+			wbuf[b] = (uint8_t)((t * 31) + (b * 7) + 1);
+			rbuf[b] = 0;
+		}
+		sdcard_diagReset(host);
+		int wr = sdcard_transferBlocks(slot, sdio_write, scratchLba, wbuf, SDCARD_BLOCKLEN);
+		if (wr == 0) {
+			wrOk++;
+		}
+
+		/* On a non-OK write, OBSERVE the card (no behaviour change to the real
+		 * path): poll DAT0 busy-release and read CMD13 state. Distinguishes
+		 * "data landed but Transfer-Complete IRQ missed" (DAT0 releases, card
+		 * back to TRAN) from "card stuck mid-transfer" (DAT0 never releases). */
+		if (wr != 0) {
+			int relMs = -1;
+			for (int p = 0; p < 500; p++) {
+				if ((*(host->base + SDHOST_REG_PRES_STATE) & dat0Level) != 0u) {
+					relMs = p;
+					break;
+				}
+				usleep(1000);
+			}
+			uint32_t st = 0;
+			int cs = sdio_cmdSend(host, SDIO_CMD13_SEND_STATUS, host->card.rca, &st);
+			printf("SDDIAG:   t=%d wr=%d DAT0release=%dms cmd13rc=%d cardState=%u\n",
+				t, wr, relMs, cs, (unsigned)CARD_STATUS_CURRENT_STATE(st));
+		}
+
+		/* Readback + content compare on EVERY attempt, regardless of wr — the
+		 * key question is whether the bytes actually reached the card. */
+		sdcard_diagReset(host);
+		int rd = sdcard_transferBlocks(slot, sdio_read, scratchLba, rbuf, SDCARD_BLOCKLEN);
+		int match = ((rd == 0) && (memcmp(wbuf, rbuf, SDCARD_BLOCKLEN) == 0));
+		if (match) {
+			matchOk++;
+		}
+		printf("SDDIAG:   t=%d wr=%d rd=%d data=%s w[0..3]=%02x%02x%02x%02x r[0..3]=%02x%02x%02x%02x\n",
+			t, wr, rd, match ? "MATCH" : "NOMATCH",
+			wbuf[0], wbuf[1], wbuf[2], wbuf[3], rbuf[0], rbuf[1], rbuf[2], rbuf[3]);
+	}
+	printf("SDDIAG: write+readback LBA%u x%d: writeRc=%d/%d dataMatch=%d/%d\n",
+		(unsigned)scratchLba, trials, wrOk, trials, matchOk, trials);
+
+	/* No clock switching done — controller left in the operational config so
+	 * the real MBR read + rootfs mount proceed normally. */
+}
+#endif
+
+
 int sdcard_initCard(unsigned int slot, bool fallbackMode)
 {
 	sdcard_hostData_t *host = sdcard_getHostForSlot(slot);
@@ -799,7 +1118,17 @@ int sdcard_initCard(unsigned int slot, bool fallbackMode)
 		return -EIO;
 	}
 
-	return fallbackMode ? 0 : sdcard_wideAndFast(host);
+	if (fallbackMode) {
+		return 0;
+	}
+
+	int rc = sdcard_wideAndFast(host);
+#ifdef SDCARD_DIAG_CLOCKSWEEP
+	if (rc == 0) {
+		sdcard_diagClockSweep(host, slot);
+	}
+#endif
+	return rc;
 }
 
 
@@ -1174,6 +1503,14 @@ static int _sdcard_transferBlocks(sdcard_hostData_t *host, sdio_dir_t dir, uint3
 
 	if ((resp & CARD_STATUS_ERRORS) != 0) {
 		LOG_ERROR("transfer error %08x", resp);
+		/* #154 read-bug diagnostic (the field "transfer error 00400900" path):
+		 * the command succeeded at the host level but the card's R1 carries error
+		 * bits. resp IS the card R1, so report it directly (no fresh CMD13 — this
+		 * runs with cmdLock held). state==TRAN+READY ⇒ host HS50 sampling margin
+		 * (fix = drop clock); off-TRAN ⇒ card wedge. */
+		if (dir == sdio_read) {
+			sdcard_readDiagR1(cmd, *(host->base + SDHOST_REG_INTR_STATUS), resp);
+		}
 		return -EIO;
 	}
 
