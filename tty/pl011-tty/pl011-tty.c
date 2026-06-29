@@ -96,11 +96,18 @@ enum { cr_uarten = 1 << 0, cr_txe = 1 << 8, cr_rxe = 1 << 9 };
 /* 16-colour ANSI palette (SGR, #49), ARGB8888 with opaque alpha. Indices 0-7 are
  * the normal colours (SGR 30-37 / 40-47), 8-15 the bright ones (SGR 90-97 /
  * 100-107, or 0-7 with bold). */
+/* The Pi 4 framebuffer is BGR (red and blue channels are swapped relative to
+ * ARGB8888 — the same byte order the V3D/Quake path compensates for, #19). The
+ * console's black/white text never revealed it (both are R==B), but colour
+ * content (mc panels, `ls --color`) came out with red<->blue swapped (mc's blue
+ * panels showed red, its cyan selection showed olive). So each entry below is the
+ * VGA colour with its R and B bytes pre-swapped (0xAARRGGBB -> 0xAABBGGRR); the
+ * framebuffer swaps them back on scanout, giving the correct colour on HDMI. */
 static const uint32_t pl011_fbcon_palette[16] = {
-	0xff000000u, 0xffaa0000u, 0xff00aa00u, 0xffaa5500u, /* blk red grn yel  */
-	0xff0000aau, 0xffaa00aau, 0xff00aaaau, 0xffaaaaaau, /* blu mag cyn wht  */
-	0xff555555u, 0xffff5555u, 0xff55ff55u, 0xffffff55u, /* bright black-yel */
-	0xff5555ffu, 0xffff55ffu, 0xff55ffffu, 0xffffffffu, /* bright blu-white */
+	0xff000000u, 0xff0000aau, 0xff00aa00u, 0xff0055aau, /* blk red grn yel  */
+	0xffaa0000u, 0xffaa00aau, 0xffaaaa00u, 0xffaaaaaau, /* blu mag cyn wht  */
+	0xff555555u, 0xff5555ffu, 0xff55ff55u, 0xff55ffffu, /* bright black-yel */
+	0xffff5555u, 0xffff55ffu, 0xffffff55u, 0xffffffffu, /* bright blu-white */
 };
 
 
