@@ -559,6 +559,14 @@ static int pl011_fbcon_init(pl011_t *uart)
 		ws.tp_col = uart->fbcols;
 		teken_set_winsize(&uart->fbteken, &ws);
 	}
+
+	/* Report the real fbcon character grid to userspace via TIOCGWINSZ. libtty
+	 * defaults to 80x25; without this, ncurses apps (mc, nano, ...) believe the
+	 * console is 80x25 and leave most of the HDMI screen unused. The console is
+	 * the primary display, so the tty window size tracks the framebuffer grid. */
+	uart->tty.ws.ws_col = uart->fbcols;
+	uart->tty.ws.ws_row = uart->fbrows;
+
 	uart->fbcurShown = 0u;
 	uart->fbcol = 0u;
 	uart->fbrow = 0u;
