@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/threads.h>
+#include <poll.h>
 
 #include <libsensors/sensor.h>
 #include <libsensors/gps/receiver.h>
@@ -39,11 +40,10 @@
 #define UBX_POS_ACCURACY 2.547f
 #define UBX_VEL_ACCURACY 0.0849f
 
-#define REC_BUF_SZ 1024
-#define INBOX_SIZE 3
+#define REC_BUF_SZ 512
 
 #ifndef UBX_DEFAULT_BAUDRATE
-#define UBX_DEFAULT_BAUDRATE B9600
+#define UBX_DEFAULT_BAUDRATE 115200
 #endif
 
 
@@ -57,28 +57,114 @@ typedef struct {
 } ubx_ctx_t;
 
 
+static int ubx_setup(ubx_ctx_t *ctx)
+{
+	static const speed_t baudTable[] = { 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600 };
+
+	struct termios termBackup;
+	int err = 0, cnt = 0;
+
+	/* Detect baudrate (NMEA frames are expected) */
+	for (uint8_t i = 0; i < (sizeof(baudTable) / sizeof(speed_t)); i++) {
+		if (gps_serialSetup(ctx->filedes, baudTable[i], (i == 0) ? &termBackup : NULL) < 0) {
+			fprintf(stderr, "%s cannot set default baud\n", ubx_STR);
+			return -1;
+		}
+		const char *msg;
+		int detected = 0;
+
+		/* scan for NMEA frames for 1 s */
+		cnt = 0;
+		memset(&ctx->receiver.pCtx, 0, sizeof(nmea_scanCtx_t));
+		while ((cnt++ < 10) && !detected) {
+			usleep(100 * 1000);
+			err = read(ctx->filedes, ctx->receiver.buf, ctx->receiver.bufSz);
+			if (err <= 0) {
+				continue;
+			}
+
+			while (nmea_scan(&ctx->receiver.pCtx, ctx->receiver.buf, err, &msg) > 0) {
+				detected = 1;
+			}
+		}
+
+		if (detected == 1) {
+			printf("%s detected NMEA device at %d baudrate\n", ubx_STR, baudTable[i]);
+			break;
+		}
+
+		if (i == (sizeof(baudTable) / sizeof(speed_t) - 1)) {
+			fprintf(stderr, "%s failed to detect baudrate\n", ubx_STR);
+			return -1;
+		}
+	}
+
+
+	/* baudrate setting to 115200 */
+	write(ctx->filedes, UBX_PREMADE_BAUD_115200, sizeof(UBX_PREMADE_BAUD_115200));
+	usleep(100 * 1000);
+
+	/* First serial setup backups termios settings */
+	if (gps_serialSetup(ctx->filedes, UBX_DEFAULT_BAUDRATE, NULL) < 0) {
+		fprintf(stderr, "%s cannot set baud %d\n", ubx_STR, UBX_DEFAULT_BAUDRATE);
+		return -1;
+	}
+	usleep(100 * 1000);
+
+	/* output messages selection */
+	write(ctx->filedes, UBX_PREMADE_RMC_OFF, sizeof(UBX_PREMADE_RMC_OFF));
+	write(ctx->filedes, UBX_PREMADE_GSV_OFF, sizeof(UBX_PREMADE_GSV_OFF));
+	write(ctx->filedes, UBX_PREMADE_GLL_OFF, sizeof(UBX_PREMADE_GLL_OFF));
+	write(ctx->filedes, UBX_PREMADE_GSA_ON, sizeof(UBX_PREMADE_GSA_ON));
+	write(ctx->filedes, UBX_PREMADE_GGA_ON, sizeof(UBX_PREMADE_GGA_ON));
+	write(ctx->filedes, UBX_PREMADE_VTG_ON, sizeof(UBX_PREMADE_VTG_ON));
+
+	/* set output rate to 10Hz */
+	write(ctx->filedes, UBX_PREMADE_FIX_10HZ, sizeof(UBX_PREMADE_FIX_10HZ));
+	usleep(100 * 1000);
+
+	return 0;
+}
+
+
 static void ubx_threadPublish(void *data)
 {
+	/* calculate time needed to fill 50 % of buffer to set it as read interval */
+	static const unsigned int sleepPeriod = ((REC_BUF_SZ / 2) * 1e6) / (UBX_DEFAULT_BAUDRATE / 10);
+
 	sensor_info_t *info = (sensor_info_t *)data;
 	struct __errno_t errnoNew;
 	ubx_ctx_t *ctx = info->ctx;
-	nmea_t message;
-	unsigned int i, inbocCap, update;
+	const char *frameStr;
+	nmea_t message = { 0 };
+	int ret = 0;
+
+	while (ubx_setup(ctx) != 0) {
+		usleep(1e6);
+	}
+
+	/* reset NMEA scanner context */
+	memset(&ctx->receiver.pCtx, 0, sizeof(nmea_scanCtx_t));
 
 	/* Redirecting errno to keep backward compatibility (in case of errno not working correctly) */
 	_errno_new(&errnoNew);
 
 	while (ctx->run) {
-		inbocCap = gps_recv(ctx->filedes, &ctx->receiver);
-		update = 0;
-		for (i = 0; i < inbocCap; i++) {
-			nmea_interpreter(ctx->receiver.inbox[i].msg, &message);
-			update |= gps_updateEvt(&message, &ctx->evtGps, UBX_POS_ACCURACY, UBX_VEL_ACCURACY);
+		ret = read(ctx->filedes, ctx->receiver.buf, ctx->receiver.bufSz);
+		while ((ret > 0) && (nmea_scan(&ctx->receiver.pCtx, ctx->receiver.buf, ret, &frameStr) > 0)) {
+			nmea_interpreter(frameStr, &message);
+			if (gps_updateEvt(&message, &ctx->evtGps, UBX_POS_ACCURACY, UBX_VEL_ACCURACY) != 0) {
+				sensors_publish(ctx->evtGps.gps.devId, &ctx->evtGps);
+			}
 		}
 
-		if (update != 0) {
-			sensors_publish(info->id, &ctx->evtGps);
+		if (ret == ctx->receiver.bufSz) {
+			/* buffer was full, there might be more data to read already */
+			continue;
 		}
+
+		/* sleep to wait for more data to arrive */
+		usleep(sleepPeriod);
 	}
 
 	endthread();
@@ -115,10 +201,10 @@ static int ubx_parse(const char *args, const char **path)
 	}
 	else {
 		fprintf(
-			stderr,
-			"%s Wrong arguments\n"
-			"Please specify the path to source device instance, for example: /dev/uart0\n",
-			ubx_STR);
+				stderr,
+				"%s Wrong arguments\n"
+				"Please specify the path to source device instance, for example: /dev/uart0\n",
+				ubx_STR);
 		err = -EINVAL;
 	}
 
@@ -131,7 +217,6 @@ static int ubx_alloc(sensor_info_t *info, const char *args)
 	int cnt = 0, err = -1;
 	const char *path;
 	ubx_ctx_t *ctx;
-	struct termios termBackup;
 
 	ctx = malloc(sizeof(ubx_ctx_t));
 	if (ctx == NULL) {
@@ -147,7 +232,7 @@ static int ubx_alloc(sensor_info_t *info, const char *args)
 	}
 
 	/* Preparing receiver */
-	err = gps_recvInit(&ctx->receiver, REC_BUF_SZ, INBOX_SIZE);
+	err = gps_recvInit(&ctx->receiver, REC_BUF_SZ);
 	if (err < 0) {
 		free(ctx);
 		return -1;
@@ -155,7 +240,7 @@ static int ubx_alloc(sensor_info_t *info, const char *args)
 
 	/* Opening serial device */
 	do {
-		ctx->filedes = open(path, O_RDWR | O_NOCTTY);
+		ctx->filedes = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
 
 		if (ctx->filedes < 0) {
 			usleep(10 * 1000);
@@ -178,42 +263,6 @@ static int ubx_alloc(sensor_info_t *info, const char *args)
 		free(ctx);
 		return -1;
 	}
-
-	/* First serial setup backups termios settings */
-	if (gps_serialSetup(ctx->filedes, UBX_DEFAULT_BAUDRATE, &termBackup) < 0) {
-		fprintf(stderr, "%s cannot set default baud\n", ubx_STR);
-		close(ctx->filedes);
-		gps_recvDone(&ctx->receiver);
-		free(ctx);
-		return -1;
-	}
-	usleep(100 * 1000);
-
-	/* baudrate setting to 115200 */
-	write(ctx->filedes, UBX_PREMADE_BAUD_115200, sizeof(UBX_PREMADE_BAUD_115200));
-	usleep(100 * 1000);
-
-	/* First serial setup backups termios settings */
-	if (gps_serialSetup(ctx->filedes, B115200, NULL) < 0) {
-		fprintf(stderr, "%s cannot set baud %d\n", ubx_STR, 115200);
-		close(ctx->filedes);
-		gps_recvDone(&ctx->receiver);
-		free(ctx);
-		return -1;
-	}
-	usleep(100 * 1000);
-
-	/* output messages selection */
-	write(ctx->filedes, UBX_PREMADE_RMC_OFF, sizeof(UBX_PREMADE_RMC_OFF));
-	write(ctx->filedes, UBX_PREMADE_GSV_OFF, sizeof(UBX_PREMADE_GSV_OFF));
-	write(ctx->filedes, UBX_PREMADE_GLL_OFF, sizeof(UBX_PREMADE_GLL_OFF));
-	write(ctx->filedes, UBX_PREMADE_GSA_ON, sizeof(UBX_PREMADE_GSA_ON));
-	write(ctx->filedes, UBX_PREMADE_GGA_ON, sizeof(UBX_PREMADE_GGA_ON));
-	write(ctx->filedes, UBX_PREMADE_VTG_ON, sizeof(UBX_PREMADE_VTG_ON));
-
-	/* set output rate to 10Hz */
-	write(ctx->filedes, UBX_PREMADE_FIX_10HZ, sizeof(UBX_PREMADE_FIX_10HZ));
-	usleep(100 * 1000);
 
 	info->ctx = ctx;
 
