@@ -391,6 +391,46 @@ static size_t usbkbd_translateUsage(usbkbd_dev_t *dev, uint8_t modifiers, uint8_
 			memcpy(out, "\033[A", 3);
 			return 3u;
 
+		/* Function keys F1-F12 (HID usages 0x3a-0x45). The fbcon console runs
+		 * TERM=linux, whose terminfo expects the Linux-console sequences: F1-F5
+		 * are "\E[[A".."\E[[E" and F6-F12 are "\E[NN~". Without these, full-screen
+		 * apps (mc's F3 View / F4 Edit / F10 Quit, nano, vi) never see the key. */
+		case 0x3au: /* F1 */
+		case 0x3bu: /* F2 */
+		case 0x3cu: /* F3 */
+		case 0x3du: /* F4 */
+		case 0x3eu: /* F5 */
+			if (outsz < 4u) {
+				return 0u;
+			}
+			out[0] = '\033';
+			out[1] = '[';
+			out[2] = '[';
+			out[3] = (char)('A' + (usage - 0x3au));
+			return 4u;
+
+		case 0x3fu: /* F6 */
+		case 0x40u: /* F7 */
+		case 0x41u: /* F8 */
+		case 0x42u: /* F9 */
+		case 0x43u: /* F10 */
+		case 0x44u: /* F11 */
+		case 0x45u: /* F12 */ {
+			/* F6..F15 -> \E[17~ \E[18~ \E[19~ \E[20~ \E[21~ \E[23~ \E[24~ (the
+			 * Linux/VT220 numbering skips 22 between F10 and F11). */
+			static const uint8_t fnum[7] = { 17u, 18u, 19u, 20u, 21u, 23u, 24u };
+			uint8_t n = fnum[usage - 0x3fu];
+			if (outsz < 6u) {
+				return 0u;
+			}
+			out[0] = '\033';
+			out[1] = '[';
+			out[2] = (char)('0' + (n / 10u));
+			out[3] = (char)('0' + (n % 10u));
+			out[4] = '~';
+			return 5u;
+		}
+
 		default:
 			return 0u;
 	}
