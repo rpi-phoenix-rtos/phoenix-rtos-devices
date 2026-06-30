@@ -43,7 +43,9 @@
  * intentionally left UNDEFINED so the diag compiles out (clean netboot/other
  * builds); re-add `#define SDCARD_DIAG_CLOCKSWEEP 1` to validate the CMD13-poll
  * write-completion fix. The reset-on-timeout fixes below are NOT gated and stay
- * active. */
+ * active. The self-test (write+readback + large consecutive read) was HW-validated
+ * 2026-06-30: writeRc=16/16, large read 2048/2048 (no EIO on a good card). Re-add
+ * `#define SDCARD_DIAG_CLOCKSWEEP 1` to re-run it (e.g. to triage a marginal card). */
 
 
 /* #154: bound on the CMD13 SEND_STATUS busy-poll that detects write completion
@@ -932,6 +934,29 @@ static void sdcard_diagClockSweep(sdcard_hostData_t *host, unsigned int slot)
 		}
 	}
 	printf("SDDIAG: read LBA%u x%d: readOk=%d/%d\n", (unsigned)readLba, trials, rdOk, trials);
+
+	/* Large CONSECUTIVE single-block read to reproduce the >256 KB sustained-
+	 * read EIO (#154/largeread): progressing LBAs, NO reset between blocks —
+	 * exactly how exec / a big file (pak0.pak) reads. The SDREADDIAG probe
+	 * fires inside the read path at the first error and prints the card CMD13
+	 * state (state==4 TRAN ⇒ host HS50 sampling margin; state!=4 ⇒ card wedge),
+	 * which selects the read fix. Reads are non-destructive (any LBA is safe). */
+	{
+		const uint32_t bigBlocks = 2048; /* ~1 MiB; EIO expected near block ~512 (256 KB) */
+		uint32_t bigOk = 0;
+		int bigFirstErr = -1;
+		sdcard_diagReset(host);
+		for (uint32_t i = 0; i < bigBlocks; i++) {
+			if (sdcard_transferBlocks(slot, sdio_read, i, rbuf, SDCARD_BLOCKLEN) == 0) {
+				bigOk++;
+			}
+			else if (bigFirstErr < 0) {
+				bigFirstErr = (int)i;
+			}
+		}
+		printf("SDDIAG: large consecutive read LBA0..%u: readOk=%u/%u firstErrBlk=%d\n",
+			(unsigned)bigBlocks, (unsigned)bigOk, (unsigned)bigBlocks, bigFirstErr);
+	}
 
 	/* Isolated single-block WRITES at the SAME 50 MHz config — no clock
 	 * switching (sdcard_diagSetDivisor was found to wedge the controller).
