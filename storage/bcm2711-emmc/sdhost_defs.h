@@ -117,6 +117,7 @@ enum SDHOST_REG {
 enum REG_STATE {
 	PRES_STATE_CMD_BUSY = (1UL << 0),
 	PRES_STATE_DAT_BUSY = (1UL << 1),
+	PRES_STATE_DAT_LINE_ACTIVE = (1UL << 2),      /* SDHCI: a data transfer is in progress */
 	PRES_STATE_BUFFER_WRITE_ENABLE = (1UL << 10), /* SDHCI: space available to write a block in PIO */
 	PRES_STATE_BUFFER_READ_ENABLE = (1UL << 11),  /* SDHCI: a block is available to read in PIO */
 	PRES_STATE_CARD_INSERTED = (1UL << 16),

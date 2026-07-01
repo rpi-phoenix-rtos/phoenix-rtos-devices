@@ -47,6 +47,8 @@
  * active. The self-test (write+readback + large consecutive read) was HW-validated
  * 2026-06-30: writeRc=16/16, large read 2048/2048 (no EIO on a good card). Re-add
  * `#define SDCARD_DIAG_CLOCKSWEEP 1` to re-run it (e.g. to triage a marginal card). */
+#define SDCARD_DIAG_CLOCKSWEEP 1 /* TODO(#62): temporary — measuring direct-PIO throughput; gate OFF before publishable */
+#define SDCARD_ENABLE_DMA 1      /* TODO(#62): SDMA data path (validating, reads-only first); gate/finalize before publish */
 
 
 /* #154: bound on the CMD13 SEND_STATUS busy-poll that detects write completion
@@ -114,6 +116,10 @@ typedef struct {
 	void *dmaBuffer;
 	/* Address of DMA buffer in physical memory (for access by the SD Host Controller) */
 	addr_t dmaBufferPhys;
+	/* True once the staging buffer is confirmed DMA-reachable (< 1 GiB CPU-phys, the
+	 * BCM2711 emmc2bus dma-ranges window): enables the SDMA data path instead of the
+	 * CPU PIO FIFO loop. Set in sdhost_allocDMA. */
+	bool useDma;
 
 	bool sdioInitialized;
 	bool isCDPinSupported;
@@ -195,6 +201,21 @@ static int sdhost_allocDMA(sdcard_hostData_t *host)
 	}
 
 	host->dmaBufferPhys = va2pa(host->dmaBuffer);
+	/* The EMMC2 DMA master can only reach the low 1 GiB of CPU-physical memory (Pi 4
+	 * emmc2bus dma-ranges: bus 0xC0000000.. -> CPU 0x0..0x3FFFFFFF). Enable the SDMA
+	 * data path only when the staging buffer actually landed there; otherwise fall
+	 * back to PIO (which has no addressing limit). The MAP_CONTIGUOUS allocation for
+	 * this small early-boot buffer reliably lands low (observed ~0x03780000).
+	 *
+	 * SDCARD_ENABLE_DMA is currently UNDEFINED: the SDMA completion path is not yet
+	 * correct on this controller (the Transfer-Complete IRQ is unreliable, as in the
+	 * #154 PIO-write case), so DMA is gated OFF and PIO is the trusted path until the
+	 * completion signaling is proven correct on the single-block-read oracle. */
+#ifdef SDCARD_ENABLE_DMA
+	host->useDma = (host->dmaBufferPhys < 0x40000000ul);
+#else
+	host->useDma = false;
+#endif
 	return 0;
 }
 
@@ -563,7 +584,11 @@ static int _sdio_pollBusyCmd(sdcard_hostData_t *host, uint8_t cmd)
 }
 
 
-static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uint32_t *res, uint16_t blockCount, bool isLongResponse)
+/* dataBuf: the buffer the PIO data phase reads from (write) or writes to (read).
+ * Callers on the throughput path pass their own (cached) buffer so the FIFO loop
+ * moves data directly with no intermediate copy; passing NULL falls back to the
+ * uncached staging buffer (used only by the small register-read path). */
+static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uint32_t *res, uint16_t blockCount, bool isLongResponse, void *dataBuf, bool useDma)
 {
 	sdhost_command_reg_t cmdFrame;
 
@@ -646,18 +671,24 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 
 			*(host->base + SDHOST_REG_SDMA_ADDRESS) = host->dmaBufferPhys;
 			sdio_dataBarrier();
+			/* SDMA boundary = 512K (the max): our staging buffer is at most
+			 * SDCARD_MAX_TRANSFER (64K), so the transfer never crosses a boundary
+			 * and the engine never raises the DMA-boundary interrupt (which the
+			 * driver does not service). A too-small boundary (the old 4K) is what
+			 * stalled SDMA after the first page — misdiagnosed as a reach limit in
+			 * #120; the buffer is in fact DMA-reachable (see sdhost_allocDMA). */
 			*(host->base + SDHOST_REG_TRANSFER_BLOCK) =
 				((uint32_t)blockCount << 16) |
-				TRANSFER_BLOCK_SDMA_BOUNDARY_4K |
+				TRANSFER_BLOCK_SDMA_BOUNDARY_512K |
 				blockLength;
 		}
 
 		cmdFrame.dataPresent = 1;
-		/* PIO, not SDMA: the BCM2711 EMMC2 SDMA engine advances its address
-		 * register but never lands data in the driver's buffer (a DMA address
-		 * limit — it can't reach the >1GB ARM-physical buffer the allocator
-		 * returns; #120). Move data over the BUFFER_DATA FIFO instead (below). */
-		cmdFrame.dmaEnable = 0;
+		/* SDMA when the staging buffer is DMA-reachable (useDma), else PIO over the
+		 * BUFFER_DATA FIFO. SDMA offloads the byte movement from the CPU; the data
+		 * lands in the (uncached, DMA-coherent) staging buffer. HOST_CONTROL DMA
+		 * select defaults to SDMA (00b), so dmaEnable alone selects the SDMA path. */
+		cmdFrame.dmaEnable = useDma ? 1 : 0;
 		cmdFrame.blockCountEnable = 1;
 		if ((dataType == CMD_READ) || (dataType == CMD_READ_MULTI) || (dataType == CMD_READ8) || (dataType == CMD_READ64)) {
 			cmdFrame.directionRead = 1;
@@ -712,8 +743,9 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 
 		if (dataType != CMD_NO_DATA) {
 			/* PIO data transfer over the BUFFER_DATA FIFO (SDMA is unusable here —
-			 * see the dmaEnable=0 note above). The buffer is the uncached DMA buffer;
-			 * the caller memcpy's it.
+			 * see the dmaEnable=0 note above). pioBuf is the caller's own buffer on
+			 * the throughput path (no staging copy), or the uncached staging buffer
+			 * for the small register-read path (dataBuf == NULL).
 			 *
 			 * Gate each block's drain on the PRES_STATE Buffer-Read/Write-Enable
 			 * LEVEL bit (the Linux sdhci_transfer_pio pattern), NOT the latched
@@ -722,12 +754,17 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 			 * Data-CRC / End-Bit error on ~every block (#120). The level bit
 			 * reflects the true buffer state, so we only touch the FIFO when the
 			 * controller says a block is actually available. */
+			bool pioRead = (dataType == CMD_READ) || (dataType == CMD_READ_MULTI) || (dataType == CMD_READ8) || (dataType == CMD_READ64);
+
+			/* PIO byte-movement only when DMA is not in use. With useDma the SDMA
+			 * engine has already moved (read) / will move (write) the data to/from
+			 * the staging buffer; we skip straight to the completion wait below. */
+			if (!useDma) {
 			uint32_t pioBlockLen = (dataType == CMD_READ8) ? 8u : ((dataType == CMD_READ64) ? 64u : SDCARD_BLOCKLEN);
 			uint32_t pioWords = pioBlockLen / 4u;
-			bool pioRead = (dataType == CMD_READ) || (dataType == CMD_READ_MULTI) || (dataType == CMD_READ8) || (dataType == CMD_READ64);
 			uint32_t pioReadyLevel = pioRead ? PRES_STATE_BUFFER_READ_ENABLE : PRES_STATE_BUFFER_WRITE_ENABLE;
 			volatile uint32_t *pioFifo = host->base + SDHOST_REG_BUFFER_DATA;
-			uint8_t *pioBuf = (uint8_t *)host->dmaBuffer;
+			uint8_t *pioBuf = (uint8_t *)((dataBuf != NULL) ? dataBuf : host->dmaBuffer);
 			int pioErr = 0;
 			uint32_t pioErrIntr = 0; /* INTR_STATUS at the offending block (#154 read diag) */
 
@@ -784,8 +821,58 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 				sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
 				return pioErr;
 			}
+			} /* end if (!useDma): PIO byte-movement */
 
-			if (pioRead) {
+			if (useDma) {
+				/* DMA completion: the Transfer-Complete IRQ is unreliable for DMA on
+				 * this controller (it does not latch — observed intr=0x0 with the bus
+				 * already idle), so DO NOT wait on TRANSFER_DONE. Poll the data lines
+				 * idle instead — the SDMA analogue of the PIO per-block PRES_STATE gate:
+				 * spin until DAT_BUSY|DAT_LINE_ACTIVE clear, or an error latches. */
+				uint32_t dmaActive = PRES_STATE_DAT_BUSY | PRES_STATE_DAT_LINE_ACTIVE;
+				uint32_t dst = 0;
+				long dspin;
+				for (dspin = 0; dspin < 2000000; dspin++) {
+					dst = *(host->base + SDHOST_REG_INTR_STATUS);
+					if ((dst & SDHOST_ERROR_REASONS) != 0u) {
+						break;
+					}
+					if ((*(host->base + SDHOST_REG_PRES_STATE) & dmaActive) == 0u) {
+						break;
+					}
+				}
+				if (((dst & SDHOST_ERROR_REASONS) != 0u) || ((*(host->base + SDHOST_REG_PRES_STATE) & dmaActive) != 0u)) {
+#ifdef SDCARD_DIAG_CLOCKSWEEP
+					printf("SDDIAG: dma-complete-fail cmd=%u dir=%s pres=0x%08x intr=0x%08x\n", (unsigned)cmd,
+						pioRead ? "rd" : "wr", (unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)dst);
+#endif
+					if (pioRead) {
+						sdcard_readDiag(host, cmd, dst);
+					}
+					*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_ERROR_REASONS;
+					mutexUnlock(host->eventLock);
+					sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+					sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+					return -EIO;
+				}
+				/* Clear any (possibly-latched) Transfer-Complete so it cannot go stale
+				 * and prematurely satisfy a later command's wait. */
+				*(host->base + SDHOST_REG_INTR_STATUS) = SDHOST_INTR_TRANSFER_DONE;
+				/* Reads: data is now in the (uncached) staging buffer, nothing more to
+				 * do. Writes: the SDMA data phase is done; poll the card back to TRAN
+				 * (programming complete), exactly as the PIO write path does. */
+				if (!pioRead) {
+					ret = _sdio_pollCardReady(host, SDCARD_WRITE_BUSY_TIMEOUT_MS);
+					if (ret < 0) {
+						TRACE("error %d on cmd %d (DMA write CMD13 completion)", ret, cmd);
+						mutexUnlock(host->eventLock);
+						sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+						sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+						return ret;
+					}
+				}
+			}
+			else if (pioRead) {
 				/* Reads have NO terminal busy phase (the card stays idle in TRAN),
 				 * so the Transfer-Complete IRQ is the proper completion signal —
 				 * provided no Auto-CMD12 STOP is appended. Single-block CMD17 never
@@ -829,7 +916,9 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 				 * read below — that reads the final CMD13's R1 (TRAN+READY, no
 				 * error bits), which the caller's CARD_STATUS_ERRORS check accepts.
 				 * The poll returns <0 on any card R1 error, so an error status can
-				 * never fall through as success. */
+				 * never fall through as success. For a DMA write the SDMA data phase
+				 * already completed via the poll-idle check above, so this is the same
+				 * card-side programming wait. */
 				ret = _sdio_pollCardReady(host, SDCARD_WRITE_BUSY_TIMEOUT_MS);
 				if (ret < 0) {
 					TRACE("error %d on cmd %d (write CMD13 completion poll, pres=0x%08x intr=0x%08x)", ret, cmd,
@@ -867,7 +956,7 @@ static int sdio_cmdSendEx(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, ui
 	mutexLock(host->cmdLock);
 	if ((cmd & SDIO_ACMD_BIT) != 0) {
 		uint32_t resAcmd;
-		ret = _sdio_cmdSend(host, SDIO_CMD55_APP_CMD, host->card.rca, &resAcmd, 0, false);
+		ret = _sdio_cmdSend(host, SDIO_CMD55_APP_CMD, host->card.rca, &resAcmd, 0, false, NULL, false);
 		if (ret < 0) {
 			mutexUnlock(host->cmdLock);
 			return ret;
@@ -901,7 +990,10 @@ static int sdio_cmdSendEx(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, ui
 	}
 
 	uint16_t blockCount = (dataSize > 0) ? 1 : 0;
-	ret = _sdio_cmdSend(host, cmd, arg, res, blockCount, isLongResponse);
+	/* Register reads (SCR/SD_STATUS/SWITCH) go through the uncached staging buffer
+	 * (dataBuf == NULL): they are small, rare (init only), and the caller's target
+	 * may be an unaligned stack array, so the aligned FIFO loop can't target it. */
+	ret = _sdio_cmdSend(host, cmd, arg, res, blockCount, isLongResponse, NULL, false);
 	if (data != NULL) {
 		memcpy(data, host->dmaBuffer, dataSize);
 	}
@@ -1007,6 +1099,12 @@ static void sdcard_diagClockSweep(sdcard_hostData_t *host, unsigned int slot)
 	uint32_t hc = *(host->base + SDHOST_REG_HOST_CONTROL);
 	printf("SDDIAG: CAPS=0x%08x baseClk[15:8]=%uMHz CTRL1=0x%08x HOSTCTRL=0x%08x refclkMbox=%uHz (as-left N1/50MHz, no clock switching)\n",
 		caps, (unsigned)((caps >> 8) & 0xff), cc, hc, (unsigned)host->refclkFrequency);
+	/* Check 1 (ADMA/SDMA go/no-go): the EMMC2 DMA master reaches only CPU-phys
+	 * 0x0..0x3FFFFFFF (Pi 4 emmc2bus dma-ranges, low 1 GiB). Report where our
+	 * MAP_CONTIGUOUS staging buffer physically landed — DMA is viable iff < 0x40000000. */
+	printf("SDDIAG: dmaBufferPhys=0x%08llx (%s for EMMC2 DMA: needs < 0x40000000)\n",
+		(unsigned long long)host->dmaBufferPhys,
+		(host->dmaBufferPhys < 0x40000000ull) ? "REACHABLE" : "OUT-OF-REACH");
 
 	/* Reads at the operational 50 MHz config (reset between each attempt). */
 	int rdOk = 0;
@@ -1725,8 +1823,40 @@ static int _sdcard_transferBlocks(sdcard_hostData_t *host, sdio_dir_t dir, uint3
 {
 	uint8_t cmd;
 
-	if (dir == sdio_write) {
-		memcpy(host->dmaBuffer, data, len);
+	/* Two data paths:
+	 *  - useDma: the SDMA engine moves the data to/from the low DMA-reachable
+	 *    staging buffer (uncached, so DMA-coherent); we copy across to the caller.
+	 *    The copy is cheap relative to the transfer and was measured not to bound
+	 *    throughput; it also lifts any alignment/physical-reach constraint on the
+	 *    caller's buffer.
+	 *  - PIO (fallback): move the FIFO directly to/from the caller's (cacheable)
+	 *    buffer when 4-byte aligned (Linux sg_miter style, no staging copy), else
+	 *    via the staging buffer.
+	 * len is bounded by SDCARD_MAX_TRANSFER upstream (fits the staging buffer). */
+	/* DMA READS ONLY. DMA reads are validated correct (0 silent-corrupt vs the PIO
+	 * write oracle, clean large-read). DMA *writes* showed intermittent first-block
+	 * silent corruption (a completion/ordering race not yet resolved), so writes stay
+	 * on the trusted PIO path (100% correct, ~10 MB/s). Reads are the headline win
+	 * (DDR50 target ~44 vs ~21); DMA writes are a later refinement. */
+	bool useDma = host->useDma && (dir == sdio_read);
+	void *xferBuf;
+	bool bounce;
+	if (useDma) {
+		xferBuf = host->dmaBuffer;
+		bounce = true;
+		if (dir == sdio_write) {
+			memcpy(host->dmaBuffer, data, len);
+		}
+	}
+	else {
+		xferBuf = data;
+		bounce = (((uintptr_t)data & 0x3u) != 0u);
+		if (bounce) {
+			xferBuf = host->dmaBuffer;
+			if (dir == sdio_write) {
+				memcpy(host->dmaBuffer, data, len);
+			}
+		}
 	}
 
 	uint16_t blockCount = len / SDCARD_BLOCKLEN;
@@ -1752,13 +1882,13 @@ static int _sdcard_transferBlocks(sdcard_hostData_t *host, sdio_dir_t dir, uint3
 	 */
 	uint32_t arg = host->card.highCapacity ? blockOffset : (blockOffset * SDCARD_BLOCKLEN);
 	uint32_t resp;
-	int ret = _sdio_cmdSend(host, cmd, arg, &resp, blockCount, false);
+	int ret = _sdio_cmdSend(host, cmd, arg, &resp, blockCount, false, xferBuf, useDma);
 
 	if (ret < 0) {
 		return ret;
 	}
 
-	if (dir == sdio_read) {
+	if (bounce && (dir == sdio_read)) {
 		memcpy(data, host->dmaBuffer, len);
 	}
 
@@ -1807,19 +1937,19 @@ static int _sdcard_eraseBlocks(sdcard_hostData_t *host, uint32_t start, uint32_t
 	uint32_t resp;
 	int ret;
 
-	ret = _sdio_cmdSend(host, SDIO_CMD32_ERASE_WR_BLK_START, start, &resp, 0, false);
+	ret = _sdio_cmdSend(host, SDIO_CMD32_ERASE_WR_BLK_START, start, &resp, 0, false, NULL, false);
 	if ((ret < 0) || ((resp & CARD_STATUS_ERRORS) != 0)) {
 		LOG_ERROR("erase start %d %08x", ret, resp);
 		return -EIO;
 	}
 
-	ret = _sdio_cmdSend(host, SDIO_CMD33_ERASE_WR_BLK_END, end, &resp, 0, false);
+	ret = _sdio_cmdSend(host, SDIO_CMD33_ERASE_WR_BLK_END, end, &resp, 0, false, NULL, false);
 	if ((ret < 0) || ((resp & CARD_STATUS_ERRORS) != 0)) {
 		LOG_ERROR("erase end %d %08x", ret, resp);
 		return -EIO;
 	}
 
-	ret = _sdio_cmdSend(host, SDIO_CMD38_ERASE, 0, &resp, 0, false);
+	ret = _sdio_cmdSend(host, SDIO_CMD38_ERASE, 0, &resp, 0, false, NULL, false);
 	if ((ret < 0) || ((resp & CARD_STATUS_ERRORS) != 0)) {
 		LOG_ERROR("do erase %d %08x", ret, resp);
 		return -EIO;
@@ -1902,7 +2032,7 @@ int sdcard_writeFF(unsigned int slot, uint32_t blockOffset, uint32_t nBlocks)
 		uint8_t cmd = (erasePerIteration > 1) ? SDIO_CMD25_WRITE_MULTIPLE_BLOCK : SDIO_CMD24_WRITE_SINGLE_BLOCK;
 		uint32_t arg = host->card.highCapacity ? blockOffset : (blockOffset * SDCARD_BLOCKLEN);
 		uint32_t resp;
-		ret = _sdio_cmdSend(host, cmd, arg, &resp, erasePerIteration, false);
+		ret = _sdio_cmdSend(host, cmd, arg, &resp, erasePerIteration, false, host->dmaBuffer, false);
 		if (ret < 0) {
 			break;
 		}
