@@ -188,7 +188,7 @@ static int sdhost_allocDMA(sdcard_hostData_t *host)
 	 * so a multi-page contiguous buffer is fine — it just has to be physically
 	 * contiguous for the (currently unused) SDMA_ADDRESS register. Cap at 64 KiB
 	 * (128 blocks) so multi-block CMD18/CMD25 transfers can be large. */
-	if (SDCARD_MAX_TRANSFER > (16 * _PAGE_SIZE)) {
+	if (SDCARD_MAX_TRANSFER > (32 * _PAGE_SIZE)) {
 		return -ENOMEM;
 	}
 
@@ -1242,7 +1242,7 @@ static void sdcard_diagMultiBlock(sdcard_hostData_t *host, unsigned int slot)
 	const uint32_t maxBlk = SDCARD_MAX_TRANSFER / SDCARD_BLOCKLEN;
 	const uint32_t readLba = 0;       /* MBR + p1 region: real data, non-destructive read */
 	const uint32_t scratchLba = 100;  /* unused MBR..p1 gap (writes safe up to LBA ~2047) */
-	const uint32_t sweep[] = { 8, 32, maxBlk };
+	const uint32_t sweep[] = { 8, 32, 128, maxBlk };
 	const int trials = 10;
 
 	uint8_t *bufA = mmap(NULL, SDCARD_MAX_TRANSFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1432,6 +1432,12 @@ int sdcard_initCard(unsigned int slot, bool fallbackMode)
 
 	host->card.commandTimeouts = 0;
 	host->card.uhs = false;
+	/* NOTE: a full RESET_ALL here was tried to make the SD-boot 1.8V/DDR50 switch
+	 * reliable, but it BREAKS card init on SD-boot (the firmware pre-inited EMMC2 and
+	 * RESET_ALL clears clock/power state this re-init does not fully restore -> the
+	 * card never comes ready, "root device not found"). So do NOT full-reset here;
+	 * the DDR50 switch is reliable on netboot and best-effort on SD-boot with a safe
+	 * HS50 fallback. */
 	/* Switch off 4-bit mode, because card will be in 1-bit mode after CMD0 */
 	*(host->base + SDHOST_REG_HOST_CONTROL) &= ~HOST_CONTROL_4_BIT_MODE;
 #ifdef SDCARD_ENABLE_DDR50

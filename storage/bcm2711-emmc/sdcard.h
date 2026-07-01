@@ -18,7 +18,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define SDCARD_MAX_TRANSFER 65536 /* Maximum size of a single (multi-block) transfer in bytes */
+#define SDCARD_MAX_TRANSFER 131072 /* Maximum size of a single (multi-block) transfer in bytes (128 KiB).
+                                    * SDMA boundary is 512 KiB and the staging buffer is contiguous, so a
+                                    * <=128 KiB transfer stays within one boundary window (a boundary cross
+                                    * would fail detectably via the completion poll, not silently). */
 #define SDCARD_BLOCKLEN     512  /* Block size in bytes used for sdcard_transferBlocks */
 
 typedef enum {
