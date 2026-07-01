@@ -18,7 +18,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define SDCARD_MAX_TRANSFER 4096 /* Maximum size of a single transfer in bytes */
+#define SDCARD_MAX_TRANSFER 65536 /* Maximum size of a single (multi-block) transfer in bytes */
 #define SDCARD_BLOCKLEN     512  /* Block size in bytes used for sdcard_transferBlocks */
 
 typedef enum {

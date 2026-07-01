@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
 #include <sys/mman.h>
 #include <sys/platform.h>
@@ -175,7 +176,11 @@ static inline bool sdcard_isWriteProtected(sdcard_hostData_t *host)
 
 static int sdhost_allocDMA(sdcard_hostData_t *host)
 {
-	if (SDCARD_MAX_TRANSFER > _PAGE_SIZE) {
+	/* The staging buffer is moved by PIO (SDMA is disabled, see _sdio_cmdSend),
+	 * so a multi-page contiguous buffer is fine — it just has to be physically
+	 * contiguous for the (currently unused) SDMA_ADDRESS register. Cap at 64 KiB
+	 * (128 blocks) so multi-block CMD18/CMD25 transfers can be large. */
+	if (SDCARD_MAX_TRANSFER > (16 * _PAGE_SIZE)) {
 		return -ENOMEM;
 	}
 
@@ -331,6 +336,62 @@ static int _sdio_rawSendStatus(sdcard_hostData_t *host, uint32_t *st)
 	}
 
 	return 0;
+}
+
+
+/* Issue a single CMD23-SET_BLOCK_COUNT (R1, no data, no busy) ahead of a
+ * multi-block CMD18/CMD25 — the Auto-CMD23 alternative to Auto-CMD12.
+ *
+ * On the BCM2711/Arasan EMMC2 controller the Transfer-Complete IRQ never latches
+ * for any data transfer that uses Auto-CMD12 (the CMD12 STOP) — proven on HW for
+ * multi-block reads, which sit idle in TRAN with no busy phase yet INTR_STATUS
+ * stays 0x0. CMD23 bounds the transfer up front, so the data command needs no
+ * trailing Auto-CMD12 STOP at all; the multi-block transfer then looks like a
+ * plain CMD17/CMD24 to the completion logic. (`SDHCI_QUIRK2_ACMD23_BROKEN` is NOT
+ * set for brcm,bcm2711-emmc2 in Linux, i.e. CMD23 is considered usable here.)
+ *
+ * The host command register exposes only `autoCmd12Enable` (bit 2), not the
+ * full 2-bit SDHCI Auto-CMD-Enable field, so hardware Auto-CMD23 is not cleanly
+ * available — we issue CMD23 manually (also the right choice on the PIO path,
+ * where hardware Auto-CMD23 would be DMA-coupled).
+ *
+ * MUST be issued BEFORE the data command's CMD_ARGUMENT (LBA) and TRANSFER_BLOCK
+ * are programmed: this helper writes those very registers, so calling it after
+ * them would clobber the data command's setup. Runs with host->cmdLock held (the
+ * caller holds it) and takes host->eventLock itself for the duration of the
+ * CMD_DONE wait. `count` is the block COUNT (not bytes). Returns 0 / <0. */
+static int _sdio_setBlockCount(sdcard_hostData_t *host, uint16_t count)
+{
+	sdhost_command_reg_t cmdFrame;
+	cmdFrame.raw = 0;
+	cmdFrame.commandIdx = SDIO_CMD23_SET_BLOCK_COUNT;
+	cmdFrame.commandMeta = sdCmdMetadata[SDIO_CMD23_SET_BLOCK_COUNT].bitsWhenSending;
+
+	/* No data phase for CMD23. */
+	*(host->base + SDHOST_REG_TRANSFER_BLOCK) = 0;
+	/* Drop any stale completion bits so the upcoming wait sees only this CMD. */
+	*(host->base + SDHOST_REG_INTR_STATUS) = (SDHOST_INTR_TRANSFER_DONE | SDHOST_INTR_CMD_DONE);
+	*(host->base + SDHOST_REG_CMD_ARGUMENT) = (uint32_t)count;
+	sdio_dataBarrier();
+	mutexLock(host->eventLock);
+	/* This register write starts command execution and must be done last. */
+	*(host->base + SDHOST_REG_CMD) = cmdFrame.raw;
+
+	int ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_CMD_DONE, 50 * 1000);
+	mutexUnlock(host->eventLock);
+
+#ifdef SDCARD_DIAG_CLOCKSWEEP
+	/* One-shot marker so the multi-block validation log shows the Auto-CMD23 path
+	 * is live (and whether the first CMD23 itself succeeded). */
+	static bool sbcLogged = false;
+	if (!sbcLogged) {
+		sbcLogged = true;
+		printf("SDDIAG-MB: CMD23-SET_BLOCK_COUNT active (Auto-CMD12 disabled), first count=%u ret=%d\n",
+			(unsigned)count, ret);
+	}
+#endif
+
+	return ret;
 }
 
 
@@ -552,6 +613,21 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 		*(host->base + SDHOST_REG_TRANSFER_BLOCK) = 0;
 	}
 	else {
+		/* Multi-block (CMD18/CMD25): set the block count with CMD23
+		 * SET_BLOCK_COUNT up front instead of arming Auto-CMD12. The Auto-CMD12
+		 * STOP suppresses this controller's Transfer-Complete IRQ; CMD23 removes
+		 * it so the multi-block transfer completes like a single block. CMD23
+		 * MUST be issued here, before the data command's TRANSFER_BLOCK /
+		 * CMD_ARGUMENT below — _sdio_setBlockCount writes those same registers,
+		 * which are then re-populated for the data command. */
+		if (((dataType == CMD_READ_MULTI) || (dataType == CMD_WRITE_MULTI)) && (blockCount != 0)) {
+			int sbcRet = _sdio_setBlockCount(host, blockCount);
+			if (sbcRet < 0) {
+				TRACE("error %d on CMD23 SET_BLOCK_COUNT (cmd %d)", sbcRet, cmd);
+				return sbcRet;
+			}
+		}
+
 		if (blockCount != 0) {
 			uint32_t blockLength;
 			switch (dataType) {
@@ -589,7 +665,10 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 
 		if ((dataType == CMD_READ_MULTI) || (dataType == CMD_WRITE_MULTI)) {
 			cmdFrame.multiBlock = 1;
-			cmdFrame.autoCmd12Enable = 1;
+			/* Auto-CMD12 OFF: block count is bounded by the CMD23 above, so the
+			 * controller must NOT append a CMD12 STOP. The trailing R1b-busy CMD12
+			 * STOP is what suppresses the Transfer-Complete IRQ on this controller. */
+			cmdFrame.autoCmd12Enable = 0;
 		}
 	}
 
@@ -707,28 +786,32 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 			}
 
 			if (pioRead) {
-				/* Reads: the Transfer-Complete IRQ DOES latch (they never enter the
-				 * card's busy/PRG phase), so keep the proven IRQ-driven wait. */
+				/* Reads have NO terminal busy phase (the card stays idle in TRAN),
+				 * so the Transfer-Complete IRQ is the proper completion signal —
+				 * provided no Auto-CMD12 STOP is appended. Single-block CMD17 never
+				 * used Auto-CMD12 and latches TC reliably; multi-block CMD18 now
+				 * bounds its length with CMD23 (above) with Auto-CMD12 OFF, so it
+				 * should likewise latch TC. Wait on TRANSFER_DONE for both. (If TC
+				 * still does not latch for CMD18, the SDDIAG read-completion-timeout
+				 * line below prints intr=0x0 — that is the HW experimental result.) */
 				ret = _sdio_cmdExecutionWait(host, SDHOST_INTR_TRANSFER_DONE, 1000 * 1000);
 				if (ret < 0) {
-					TRACE("error %d on cmd %d (data transfer_done wait, pres=0x%08x intr=0x%08x)", ret, cmd,
+					TRACE("error %d on cmd %d (read completion, pres=0x%08x intr=0x%08x)", ret, cmd,
 						(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
 #ifdef SDCARD_DIAG_CLOCKSWEEP
-					printf("SDDIAG: transfer_done-timeout cmd=%u ret=%d pres=0x%08x intr=0x%08x\n", (unsigned)cmd, ret,
+					printf("SDDIAG: read-completion-timeout cmd=%u ret=%d pres=0x%08x intr=0x%08x\n", (unsigned)cmd, ret,
 						(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)*(host->base + SDHOST_REG_INTR_STATUS));
 #endif
 					/* #154 read-bug diagnostic (default-on, first few only): the
 					 * host data-end-bit interrupt vs. the card's own CMD13 R1 state
-					 * are different facts; log BOTH so the large-read EIO can be
-					 * classed as host sampling margin (card in TRAN+READY ⇒ drop
-					 * clock) vs. a card wedge (CMD13 not TRAN ⇒ re-init). CMD13 is
-					 * issued raw with eventLock still held (do NOT unlock first —
+					 * are different facts; log BOTH so a read EIO can be classed as
+					 * host sampling margin (card in TRAN+READY) vs. a card wedge. CMD13
+					 * is issued raw with eventLock still held (do NOT unlock first —
 					 * the raw send condWaits on eventLock). */
 					sdcard_readDiag(host, cmd, *(host->base + SDHOST_REG_INTR_STATUS));
 					mutexUnlock(host->eventLock);
-					/* #154: see the CMD_DONE-timeout note above — recover the DAT/CMD
-					 * engine so a single timed-out data phase can't wedge every
-					 * following command. */
+					/* #154: recover the DAT/CMD engine so a single timed-out data
+					 * phase can't wedge every following command. */
 					sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
 					sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
 					return ret;
@@ -1012,6 +1095,158 @@ static void sdcard_diagClockSweep(sdcard_hostData_t *host, unsigned int slot)
 	/* No clock switching done — controller left in the operational config so
 	 * the real MBR read + rootfs mount proceed normally. */
 }
+
+
+/* Multi-block (CMD18/CMD25) proof + throughput sweep (#154-perf). The storage
+ * layer currently forces single-block I/O (a #120 sidestep), so multi-block has
+ * never run on this controller. For each block count this: (1) reads the same
+ * region single-block-in-a-loop and once as multi-block and byte-compares them
+ * (proves CMD18 reads correct data), (2) multi-block-writes a pattern to the
+ * scratch gap and reads it back to verify (proves CMD25 + the CMD13-poll write
+ * completion across blocks), and times each so the boot reports MB/s. Reads are
+ * non-destructive; writes hit the unused LBA100+ MBR..p1 gap. */
+static uint64_t sdcard_diagElapsedUs(struct timespec *a, struct timespec *b)
+{
+	return (uint64_t)(b->tv_sec - a->tv_sec) * 1000000ULL + (uint64_t)(b->tv_nsec - a->tv_nsec) / 1000ULL;
+}
+
+
+static unsigned long sdcard_diagKBps(size_t bytes, uint64_t us)
+{
+	if (us == 0) {
+		return 0;
+	}
+	return (unsigned long)(((uint64_t)bytes * 1000000ULL) / 1024ULL / us);
+}
+
+
+/* First 512-byte block where a and b differ, or -1 if identical. */
+static int sdcard_diagFirstDiffBlk(const uint8_t *a, const uint8_t *b, uint32_t nb)
+{
+	for (uint32_t i = 0; i < nb; i++) {
+		if (memcmp(a + (size_t)i * SDCARD_BLOCKLEN, b + (size_t)i * SDCARD_BLOCKLEN, SDCARD_BLOCKLEN) != 0) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+
+static void sdcard_diagMultiBlock(sdcard_hostData_t *host, unsigned int slot)
+{
+	const uint32_t maxBlk = SDCARD_MAX_TRANSFER / SDCARD_BLOCKLEN;
+	const uint32_t readLba = 0;       /* MBR + p1 region: real data, non-destructive read */
+	const uint32_t scratchLba = 100;  /* unused MBR..p1 gap (writes safe up to LBA ~2047) */
+	const uint32_t sweep[] = { 8, 32, maxBlk };
+	const int trials = 10;
+
+	uint8_t *bufA = mmap(NULL, SDCARD_MAX_TRANSFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	uint8_t *bufB = mmap(NULL, SDCARD_MAX_TRANSFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if ((bufA == MAP_FAILED) || (bufB == MAP_FAILED)) {
+		printf("SDDIAG-MB: test buffer alloc failed\n");
+		return;
+	}
+
+	/* The single-block path is the proven-reliable oracle (2048/2048, 16/16). Use
+	 * it to VERIFY multi-block transfers so a silent multi-block fault (rc==0 but
+	 * wrong data — the only unrecoverable failure, since retry can't see it) is
+	 * caught distinctly from a detected/retryable error. No per-op reset (the real
+	 * storage path doesn't reset between transfers); repeated to separate a
+	 * transient from a real bug. */
+	printf("SDDIAG-MB: oracle=single-block, trials=%d, no per-op reset (detected-fail is retryable; SILENT is the showstopper)\n", trials);
+
+	for (size_t s = 0; s < sizeof(sweep) / sizeof(sweep[0]); s++) {
+		uint32_t nb = sweep[s];
+		if ((nb == 0) || (nb > maxBlk) || ((s > 0) && (nb == sweep[s - 1]))) {
+			continue;
+		}
+		size_t len = (size_t)nb * SDCARD_BLOCKLEN;
+		struct timespec t0, t1;
+
+		/* READ A/B (the decisive diagnostic): is a per-transfer CMD+DAT re-arm the
+		 * thing that makes multi-block reads work? Each trial issues the SAME
+		 * multi-block read twice — once with NO reset before it, once with a
+		 * sdcard_diagReset (CLOCK_CONTROL_RESET_CMD+DAT) before it. The reset is the
+		 * variable that flipped reads from working (sdmb: reset-before-each) to
+		 * failing (sdmb2/sds3: no reset). Also capture the first non-zero return code
+		 * (rc) — every gated error probe came back empty, so we need to see WHAT the
+		 * read returns (-ETIME=-37 completion, -EIO=-5 R1/CRC, etc.). */
+		int rdFailNo = 0, rdFailReset = 0, rdFirstRc = 0;
+		uint64_t rdUsBest = ~0ULL;
+		for (int t = 0; t < trials; t++) {
+			/* no reset before */
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			int mb = sdcard_transferBlocks(slot, sdio_read, readLba, bufA, len);
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			if (mb != 0) {
+				rdFailNo++;
+				if (rdFirstRc == 0) {
+					rdFirstRc = mb;
+				}
+			}
+			else {
+				uint64_t us = sdcard_diagElapsedUs(&t0, &t1);
+				if (us < rdUsBest) {
+					rdUsBest = us;
+				}
+			}
+			/* CMD+DAT re-arm before the same read */
+			sdcard_diagReset(host);
+			int mbR = sdcard_transferBlocks(slot, sdio_read, readLba, bufB, len);
+			if (mbR != 0) {
+				rdFailReset++;
+				if (rdFirstRc == 0) {
+					rdFirstRc = mbR;
+				}
+			}
+		}
+		printf("SDDIAG-MB: READ  nb=%u noReset-fail=%d/%d withReset-fail=%d/%d firstRc=%d bestKBps=%lu\n",
+			(unsigned)nb, rdFailNo, trials, rdFailReset, trials, rdFirstRc,
+			(rdUsBest == ~0ULL) ? 0UL : sdcard_diagKBps(len, rdUsBest));
+
+		/* WRITE: multi-block write to scratch, VERIFY with single-block reads, x trials.
+		 * SILENT-CORRUPT>0 means a write returned success but the bytes on the card
+		 * are wrong — the unrecoverable case that blocks enabling multi-block. */
+		int wrFail = 0, wrSilent = 0, wrBadBlk = -1;
+		uint64_t wrUsBest = ~0ULL;
+		for (int t = 0; t < trials; t++) {
+			for (size_t i = 0; i < len; i++) {
+				bufA[i] = (uint8_t)((i * 7) + (t * 13) + nb + 1);
+			}
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			int wr = sdcard_transferBlocks(slot, sdio_write, scratchLba, bufA, len);
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			uint64_t us = sdcard_diagElapsedUs(&t0, &t1);
+			memset(bufB, 0, len);
+			int orErr = 0;
+			for (uint32_t i = 0; i < nb; i++) {
+				if (sdcard_transferBlocks(slot, sdio_read, scratchLba + i, bufB + (size_t)i * SDCARD_BLOCKLEN, SDCARD_BLOCKLEN) != 0) {
+					orErr++;
+				}
+			}
+			if (wr != 0) {
+				wrFail++;
+			}
+			else {
+				if (us < wrUsBest) {
+					wrUsBest = us;
+				}
+				if ((orErr == 0) && (memcmp(bufA, bufB, len) != 0)) {
+					wrSilent++;
+					if (wrBadBlk < 0) {
+						wrBadBlk = sdcard_diagFirstDiffBlk(bufA, bufB, nb);
+					}
+				}
+			}
+		}
+		printf("SDDIAG-MB: WRITE nb=%u detected-fail=%d/%d SILENT-CORRUPT=%d/%d firstBadBlk=%d bestKBps=%lu\n",
+			(unsigned)nb, wrFail, trials, wrSilent, trials, wrBadBlk,
+			(wrUsBest == ~0ULL) ? 0UL : sdcard_diagKBps(len, wrUsBest));
+	}
+
+	munmap(bufA, SDCARD_MAX_TRANSFER);
+	munmap(bufB, SDCARD_MAX_TRANSFER);
+}
 #endif
 
 
@@ -1151,6 +1386,7 @@ int sdcard_initCard(unsigned int slot, bool fallbackMode)
 #ifdef SDCARD_DIAG_CLOCKSWEEP
 	if (rc == 0) {
 		sdcard_diagClockSweep(host, slot);
+		sdcard_diagMultiBlock(host, slot);
 	}
 #endif
 	return rc;

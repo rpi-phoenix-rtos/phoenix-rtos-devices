@@ -32,6 +32,7 @@ enum SDIO_CMD {
 	SDIO_CMD16_SET_BLOCKLEN = 16,         /* set block length for data transfers (non-SDHC cards only) */
 	SDIO_CMD17_READ_SINGLE_BLOCK = 17,    /* read single block */
 	SDIO_CMD18_READ_MULTIPLE_BLOCK = 18,  /* read multiple blocks */
+	SDIO_CMD23_SET_BLOCK_COUNT = 23,      /* set block count for the next multi-block transfer (Auto-CMD23 alternative to Auto-CMD12) */
 	SDIO_CMD24_WRITE_SINGLE_BLOCK = 24,   /* write single block */
 	SDIO_CMD25_WRITE_MULTIPLE_BLOCK = 25, /* write multiple blocks */
 	SDIO_CMD32_ERASE_WR_BLK_START = 32,   /* set start address for erase operation */
@@ -315,6 +316,7 @@ static const cmd_metadata_t sdCmdMetadata[MAX_SD_COMMANDS] = {
 	[SDIO_CMD16_SET_BLOCKLEN] = RESPONSE_METADATA_R1(CMD_NO_DATA),
 	[SDIO_CMD17_READ_SINGLE_BLOCK] = RESPONSE_METADATA_R1(CMD_READ),
 	[SDIO_CMD18_READ_MULTIPLE_BLOCK] = RESPONSE_METADATA_R1(CMD_READ_MULTI),
+	[SDIO_CMD23_SET_BLOCK_COUNT] = RESPONSE_METADATA_R1(CMD_NO_DATA),
 	[SDIO_CMD24_WRITE_SINGLE_BLOCK] = RESPONSE_METADATA_R1(CMD_WRITE),
 	[SDIO_CMD25_WRITE_MULTIPLE_BLOCK] = RESPONSE_METADATA_R1(CMD_WRITE_MULTI),
 	[SDIO_CMD32_ERASE_WR_BLK_START] = RESPONSE_METADATA_R1(CMD_NO_DATA),

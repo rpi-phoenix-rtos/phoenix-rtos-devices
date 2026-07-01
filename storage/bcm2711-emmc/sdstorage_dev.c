@@ -42,8 +42,13 @@
 #define TRACE(str, ...)     do { if (0) fprintf(stderr, LOG_TAG " trace: " str "\n", ##__VA_ARGS__); } while (0)
 /* clang-format on */
 
-#define BLK_CACHE_SECSIZE   (2 * SDCARD_BLOCKLEN) /* Size of cache sector (must be multiple of SDCARD_BLOCKLEN) */
-#define BLK_CACHE_SECNUM    16                    /* Maximum number of cached sectors in a region */
+/* Cache sector = the unit libcache reads/writes per miss/flush, i.e. the size of
+ * each sdcard_transferBlocks() request. 16 KiB (32 blocks) lets the proven
+ * multi-block CMD18/CMD25 path move large bursts (~10-15 MB/s) instead of the old
+ * 1 KiB (2-block) requests. Must be a multiple of SDCARD_BLOCKLEN and <=
+ * SDCARD_MAX_TRANSFER (64 KiB). */
+#define BLK_CACHE_SECSIZE   (32 * SDCARD_BLOCKLEN) /* 16 KiB */
+#define BLK_CACHE_SECNUM    64                     /* 64 * 16 KiB = 1 MiB cache per region */
 #define MTD_DEFAULT_ERASESZ 0x10000
 #define SDCARD_READ_RETRIES  5 /* TODO(#120): bounded retry of transient single-block read errors */
 #define SDCARD_WRITE_RETRIES 5 /* TODO(#120): same, for single-block CMD24 writes (idempotent on CRC reject) */
@@ -127,12 +132,27 @@ static ssize_t sdcard_readCb(uint64_t offs, void *buff, size_t len, cache_devCtx
 	uint32_t lba = offs / SDCARD_BLOCKLEN;
 	len = min(len, SDCARD_MAX_TRANSFER);
 
-	/* TODO: CMD18 (READ_MULTIPLE_BLOCK) is unproven on this controller --
-	 * the ext2 mount's 2-block reads returned -EIO while the single-block CMD17
-	 * path (validated by the boot-time MBR read) works. The multi-block transfer
-	 * path (block-count / auto-CMD12 setup) is NOT yet fixed; force single-block
-	 * reads so the filesystem comes up. Remove this loop and use a single
-	 * sdcard_transferBlocks(len) once multi-block CMD18 is fixed and validated. */
+	/* Fast path: one multi-block CMD18 for the whole request. HW-proven under a
+	 * clean controller init (netboot): READ 0/10 fail at ~15-20 MB/s (SDDIAG-MB).
+	 * Multi-block reads can fail ONLY when the firmware left the EMMC2 in a stale
+	 * state after an SD-boot (TODO: full controller reset at init clears that); the
+	 * single-block loop below is the safe fallback for that case (reads idempotent). */
+	if (len > SDCARD_BLOCKLEN) {
+		int mb = -EIO;
+		for (int attempt = 0; attempt < SDCARD_READ_RETRIES; attempt++) {
+			mb = sdcard_transferBlocks(ctx->id, sdio_read, lba, buff, len);
+			if (mb >= 0) {
+				break;
+			}
+		}
+		if (mb >= 0) {
+			return len;
+		}
+		fprintf(stderr, "sdstorage(#154-perf): multi-block read lba=%u nblk=%u failed, single-block fallback\n",
+			(unsigned)lba, (unsigned)(len / SDCARD_BLOCKLEN));
+	}
+
+	/* Single-block fallback (and the single-block request case). */
 	for (size_t done = 0; done < len; done += SDCARD_BLOCKLEN) {
 		uint32_t blkLba = lba + (uint32_t)(done / SDCARD_BLOCKLEN);
 		int ret = -EIO;
@@ -179,9 +199,26 @@ static ssize_t sdcard_writeCb(uint64_t offs, const void *buff, size_t len, cache
 	uint32_t lba = offs / SDCARD_BLOCKLEN;
 	len = min(len, SDCARD_MAX_TRANSFER);
 
-	/* TODO: force single-block CMD24 writes, mirroring the read sidestep --
-	 * multi-block CMD25 (WRITE_MULTIPLE_BLOCK) uses the same unproven multi-block
-	 * path that returned -EIO for reads. Remove once multi-block is fixed. */
+	/* Fast path: one multi-block CMD25 for the whole request (proven correct +
+	 * ~10 MB/s; #154 autoCmd12 CMD13->TRAN completion). Retry; on persistent
+	 * failure fall back to the single-block loop below (idempotent — re-writing the
+	 * same data is safe). */
+	if (len > SDCARD_BLOCKLEN) {
+		int mb = -EIO;
+		for (int attempt = 0; attempt < SDCARD_WRITE_RETRIES; attempt++) {
+			mb = sdcard_transferBlocks(ctx->id, sdio_write, lba, (void *)buff, len);
+			if (mb >= 0) {
+				break;
+			}
+		}
+		if (mb >= 0) {
+			return len;
+		}
+		fprintf(stderr, "sdstorage(#154-perf): multi-block write lba=%u nblk=%u failed, single-block fallback\n",
+			(unsigned)lba, (unsigned)(len / SDCARD_BLOCKLEN));
+	}
+
+	/* Single-block fallback (and the single-block request case). */
 	for (size_t done = 0; done < len; done += SDCARD_BLOCKLEN) {
 		uint32_t blkLba = lba + (uint32_t)(done / SDCARD_BLOCKLEN);
 		int ret = -EIO;
