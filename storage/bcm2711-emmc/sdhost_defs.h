@@ -27,6 +27,7 @@ enum SDIO_CMD {
 	SDIO_CMD8_SEND_IF_COND = 8,           /* inquire about operating conditions */
 	SDIO_CMD9_SEND_CSD = 9,               /* get CSD of addressed card */
 	SDIO_CMD10_SEND_CID = 10,             /* get CID of addressed card */
+	SDIO_CMD11_VOLTAGE_SWITCH = 11,       /* switch card I/O signaling to 1.8V (UHS-I) */
 	SDIO_CMD13_SEND_STATUS = 13,          /* get status of addressed card */
 	SDIO_CMD15_STATE_INACTIVE = 15,       /* set the card into inactive state */
 	SDIO_CMD16_SET_BLOCKLEN = 16,         /* set block length for data transfers (non-SDHC cards only) */
@@ -327,6 +328,7 @@ static const cmd_metadata_t sdCmdMetadata[MAX_SD_COMMANDS] = {
 	[SDIO_CMD8_SEND_IF_COND] = RESPONSE_METADATA_R7,
 	[SDIO_CMD9_SEND_CSD] = RESPONSE_METADATA_R2,
 	[SDIO_CMD10_SEND_CID] = RESPONSE_METADATA_R2,
+	[SDIO_CMD11_VOLTAGE_SWITCH] = RESPONSE_METADATA_R1(CMD_NO_DATA),
 	[SDIO_CMD13_SEND_STATUS] = RESPONSE_METADATA_R1(CMD_NO_DATA),
 	[SDIO_CMD16_SET_BLOCKLEN] = RESPONSE_METADATA_R1(CMD_NO_DATA),
 	[SDIO_CMD17_READ_SINGLE_BLOCK] = RESPONSE_METADATA_R1(CMD_READ),
@@ -377,7 +379,8 @@ static const cmd_metadata_t sdCmdMetadata[MAX_SD_COMMANDS] = {
 
 #define SDIO_SWITCH_FUNC_GET        (0 << 31)
 #define SDIO_SWITCH_FUNC_SET        (1 << 31)
-#define SDIO_SWITCH_FUNC_HIGH_SPEED (1 << 0)
+#define SDIO_SWITCH_FUNC_HIGH_SPEED (1 << 0) /* access-mode group 1, function 1 (HS/SDR25) */
+#define SDIO_SWITCH_FUNC_DDR50      (4 << 0) /* access-mode group 1, function 4 (UHS-I DDR50) */
 
 enum CARD_STATUS {
 	CARD_STATUS_APP_CMD = (1 << 5),

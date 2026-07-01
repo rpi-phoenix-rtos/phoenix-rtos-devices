@@ -49,6 +49,7 @@
  * `#define SDCARD_DIAG_CLOCKSWEEP 1` to re-run it (e.g. to triage a marginal card). */
 #define SDCARD_DIAG_CLOCKSWEEP 1 /* TODO(#62): temporary — measuring direct-PIO throughput; gate OFF before publishable */
 #define SDCARD_ENABLE_DMA 1      /* TODO(#62): SDMA data path (validating, reads-only first); gate/finalize before publish */
+#define SDCARD_ENABLE_DDR50 1    /* TODO(#62): UHS-I DDR50 (1.8V switch, ~2x read); validating, gate/finalize before publish */
 
 
 /* #154: bound on the CMD13 SEND_STATUS busy-poll that detects write completion
@@ -103,6 +104,8 @@ typedef struct {
 	uint32_t commandTimeouts;
 	/* Whether the card supports SDHC protocol (requires slightly different handling) */
 	bool highCapacity;
+	/* Whether the card+host completed the 1.8V UHS-I signaling switch at init (enables DDR50). */
+	bool uhs;
 } sdcard_cardMetadata_t;
 
 typedef struct {
@@ -1105,6 +1108,11 @@ static void sdcard_diagClockSweep(sdcard_hostData_t *host, unsigned int slot)
 	printf("SDDIAG: dmaBufferPhys=0x%08llx (%s for EMMC2 DMA: needs < 0x40000000)\n",
 		(unsigned long long)host->dmaBufferPhys,
 		(host->dmaBufferPhys < 0x40000000ull) ? "REACHABLE" : "OUT-OF-REACH");
+	/* DDR50 state: HC2 lives in the upper 16 bits of the 0x3C word. */
+	uint32_t hc2word = *(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS);
+	printf("SDDIAG: HC2=0x%04x uhsMode=%u vdd180=%u cardUhs=%d (uhsMode 4=DDR50)\n",
+		(unsigned)(hc2word >> 16), (unsigned)((hc2word >> 16) & 0x7), (unsigned)((hc2word >> 19) & 1),
+		(int)host->card.uhs);
 
 	/* Reads at the operational 50 MHz config (reset between each attempt). */
 	int rdOk = 0;
@@ -1348,6 +1356,74 @@ static void sdcard_diagMultiBlock(sdcard_hostData_t *host, unsigned int slot)
 #endif
 
 
+#ifdef SDCARD_ENABLE_DDR50
+/* PRES_STATE DAT[3:0] signal levels (bits 20-23): the card holds them low during
+ * the CMD11 voltage-switch handshake and releases them high once the switch to
+ * 1.8V signaling is complete. */
+#define PRES_STATE_DAT30_LEVEL (0xfUL << 20)
+
+/* Perform the SD UHS-I 1.8V signal-voltage switch (CMD11 handshake). Mirrors the
+ * Linux sdhci sequence: CMD11 (card drives DAT[3:0] low) -> gate the SD clock ->
+ * switch the I/O rail to 1.8V (firmware GPIO) + enable HC2 1.8V signaling ->
+ * restart the clock -> confirm the card released DAT[3:0] high. Returns 0 on a
+ * completed switch; on any failure reverts the rail to 3.3V and returns <0 (the
+ * caller then continues at 3.3V/High-Speed). Must run with the init clock active. */
+static int sdcard_switchTo18V(sdcard_hostData_t *host)
+{
+	uint32_t resp;
+	if (_sdio_cmdSend(host, SDIO_CMD11_VOLTAGE_SWITCH, 0, &resp, 0, false, NULL, false) < 0) {
+		return -EIO;
+	}
+	if ((resp & CARD_STATUS_ERRORS) != 0) {
+		return -EIO;
+	}
+
+	/* Gate the SD clock while switching (SD spec). */
+	*(host->base + SDHOST_REG_CLOCK_CONTROL) &= ~CLOCK_CONTROL_START_SD_CLOCK;
+	sdio_dataBarrier();
+	usleep(2000);
+
+	/* Rail to 1.8V first, then enable 1.8V signaling in the host controller. */
+	if (sdio_setSdIoVoltage18(true) < 0) {
+		return -EIO;
+	}
+	usleep(5000); /* regulator settling (DT settling-time-us = 5000) */
+
+	uint32_t hc2 = *(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS);
+	hc2 |= HOST_CONTROL2_VDD_180;
+	*(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS) = hc2;
+	sdio_dataBarrier();
+	usleep(5000);
+
+	if ((*(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS) & HOST_CONTROL2_VDD_180) == 0) {
+		/* Host rejected 1.8V signaling — revert. */
+		(void)sdio_setSdIoVoltage18(false);
+		return -EIO;
+	}
+
+	/* Restart the SD clock; the card should release DAT[3:0] high within ~1 ms. */
+	*(host->base + SDHOST_REG_CLOCK_CONTROL) |= CLOCK_CONTROL_START_SD_CLOCK;
+	sdio_dataBarrier();
+	usleep(1000);
+
+	for (int i = 0; i < 100; i++) {
+		if ((*(host->base + SDHOST_REG_PRES_STATE) & PRES_STATE_DAT30_LEVEL) == PRES_STATE_DAT30_LEVEL) {
+			return 0;
+		}
+		usleep(1000);
+	}
+
+	/* Card never released the data lines — the switch failed; revert the rail so a
+	 * re-init can proceed at 3.3V. */
+	hc2 = *(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS);
+	hc2 &= ~HOST_CONTROL2_VDD_180;
+	*(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS) = hc2;
+	(void)sdio_setSdIoVoltage18(false);
+	return -EIO;
+}
+#endif /* SDCARD_ENABLE_DDR50 */
+
+
 int sdcard_initCard(unsigned int slot, bool fallbackMode)
 {
 	sdcard_hostData_t *host = sdcard_getHostForSlot(slot);
@@ -1356,8 +1432,16 @@ int sdcard_initCard(unsigned int slot, bool fallbackMode)
 	}
 
 	host->card.commandTimeouts = 0;
+	host->card.uhs = false;
 	/* Switch off 4-bit mode, because card will be in 1-bit mode after CMD0 */
 	*(host->base + SDHOST_REG_HOST_CONTROL) &= ~HOST_CONTROL_4_BIT_MODE;
+#ifdef SDCARD_ENABLE_DDR50
+	/* Start every init from a known 3.3V state: clear HC2 1.8V-signaling and drive
+	 * the I/O rail back to 3.3V, so CMD0/identification runs at 3.3V even after a
+	 * previous (possibly failed) 1.8V switch. */
+	*(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS) &= ~(HOST_CONTROL2_VDD_180 | HOST_CONTROL2_UHS_MASK);
+	(void)sdio_setSdIoVoltage18(false);
+#endif
 	sdcard_configClockAndPower(host, SD_FREQ_INITIAL);
 	/* Before we know the card's RCA, set to 0 to send to all cards */
 	host->card.rca = 0;
@@ -1390,6 +1474,13 @@ int sdcard_initCard(unsigned int slot, bool fallbackMode)
 
 	uint32_t acmd41Response;
 	uint32_t acmd41Arg = trySdhc ? (1 << 30) : 0;
+#ifdef SDCARD_ENABLE_DDR50
+	/* S18R (bit 24): request 1.8V signaling support so the card advertises S18A in
+	 * its OCR. Only meaningful on v2/SDHC cards (trySdhc). */
+	if (trySdhc) {
+		acmd41Arg |= (1u << 24);
+	}
+#endif
 	int acmd41Ret = sdio_cmdSend(host, SDIO_ACMD41_SD_SEND_OP_COND, acmd41Arg, &acmd41Response);
 	if (acmd41Ret < 0) {
 		/* The Pi 4 EMMC2 SD slot has no software-readable card-detect, so the
@@ -1433,6 +1524,20 @@ int sdcard_initCard(unsigned int slot, bool fallbackMode)
 	}
 
 	host->card.highCapacity = trySdhc && (((acmd41Response >> 30) & 1) != 0);
+
+#ifdef SDCARD_ENABLE_DDR50
+	/* S18A (OCR bit 24): the card accepted 1.8V signaling. Switch now, while the
+	 * card is in the ready state and before CMD2 identification. On any failure the
+	 * rail is reverted to 3.3V inside sdcard_switchTo18V and we continue at 3.3V/HS. */
+	if ((acmd41Response & (1u << 24)) != 0) {
+		if (sdcard_switchTo18V(host) == 0) {
+			host->card.uhs = true;
+		}
+		else {
+			LOG_ERROR("1.8V UHS switch failed; continuing at 3.3V");
+		}
+	}
+#endif
 
 	/* Not sure what that is for, but it's in the documentation that we should do this */
 	if (sdio_cmdSend(host, SDIO_CMD2_ALL_SEND_CID, 0, NULL) < 0) {
@@ -1558,6 +1663,34 @@ static int sdcard_wideAndFast(sdcard_hostData_t *host)
 			return -EIO;
 		}
 	}
+
+#ifdef SDCARD_ENABLE_DDR50
+	/* UHS-I DDR50: only after a successful 1.8V switch. CMD6 SET access-mode group
+	 * -> DDR50 (function 4), then run the 50 MHz clock with Host Control 2 in DDR50
+	 * mode (double-data-rate sampling = ~2x the SDR bus rate at the same clock). */
+	if (host->card.uhs && cmd6Supported) {
+		uint32_t ddrArg = SDIO_SWITCH_FUNC_SET | SDIO_SWITCH_FUNC_DDR50;
+		if ((sdio_cmdSendEx(host, SDIO_CMD6_SWITCH_FUNC, ddrArg, NULL, false, bigRegs) == 0) &&
+				(sdcard_extractFunctionSwitchResult(bigRegs, SDCARD_FUNCTION_GROUP_ACCESS_MODE) == 4)) {
+			if (sdcard_configClockAndPower(host, SD_FREQ_50M) < 0) {
+				return -EIO;
+			}
+			/* Select DDR50 in Host Control 2 (upper half of the 0x3C word). */
+			uint32_t hc2 = *(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS);
+			hc2 = (hc2 & ~HOST_CONTROL2_UHS_MASK) | HOST_CONTROL2_UHS_DDR50;
+			*(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS) = hc2;
+			sdio_dataBarrier();
+			TRACE("using UHS DDR50");
+			usleep(10);
+			if (sdio_cmdSendEx(host, SDIO_ACMD13_SD_STATUS, 0, NULL, false, NULL) < 0) {
+				LOG_ERROR("DDR50 verify failed");
+				return -EIO;
+			}
+			return 0;
+		}
+		TRACE("DDR50 CMD6 not accepted; falling back");
+	}
+#endif
 
 	bool isHighSpeedSupported = false;
 	if (cmd6Supported && sdcard_hasHighSpeedFunction(host, bigRegs)) {
