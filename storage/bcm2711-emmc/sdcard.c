@@ -1967,10 +1967,11 @@ static int _sdcard_transferBlocks(sdcard_hostData_t *host, sdio_dir_t dir, uint3
 	 *    via the staging buffer.
 	 * len is bounded by SDCARD_MAX_TRANSFER upstream (fits the staging buffer). */
 	/* DMA READS ONLY. DMA reads are validated correct (0 silent-corrupt vs the PIO
-	 * write oracle, clean large-read). DMA *writes* showed intermittent first-block
-	 * silent corruption (a completion/ordering race not yet resolved), so writes stay
-	 * on the trusted PIO path (100% correct, ~10 MB/s). Reads are the headline win
-	 * (DDR50 target ~44 vs ~21); DMA writes are a later refinement. */
+	 * oracle, clean large-read) and DDR50-fast. DMA *writes* show intermittent
+	 * first-block silent corruption that survived both a poll-idle completion and a
+	 * `dsb` drain barrier — a write-DMA quirk on this controller — so writes stay on
+	 * the trusted PIO path (100% correct; ~13 MB/s at the DDR50 clock). Reads are the
+	 * headline win; correct DMA writes are a separate investigation. */
 	bool useDma = host->useDma && (dir == sdio_read);
 	void *xferBuf;
 	bool bounce;
