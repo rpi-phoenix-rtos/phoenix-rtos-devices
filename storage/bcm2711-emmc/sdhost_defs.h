@@ -128,6 +128,20 @@ enum REG_STATE {
 
 #define PRES_STATE_BUSY_FLAGS (PRES_STATE_DAT_BUSY | PRES_STATE_CMD_BUSY)
 
+/* Host Control 2 (SDHCI offset 0x3E, 16-bit) lives in the UPPER 16 bits of the
+ * 32-bit word at 0x3C (SDHOST_REG_AUTOCMD12_ERROR_STATUS) — the BCM2711 EMMC2 is
+ * 32-bit-access only, so HC2 fields are pre-shifted by 16 for a 32-bit RMW of that
+ * word. Used for UHS-I DDR50 bring-up (1.8V signaling + UHS mode select). */
+enum HOST_CONTROL2 {
+	HOST_CONTROL2_UHS_MASK   = 0x7UL << 16, /* HC2[2:0] UHS mode select */
+	HOST_CONTROL2_UHS_SDR12  = 0x0UL << 16,
+	HOST_CONTROL2_UHS_SDR25  = 0x1UL << 16,
+	HOST_CONTROL2_UHS_SDR50  = 0x2UL << 16,
+	HOST_CONTROL2_UHS_SDR104 = 0x3UL << 16,
+	HOST_CONTROL2_UHS_DDR50  = 0x4UL << 16,
+	HOST_CONTROL2_VDD_180    = 0x8UL << 16, /* HC2[3] 1.8V signaling enable */
+};
+
 enum TRANSFER_BLOCK {
 	TRANSFER_BLOCK_SDMA_BOUNDARY_4K = 0b000UL << 12,   /* 4K bytes (Detects A11 carry out)*/
 	TRANSFER_BLOCK_SDMA_BOUNDARY_8K = 0b001UL << 12,   /* 8K bytes (Detects A12 carry out)*/

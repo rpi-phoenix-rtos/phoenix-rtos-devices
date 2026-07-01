@@ -50,4 +50,14 @@ static inline void sdio_dataBarrier(void)
 
 int sdio_platformConfigure(unsigned int slot, sdio_platformInfo_t *infoOut);
 
+
+/* Switch the Pi 4 SD I/O signaling rail via the VideoCore mailbox. The rail
+ * (sd_io_1v8_reg in the Linux DT) is driven by firmware GPIO 132 (expgpio pin 4):
+ * enable=true selects 1.8V (required for UHS-I DDR50/SDR50), false selects 3.3V
+ * (default / High-Speed). Returns 0 on success, negative errno otherwise. The
+ * caller must observe the regulator settling time (~5 ms) before relying on the
+ * new level. There is no Linux-style regulator framework on Phoenix, so this
+ * mailbox SET_GPIO_STATE call is the direct equivalent. */
+int sdio_setSdIoVoltage18(bool enable);
+
 #endif /* _BCM2711_SDIO_H_ */

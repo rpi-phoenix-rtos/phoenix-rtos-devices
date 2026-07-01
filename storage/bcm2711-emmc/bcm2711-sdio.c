@@ -44,6 +44,12 @@
 
 #define VC_CLOCK_EMMC2 12u
 
+/* VideoCore firmware GPIO expander (expgpio): pin 4 drives sd_io_1v8_reg, the SD
+ * I/O signaling rail. Firmware GPIO numbering bases the expander at 128, so
+ * expgpio 4 = 132. State 1 = 1.8V (UHS), state 0 = 3.3V (default/High-Speed). */
+#define VC_PROP_SET_GPIO_STATE 0x00038041u
+#define VC_GPIO_SD_IO_1V8      132u
+
 /* Fallback if the firmware reports no rate (it normally has EMMC2 running,
  * since the board boots from the SD card). */
 #define BCM2711_EMMC2_DEFAULT_HZ (100u * 1000u * 1000u)
@@ -96,6 +102,18 @@ static uint32_t sdio_emmc2ClockHz(void)
 	}
 
 	return BCM2711_EMMC2_DEFAULT_HZ;
+}
+
+
+int sdio_setSdIoVoltage18(bool enable)
+{
+	uint32_t payload[2];
+
+	/* SET_GPIO_STATE: [gpio, state] -> [gpio, state]. Drives expgpio 4 (fw GPIO
+	 * 132) which selects the SD I/O rail: 1 = 1.8V (UHS), 0 = 3.3V. */
+	payload[0] = VC_GPIO_SD_IO_1V8;
+	payload[1] = enable ? 1u : 0u;
+	return sdio_mboxProperty(VC_PROP_SET_GPIO_STATE, payload, 2);
 }
 
 
