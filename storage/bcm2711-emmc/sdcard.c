@@ -47,9 +47,8 @@
  * active. The self-test (write+readback + large consecutive read) was HW-validated
  * 2026-06-30: writeRc=16/16, large read 2048/2048 (no EIO on a good card). Re-add
  * `#define SDCARD_DIAG_CLOCKSWEEP 1` to re-run it (e.g. to triage a marginal card). */
-#define SDCARD_DIAG_CLOCKSWEEP 1 /* TODO(#62): temporary — measuring direct-PIO throughput; gate OFF before publishable */
-#define SDCARD_ENABLE_DMA 1      /* TODO(#62): SDMA data path (validating, reads-only first); gate/finalize before publish */
-#define SDCARD_ENABLE_DDR50 1    /* TODO(#62): UHS-I DDR50 (1.8V switch, ~2x read); validating, gate/finalize before publish */
+#define SDCARD_ENABLE_DMA 1   /* SDMA read data path (HW-validated; reads only — writes use PIO, see the write path) */
+#define SDCARD_ENABLE_DDR50 1 /* UHS-I DDR50 1.8V (HW-validated ~1.6x read on netboot + SD-boot; HS50 fallback) */
 
 
 /* #154: bound on the CMD13 SEND_STATUS busy-poll that detects write completion
@@ -1680,7 +1679,7 @@ static int sdcard_wideAndFast(sdcard_hostData_t *host)
 			hc2 = (hc2 & ~HOST_CONTROL2_UHS_MASK) | HOST_CONTROL2_UHS_DDR50;
 			*(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS) = hc2;
 			sdio_dataBarrier();
-			TRACE("using UHS DDR50");
+			printf("sdcard: UHS-I DDR50 @ 50 MHz DDR (1.8V)\n");
 			usleep(10);
 			if (sdio_cmdSendEx(host, SDIO_ACMD13_SD_STATUS, 0, NULL, false, NULL) < 0) {
 				LOG_ERROR("DDR50 verify failed");
@@ -1703,13 +1702,13 @@ static int sdcard_wideAndFast(sdcard_hostData_t *host)
 	}
 
 	if (isHighSpeedSupported) {
-		TRACE("using HS mode");
+		printf("sdcard: High-Speed @ 50 MHz (3.3V)\n");
 		if (sdcard_configClockAndPower(host, SD_FREQ_50M) < 0) {
 			return -EIO;
 		}
 	}
 	else {
-		TRACE("HS mode not supported");
+		printf("sdcard: default speed @ 25 MHz\n");
 		if (sdcard_configClockAndPower(host, SD_FREQ_25M) < 0) {
 			return -EIO;
 		}
