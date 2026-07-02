@@ -16,6 +16,14 @@ LOCAL_SRCS := xhci.c phy-$(TARGET_FAMILY)-$(TARGET_SUBFAMILY).c
 ifeq ($(PCI_EXPRESS_BCM2711_INDEXED_CFG),y)
   LOCAL_SRCS += bcm2711-pcie.c
   CFLAGS += -DPCI_EXPRESS_BCM2711_INDEXED_CFG
+  # bcm2711-pcie.c does `#include <libvcmbox.h>`, a header installed into the
+  # shared per-target include prefix by the rpi4-vcmbox component (its libvcmbox
+  # static lib) in this same devices pass. There is no file-level dependency
+  # edge, so under parallel make (-j) on a cold sysroot the xhci objects could
+  # compile before that header is installed. DEPS adds an order-only prerequisite
+  # (static-lib.mk: `$(OBJS): | $(DEPS)`) on the libvcmbox component, whose
+  # `libvcmbox-headers` sub-target installs the header, forcing correct ordering.
+  DEPS += libvcmbox
 endif
 
 include $(static-lib.mk)
