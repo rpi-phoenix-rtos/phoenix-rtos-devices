@@ -112,7 +112,8 @@ enum {
 /* BCM2711 legacy DMA controller. 15 channels, 0x100 apart, from DMA_BASE. We use
  * one channel to pace the PWM FIFO from a DRAM tone buffer via the PWM DREQ (no CPU
  * spin). Bus addresses: peripherals at 0x7e... (PWM_FIF1 = 0x7e20c818); DRAM via the
- * 0xC0000000 legacy uncached alias for the low 1 GB (logged + checked at runtime). */
+ * 0xC0000000 legacy uncached alias for the low 1 GB; audio_dmaStart falls back to
+ * PIO if a DMA buffer lands at/above 1 GB (the alias can't reach it). */
 #define DMA_BASE        0xfe007000u
 #define DMA_CHAN        5u             /* avoid VPU-reserved 0..4; revisit via the firmware mask */
 #define DMA_CS          (0x00u / 4u)
@@ -373,6 +374,20 @@ static void audio_dmaStart(void)
 	ad.ring_pa = (uintptr_t)va2pa((void *)ad.ring);
 
 	cb_pa = (uintptr_t)va2pa(cb);
+
+	/* The 0xC0000000 legacy DMA alias only reaches the low 1 GB. If either buffer
+	 * landed at/above 1 GB (possible on a 2/4/8 GB Pi 4), DRAM_BUS() would truncate
+	 * the address and the engine would fetch an unrelated DRAM region -> garbage to
+	 * the PWM FIFO. Fall back to PIO instead of driving a bad DMA. */
+	if ((((ad.ring_pa | cb_pa) >> 30) != 0)) {
+		printf("rpi4-audio: DMA buffer PA >= 1GB (ring=0x%08x cb=0x%08x) - PIO fallback\n",
+			(uint32_t)ad.ring_pa, (uint32_t)cb_pa);
+		munmap((void *)ad.ring, (RING_BYTES + _PAGE_SIZE - 1u) & ~((uint32_t)_PAGE_SIZE - 1u));
+		munmap(cb, _PAGE_SIZE);
+		ad.ring = NULL;
+		return;
+	}
+
 	cb->ti = TI_WAIT_RESP | TI_DEST_DREQ | TI_SRC_INC | TI_PERMAP_PWM;
 	cb->source_ad = DRAM_BUS(ad.ring_pa);
 	cb->dest_ad = PWM_FIF1_BUS;

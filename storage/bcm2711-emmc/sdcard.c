@@ -184,9 +184,8 @@ static inline bool sdcard_isWriteProtected(sdcard_hostData_t *host)
 
 static int sdhost_allocDMA(sdcard_hostData_t *host)
 {
-	/* The staging buffer is moved by PIO (SDMA is disabled, see _sdio_cmdSend),
-	 * so a multi-page contiguous buffer is fine — it just has to be physically
-	 * contiguous for the (currently unused) SDMA_ADDRESS register. Cap at 64 KiB
+	/* The staging buffer must be physically contiguous for the SDMA_ADDRESS
+	 * register (the SDMA read path programs it directly). Cap at 64 KiB
 	 * (128 blocks) so multi-block CMD18/CMD25 transfers can be large. */
 	if (SDCARD_MAX_TRANSFER > (32 * _PAGE_SIZE)) {
 		return -ENOMEM;
@@ -209,10 +208,9 @@ static int sdhost_allocDMA(sdcard_hostData_t *host)
 	 * back to PIO (which has no addressing limit). The MAP_CONTIGUOUS allocation for
 	 * this small early-boot buffer reliably lands low (observed ~0x03780000).
 	 *
-	 * SDCARD_ENABLE_DMA is currently UNDEFINED: the SDMA completion path is not yet
-	 * correct on this controller (the Transfer-Complete IRQ is unreliable, as in the
-	 * #154 PIO-write case), so DMA is gated OFF and PIO is the trusted path until the
-	 * completion signaling is proven correct on the single-block-read oracle. */
+	 * SDCARD_ENABLE_DMA is defined: SDMA is the read data path (reads only — writes
+	 * still use PIO, see the write path). useDma additionally requires the staging
+	 * buffer to be DMA-reachable (< 1 GiB), else this read falls back to PIO. */
 #ifdef SDCARD_ENABLE_DMA
 	host->useDma = (host->dmaBufferPhys < 0x40000000ul);
 #else
