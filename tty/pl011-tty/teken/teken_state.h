@@ -1,4 +1,6 @@
-/* Generated file. Do not edit. */
+/* Generated file. Do not edit.
+ * Generated from FreeBSD's teken (gensequences); covered by the BSD-2-Clause
+ * license of teken.c in this directory. */
 
 static teken_state_t	teken_state_3;
 static teken_state_t	teken_state_8;

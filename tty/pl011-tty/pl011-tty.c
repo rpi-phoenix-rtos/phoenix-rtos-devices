@@ -1189,10 +1189,7 @@ static void pl011_kbdthr(void *arg)
 
 		libtty_putchar_lock(&uart->tty);
 		for (i = 0u; i < (size_t)len; ++i) {
-			int woke = 0;
-
 			(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &wake_reader);
-			wake_reader |= woke;
 		}
 		libtty_putchar_unlock(&uart->tty);
 

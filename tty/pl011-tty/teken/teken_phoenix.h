@@ -2,6 +2,10 @@
  * Phoenix-RTOS compat shim for FreeBSD's teken (force-included).
  * Defines the few <sys/cdefs.h> attribute macros teken uses that Phoenix's
  * headers don't provide. Each is a no-op-equivalent GCC attribute.
+ *
+ * Copyright 2026 Phoenix Systems
+ *
+ * %LICENSE%
  */
 #ifndef TEKEN_PHOENIX_H
 #define TEKEN_PHOENIX_H
