@@ -404,9 +404,9 @@ static void audio_dmaStart(void)
 	ad.dma[DMA_CONBLK_AD] = DRAM_BUS(cb_pa);
 	ad.dma[DMA_CS] = DMA_CS_ACTIVE;
 
-	/* Let it run a moment and confirm it stays ACTIVE with no error + the read cursor moves. */
-	for (spins = 2000000u; spins; spins--) {
-	}
+	/* Let it run a moment, then confirm it stays ACTIVE with no error. usleep gives a
+	 * real settle delay — a bare empty spin loop can be optimized away (zero settle). */
+	usleep(20000);
 
 	if (((ad.dma[DMA_CS] & DMA_CS_ACTIVE) != 0) && ((ad.dma[DMA_CS] & DMA_CS_ERROR) == 0)) {
 		ad.dma_active = 1;
