@@ -185,8 +185,8 @@ static inline bool sdcard_isWriteProtected(sdcard_hostData_t *host)
 static int sdhost_allocDMA(sdcard_hostData_t *host)
 {
 	/* The staging buffer must be physically contiguous for the SDMA_ADDRESS
-	 * register (the SDMA read path programs it directly). Cap at 64 KiB
-	 * (128 blocks) so multi-block CMD18/CMD25 transfers can be large. */
+	 * register (the SDMA read path programs it directly). Cap at 128 KiB
+	 * (256 blocks) so multi-block CMD18/CMD25 transfers can be large. */
 	if (SDCARD_MAX_TRANSFER > (32 * _PAGE_SIZE)) {
 		return -ENOMEM;
 	}

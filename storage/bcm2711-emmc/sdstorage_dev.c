@@ -43,9 +43,9 @@
 /* clang-format on */
 
 /* Cache sector = the unit libcache reads/writes per miss/flush, i.e. the size of
- * each sdcard_transferBlocks() request. 16 KiB (32 blocks) lets the proven
- * multi-block CMD18/CMD25 path move large bursts (~10-15 MB/s) instead of the old
- * 1 KiB (2-block) requests. Must be a multiple of SDCARD_BLOCKLEN and <=
+ * each sdcard_transferBlocks() request. 128 KiB (256 blocks) lets the proven
+ * multi-block CMD18/CMD25 path move large bursts instead of the old 1 KiB
+ * (2-block) requests. Must be a multiple of SDCARD_BLOCKLEN and <=
  * SDCARD_MAX_TRANSFER. Sized to SDCARD_MAX_TRANSFER (128 KiB) so a cache miss
  * issues one full-size DDR50 transfer — the throughput sweet spot (raw 128 KiB
  * reads measured ~38 MB/s vs ~24 at 16 KiB); SECNUM keeps ~4 MiB of cache/region. */
