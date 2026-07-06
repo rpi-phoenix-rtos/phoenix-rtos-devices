@@ -617,7 +617,9 @@ static int usbmouse_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion,
 	mutexUnlock(usbmouse_common.lock);
 
 	if (err < 0) {
-		free(dev);
+		/* _usbmouse_put above dropped the last ref (idtree_remove only); free the
+		 * fifo + lock + cond + struct too, not just the struct (matches deletion). */
+		usbmouse_free(dev);
 		return err;
 	}
 

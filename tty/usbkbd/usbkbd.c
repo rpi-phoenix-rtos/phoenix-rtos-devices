@@ -864,7 +864,10 @@ static int usbkbd_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, u
 	mutexUnlock(usbkbd_common.lock);
 
 	if (err < 0) {
-		free(dev);
+		/* _usbkbd_put above dropped the last ref (idtree_remove only); free the
+		 * fifo + lock + cond + struct that _usbkbd_devAlloc created, not just the
+		 * struct (matches usbkbd_handleDeletion). */
+		usbkbd_free(dev);
 		return err;
 	}
 
