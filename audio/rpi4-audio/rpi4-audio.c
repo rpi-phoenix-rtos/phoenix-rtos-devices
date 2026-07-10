@@ -4,10 +4,13 @@
  * Raspberry Pi 4 (BCM2711) PWM audio output (/dev/audio0)
  *
  * First-light PWM audio driver for the on-board 3.5 mm headphone jack, driven by
- * the dedicated PWM1 engine on GPIO 40/41 (ALT0), exactly as the rpi4os.com
- * part9-sound bare-metal tutorial does. Brings up the PWM clock (CPRMAN ->
- * ~44.1 kHz sample class), muxes the jack GPIOs, enables PWM1 channels 1+2 in
- * mark/space + FIFO mode, and exposes a streaming char device:
+ * the dedicated PWM1 engine on GPIO 40/41 (ALT0). The clock/GPIO/PWM bring-up
+ * sequence follows the BCM2711 peripheral datasheet (the rpi4os.com part9-sound
+ * bare-metal tutorial documents the same sequence and was a useful reference);
+ * the code here is an original Phoenix userspace driver, not derived from it.
+ * Brings up the PWM clock (CPRMAN -> ~44.1 kHz sample class), muxes the jack
+ * GPIOs, enables PWM1 channels 1+2 in mark/space + FIFO mode, and exposes a
+ * streaming char device:
  *
  *   write()  - 16-bit signed mono/stereo PCM, converted to PWM duty words and fed
  *              to the jack by a continuous, self-chained DMA ring (DREQ-paced to
