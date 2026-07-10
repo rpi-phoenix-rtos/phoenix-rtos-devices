@@ -152,7 +152,9 @@ static int probe_named(void)
 
 	n = read(cfd, buf, sizeof(buf));
 	if (n == 4 && memcmp(buf, "PING", 4) == 0) {
-		write(cfd, "PONG", 4);
+		if (write(cfd, "PONG", 4) != 4) {
+			printf("rpi4-ipcprobe: named FAIL: server write PONG errno=%d\n", errno);
+		}
 	}
 	else {
 		printf("rpi4-ipcprobe: named FAIL: server read got %d bytes errno=%d\n", (int)n, errno);

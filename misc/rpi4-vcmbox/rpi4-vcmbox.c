@@ -81,6 +81,7 @@
 typedef enum {
 	MBOX_OK = 0,        /* matched our request, RESP_OK */
 	MBOX_EMPTY,         /* FIFO never went non-empty -> firmware never replied (#2) */
+	MBOX_WRFULL,        /* write FIFO stayed full -> request could not be posted */
 	MBOX_RACED,         /* consumed a non-matching entry -> another client's resp (#1) */
 	MBOX_BADRESP        /* matched, but firmware code != RESP_OK (#3) */
 } mbox_outcome_t;
@@ -109,7 +110,7 @@ static mbox_outcome_t vcmbox_fifoRoundtrip(void)
 	/* Wait for write space. */
 	for (spins = MBOX_SPINS; (mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u; spins--) {
 		if (spins == 0u) {
-			return MBOX_EMPTY;
+			return MBOX_WRFULL;
 		}
 	}
 	mbox[VC_MBOX_WRITE / 4] = request;
@@ -194,6 +195,10 @@ static void vcmbox_transact(const vcmbox_req_t *req, vcmbox_resp_t *resp)
 			printf("rpi4-vcmbox: tag 0x%08x FAILED - FIFO stayed empty (firmware never replied; "
 				"buf_pa=0x%08x may be above VC-addressable range)\n",
 				req->tag, vcmbox.buf_pa);
+			break;
+		case MBOX_WRFULL:
+			printf("rpi4-vcmbox: tag 0x%08x FAILED - write FIFO stayed full (request not posted)\n",
+				req->tag);
 			break;
 		case MBOX_RACED:
 			printf("rpi4-vcmbox: tag 0x%08x FAILED - consumed a non-matching FIFO entry "
