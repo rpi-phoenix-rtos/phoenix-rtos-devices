@@ -672,7 +672,7 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 			*(host->base + SDHOST_REG_SDMA_ADDRESS) = host->dmaBufferPhys;
 			sdio_dataBarrier();
 			/* SDMA boundary = 512K (the max): our staging buffer is at most
-			 * SDCARD_MAX_TRANSFER (64K), so the transfer never crosses a boundary
+			 * SDCARD_MAX_TRANSFER (128K), so the transfer never crosses a boundary
 			 * and the engine never raises the DMA-boundary interrupt (which the
 			 * driver does not service). A too-small boundary (the old 4K) is what
 			 * stalled SDMA after the first page — misdiagnosed as a reach limit in
