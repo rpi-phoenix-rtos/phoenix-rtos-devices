@@ -371,7 +371,7 @@ static int spw_transmit(spw_dev_t *dev, const uint8_t *buf, size_t bufsz, const 
 		}
 		desc->hdrAddr = pa;
 
-		pa = va2pa((void *)txBuff + hdrLen);
+		pa += hdrLen;
 		if ((pa & ~SPW_ADDR_MASK) != 0) {
 			LOG_ERROR("DMA addr 0x%" PRIxPTR "exceeds 32-bit limit", pa);
 			return -EINVAL;
@@ -469,11 +469,11 @@ static int spw_rxConfigure(spw_dev_t *dev, size_t *firstDesc, const size_t nPack
 
 
 /* Read from RX buffers */
-static int spw_rxRead(spw_dev_t *dev, uint8_t *buf, size_t bufsz, size_t *readCnt, const spw_t *ictl)
+static int spw_rxRead(spw_dev_t *dev, uint8_t *buf, size_t bufsz, size_t *readCnt, const spw_rx_t *rx)
 {
-	size_t firstDesc = ictl->task.rx.firstDesc;
-	const size_t nPackets = ictl->task.rx.nPackets;
-	const uint32_t timeoutUs = ictl->task.rx.timeoutUs;
+	size_t firstDesc = rx->firstDesc;
+	const size_t nPackets = rx->nPackets;
+	const uint32_t timeoutUs = rx->timeoutUs;
 	int err = 0;
 
 	if ((firstDesc >= SPW_RX_DESC_CNT) || (nPackets > SPW_RX_DESC_CNT)) {
@@ -560,6 +560,31 @@ static int spw_configure(spw_dev_t *dev, const spw_config_t *config)
 }
 
 
+static ssize_t spw_xferOp(spw_dev_t *dev, const uint8_t *txbuf, size_t txbufsz, uint8_t *rxbuf, size_t rxbufsz, const spw_xfer_t *xfer, size_t *readCnt)
+{
+	if ((xfer->nRxPackets > SPW_RX_DESC_CNT) || (txbufsz < SPW_TX_MIN_BUFSZ)) {
+		return -EINVAL;
+	}
+
+	/* Configure, transmit and receive in one operation */
+	size_t firstDesc;
+	int err = spw_rxConfigure(dev, &firstDesc, xfer->nRxPackets);
+	if (err < 0) {
+		return err;
+	}
+
+	(void)spw_transmit(dev, txbuf, txbufsz, xfer->nTxPackets, true);
+
+	spw_rx_t rx = {
+		.firstDesc = firstDesc,
+		.nPackets = xfer->nRxPackets,
+		.timeoutUs = xfer->rxTimeoutUs,
+	};
+
+	return spw_rxRead(dev, rxbuf, rxbufsz, readCnt, &rx);
+}
+
+
 /* Message handling */
 
 
@@ -570,7 +595,7 @@ static void spw_handleDevCtl(msg_t *msg, int dev)
 		return;
 	}
 
-	const spw_t *ictl = (spw_t *)msg->i.raw;
+	const spw_i_t *ictl = (spw_i_t *)msg->i.raw;
 	spw_o_t *octl = (spw_o_t *)msg->o.raw;
 	spw_dev_t *spw = &spw_common.dev[dev];
 
@@ -584,11 +609,15 @@ static void spw_handleDevCtl(msg_t *msg, int dev)
 			break;
 
 		case spw_rx:
-			msg->o.err = spw_rxRead(spw, msg->o.data, msg->o.size, &octl->val, ictl);
+			msg->o.err = spw_rxRead(spw, msg->o.data, msg->o.size, &octl->val, &ictl->task.rx);
 			break;
 
 		case spw_tx:
 			msg->o.err = spw_transmit(spw, msg->i.data, msg->i.size, ictl->task.tx.nPackets, ictl->task.tx.async);
+			break;
+
+		case spw_xfer:
+			msg->o.err = spw_xferOp(spw, msg->i.data, msg->i.size, msg->o.data, msg->o.size, &ictl->task.xfer, &octl->val);
 			break;
 
 		default:
@@ -688,7 +717,7 @@ static int spw_defaultConfig(spw_dev_t *dev)
 		LOG_ERROR("DMA addr 0x%" PRIxPTR "exceeds 32-bit limit", pa);
 		return -EINVAL;
 	}
-	dev->vbase[DMA_RX_DESC] = va2pa((void *)dev->rxDesc);
+	dev->vbase[DMA_RX_DESC] = (uint32_t)pa;
 
 	return 0;
 }
