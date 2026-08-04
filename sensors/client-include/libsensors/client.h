@@ -51,7 +51,7 @@ typedef struct {
 
 typedef struct {
 	uint32_t devId;
-	uint32_t pressure; /* pressure in [Pa] */
+	uint32_t pressure; /* pressure in [cPa] */
 	uint32_t temp;     /* temperature value in Kelvin [K] */
 } baro_data_t;
 
@@ -92,9 +92,9 @@ typedef struct {
  */
 typedef struct {
 	uint32_t devId;
-	int32_t gyroX;    /* latest angular velocity value in [mrad/s] */
-	int32_t gyroY;    /* latest angular velocity value in [mrad/s] */
-	int32_t gyroZ;    /* latest angular velocity value in [mrad/s] */
+	int32_t gyroX;    /* latest angular velocity value in [urad/s] */
+	int32_t gyroY;    /* latest angular velocity value in [urad/s] */
+	int32_t gyroZ;    /* latest angular velocity value in [urad/s] */
 	uint32_t dAngleX; /* delta angle in [urad] since driver start */
 	uint32_t dAngleY; /* delta angle in [urad] since driver start */
 	uint32_t dAngleZ; /* delta angle in [urad] since driver start */
@@ -105,10 +105,9 @@ typedef struct {
 /* Magnetometer data */
 typedef struct {
 	uint32_t devId;
-	int16_t magX; /* value in 1E-7 [T] */
-	int16_t magY; /* value in 1E-7 [T] */
-	int16_t magZ; /* value in 1E-7 [T] */
-	uint8_t reserved[2];
+	int32_t magX; /* value in 0.1 [nT] */
+	int32_t magY; /* value in 0.1 [nT] */
+	int32_t magZ; /* value in 0.1 [nT] */
 } mag_data_t;
 
 

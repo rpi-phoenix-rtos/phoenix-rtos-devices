@@ -6,9 +6,7 @@
  * Copyright 2025 Phoenix Systems
  * Author: Lukasz Leczkowski, Andrzej Tlomak
  *
- * This file is part of Phoenix-RTOS.
- *
- * %LICENSE%
+ * SPDX-License-Identifier: BSD-3-Clause
  */
 
 
@@ -16,18 +14,12 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <stdbool.h>
 #include <string.h>
-#include <sys/debug.h>
-#include <sys/minmax.h>
 #include <sys/mman.h>
 #include <sys/interrupt.h>
 #include <sys/platform.h>
-#include <sys/types.h>
 #include <sys/threads.h>
-#include <posix/utils.h>
 #include <phoenix/gaisler/ambapp.h>
 #include <inttypes.h>
 
@@ -63,55 +55,47 @@
 #define DMA_ADDR      12
 
 /* SPW CTRL bits */
-#define SPW_CTRL_RA  (1u << 31) /* RMAP available */
-#define SPW_CTRL_RX  (1u << 30) /* RX unaligned access available */
-#define SPW_CTRL_RC  (1u << 29) /* RMAP CRC available */
-#define SPW_CTRL_NCH (3u << 27) /* Number of DMA channels */
-#define SPW_CTRL_PO  (1u << 26) /* Number of ports - 1 */
-#define SPW_CTRL_PS  (1u << 21) /* Port select */
-#define SPW_CTRL_NP  (1u << 20) /* Disable port force */
-#define SPW_CTRL_RD  (1u << 17) /* RMAP buffer disable */
-#define SPW_CTRL_RE  (1u << 16) /* RMAP enable */
-#define SPW_CTRL_TR  (1u << 11) /* Time RX enable */
-#define SPW_CTRL_TT  (1u << 10) /* Time TX enable */
-#define SPW_CTRL_LI  (1u << 9)  /* Link error IRQ */
-#define SPW_CTRL_TQ  (1u << 8)  /* Tick-out IRQ */
-#define SPW_CTRL_RS  (1u << 6)  /* Reset */
-#define SPW_CTRL_PM  (1u << 5)  /* Promiscuous mode */
-#define SPW_CTRL_TI  (1u << 4)  /* Tick in */
-#define SPW_CTRL_IE  (1u << 3)  /* Interrupt enable */
-#define SPW_CTRL_AS  (1u << 2)  /* Autostart */
-#define SPW_CTRL_LS  (1u << 1)  /* Link start */
-#define SPW_CTRL_LD  (1u << 0)  /* Link disable */
+#define SPW_CTRL_RA  (1U << 31) /* RMAP available */
+#define SPW_CTRL_RX  (1U << 30) /* RX unaligned access available */
+#define SPW_CTRL_RC  (1U << 29) /* RMAP CRC available */
+#define SPW_CTRL_NCH (3U << 27) /* Number of DMA channels */
+#define SPW_CTRL_PO  (1U << 26) /* Number of ports - 1 */
+#define SPW_CTRL_PS  (1U << 21) /* Port select */
+#define SPW_CTRL_NP  (1U << 20) /* Disable port force */
+#define SPW_CTRL_RD  (1U << 17) /* RMAP buffer disable */
+#define SPW_CTRL_RE  (1U << 16) /* RMAP enable */
+#define SPW_CTRL_TR  (1U << 11) /* Time RX enable */
+#define SPW_CTRL_TT  (1U << 10) /* Time TX enable */
+#define SPW_CTRL_LI  (1U << 9)  /* Link error IRQ */
+#define SPW_CTRL_TQ  (1U << 8)  /* Tick-out IRQ */
+#define SPW_CTRL_RS  (1U << 6)  /* Reset */
+#define SPW_CTRL_PM  (1U << 5)  /* Promiscuous mode */
+#define SPW_CTRL_TI  (1U << 4)  /* Tick in */
+#define SPW_CTRL_IE  (1U << 3)  /* Interrupt enable */
+#define SPW_CTRL_AS  (1U << 2)  /* Autostart */
+#define SPW_CTRL_LS  (1U << 1)  /* Link start */
+#define SPW_CTRL_LD  (1U << 0)  /* Link disable */
 
 /* DMA CTRL bits */
-#define DMA_CTRL_LE  (1u << 16) /* Disable TX when link error occurs */
-#define DMA_CTRL_SP  (1u << 15) /* Remove 2nd byte (protocol id) of each packet */
-#define DMA_CTRL_SA  (1u << 14) /* Remove 1st byte (address) of each packet */
-#define DMA_CTRL_ENA (1u << 13) /* Enable separate node address for channel */
-#define DMA_CTRL_NS  (1u << 12) /* No spill */
-#define DMA_CTRL_RD  (1u << 11) /* RX descriptors available */
-#define DMA_CTRL_RX  (1u << 10) /* RX active (read only) */
-#define DMA_CTRL_AT  (1u << 9)  /* Abort TX */
-#define DMA_CTRL_RA  (1u << 8)  /* RX AHB error */
-#define DMA_CTRL_TA  (1u << 7)  /* TX AHB error */
-#define DMA_CTRL_PR  (1u << 6)  /* Packet received */
-#define DMA_CTRL_PS  (1u << 5)  /* Packet sent */
-#define DMA_CTRL_AI  (1u << 4)  /* AHB error IRQ */
-#define DMA_CTRL_RI  (1u << 3)  /* RX IRQ (if set in corresponding descriptor) */
-#define DMA_CTRL_TI  (1u << 2)  /* TX IRQ (if set in corresponding descriptor) */
-#define DMA_CTRL_RE  (1u << 1)  /* Receiver enable */
-#define DMA_CTRL_TE  (1u << 0)  /* Transmitter enable */
+#define DMA_CTRL_LE  (1U << 16) /* Disable TX when link error occurs */
+#define DMA_CTRL_SP  (1U << 15) /* Remove 2nd byte (protocol id) of each packet */
+#define DMA_CTRL_SA  (1U << 14) /* Remove 1st byte (address) of each packet */
+#define DMA_CTRL_ENA (1U << 13) /* Enable separate node address for channel */
+#define DMA_CTRL_NS  (1U << 12) /* No spill */
+#define DMA_CTRL_RD  (1U << 11) /* RX descriptors available */
+#define DMA_CTRL_RX  (1U << 10) /* RX active (read only) */
+#define DMA_CTRL_AT  (1U << 9)  /* Abort TX */
+#define DMA_CTRL_RA  (1U << 8)  /* RX AHB error */
+#define DMA_CTRL_TA  (1U << 7)  /* TX AHB error */
+#define DMA_CTRL_PR  (1U << 6)  /* Packet received */
+#define DMA_CTRL_PS  (1U << 5)  /* Packet sent */
+#define DMA_CTRL_AI  (1U << 4)  /* AHB error IRQ */
+#define DMA_CTRL_RI  (1U << 3)  /* RX IRQ (if set in corresponding descriptor) */
+#define DMA_CTRL_TI  (1U << 2)  /* TX IRQ (if set in corresponding descriptor) */
+#define DMA_CTRL_RE  (1U << 1)  /* Receiver enable */
+#define DMA_CTRL_TE  (1U << 0)  /* Transmitter enable */
 
 #define DMA_CTRL_USR_MSK (DMA_CTRL_LE | DMA_CTRL_SP | DMA_CTRL_SA | DMA_CTRL_ENA | DMA_CTRL_NS)
-
-#define SPW_RX_DESC_CNT 128
-#define SPW_TX_DESC_CNT 64
-
-/* Sensible maximum value */
-#ifndef SPW_MAX_PACKET_LEN
-#define SPW_MAX_PACKET_LEN 1024
-#endif
 
 
 /* RX descriptor ctrl bits:
@@ -131,21 +115,16 @@
  * CRC for the packet according to the RMAP standard.
  */
 
-#define RX_DESC_TRUNC   (1u << 31)
-#define RX_DESC_DCRC    (1u << 30)
-#define RX_DESC_HCRC    (1u << 29)
-#define RX_DESC_EEP     (1u << 28)
-#define RX_DESC_IE      (1u << 27)
-#define RX_DESC_WR      (1u << 26)
-#define RX_DESC_EN      (1u << 25)
-#define RX_DESC_LEN     (0x1ffffffu)
+#define RX_DESC_TRUNC   (1U << 31)
+#define RX_DESC_DCRC    (1U << 30)
+#define RX_DESC_HCRC    (1U << 29)
+#define RX_DESC_EEP     (1U << 28)
+#define RX_DESC_IE      (1U << 27)
+#define RX_DESC_WR      (1U << 26)
+#define RX_DESC_EN      (1U << 25)
+#define RX_DESC_LEN     (0x1ffffffU)
 #define RX_DESC_USR_MSK (RX_DESC_TRUNC | RX_DESC_DCRC | RX_DESC_HCRC | RX_DESC_EEP | RX_DESC_LEN)
 
-
-typedef struct {
-	volatile uint32_t ctrl;
-	uint32_t addr; /* RX buff phy addr - must be word aligned */
-} spw_rxDesc_t;
 
 /* TX descriptor ctrl bits:
  * 17 - append data CRC
@@ -158,68 +137,15 @@ typedef struct {
  * 7:0 - header length in bytes
  */
 
-#define TX_DESC_DCRC    (1u << 17)
-#define TX_DESC_HCRC    (1u << 16)
-#define TX_DESC_LERR    (1u << 15)
-#define TX_DESC_IE      (1u << 14)
-#define TX_DESC_WR      (1u << 13)
-#define TX_DESC_EN      (1u << 12)
-#define TX_DESC_NON_CRC (0xfu << 8)
-#define TX_DESC_HDR_LEN (0xffu)
+#define TX_DESC_DCRC    (1U << 17)
+#define TX_DESC_HCRC    (1U << 16)
+#define TX_DESC_LERR    (1U << 15)
+#define TX_DESC_IE      (1U << 14)
+#define TX_DESC_WR      (1U << 13)
+#define TX_DESC_EN      (1U << 12)
+#define TX_DESC_NON_CRC (0xfU << 8)
+#define TX_DESC_HDR_LEN (0xffU)
 #define TX_DESC_USR_MSK (TX_DESC_DCRC | TX_DESC_HCRC | TX_DESC_NON_CRC | TX_DESC_HDR_LEN)
-
-
-typedef struct {
-	volatile uint32_t ctrl;
-	uint32_t hdrAddr;   /* TX header buff phy addr - does not have to be word aligned */
-	uint32_t packetLen; /* TX packet length in bytes (without header) */
-	uint32_t dataAddr;  /* TX data buff phy addr - does not have to be word aligned */
-} spw_txDesc_t;
-
-
-typedef struct {
-	volatile uint32_t *vbase;
-	uint8_t addr;
-	uint8_t txDescFree;
-
-	size_t sentDesc;
-	size_t lastTxDesc;
-	size_t nextRxDesc;
-
-	bool rxAcknowledged[SPW_RX_DESC_CNT];
-
-	handle_t ctrlLock;
-	handle_t txLock;
-	handle_t txIrqLock;
-	handle_t rxLock;
-	handle_t rxConfLock;
-	handle_t cond;
-	handle_t rxAckCond;
-
-	volatile uint8_t (*txBuff)[SPW_MAX_PACKET_LEN];
-	volatile uint8_t (*rxBuff)[SPW_MAX_PACKET_LEN];
-	volatile spw_txDesc_t *txDesc;
-	volatile spw_rxDesc_t *rxDesc;
-} spw_dev_t;
-
-
-static struct {
-	volatile uint32_t *base;
-	unsigned int irq;
-	unsigned int active;
-} spw_info[] = {
-	{ .active = SPW0_ACTIVE },
-	{ .active = SPW1_ACTIVE },
-	{ .active = SPW2_ACTIVE },
-	{ .active = SPW3_ACTIVE },
-	{ .active = SPW4_ACTIVE },
-	{ .active = SPW5_ACTIVE },
-};
-
-
-static struct {
-	spw_dev_t dev[SPW_CNT];
-} spw_common;
 
 
 /* Auxiliary functions */
@@ -270,18 +196,18 @@ static size_t spw_txMsgToPacket(const uint8_t *buf, spw_txPacket_t *packet)
 	packet->dataLen = (buf[4] << 24) | (buf[5] << 16) | (buf[6] << 8) | buf[7];
 
 	packet->hdr = &buf[SPW_TX_MIN_BUFSZ];
-	packet->data = &buf[SPW_TX_MIN_BUFSZ] + (packet->flags & 0xff);
+	packet->data = &buf[SPW_TX_MIN_BUFSZ] + (packet->flags & 0xffU);
 
-	return SPW_TX_MIN_BUFSZ + (packet->flags & 0xffu) + packet->dataLen;
+	return SPW_TX_MIN_BUFSZ + (packet->flags & 0xffU) + packet->dataLen;
 }
 
 
 static size_t spw_rxPacketToMsg(const uint32_t flags, const size_t rxLen, const uint8_t *rx, uint8_t *buf)
 {
 	buf[0] = flags >> 24;
-	buf[1] = (flags >> 16) & 0xffu;
-	buf[2] = (flags >> 8) & 0xffu;
-	buf[3] = flags & 0xffu;
+	buf[1] = (flags >> 16) & 0xffU;
+	buf[2] = (flags >> 8) & 0xffU;
+	buf[3] = flags & 0xffU;
 
 	memcpy(&buf[SPW_RX_MIN_BUFSZ], rx, rxLen);
 
@@ -318,26 +244,26 @@ __attribute__((section(".interrupt"))) static int spw_irqHandler(unsigned int n,
 /* Operations on device */
 
 
-static int spw_transmit(spw_dev_t *dev, const uint8_t *buf, size_t bufsz, const size_t nPackets, bool async)
+int spw_transmit(spw_dev_t *dev, const uint8_t *buf, size_t bufsz, const spw_tx_t *tx)
 {
 	if ((buf == NULL) || (bufsz < SPW_TX_MIN_BUFSZ)) {
 		return -EINVAL;
 	}
 
-	if (!async && (nPackets > SPW_TX_DESC_CNT)) {
+	if (!tx->async && (tx->nPackets > SPW_TX_DESC_CNT)) {
 		return -EINVAL;
 	}
 
 	(void)mutexLock(dev->txLock);
 
-	TRACE("nPackets: %zu", nPackets);
+	TRACE("nPackets: %zu", tx->nPackets);
 
 	/* Setup descriptors */
 	size_t firstDesc = dev->lastTxDesc;
-	const size_t lastDesc = (dev->lastTxDesc + nPackets) % SPW_TX_DESC_CNT;
+	const size_t lastDesc = (dev->lastTxDesc + tx->nPackets) % SPW_TX_DESC_CNT;
 	bool wrapped = (lastDesc <= firstDesc);
 
-	for (size_t cnt = 0; cnt < nPackets; cnt++) {
+	for (size_t cnt = 0; cnt < tx->nPackets; cnt++) {
 		(void)mutexLock(dev->txIrqLock);
 		while (dev->txDescFree == 0) {
 			/* Wait for free descriptor or for packet to be acknowledged */
@@ -389,7 +315,7 @@ static int spw_transmit(spw_dev_t *dev, const uint8_t *buf, size_t bufsz, const 
 		dev->lastTxDesc = (dev->lastTxDesc + 1) % SPW_TX_DESC_CNT;
 	}
 
-	if (!async) {
+	if (!tx->async) {
 		/* Wait for transmission to finish */
 		while ((firstDesc <= lastDesc) || wrapped) {
 			if ((dev->txDesc[firstDesc].ctrl & TX_DESC_EN) == 0) {
@@ -411,12 +337,12 @@ static int spw_transmit(spw_dev_t *dev, const uint8_t *buf, size_t bufsz, const 
 
 	(void)mutexUnlock(dev->txLock);
 
-	return nPackets;
+	return tx->nPackets;
 }
 
 
 /* Configure RX DMA descriptors */
-static int spw_rxConfigure(spw_dev_t *dev, size_t *firstDesc, const size_t nPackets)
+int spw_rxConfigure(spw_dev_t *dev, size_t *firstDesc, const size_t nPackets)
 {
 	if (nPackets > SPW_RX_DESC_CNT) {
 		return -EINVAL;
@@ -469,7 +395,7 @@ static int spw_rxConfigure(spw_dev_t *dev, size_t *firstDesc, const size_t nPack
 
 
 /* Read from RX buffers */
-static int spw_rxRead(spw_dev_t *dev, uint8_t *buf, size_t bufsz, size_t *readCnt, const spw_rx_t *rx)
+int spw_rxRead(spw_dev_t *dev, uint8_t *buf, size_t bufsz, size_t *readCnt, const spw_rx_t *rx)
 {
 	size_t firstDesc = rx->firstDesc;
 	const size_t nPackets = rx->nPackets;
@@ -546,7 +472,7 @@ static int spw_rxRead(spw_dev_t *dev, uint8_t *buf, size_t bufsz, size_t *readCn
 }
 
 
-static int spw_configure(spw_dev_t *dev, const spw_config_t *config)
+int spw_configure(spw_dev_t *dev, const spw_config_t *config)
 {
 	(void)mutexLock(dev->ctrlLock);
 
@@ -560,7 +486,7 @@ static int spw_configure(spw_dev_t *dev, const spw_config_t *config)
 }
 
 
-static ssize_t spw_xferOp(spw_dev_t *dev, const uint8_t *txbuf, size_t txbufsz, uint8_t *rxbuf, size_t rxbufsz, const spw_xfer_t *xfer, size_t *readCnt)
+ssize_t spw_xferOp(spw_dev_t *dev, const uint8_t *txbuf, size_t txbufsz, uint8_t *rxbuf, size_t rxbufsz, const spw_xfer_t *xfer, size_t *readCnt)
 {
 	if ((xfer->nRxPackets > SPW_RX_DESC_CNT) || (txbufsz < SPW_TX_MIN_BUFSZ)) {
 		return -EINVAL;
@@ -573,7 +499,8 @@ static ssize_t spw_xferOp(spw_dev_t *dev, const uint8_t *txbuf, size_t txbufsz, 
 		return err;
 	}
 
-	(void)spw_transmit(dev, txbuf, txbufsz, xfer->nTxPackets, true);
+	spw_tx_t tx = { .nPackets = xfer->nTxPackets, .async = true };
+	(void)spw_transmit(dev, txbuf, txbufsz, &tx);
 
 	spw_rx_t rx = {
 		.firstDesc = firstDesc,
@@ -582,87 +509,6 @@ static ssize_t spw_xferOp(spw_dev_t *dev, const uint8_t *txbuf, size_t txbufsz, 
 	};
 
 	return spw_rxRead(dev, rxbuf, rxbufsz, readCnt, &rx);
-}
-
-
-/* Message handling */
-
-
-static void spw_handleDevCtl(msg_t *msg, int dev)
-{
-	if ((dev < 0) || (dev >= (sizeof(spw_common.dev) / sizeof(spw_common.dev[0])))) {
-		msg->o.err = -ENODEV;
-		return;
-	}
-
-	const spw_i_t *ictl = (spw_i_t *)msg->i.raw;
-	spw_o_t *octl = (spw_o_t *)msg->o.raw;
-	spw_dev_t *spw = &spw_common.dev[dev];
-
-	switch (ictl->type) {
-		case spw_config:
-			msg->o.err = spw_configure(spw, &ictl->task.config);
-			break;
-
-		case spw_rxConfig:
-			msg->o.err = spw_rxConfigure(spw, &octl->val, ictl->task.rxConfig.nPackets);
-			break;
-
-		case spw_rx:
-			msg->o.err = spw_rxRead(spw, msg->o.data, msg->o.size, &octl->val, &ictl->task.rx);
-			break;
-
-		case spw_tx:
-			msg->o.err = spw_transmit(spw, msg->i.data, msg->i.size, ictl->task.tx.nPackets, ictl->task.tx.async);
-			break;
-
-		case spw_xfer:
-			msg->o.err = spw_xferOp(spw, msg->i.data, msg->i.size, msg->o.data, msg->o.size, &ictl->task.xfer, &octl->val);
-			break;
-
-		default:
-			msg->o.err = -EINVAL;
-			break;
-	}
-}
-
-
-void spw_handleMsg(msg_t *msg, int dev)
-{
-	dev -= id_spw0;
-	switch (msg->type) {
-		case mtDevCtl:
-			spw_handleDevCtl(msg, dev);
-			break;
-
-		default:
-			msg->o.err = -ENOSYS;
-			break;
-	}
-}
-
-
-/* Initialization */
-
-
-int spw_createDevs(oid_t *oid)
-{
-	for (unsigned int i = 0; i < SPW_CNT; i++) {
-		if (spw_info[i].active == 0) {
-			continue;
-		}
-
-		char buf[8];
-		if (snprintf(buf, sizeof(buf), "spw%d", i) >= sizeof(buf)) {
-			return -1;
-		}
-
-		oid->id = id_spw0 + i;
-		if (create_dev(oid, buf) < 0) {
-			return -1;
-		}
-	}
-	return 0;
 }
 
 
@@ -779,7 +625,7 @@ static int spw_createResources(spw_dev_t *dev, addr_t pbase)
 		return -1;
 	}
 
-	dev->vbase += (pbase - base) / sizeof(uintptr_t);
+	dev->vbase = (void *)((uintptr_t)dev->vbase + (pbase - base));
 
 	return 0;
 }
@@ -823,61 +669,52 @@ static void spw_cleanupResources(spw_dev_t *dev)
 }
 
 
-int spw_init(void)
+int spw_initDev(unsigned int instance, spw_dev_t *spwdev)
 {
-	for (unsigned int i = 0; i < SPW_CNT; i++) {
-		if (spw_info[i].active == 0) {
-			continue;
+	unsigned int ppInstance = instance;
+	ambapp_dev_t dev = { .devId = CORE_ID_GRSPW2 };
+	platformctl_t pctl = {
+		.action = pctl_get,
+		.type = pctl_ambapp,
+		.task.ambapp = {
+			.dev = &dev,
+			.instance = &ppInstance,
 		}
+	};
 
-		unsigned int instance = i;
-		ambapp_dev_t dev = { .devId = CORE_ID_GRSPW2 };
-		platformctl_t pctl = {
-			.action = pctl_get,
-			.type = pctl_ambapp,
-			.task.ambapp = {
-				.dev = &dev,
-				.instance = &instance,
-			}
-		};
-
-		/* try DMA core (spwrtr) */
+	/* try DMA core (spwrtr) */
+	if (platformctl(&pctl) < 0) {
+		dev.devId = CORE_ID_GRSPW2_DMA;
 		if (platformctl(&pctl) < 0) {
-			dev.devId = CORE_ID_GRSPW2_DMA;
-			if (platformctl(&pctl) < 0) {
-				return -1;
-			}
-			LOG("spw%d: grspw2_dma core found", i);
-		}
-		else {
-			LOG("spw%d: grspw2 core found", i);
-		}
-
-		if (dev.bus != BUS_AMBA_APB) {
-			/* GRSPW2/DMA should be on APB bus */
 			return -1;
 		}
+		LOG("spw%d: grspw2_dma core found", instance);
+	}
+	else {
+		LOG("spw%d: grspw2 core found", instance);
+	}
 
-		spw_info[i].base = dev.info.apb.base;
-		spw_info[i].irq = dev.irqn;
+	if (dev.bus != BUS_AMBA_APB) {
+		/* GRSPW2/DMA should be on APB bus */
+		return -1;
+	}
 
-		if (spw_cguInit(i) < 0) {
-			return -1;
-		}
+	if (spw_cguInit(instance) < 0) {
+		return -1;
+	}
 
-		if (spw_createResources(&spw_common.dev[i], (addr_t)spw_info[i].base) < 0) {
-			spw_cleanupResources(&spw_common.dev[i]);
-			return -1;
-		}
+	if (spw_createResources(spwdev, (addr_t)dev.info.apb.base) < 0) {
+		spw_cleanupResources(spwdev);
+		return -1;
+	}
 
-		spw_common.dev[i].txDescFree = SPW_TX_DESC_CNT;
+	spwdev->txDescFree = SPW_TX_DESC_CNT;
 
-		(void)interrupt(spw_info[i].irq, spw_irqHandler, &spw_common.dev[i], spw_common.dev[i].cond, NULL);
+	(void)interrupt(dev.irqn, spw_irqHandler, spwdev, spwdev->cond, NULL);
 
-		if (spw_defaultConfig(&spw_common.dev[i]) < 0) {
-			spw_cleanupResources(&spw_common.dev[i]);
-			return -1;
-		}
+	if (spw_defaultConfig(spwdev) < 0) {
+		spw_cleanupResources(spwdev);
+		return -1;
 	}
 	return 0;
 }

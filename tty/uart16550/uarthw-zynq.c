@@ -19,6 +19,7 @@
 #include <board_config.h>
 
 #include "uart16550.h"
+#include "uarthw.h"
 
 #ifndef UART16550_BASE0
 #define UART16550_BASE0 0
@@ -88,11 +89,11 @@ unsigned int uarthw_irq(void *hwctx)
 }
 
 
-int uarthw_init(unsigned int uartn, void *hwctx, size_t hwctxsz, unsigned int *fclk)
+int uarthw_init(unsigned int uartn, void *hwctx, size_t hwctxsz, uarthw_info_t *infoOut)
 {
 	void *base;
 	static const struct {
-		uint32_t base;
+		uintptr_t base;
 		unsigned int irqno;
 	} uarthw_info[] = {
 		{ .base = UART16550_BASE0, .irqno = UART16550_IRQ0 },
@@ -123,7 +124,9 @@ int uarthw_init(unsigned int uartn, void *hwctx, size_t hwctxsz, unsigned int *f
 		return -ENODEV;
 	}
 
-	*fclk = 100 * 1000 * 1000;
+	infoOut->fclk = 100 * 1000 * 1000;
+	/* On AXI UART 16550 reserved bits in FCR have no function */
+	infoOut->fcr = 0;
 
 	return EOK;
 }

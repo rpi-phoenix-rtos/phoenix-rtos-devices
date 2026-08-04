@@ -69,6 +69,7 @@ static void sdma_configure(void)
 	cfg.trig = sdma_trig__event;
 	cfg.event = event_channel;
 	cfg.priority = SDMA_CHANNEL_PRIORITY_MIN + 1;
+	cfg.options = sdma_chOption__auto_bd_done;
 	sdma_channel_configure(&sdma_common.sdma, &cfg);
 }
 
@@ -79,7 +80,7 @@ static int sdma_init(size_t size, size_t count, addr_t *phys_addr)
 	addr_t bd_phys_addr;
 
 	if ((size % _PAGE_SIZE) != 0) {
-		log_error("buffer size is not aligned to %lu", _PAGE_SIZE);
+		log_error("buffer size is not aligned to %zu", (size_t)_PAGE_SIZE);
 		return -1;
 	}
 
