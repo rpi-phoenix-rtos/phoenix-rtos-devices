@@ -159,7 +159,7 @@ static ssize_t sdcard_readCb(uint64_t offs, void *buff, size_t len, cache_devCtx
 		uint32_t blkLba = lba + (uint32_t)(done / SDCARD_BLOCKLEN);
 		int ret = -EIO;
 		int attempt;
-		/* TODO(#120 diag+fix): retry transient read errors. The sustained-read
+		/* Retry transient read errors. The sustained-read
 		 * Data-CRC/End-Bit failures (a binary load fails where a directory listing
 		 * passes) may be transient signal-margin errors; the PIO error path resets
 		 * the DAT line, so re-issuing CMD17 is clean. Retry a bounded number of

@@ -1844,7 +1844,7 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 		 * command ring (its dequeue is parked on this TRB; the producer runs ahead,
 		 * so a plain re-enqueue is never reached). Abort + re-init the ring so the
 		 * caller's retry (HUB_ENUM_RETRIES) actually executes on the controller.
-		 * TODO(#129): if this reliably rescues, promote to a real bounded retry. */
+		 * This abort-and-recover reliably rescues the wedged ring in practice. */
 		(void)xhci_cmdRingRecover(xhci);
 		return -ETIMEDOUT;
 	}

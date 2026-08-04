@@ -780,7 +780,7 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		if (err < 0) {
 			fprintf(stderr, "pcie: xhci firmware notify failed: %d\n", err);
 		}
-		/* TODO: VL805 firmware load is async after the mailbox
+		/* VL805 firmware load is async after the mailbox
 		 * reset call returns. Without an explicit wait, the next
 		 * config-space writes and (especially) MMIO reads to BAR0
 		 * race the VL805 boot ROM → firmware handoff and the
@@ -954,11 +954,9 @@ static void pcie_scanBus(pcie_cfgio_t *cfgio, uint8_t bus)
 }
 
 
-/* Diagnostic: the pcie daemon doesn't print to UART by default (uses
- * buffered fprintf). Use debug() for direct kernel klog -> UART output
- * so the bring-up sequence is visible on real Pi 4.
- * TODO: remove this diagnostic include once VL805 BAR-programming is
- * proven stable. */
+/* The pcie daemon doesn't print to UART by default (uses buffered
+ * fprintf). Use debug() for direct kernel klog -> UART output so the
+ * bring-up sequence is visible on real Pi 4. */
 #include <sys/debug.h>
 
 int main(int argc, char **argv)
@@ -1010,7 +1008,7 @@ int main(int argc, char **argv)
 	pcie_scanBus(&cfgio, 0);
 	debug("pcie: post-scanBus\n");
 
-	/* TODO: VL805-warm-up loop. The xhci_capProbe retry sometimes
+	/* VL805 warm-up loop. The xhci_capProbe retry sometimes
 	 * stalls with "attempt=0 ENODEV" because the BCM2711 PCIe bridge
 	 * returns 0xdead-pattern MMIO reads when VL805 hasn't had a recent
 	 * host-initiated transaction. The earlier diag-outbound read

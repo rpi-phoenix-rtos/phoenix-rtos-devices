@@ -37,7 +37,7 @@
 #define TRACE(str, ...)     do { if (0) fprintf(stderr, LOG_TAG " trace: " str "\n", ##__VA_ARGS__); } while (0)
 /* clang-format on */
 
-/* TODO(#154 diag): one-shot write/read self-test at end of card bring-up.
+/* Optional one-shot write/read self-test at end of card bring-up.
  * Root cause is now FOUND (writes land but Transfer-Complete IRQ never fires for
  * PIO writes; see docs/inprogress/2026-06-07-sd-write-completion-rootcause.md).
  * The diagnostic code below is gated on this macro being DEFINED (#ifdef). It is

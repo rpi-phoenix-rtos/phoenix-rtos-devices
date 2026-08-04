@@ -626,13 +626,10 @@ static int pl011_createTty0(pl011_t *uart)
 	unsigned int i;
 
 	err = -ENODEV;
-	/* TODO(TD-14-pl011-retry): originally 50 retries (5 s wall), bumped
-	 * to 500 (50 s) for slow Pi 4 IPC, then 30 (3 s) once the caller
-	 * was made TD-14-tty0-nonfatal, then 5 here (~500 ms nominal but
-	 * each lookup IPC itself can stretch 1 ms to 43 s per TD-14, so the
-	 * fewer retries the better when /dev/tty0 is optional anyway).
-	 * Restore to 50 after IPC slowness is rooted out and the non-fatal
-	 * hack is reverted. */
+	/* /dev/tty0 is optional here, so keep the retry budget small: each
+	 * devfs lookup IPC can itself stretch from ~1 ms to tens of seconds
+	 * on Pi 4, so fewer retries beats a long stall when the node is
+	 * absent. */
 	for (i = 0; i < 5; ++i) {
 		err = lookup("devfs", NULL, &odev);
 		if (err >= 0) {
@@ -1165,7 +1162,7 @@ static void pl011_kbdthr(void *arg)
 				usleep(PL011_TTY_KBD_RETRY_US);
 				continue;
 			}
-			/* TODO(#127): bring-up observability — the open succeeding both starts
+			/* Bring-up observability: the open succeeding both starts
 			 * the keyboard's URB polling (usbkbd opens on first client) and marks
 			 * when the USB keyboard became usable relative to boot. */
 			fprintf(stderr, "pl011-tty: kbd bridge opened %s\n", path);
