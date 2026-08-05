@@ -414,9 +414,6 @@ static void audio_dmaStart(void)
 	if (((ad.dma[DMA_CS] & DMA_CS_ACTIVE) != 0) && ((ad.dma[DMA_CS] & DMA_CS_ERROR) == 0)) {
 		ad.dma_active = 1;
 	}
-	printf("rpi4-audio: dma-stream ch%u ring_pa=0x%08x words=%u -> CS=0x%08x DEBUG=0x%08x read_idx=%u STA=0x%08x active=%d\n",
-		DMA_CHAN, (uint32_t)ad.ring_pa, RING_WORDS, ad.dma[DMA_CS], ad.dma[DMA_DEBUG],
-		audio_ringReadIdx(), ad.pwm[PWM_STA], ad.dma_active);
 }
 
 
@@ -447,10 +444,6 @@ int main(int argc, char **argv)
 		printf("rpi4-audio: mmap of PWM/CPRMAN/GPIO failed\n");
 		return 1;
 	}
-
-	/* P0 scout: report firmware-left state before we touch anything. */
-	printf("rpi4-audio: scout CM_PWMCTL=0x%08x CM_PWMDIV=0x%08x PWM_CTL=0x%08x PWM_STA=0x%08x GPFSEL4=0x%08x\n",
-		ad.cprman[CM_PWMCTL], ad.cprman[CM_PWMDIV], ad.pwm[PWM_CTL], ad.pwm[PWM_STA], ad.gpio[GPFSEL4]);
 
 	/* P1 bring-up: GPIO ALT0, PWM clock, PWM engine. */
 	audio_gpioAlt0();

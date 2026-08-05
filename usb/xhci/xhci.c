@@ -868,18 +868,6 @@ static int xhci_reset(xhci_t *xhci)
 	uint32_t usbcmd;
 	uint32_t usbsts;
 	int err;
-	char dbgbuf[96];
-
-	/* USB-DBG (2026-05-26): announce entry state to UART via
-	 * debug() so we can see where the wedge originates. printf
-	 * goes through stdio buffering that may not flush before the
-	 * process exits on init failure. */
-	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-	usbcmd = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
-	snprintf(dbgbuf, sizeof(dbgbuf),
-		"xhci_reset: enter USBSTS=0x%08x USBCMD=0x%08x\n",
-		usbsts, usbcmd);
-	debug(dbgbuf);
 
 	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_CNR, 0u, XHCI_CNR_TIMEOUT_MS);
 	if (err < 0) {
@@ -916,10 +904,6 @@ static int xhci_reset(xhci_t *xhci)
 
 	err = xhci_waitOpBits(xhci, XHCI_REG_OP_USBCMD, XHCI_REG_OP_USBCMD_HCRST, 0u, XHCI_HCRST_TIMEOUT_MS);
 	if (err < 0) {
-		usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-		snprintf(dbgbuf, sizeof(dbgbuf),
-			"xhci_reset: HCRST timeout USBSTS=0x%08x\n", usbsts);
-		debug(dbgbuf);
 		return err;
 	}
 
@@ -928,11 +912,6 @@ static int xhci_reset(xhci_t *xhci)
 		debug("xhci_reset: CNR did not clear after reset\n");
 		return err;
 	}
-
-	usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-	snprintf(dbgbuf, sizeof(dbgbuf),
-		"xhci_reset: post-HCRST USBSTS=0x%08x\n", usbsts);
-	debug(dbgbuf);
 
 	/* 100 ms settling window after HCRST. Empirically the BCM2711
 	 * bridge and VL805 internal state can be in a transient mode
@@ -1348,21 +1327,8 @@ static int xhci_enterRunState(xhci_t *xhci)
 
 			usbsts = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
 			if ((usbsts & (XHCI_REG_OP_USBSTS_HSE | XHCI_REG_OP_USBSTS_HCE)) == 0u) {
-				if (attempt > 0u) {
-					char dbgbuf[64];
-					snprintf(dbgbuf, sizeof(dbgbuf),
-						"xhci: enterRun recovered on attempt %u\n", attempt);
-					debug(dbgbuf);
-				}
 				xhci->running = 1u;
 				return EOK;
-			}
-
-			{
-				char dbgbuf[96];
-				snprintf(dbgbuf, sizeof(dbgbuf),
-					"xhci: enterRun HSE attempt %u USBSTS=0x%08x\n", attempt, usbsts);
-				debug(dbgbuf);
 			}
 
 			/* Clear HSE (W1C), drop R/S, wait for halt, retry. */
@@ -1372,17 +1338,6 @@ static int xhci_enterRunState(xhci_t *xhci)
 			(void)xhci_waitOpBits(xhci, XHCI_REG_OP_USBSTS, XHCI_REG_OP_USBSTS_HCH, XHCI_REG_OP_USBSTS_HCH, XHCI_RUNSTOP_TIMEOUT_MS);
 
 			__asm__ volatile("dsb sy" ::: "memory");
-		}
-
-		{
-			char dbgbuf[160];
-			uint32_t erdp = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERDP_LO);
-			uint32_t erstba = xhci_rtRead32(xhci, XHCI_REG_RT_IR_ERSTBA_LO);
-			uint32_t dcbaap = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP);
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"xhci: enterRun GAVE UP USBSTS=0x%08x ERDP=0x%08x ERSTBA=0x%08x DCBAAP=0x%08x\n",
-				usbsts, erdp, erstba, dcbaap);
-			debug(dbgbuf);
 		}
 	}
 	return -ENODEV;
@@ -1815,29 +1770,6 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_CMD_COMPLETION, cmdPhys, 0u, 0u, XHCI_CMD_TIMEOUT_MS, &ev);
 
 	if (err < 0) {
-		/* TODO(#129) diag: rate-limit the timeout report. A wedged controller
-		 * (event ring stops advancing) makes every subsequent command time out;
-		 * an unbounded caller then floods the UART, which both hides the boot and
-		 * back-pressure-truncates the very line we need (the leading USBSTS got
-		 * eaten in earlier captures). Print the first few IN FULL — including the
-		 * in-flight command TRB type and the cmd-ring producer index, to identify
-		 * which command wedges and confirm whether the ring is being re-inited
-		 * (cmdEnqueue resetting) — then suppress. */
-		static unsigned timeoutLogged = 0u;
-		if (timeoutLogged < 12u) {
-			char dbgbuf[200];
-			uint32_t usbsts2 = xhci_opRead32(xhci, XHCI_REG_OP_USBSTS);
-			uint32_t usbcmd2 = xhci_opRead32(xhci, XHCI_REG_OP_USBCMD);
-			uint32_t trbType = (control >> XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) & 0x3fu;
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"xhci_cmdExec TIMEOUT trb=%u USBSTS=0x%08x USBCMD=0x%08x cmd_phys=0x%08llx enq=%u deq=%u ccs=%u\n",
-				(unsigned)trbType, usbsts2, usbcmd2, (unsigned long long)cmdPhys,
-				(unsigned)xhci->cmdEnqueue, (unsigned)xhci->eventDeq, (unsigned)xhci->eventCycleState);
-			debug(dbgbuf);
-			if (++timeoutLogged == 12u) {
-				debug("xhci_cmdExec TIMEOUT: suppressing further timeout reports\n");
-			}
-		}
 		(void)xhci_enterHaltedState(xhci);
 		memset(cmd, 0, sizeof(*cmd));
 		/* The controller dequeued this command but never completed it, wedging the

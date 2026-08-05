@@ -16,7 +16,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <endian.h>
-#include <sys/debug.h>
 #include <sys/interrupt.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
@@ -636,25 +635,6 @@ static void bcm2711SetRcBar2(pcie_bcm2711_ctx_t *ctx, uint64_t pcieAddr, uint64_
 		remap |= BCM2711_PCIE_UBUS_BAR2_ACCESS_EN;
 		writeReg(ctx->base, BCM2711_PCIE_UBUS_BAR2_REMAP_LO, remap);
 	}
-
-	/* USB-FIX-11 (2026-05-26): read RC_BAR2 back and report via
-	 * debug() so we can confirm the inbound DMA window is actually
-	 * programmed. If the readback doesn't match what we wrote, the
-	 * bridge isn't accepting the configuration and VL805's inbound
-	 * DMA reads fail at the bridge level. */
-	{
-		uint32_t lo_rb = readReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_LO);
-		uint32_t hi_rb = readReg(ctx->base, BCM2711_PCIE_RC_BAR2_CONFIG_HI);
-		uint32_t remap_lo = readReg(ctx->base, BCM2711_PCIE_UBUS_BAR2_REMAP_LO);
-		char dbgbuf[160];
-		snprintf(dbgbuf, sizeof(dbgbuf),
-			"pcie: RC_BAR2 LO=0x%08x HI=0x%08x sz=0x%x  UBUS_REMAP=0x%08x (EN=%u)\n",
-			lo_rb, hi_rb,
-			(unsigned)(lo_rb & BCM2711_PCIE_RC_BAR2_SIZE_MASK),
-			remap_lo,
-			(unsigned)(remap_lo & BCM2711_PCIE_UBUS_BAR2_ACCESS_EN));
-		debug(dbgbuf);
-	}
 }
 
 
@@ -692,59 +672,27 @@ static void bcm2711ExposeDownstreamBridge(pcie_bcm2711_ctx_t *ctx)
 		rootControl |= PCI_EXP_RTCTL_CRSSVE;
 		bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + PCI_EXP_RTCTL, rootControl);
 
-		/* USB-FIX-8 instrumentation: print RC PCIe Cap MPS/MRRS. */
 		{
-			uint32_t devcap = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x04);
-			uint32_t devctl = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x08);
-			char dbgbuf[128];
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"pcie: RC PCIe Cap @0xAC DCAP=0x%08x DCTL=0x%08x\n",
-				devcap, devctl);
-			debug(dbgbuf);
-
-			/* USB-FIX-9 (2026-05-26): clear NO_SNOOP_EN (bit 11) in
-			 * RC's DCTL. BCM2711 PCIe is not cache-coherent by
-			 * default; NoSnoop TLPs bypass CPU caches, so an
-			 * inbound DMA fetch can read stale DRAM if the most
+			/* USB-FIX-9: clear NO_SNOOP_EN (bit 11) in RC's DCTL. BCM2711
+			 * PCIe is not cache-coherent by default; NoSnoop TLPs bypass CPU
+			 * caches, so an inbound DMA fetch can read stale DRAM if the most
 			 * recent CPU write is still in a dirty cache line. */
+			uint32_t devctl = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x08);
 			bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + 0x08,
 				(uint16_t)((devctl & 0xFFFFu) & ~0x0800u));
 
-			/* USB-FIX-10: clear RC Device Status sticky bits
-			 * (bits 0..4: CED, NFED, FED, URD, AUX_PWR_DET). They
-			 * are RW1C; write the mask to clear. */
+			/* USB-FIX-10: clear RC Device Status sticky bits (bits 0..4:
+			 * CED, NFED, FED, URD, AUX_PWR_DET). They are RW1C; write the
+			 * mask to clear. */
 			bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + 0x0A, 0x001Fu);
 
-			{
-				uint32_t devctl_post = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x08);
-				snprintf(dbgbuf, sizeof(dbgbuf),
-					"  RC DCTL post-fix=0x%08x (NoSnoop+sticky cleared)\n",
-					devctl_post);
-				debug(dbgbuf);
-			}
-
-			/* USB-FIX-11: read Link Control (PCIe Cap offset 0x10),
-			 * print current ASPM state, then disable ASPM (bits[1:0]
-			 * = 00). If VL805's link is in L1 when we issue R/S=1,
-			 * coming out of L1 takes time and the first DMA can
-			 * timeout. Linux disables ASPM on VL805 via PCI quirk. */
-			{
-				uint32_t lnkcap = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x0C);
-				uint32_t lnkctl = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x10);
-				snprintf(dbgbuf, sizeof(dbgbuf),
-					"  RC LNKCAP=0x%08x LNKCTL=0x%08x (ASPM=%u)\n",
-					lnkcap, lnkctl, (unsigned)(lnkctl & 0x3u));
-				debug(dbgbuf);
-				bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + 0x10,
-					(uint16_t)((lnkctl & 0xFFFFu) & ~0x0003u));
-				{
-					uint32_t lnkctl_post = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x10);
-					snprintf(dbgbuf, sizeof(dbgbuf),
-						"  RC LNKCTL post-fix=0x%08x (ASPM disabled)\n",
-						lnkctl_post);
-					debug(dbgbuf);
-				}
-			}
+			/* USB-FIX-11: disable ASPM via Link Control (bits[1:0] = 00). If
+			 * VL805's link is in L1 when we issue R/S=1, coming out of L1
+			 * takes time and the first DMA can timeout. Linux disables ASPM
+			 * on VL805 via PCI quirk. */
+			uint32_t lnkctl = bcm2711RootRead32(ctx, BCM2711_PCIE_CAP_REGS + 0x10);
+			bcm2711RootWrite16(ctx, BCM2711_PCIE_CAP_REGS + 0x10,
+				(uint16_t)((lnkctl & 0xFFFFu) & ~0x0003u));
 		}
 	}
 
@@ -961,14 +909,6 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			uint16_t cmd = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
 			uint16_t want = (cmd | PCI_CMD_MEM_ENABLE) & ~(uint16_t)PCI_CMD_MASTER_ENABLE;
 			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
-			uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
-			char dbgbuf[80];
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"pcie: VL805 pre-mailbox CMD=0x%04x (MEM only, MASTER deferred)\n", rb);
-			debug(dbgbuf);
-			if ((rb & PCI_CMD_MEM_ENABLE) == 0) {
-				debug("pcie: VL805 MEM_ENABLE did not stick\n");
-			}
 		}
 
 		/*
@@ -981,59 +921,21 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		 */
 		uint32_t fw_ver_pre = cfgio->read32(cfgio->ctx, bus, dev, fun, 0x50);
 		int skip_mailbox = (fw_ver_pre != 0u);
-		{
-			char dbgbuf[96];
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"pcie: VL805 fw_ver @0x50 = 0x%08x  %s\n",
-				fw_ver_pre,
-				skip_mailbox ? "(loaded, skip mailbox)" : "(zero, will notify)");
-			debug(dbgbuf);
-		}
 
-		/* USB-FIX-8 (2026-05-26): read VL805's PCIe Capability MPS/MRRS
-		 * fields. VL805 PCIe Cap is at config offset 0xC4 per the boot-time
-		 * "pcie: CAP id 0x10 address 0xc4" print. */
+		/* VL805 PCIe Capability is at config offset 0xC4. */
 		{
-			uint32_t devcap = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x04);
+			/* USB-FIX-9: clear NO_SNOOP_EN in VL805 DCTL (bit 11).
+			 * USB-FIX-10: clear Device Status sticky bits (RW1C). */
 			uint32_t devctl = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08);
-			char dbgbuf[128];
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"pcie: VL805 PCIe Cap @0xC4 DCAP=0x%08x DCTL=0x%08x\n",
-				devcap, devctl);
-			debug(dbgbuf);
-
-			/* USB-FIX-9: clear NO_SNOOP_EN in VL805 DCTL (bit 11). */
 			uint32_t devctl_new = (devctl & 0xFFFFu) & ~0x0800u;
 			cfgio->write32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08, devctl_new);
-
-			/* USB-FIX-10: clear Device Status sticky bits (RW1C). */
 			cfgio->write32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08,
 				devctl_new | (0x001Fu << 16));
 
-			{
-				uint32_t devctl_post = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x08);
-				snprintf(dbgbuf, sizeof(dbgbuf),
-					"  VL805 DCTL post-fix=0x%08x\n", devctl_post);
-				debug(dbgbuf);
-			}
-
 			/* USB-FIX-11: VL805 ASPM disable via Link Control. */
-			{
-				uint32_t lnkcap = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x0C);
-				uint32_t lnkctl = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x10);
-				snprintf(dbgbuf, sizeof(dbgbuf),
-					"  VL805 LNKCAP=0x%08x LNKCTL=0x%08x (ASPM=%u)\n",
-					lnkcap, lnkctl, (unsigned)(lnkctl & 0x3u));
-				debug(dbgbuf);
-				cfgio->write32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x10,
-					(lnkctl & 0xFFFFu) & ~0x0003u);
-				{
-					uint32_t lnkctl_post = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x10);
-					snprintf(dbgbuf, sizeof(dbgbuf),
-						"  VL805 LNKCTL post-fix=0x%08x\n", lnkctl_post);
-					debug(dbgbuf);
-				}
-			}
+			uint32_t lnkctl = cfgio->read32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x10);
+			cfgio->write32(cfgio->ctx, bus, dev, fun, 0xc4 + 0x10,
+				(lnkctl & 0xFFFFu) & ~0x0003u);
 		}
 
 		int err = 0;
@@ -1140,16 +1042,6 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		uint16_t want = cmd | PCI_CMD_MEM_ENABLE | PCI_CMD_MASTER_ENABLE;
 		if (want != cmd) {
 			cfgio->write32(cfgio->ctx, bus, dev, fun, PCI_COMMAND, want);
-		}
-		uint16_t rb = pcie_cfgRead16(cfgio, bus, dev, fun, PCI_COMMAND);
-		{
-			char dbgbuf[96];
-			snprintf(dbgbuf, sizeof(dbgbuf),
-				"pcie: %02x:%02x.%u final CMD=0x%04x (MEM=%u MASTER=%u)\n",
-				bus, dev, fun, rb,
-				(unsigned)(!!(rb & PCI_CMD_MEM_ENABLE)),
-				(unsigned)(!!(rb & PCI_CMD_MASTER_ENABLE)));
-			debug(dbgbuf);
 		}
 	}
 
