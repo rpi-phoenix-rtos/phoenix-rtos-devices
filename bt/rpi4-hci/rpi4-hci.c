@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include <sys/mman.h>
 #include <sys/msg.h>
@@ -497,24 +498,22 @@ static int hci_selftest(void)
 }
 
 
-int main(int argc, char **argv)
+static void hci_sigExit(int sig)
 {
-	const char *hcd = DEFAULT_HCD;
-	int selftest = 0, ai;
+	(void)sig;
+	_exit(0);
+}
+
+
+/* Full bring-up: power + route + reset + patchram, then register /dev/hci0 and
+ * start the RX + message threads. Returns 0 on success (the device is live and
+ * served by threads), or a nonzero code on failure. */
+static int hci_bringup(const char *hcd)
+{
 	uint32_t port, core_hz, baud_reg;
 	oid_t dev;
 	uint8_t resp[64];
 	int n, total = 0, ok;
-
-	/* args: [hcd-path] [selftest]  (order-independent) */
-	for (ai = 1; ai < argc; ++ai) {
-		if (strcmp(argv[ai], "selftest") == 0) {
-			selftest = 1;
-		}
-		else {
-			hcd = argv[ai];
-		}
-	}
 
 	printf("rpi4-hci: BCM43455 Bluetooth HCI bring-up (hcd=%s)\n", hcd);
 
@@ -614,23 +613,66 @@ int main(int argc, char **argv)
 	}
 	printf("rpi4-hci: registered /dev/hci0 (raw H4 HCI byte stream)\n");
 
-	/* Serve /dev/hci0 in a thread so main can (optionally) self-test it. */
+	/* Serve /dev/hci0 in a thread. */
 	if (beginthread(hci_thread, 3, hci_common.msgStack, sizeof(hci_common.msgStack),
 			(void *)(uintptr_t)port) != EOK) {
 		printf("rpi4-hci: msg thread failed\n");
 		return 7;
 	}
 
+	return 0;
+}
+
+
+int main(int argc, char **argv)
+{
+	const char *hcd = DEFAULT_HCD;
+	int selftest = 0, ai, rc;
+	pid_t pid;
+
+	/* args: [hcd-path] [selftest]  (order-independent) */
+	for (ai = 1; ai < argc; ++ai) {
+		if (strcmp(argv[ai], "selftest") == 0) {
+			selftest = 1;
+		}
+		else {
+			hcd = argv[ai];
+		}
+	}
+
 	if (selftest != 0) {
-		int rc = hci_selftest();
-		/* leave the device up briefly so the log flushes, then exit */
-		usleep(100 * 1000);
+		/* Single-process acceptance harness: bring up + be our own client. */
+		rc = hci_bringup(hcd);
+		if (rc == 0) {
+			rc = hci_selftest();
+		}
+		usleep(100 * 1000); /* let the log flush */
 		return rc;
 	}
 
-	/* Resident mode: serve forever (for boot/plo integration). */
+	/* Resident daemon: fork so the shell returns once /dev/hci0 is up while the
+	 * child keeps serving (canonical Phoenix pattern, cf. flashsrv.c). */
+	signal(SIGUSR1, hci_sigExit);
+	pid = fork();
+	if (pid < 0) {
+		printf("rpi4-hci: fork failed\n");
+		return 1;
+	}
+	if (pid > 0) {
+		(void)sleep(10); /* wait to be signalled by the child, then give up */
+		return 1;
+	}
+
+	/* child: bring up, tell the parent, then serve forever */
+	signal(SIGUSR1, hci_sigExit);
+	(void)setsid();
+	rc = hci_bringup(hcd);
+	if (rc != 0) {
+		return rc;
+	}
+	kill(getppid(), SIGUSR1);
 	for (;;) {
-		usleep(1000 * 1000);
+		usleep(1000 * 1000); /* the RX + msg threads do the work */
 	}
 	return 0;
 }
