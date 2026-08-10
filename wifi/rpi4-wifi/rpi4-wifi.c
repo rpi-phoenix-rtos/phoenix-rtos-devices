@@ -2689,6 +2689,131 @@ static int wifi_scan(char *out, int cap)
 }
 
 
+/* WLC ioctl command numbers (brcmu; == BRCMF_C_*). */
+#define WLC_SET_INFRA 20u
+#define WLC_SET_SSID  26u
+
+/* Exercise the join (association) CONTROL PATH against `ssid`: enable the join
+ * events, bring the radio up, set infrastructure mode, WLC_SET_SSID, then drain
+ * the WLC_E_* association events reporting each type+status. Run after a scan
+ * (which loads the CLM channel data). Against a non-existent test SSID this
+ * reports SET_SSID + association-failure events, proving the join machinery
+ * end-to-end. NOTE: this is an OPEN-network join; WPA2 key setup (wsec /
+ * wpa_auth / wsec_pmk) and a real-network association with a real PSK are the
+ * documented owner-triggered follow-on (needs a real AP for strong validation).
+ * Event framing + WLC numbers verified vs the brcmfmac primary source. */
+static int wifi_join(const char *ssid, char *out, int cap)
+{
+	uint32_t reqid = 0x4000u, i, rxlen, slen = 0u;
+	uint8_t seq = 0x40u, emask[16], ssidbuf[36], infra[4];
+	int off = 0, t, r, saw_set_ssid = 0, saw_assoc = 0, saw_link = 0;
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	}
+
+	/* Enable the association events (keep escan bit 69): SET_SSID(0), JOIN(1),
+	 * AUTH(3), ASSOC(7), LINK(16). */
+	for (i = 0u; i < 16u; ++i) {
+		emask[i] = 0u;
+	}
+	emask[0] = (uint8_t)((1u << 0) | (1u << 1) | (1u << 3) | (1u << 7));
+	emask[2] = (uint8_t)(1u << 0); /* event 16 -> byte 2 bit 0 */
+	emask[8] = 0x20u;              /* event 69 (escan) */
+	(void)diag_iovar(g_sdhci, g_sdio_core, 1, "event_msgs", emask, 16u, NULL, 0u, &rxlen, reqid++, seq++);
+
+	(void)diag_bcdcCmd(g_sdhci, g_sdio_core, 1, WLC_UP_CMD, NULL, 0u, NULL, 0u, &rxlen, reqid++, seq++);
+	infra[0] = 1u; infra[1] = 0u; infra[2] = 0u; infra[3] = 0u;
+	(void)diag_bcdcCmd(g_sdhci, g_sdio_core, 1, WLC_SET_INFRA, infra, 4u, NULL, 0u, &rxlen, reqid++, seq++);
+
+	/* WLC_SET_SSID: wlc_ssid_t { le32 SSID_len; u8 SSID[32] } -> triggers the join. */
+	while (ssid[slen] != '\0' && slen < 32u) {
+		slen++;
+	}
+	for (i = 0u; i < sizeof(ssidbuf); ++i) {
+		ssidbuf[i] = 0u;
+	}
+	ssidbuf[0] = (uint8_t)slen;
+	for (i = 0u; i < slen; ++i) {
+		ssidbuf[4u + i] = (uint8_t)ssid[i];
+	}
+	(void)diag_bcdcCmd(g_sdhci, g_sdio_core, 1, WLC_SET_SSID, ssidbuf, 36u, NULL, 0u, &rxlen, reqid++, seq++);
+
+	off += snprintf(out + off, (size_t)(cap - off), "join \"%.*s\": association events:\n", (int)slen, ssid);
+
+	/* Drain WLC_E_* association events for ~6 s (same channel-1 event framing as
+	 * the escan reader: sdoff=buf[7], ehdr=sdoff+4+4*buf[sdoff+3], h_proto@+12,
+	 * event_type@+28, status@+32, all big-endian). */
+	for (t = 0; t < 600 && off < cap; ++t) {
+		uint16_t len;
+		uint8_t chan;
+		int fr;
+		uint32_t sdoff, ehdr, etype, status;
+
+		fr = diag_f2RecvFrame(g_sdhci, g_rxf, &len, &chan);
+		if (fr == 1) {
+			usleep(10000);
+			continue;
+		}
+		if (fr < 0) {
+			usleep(5000);
+			continue;
+		}
+		{
+			uint32_t st = diag_bpRead32(g_sdhci, g_sdio_core + 0x20u);
+			if (st != 0u && st != 0xffffffffu) {
+				diag_bpWrite32(g_sdhci, g_sdio_core + 0x20u, st);
+			}
+		}
+		if (chan != 1u) {
+			continue;
+		}
+		sdoff = g_rxf[7];
+		if (sdoff + 4u > len) {
+			continue;
+		}
+		ehdr = sdoff + 4u + 4u * (uint32_t)g_rxf[sdoff + 3u];
+		if (ehdr + 40u > (uint32_t)len) {
+			continue;
+		}
+		if (diag_be16(g_rxf + ehdr + 12u) != 0x886Cu) {
+			continue; /* not an event (h_proto != ETH_P_LINK_CTL) */
+		}
+		etype = diag_be32(g_rxf + ehdr + 28u);
+		status = diag_be32(g_rxf + ehdr + 32u);
+		if (etype == 0u || etype == 1u || etype == 3u || etype == 5u ||
+			etype == 6u || etype == 7u || etype == 16u) {
+			const char *nm = (etype == 0u) ? "SET_SSID" : (etype == 1u) ? "JOIN" :
+				(etype == 3u) ? "AUTH" : (etype == 5u) ? "DEAUTH" :
+				(etype == 6u) ? "DEAUTH_IND" : (etype == 7u) ? "ASSOC" : "LINK";
+			r = snprintf(out + off, (size_t)(cap - off),
+				"  WLC_E_%s (type=%u) status=%u\n", nm, (unsigned)etype, (unsigned)status);
+			if (r > 0 && r < cap - off) {
+				off += r;
+			}
+			if (etype == 0u) { saw_set_ssid = 1; }
+			if (etype == 7u) { saw_assoc = 1; }
+			if (etype == 16u) {
+				saw_link = 1;
+				if (status == 0u) {
+					break; /* link up */
+				}
+			}
+		}
+	}
+	if (off < cap) {
+		r = snprintf(out + off, (size_t)(cap - off),
+			"join machinery ran: SET_SSID=%d ASSOC=%d LINK=%d "
+			"(test SSID -> failure events expected; proves the control path)\n",
+			saw_set_ssid, saw_assoc, saw_link);
+		if (r > 0 && r < cap - off) {
+			off += r;
+		}
+	}
+	return off;
+}
+
+
 /* ---- /dev/wifi message loop -------------------------------------------- */
 /* Offset-aware slice of the most recent scan result (cf. rpi4-gpio's read). */
 static int wifi_readResp(off_t offs, char *dst, size_t size)
@@ -2731,10 +2856,25 @@ static void wifi_thread(void *arg)
 				break;
 
 			case mtWrite:
-				/* write("scan") triggers a fresh escan into g_resp; a client then
-				 * read()s the result. Any other payload is accepted but ignored. */
+				/* write("scan") triggers a fresh escan into g_resp; write("join
+				 * <ssid>") exercises the association control path (run after a
+				 * scan, which loads the CLM channel data). A client read()s the
+				 * result. Any other payload is accepted but ignored. */
 				if (msg.i.size >= 4 && memcmp(msg.i.data, "scan", 4) == 0) {
 					g_resp_len = wifi_scan(g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 6 && memcmp(msg.i.data, "join ", 5) == 0) {
+					char ssid[33];
+					int n = (int)msg.i.size - 5;
+					if (n > 32) {
+						n = 32;
+					}
+					memcpy(ssid, (const char *)msg.i.data + 5, (size_t)n);
+					ssid[n] = '\0';
+					while (n > 0 && (ssid[n - 1] == '\n' || ssid[n - 1] == '\r' || ssid[n - 1] == ' ')) {
+						ssid[--n] = '\0';
+					}
+					g_resp_len = wifi_join(ssid, g_resp, (int)sizeof(g_resp));
 				}
 				msg.o.err = (int)msg.i.size;
 				break;
@@ -2768,7 +2908,7 @@ static void wifi_sigExit(int sig)
 
 int main(int argc, char **argv)
 {
-	int selftest = 0, ai, rc;
+	int selftest = 0, jointest = 0, ai, rc;
 	uint32_t port;
 	oid_t dev;
 	pid_t pid;
@@ -2777,15 +2917,25 @@ int main(int argc, char **argv)
 		if (strcmp(argv[ai], "selftest") == 0) {
 			selftest = 1;
 		}
+		else if (strcmp(argv[ai], "jointest") == 0) {
+			jointest = 1;
+		}
 	}
 
-	if (selftest != 0) {
-		/* Single-process acceptance harness: bring up, scan once, print. */
+	if (selftest != 0 || jointest != 0) {
+		/* Single-process acceptance harness: bring up, scan once (also loads the
+		 * CLM channel data + brings the radio up), print. For jointest, then
+		 * exercise the association control path against a non-existent test SSID
+		 * (failure events are expected; it proves the join machinery). */
 		rc = wifi_bringup();
 		if (rc == 0) {
 			g_resp_len = wifi_scan(g_resp, (int)sizeof(g_resp));
 			printf("rpi4-wifi selftest: scan result (%d bytes):\n%.*s",
 				g_resp_len, g_resp_len, g_resp);
+			if (jointest != 0) {
+				g_resp_len = wifi_join("PHX-JOIN-TEST-NOAP", g_resp, (int)sizeof(g_resp));
+				printf("rpi4-wifi jointest:\n%.*s", g_resp_len, g_resp);
+			}
 		}
 		usleep(100 * 1000); /* let the log flush */
 		return rc;
