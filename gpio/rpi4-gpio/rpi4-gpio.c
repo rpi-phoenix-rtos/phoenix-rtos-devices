@@ -85,7 +85,7 @@ static unsigned gpio_pull(unsigned pin)
 /* Render the full register snapshot into buf. Returns the byte count. */
 static int gpio_snapshot(char *buf, size_t size)
 {
-	return snprintf(buf, size,
+	int len = snprintf(buf, size,
 		"PHX-RPI4-GPIO\n"
 		"GPFSEL0..5:  %08x %08x %08x %08x %08x %08x\n"
 		"GPLEV0/1:    %08x %08x\n"
@@ -95,6 +95,13 @@ static int gpio_snapshot(char *buf, size_t size)
 		gpio_rd(GPIO_GPLEV0 + 0u), gpio_rd(GPIO_GPLEV0 + 4u),
 		gpio_rd(GPIO_PUP_PDN0 + 0u), gpio_rd(GPIO_PUP_PDN0 + 4u),
 		gpio_rd(GPIO_PUP_PDN0 + 8u), gpio_rd(GPIO_PUP_PDN0 + 12u));
+	/* snprintf returns the would-have-written length; clamp it so gpio_read can
+	 * never derive an out-of-bounds slice from an inflated len should the format
+	 * ever outgrow buf (currently ~161 B, well within callers' buffers). */
+	if ((len >= 0) && ((size_t)len >= size)) {
+		len = (int)size - 1;
+	}
+	return len;
 }
 
 
