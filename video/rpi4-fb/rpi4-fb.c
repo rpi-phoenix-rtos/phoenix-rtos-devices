@@ -117,7 +117,9 @@ static int fb_write(off_t offs, const void *src, size_t size)
 		return -ENOSPC;
 	}
 	if (size > fb_common.fbsize - (size_t)offs) {
-		size = fb_common.fbsize - (size_t)offs;
+		/* Reject (don't truncate): a write running past the framebuffer end is a
+		 * client bug, and a silent short write would mask it. */
+		return -ENOSPC;
 	}
 	memcpy((void *)(fb_common.fb + offs), src, size);
 	return (int)size;
