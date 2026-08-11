@@ -388,8 +388,13 @@ static void hci_thread(void *arg)
 				n = ring_pop((uint8_t *)msg.o.data, (int)msg.o.size);
 				if (n == 0) {
 					usleep(2000); /* no event pending: throttle the poll */
+					/* POSIX: a non-blocking read with no data yet is -EAGAIN, not
+					 * 0 (0 == EOF, which would make a standard HCI client stop). */
+					msg.o.err = -EAGAIN;
 				}
-				msg.o.err = n; /* non-blocking: 0 == "no event yet, retry" */
+				else {
+					msg.o.err = n;
+				}
 				break;
 
 			case mtWrite:
