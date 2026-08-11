@@ -150,7 +150,9 @@ static void rng_thread(void *arg)
 					memcpy(dst + got, &w, n);
 					got += n;
 				}
-				msg.o.err = (got > 0) ? (int)got : -EIO;
+				/* POSIX: a zero-length read returns 0, not an error; -EIO only
+				 * when a non-empty request could not draw any entropy. */
+				msg.o.err = (got > 0) ? (int)got : ((want == 0u) ? 0 : -EIO);
 				break;
 			}
 
