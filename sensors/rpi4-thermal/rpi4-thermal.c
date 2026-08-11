@@ -90,6 +90,29 @@ static int thermal_format(id_t id, char *buf, size_t size)
 }
 
 
+/* read(): offset-aware slice of the rendered value (mirrors rpi4-gpio's gpio_read).
+ * Renders into a local buffer first, then clamps to the caller's size — snprintf
+ * returns the length it WOULD have written, which can exceed the client buffer;
+ * handing that back as the read count would over-report and desync the reader. */
+static int thermal_read(id_t id, off_t offs, char *dst, size_t size)
+{
+	char scratch[32];
+	int len = thermal_format(id, scratch, sizeof(scratch));
+
+	if (len < 0) {
+		return len; /* -EIO from a failed mailbox query */
+	}
+	if ((offs < 0) || (offs >= len)) {
+		return 0;
+	}
+	if (size > (size_t)(len - offs)) {
+		size = (size_t)(len - offs);
+	}
+	memcpy(dst, scratch + offs, size);
+	return (int)size;
+}
+
+
 static void thermal_thread(void *arg)
 {
 	uint32_t port = (uint32_t)(uintptr_t)arg;
@@ -117,13 +140,7 @@ static void thermal_thread(void *arg)
 				break;
 
 			case mtRead:
-				/* No partial reads: any non-zero offset signals EOF. */
-				if (msg.i.io.offs > 0) {
-					msg.o.err = 0;
-				}
-				else {
-					msg.o.err = thermal_format(msg.oid.id, msg.o.data, msg.o.size);
-				}
+				msg.o.err = thermal_read(msg.oid.id, msg.i.io.offs, msg.o.data, msg.o.size);
 				break;
 
 			default:
