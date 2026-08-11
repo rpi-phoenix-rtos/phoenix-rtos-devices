@@ -115,6 +115,7 @@ static uint32_t diag_mboxPower(uint32_t tag, uint32_t device_id, uint32_t state)
 	uintptr_t msg_pa;
 	uint32_t request;
 	uint32_t result = 0xFFFFFFFFu;
+	uint32_t deadline;
 	void *mbox_page;
 	void *msg_page;
 
@@ -146,23 +147,42 @@ static uint32_t diag_mboxPower(uint32_t tag, uint32_t device_id, uint32_t state)
 	msg[7] = 0;
 
 	msg_pa = (uintptr_t)va2pa(msg);
-	if (msg_pa == (uintptr_t)-1) {
+	/* The mailbox request carries a 32-bit bus address; reject an unmapped page
+	 * (-1) or one whose PA doesn't fit in 32 bits (a >4 GiB contiguous alloc on a
+	 * large Pi 4) rather than silently truncating it and pointing VideoCore at the
+	 * wrong physical page. */
+	if ((msg_pa == (uintptr_t)-1) || ((uint64_t)msg_pa > 0xffffffffULL)) {
 		munmap(msg_page, _PAGE_SIZE);
 		munmap(mbox_page, _PAGE_SIZE);
 		return 0xFFFFFFFFu;
 	}
 	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
 
-	while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u) {
+	/* Bound every mailbox spin (cf. the SDHCI helpers' 100000-iteration caps): a
+	 * wedged/unresponsive VideoCore must fail bring-up, not hang the WiFi thread
+	 * forever (which would leave /dev/wifi unregistered and the parent blocked). */
+	for (deadline = 100000u; ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u) && (deadline > 0u); --deadline) {
+	}
+	if (deadline == 0u) {
+		munmap(msg_page, _PAGE_SIZE);
+		munmap(mbox_page, _PAGE_SIZE);
+		return 0xFFFFFFFFu;
 	}
 	mbox[VC_MBOX_WRITE / 4] = request;
 
-	for (;;) {
-		while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) != 0u) {
+	for (deadline = 100000u; deadline > 0u; --deadline) {
+		if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) != 0u) {
+			continue; /* no response yet */
 		}
 		if (mbox[VC_MBOX_READ / 4] == request) {
-			break;
+			break; /* our response */
 		}
+		/* else: a response for a different request — drain and keep waiting */
+	}
+	if (deadline == 0u) {
+		munmap(msg_page, _PAGE_SIZE);
+		munmap(mbox_page, _PAGE_SIZE);
+		return 0xFFFFFFFFu;
 	}
 
 	if (msg[1] == VC_MBOX_RESP_OK) {
