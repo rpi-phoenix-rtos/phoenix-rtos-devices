@@ -367,6 +367,13 @@ static void audio_dmaStart(void)
 		PROT_READ | PROT_WRITE, MAP_CONTIGUOUS | MAP_UNCACHED | MAP_ANONYMOUS, -1, 0);
 	if ((cb == MAP_FAILED) || (ad.ring == MAP_FAILED)) {
 		printf("rpi4-audio: dma-stream mmap failed (PIO fallback)\n");
+		/* munmap whichever mapping succeeded so a partial failure doesn't leak it. */
+		if (cb != MAP_FAILED) {
+			munmap(cb, _PAGE_SIZE);
+		}
+		if (ad.ring != MAP_FAILED) {
+			munmap((void *)ad.ring, (RING_BYTES + _PAGE_SIZE - 1u) & ~((uint32_t)_PAGE_SIZE - 1u));
+		}
 		ad.ring = NULL;
 		return;
 	}
@@ -381,8 +388,10 @@ static void audio_dmaStart(void)
 	/* The 0xC0000000 legacy DMA alias only reaches the low 1 GB. If either buffer
 	 * landed at/above 1 GB (possible on a 2/4/8 GB Pi 4), DRAM_BUS() would truncate
 	 * the address and the engine would fetch an unrelated DRAM region -> garbage to
-	 * the PWM FIFO. Fall back to PIO instead of driving a bad DMA. */
-	if ((((ad.ring_pa | cb_pa) >> 30) != 0)) {
+	 * the PWM FIFO. Check each buffer's LAST byte (base + length - 1), not just its
+	 * base: a 64 KB ring whose base is just under 1 GB can still straddle the boundary
+	 * and DMA its tail from the low alias. Fall back to PIO instead of driving a bad DMA. */
+	if (((((ad.ring_pa + RING_BYTES - 1u) | (cb_pa + _PAGE_SIZE - 1u)) >> 30) != 0)) {
 		printf("rpi4-audio: DMA buffer PA >= 1GB (ring=0x%08x cb=0x%08x) - PIO fallback\n",
 			(uint32_t)ad.ring_pa, (uint32_t)cb_pa);
 		munmap((void *)ad.ring, (RING_BYTES + _PAGE_SIZE - 1u) & ~((uint32_t)_PAGE_SIZE - 1u));
