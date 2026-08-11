@@ -113,6 +113,11 @@ static mbox_outcome_t vcmbox_fifoRoundtrip(void)
 			return MBOX_WRFULL;
 		}
 	}
+	/* Ensure the Normal-NC bounce-buffer stores (the message the caller built)
+	 * complete before the Device doorbell store below: ARM permits reordering
+	 * Normal-NC vs Device accesses to different addresses, so without this DSB the
+	 * firmware could observe the doorbell before the message lands. */
+	__asm__ volatile("dsb sy" ::: "memory");
 	mbox[VC_MBOX_WRITE / 4] = request;
 
 	/* Drain until our own response surfaces. Reading MBOX0 consumes the entry;
@@ -132,6 +137,9 @@ static mbox_outcome_t vcmbox_fifoRoundtrip(void)
 		return (sawNonEmpty != 0) ? MBOX_RACED : MBOX_EMPTY;
 	}
 
+	/* The doorbell response surfaced; DSB before reading the firmware's Normal-NC
+	 * buffer writes so they are observed in order after the Device FIFO read. */
+	__asm__ volatile("dsb sy" ::: "memory");
 	if (vcmbox.buf[1] != VC_MBOX_RESP_OK) {
 		return MBOX_BADRESP;
 	}
