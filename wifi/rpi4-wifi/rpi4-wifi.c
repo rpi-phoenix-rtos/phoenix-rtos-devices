@@ -1212,14 +1212,7 @@ static void diag_sdhciResetDatCmd(volatile uint8_t *sdhci)
  * CMD53 addr 0x8000; write=incrementing, read=fixed FIFO. Small frame padded to
  * a 64-byte block (F2 blocksize set to 64 via CCCR FBR to reuse block-mode). */
 #define IOCTL_F2_ADDR 0x8000u
-#define WLC_GET_VERSION 1u
 #define F2_FRAME_MAX 512u    /* per-frame F2 read size (byte-mode cap; card pads short frames) */
-static int g_ioctl_mode = 0;
-static int g_ioctl_ran = 0;
-static uint32_t g_ioctl_is_pre = 0u;   /* intstatus before the sequence */
-/* GET_VERSION-via-demux validation results */
-static int g_ioctl_rc = -100;          /* BCDC status (0=ok) or negative transport error */
-static uint32_t g_ioctl_version = 0u;
 static int g_evt_seen = 0;             /* chan-1 (event) frames demuxed past */
 static int g_ctrl_seen = 0;            /* chan-0 (control) frames read */
 static uint16_t g_last_evt_len = 0u;
@@ -1394,29 +1387,6 @@ static int diag_bcdcCmd(volatile uint8_t *sdhci, uint32_t sdio_core, int is_set,
 		/* data channel -- ignore */
 	}
 	return -1042; /* no matching reply (transport error range, distinct from fw BCME_*) */
-}
-
-/* Validate the RX demux: a single GET_VERSION that must skip any queued async
- * event frame and match the control reply by reqid, returning version in ONE
- * call (previously took two reads because a pending event sat at the queue head). */
-static void diag_bcdcGetVersion(volatile uint8_t *sdhci, uint32_t sdio_core)
-{
-	uint8_t ver[8];
-	uint32_t rxlen = 0u;
-	int rc, i;
-
-	g_ioctl_ran = 1;
-	diag_sdhciResetDatCmd(sdhci);
-	g_ioctl_is_pre = diag_bpRead32(sdhci, sdio_core + 0x20u);
-	for (i = 0; i < 8; ++i) {
-		ver[i] = 0u;
-	}
-	rc = diag_bcdcCmd(sdhci, sdio_core, /*is_set=*/0, WLC_GET_VERSION,
-		NULL, 4u, ver, sizeof(ver), &rxlen, /*reqid=*/1u, /*seq=*/0u);
-	g_ioctl_rc = rc;
-	if (rc >= 0 && rxlen >= 4u) {
-		g_ioctl_version = diag_le32(ver);
-	}
 }
 
 /* ---- #91 WiFi scan (escan) over the BCDC ioctl API ------------------------
@@ -2271,10 +2241,6 @@ static int wifi_bringup(void)
 			diag_readShared(sdhci, ram_size);
 		}
 
-		/* #91: BCDC control-ioctl round-trip over F2 (real fw + argv ioctl). */
-		if (!g_trivial_mode && g_ioctl_mode) {
-			diag_bcdcGetVersion(sdhci, sdio_core);
-		}
 		/* The escan itself is deferred to wifi_scan(), run per client request
 		 * against the SDIO controller left mapped in g_sdhci below. This is the
 		 * split point: everything above is one-shot bring-up; the scan is not. */
@@ -2566,43 +2532,6 @@ static int wifi_bringup(void)
 			r = snprintf(buf + off, cap - off,
 				"sdpcm_shared: word@ram_top-4=0x%08x INVALID (NVRAM-token pattern => fw not booted / no shared)\n",
 				(unsigned)g_sh_word);
-			if (r > 0 && (size_t)r < cap - off) {
-				off += r;
-			}
-		}
-	}
-
-	/* #91 BCDC ioctl round-trip report. */
-	if (g_ioctl_ran) {
-		int bi;
-		r = snprintf(buf + off, cap - off,
-			"BCDC GET_VERSION via RX-demux: rc=%d VERSION=%u  (events demuxed past=%d, ctrl frames=%d, intstatus pre=0x%08x)\n",
-			g_ioctl_rc, (unsigned)g_ioctl_version, g_evt_seen, g_ctrl_seen,
-			(unsigned)g_ioctl_is_pre);
-		if (r > 0 && (size_t)r < cap - off) {
-			off += r;
-		}
-		r = snprintf(buf + off, cap - off,
-			"  -> %s\n",
-			(g_ioctl_rc == 0 && g_ioctl_version != 0u)
-				? "IOCTL OK -- RX demux matches the control reply past queued events (ready for scan)"
-				: "ioctl did not complete (see rc)");
-		if (r > 0 && (size_t)r < cap - off) {
-			off += r;
-		}
-		if (g_last_evt_len > 0u) {
-			r = snprintf(buf + off, cap - off,
-				"  last event frame: len=%u  head:", (unsigned)g_last_evt_len);
-			if (r > 0 && (size_t)r < cap - off) {
-				off += r;
-			}
-			for (bi = 0; bi < 32 && (size_t)(off + 4) < cap; ++bi) {
-				r = snprintf(buf + off, cap - off, " %02x", g_last_evt[bi]);
-				if (r > 0 && (size_t)r < cap - off) {
-					off += r;
-				}
-			}
-			r = snprintf(buf + off, cap - off, "\n");
 			if (r > 0 && (size_t)r < cap - off) {
 				off += r;
 			}
