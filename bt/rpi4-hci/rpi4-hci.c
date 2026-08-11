@@ -664,7 +664,14 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (pid > 0) {
-		(void)sleep(10); /* wait to be signalled by the child, then give up */
+		/* Wait to be signalled ready by the child (its hci_sigExit _exit(0)s early,
+		 * cutting this short). Unlike flashsrv (fast init), BT bring-up takes ~20 s:
+		 * patchram (~323 records) + the 63 KB .hcd firmware TX over the slow mini-UART.
+		 * The old 10 s expired mid-bring-up, so the parent falsely returned failure AND
+		 * the child's later kill(getppid()) landed on init (the reparented reaper). A
+		 * margin over the real bring-up time fixes both; only a bring-up FAILURE (child
+		 * exits without signalling) waits the full timeout out. */
+		(void)sleep(60);
 		return 1;
 	}
 
