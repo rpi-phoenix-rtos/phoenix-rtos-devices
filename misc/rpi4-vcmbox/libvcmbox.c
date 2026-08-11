@@ -117,7 +117,13 @@ int vcmbox_call(uint32_t tag, uint32_t valBufSize, const uint32_t *in, uint32_t 
 	uint32_t i;
 	int err;
 
-	if ((nIn > VCMBOX_MAX_WORDS) || (nOut > VCMBOX_MAX_WORDS)) {
+	/* valBufSize is the firmware value-buffer size in BYTES and must be a whole
+	 * number of words that fits the bounce buffer. Reject an oversize/misaligned
+	 * request here rather than let the server silently cap it and report a
+	 * truncated transaction as success. (VideoCore property buffers are always
+	 * word-multiples, so a valid caller never trips the alignment check.) */
+	if ((nIn > VCMBOX_MAX_WORDS) || (nOut > VCMBOX_MAX_WORDS)
+			|| (valBufSize > (VCMBOX_MAX_WORDS * 4u)) || ((valBufSize & 3u) != 0u)) {
 		return -EINVAL;
 	}
 

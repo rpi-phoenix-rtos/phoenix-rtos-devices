@@ -308,8 +308,14 @@ static int vcmbox_init(void)
 	vcmbox.buf = buf_page;
 
 	buf_pa = (uintptr_t)va2pa(vcmbox.buf);
-	if (buf_pa == (uintptr_t)-1) {
-		printf("rpi4-vcmbox: va2pa of bounce buffer failed\n");
+	/* The VideoCore mailbox request is a 32-bit bus address. Reject a bounce buffer
+	 * that va2pa couldn't resolve (-1) OR that landed above 4 GiB (possible for a
+	 * MAP_CONTIGUOUS page on a 4/8 GB Pi 4): truncating it to uint32_t would silently
+	 * point the firmware at the wrong physical page while the transaction still
+	 * "matches" (same PA key) and reports success. Fail init loudly instead. */
+	if ((buf_pa == (uintptr_t)-1) || ((uint64_t)buf_pa > 0xffffffffULL)) {
+		printf("rpi4-vcmbox: bounce-buffer PA 0x%llx not VC-addressable (need < 4 GiB)\n",
+			(unsigned long long)buf_pa);
 		munmap(buf_page, _PAGE_SIZE);
 		munmap(mbox_page, _PAGE_SIZE);
 		return -1;
