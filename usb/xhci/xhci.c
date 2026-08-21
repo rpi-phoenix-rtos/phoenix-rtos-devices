@@ -1899,10 +1899,15 @@ static int xhci_allocSlotSpace(xhci_t *xhci, xhci_slot_t *slot)
 		return -ENOMEM;
 	}
 
-	xhci->inputCtx = usb_allocAligned(xhci->inputCtxSize, XHCI_CONTEXT_ALIGN);
+	/* inputCtx is a shared per-controller scratch buffer reused across slot
+	 * setups (memset below re-zeros it each call); allocate it once, else each
+	 * device behind a hub leaks the previous one (B2). */
 	if (xhci->inputCtx == NULL) {
-		fprintf(stderr, "xhci: failed to allocate input context\n");
-		return -ENOMEM;
+		xhci->inputCtx = usb_allocAligned(xhci->inputCtxSize, XHCI_CONTEXT_ALIGN);
+		if (xhci->inputCtx == NULL) {
+			fprintf(stderr, "xhci: failed to allocate input context\n");
+			return -ENOMEM;
+		}
 	}
 
 	slot->ep0Ring = usb_allocAligned(xhci->ep0RingSize, XHCI_TRANSFER_RING_ALIGN);
@@ -3188,19 +3193,19 @@ static int xhci_clearPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 			 * getPortStatus stop synthesizing C_CONNECTION for a device
 			 * that was already attached before bring-up. */
 			xhci->portConnAnnounced |= (1u << (unsigned)port);
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_CSC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_CSC);
 			break;
 
 		case USB_PORT_FEAT_C_ENABLE:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_PEC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_PEC);
 			break;
 
 		case USB_PORT_FEAT_C_OVER_CURRENT:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_OCC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_OCC);
 			break;
 
 		case USB_PORT_FEAT_C_RESET:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~XHCI_REG_OP_PORT_PORTSC_PED) | XHCI_REG_OP_PORT_PORTSC_PRC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_PRC);
 			break;
 
 		case USB_PORT_FEAT_ENABLE:
