@@ -541,6 +541,15 @@ int libtty_ioctl(libtty_common_t *tty, pid_t sender_pid, unsigned int cmd, const
 			}
 			CALLBACK(set_halfduplex, enable);
 			break;
+		case FIONREAD:
+			/* bytes immediately available in the rx buffer. readline/bash query this
+			 * (bash_cv_fionread_in_ioctl=yes) to gauge pending input; returning -EINVAL
+			 * here made an interactive shell mis-detect EOF and exit at its first prompt.
+			 * Int-out via tty->temp (same pattern as TIOCGHALFD). */
+			tty->temp = (int)fifo_count(tty->rx_fifo);
+			*out_arg = (const void *)&tty->temp;
+			log_ioctl("FIONREAD = %d", tty->temp);
+			break;
 		default:
 			log_warn("unsupported ioctl: 0x%x", cmd);
 			ret = -EINVAL;
