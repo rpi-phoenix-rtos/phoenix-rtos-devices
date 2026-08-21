@@ -1186,7 +1186,14 @@ static void pl011_kbdthr(void *arg)
 
 		libtty_putchar_lock(&uart->tty);
 		for (i = 0u; i < (size_t)len; ++i) {
-			(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &wake_reader);
+			/* Accumulate per-char (B8): libtty_putchar_helper resets *wake_reader to
+			 * 0 on entry, so passing &wake_reader directly would collapse a multi-char
+			 * burst to only the LAST char's wake decision — a line completed mid-burst
+			 * would lose its reader wakeup. OR each char's decision into wake_reader
+			 * (matches the reset-and-accumulate pattern the other tty drivers use). */
+			int wh = 0;
+			(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &wh);
+			wake_reader |= wh;
 		}
 		libtty_putchar_unlock(&uart->tty);
 
