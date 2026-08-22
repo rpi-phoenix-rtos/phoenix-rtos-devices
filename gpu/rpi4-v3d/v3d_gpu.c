@@ -573,23 +573,10 @@ int v3d_gpu_init(void)
 		}
 	}
 
-	/* PT-PERSISTENCE PROBE (TODO(v3d-pt-probe): remove after the open 2c-server
-	 * question is answered). 2b/2c-server saw fresh client VAs read garbage PTEs on HW
-	 * despite the init full-PT zero loop provably covering them ("init clear did not
-	 * survive to first use"). va_alloc now clears the ALLOCATED range at hand-out, but
-	 * whether the ~57k UNALLOCATED entries persist as 0 is load-bearing for CL's MMU
-	 * fault net. Log a few unallocated slots (at/above next_gpuva) right before serving:
-	 * all-zero => the init zero persists (fault net intact); non-zero => full-PT-zero
-	 * persistence, not just at-hand-out clearing, is the real fix. */
-	{
-		uint32_t base = W.next_gpuva >> PAGE_SHIFT;
-		uint32_t probe[4] = { base, base + 16u, base + 0x1000u, GPUVA_PT_ENTRIES - 1u };
-		fprintf(stderr, "rpi4-v3d: PT-PROBE unallocated slots (expect 0): "
-			"[%u]=0x%08x [%u]=0x%08x [%u]=0x%08x [%u]=0x%08x\n",
-			probe[0], W.pt[probe[0]], probe[1], W.pt[probe[1]],
-			probe[2], W.pt[probe[2]], probe[3], W.pt[probe[3]]);
-	}
-
+	/* NOTE (PT-persistence, resolved 2026-08-22 at M3a/M3b HW bring-up): a startup probe
+	 * of unallocated PT slots read all-zero on HW → the init full-PT zero persists and the
+	 * MMU fault net is intact. The va_alloc clear-at-hand-out (see va_alloc) additionally
+	 * guarantees every allocated range is invalid before first use. Probe removed. */
 	W.inited = 1;
 	return 0;
 }
