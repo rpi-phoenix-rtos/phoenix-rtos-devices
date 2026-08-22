@@ -72,5 +72,12 @@ int v3d_gpu_mmapBo(uint32_t handle, uint64_t *pa, uint32_t *size);
  * an already-freed / never-ours handle, matching the winsys). */
 int v3d_gpu_closeBo(uint32_t handle);
 
+/* SUBMIT_CSD: run one synchronous compute-shader dispatch from the 7 CSD config
+ * words (cfg[0..6] == CSD_QUEUED_CFG0..6; the CFG0 write kicks the job). Blocks
+ * on INT_CSDDONE, then cleans the compute's dirty caches to DRAM so the output
+ * BO is CPU-visible. The dispatch consumes only cfg[]; it never dereferences the
+ * BO handles (Phoenix submit is synchronous, no async fencing). Returns 0. */
+int v3d_gpu_submitCsd(const uint32_t cfg[7]);
+
 
 #endif /* _V3D_GPU_H_ */

@@ -15,20 +15,22 @@
  * (exactly how rpi4-vcmbox de-races the single VideoCore mailbox FIFO).
  *
  * ===========================================================================
- * M1 step 2a - GPU OWNERSHIP + BO LIFECYCLE (submit still stubbed).
+ * M1 step 2a+2b - GPU OWNERSHIP + BO LIFECYCLE + CSD (compute) SUBMIT.
  * ===========================================================================
- * main() now takes exclusive ownership of the GPU before serving (v3d_gpu_init:
+ * main() takes exclusive ownership of the GPU before serving (v3d_gpu_init:
  * power-on once, map HUB/CORE0, install the single flat MMU page table + VA
- * allocator + BO table). The GPU-owning + BO logic lives in v3d_gpu.c, copied
- * essentially verbatim from the in-process winsys (state struct W, power-on,
- * apply_core_regs, va_alloc, BO table, ioc_create_bo/ioc_close_bo); this file is
- * the RPC/message-loop half only. The CREATE_BO / GET_BO_OFFSET / MMAP_BO /
- * GEM_CLOSE handlers call into v3d_gpu and hand back the BO physical address so
- * a client can share the BO via mmap(MAP_PHYSMEM).
+ * allocator + BO table). The GPU-owning + BO + CSD logic lives in v3d_gpu.c,
+ * copied essentially verbatim from the in-process winsys (state struct W,
+ * power-on, apply_core_regs, va_alloc, BO table, ioc_create_bo/ioc_close_bo, and
+ * ioc_submit_csd + its cache-flush helpers); this file is the RPC/message-loop
+ * half only. CREATE_BO / GET_BO_OFFSET / MMAP_BO / GEM_CLOSE hand back the BO
+ * physical address so a client can share the BO via mmap(MAP_PHYSMEM); SUBMIT_CSD
+ * forwards the 7 dispatch words in msg.i.raw and runs the synchronous dispatch.
  *
- * SUBMIT_CL/TFU/CSD stay stubs (return -ENOSYS): step 2b lifts ioc_submit_* and
- * the wedge reset/overflow servicing. The in-process winsys stays UNTOUCHED and
- * keeps working; this daemon is a separate, opt-in component.
+ * SUBMIT_CL/TFU stay stubs (return -ENOSYS): step 2c lifts the binner + CL/TFU
+ * paths and their [descriptor][bo_handles[]] i.data marshaling. The in-process
+ * winsys stays UNTOUCHED and keeps working; this daemon is a separate, opt-in
+ * component.
  *
  * Copyright 2026 Phoenix Systems
  * Author: Witold Bołt
@@ -90,15 +92,21 @@ static void v3d_srv_gemClose(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
 }
 
 
+/* SUBMIT_CSD: the 7 dispatch words ride in req->cfg (no i.data). The dispatch is
+ * synchronous, so resp->err reflects completion. */
+static void v3d_srv_submitCsd(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
+{
+	resp->err = v3d_gpu_submitCsd(req->cfg);
+}
+
+
+/* SUBMIT_CL / SUBMIT_TFU: still stubbed (step 2c lifts the binner + CL/TFU paths
+ * and the [descriptor][bo_handles[]] i.data marshaling). */
 static void v3d_srv_submit(const v3d_rpc_req_t *req, const msg_t *msg, v3d_rpc_resp_t *resp,
 	const char *what)
 {
 	printf("rpi4-v3d: %s desc_size=%u bo_handle_count=%u data_size=%u (stub)\n",
 		what, req->desc_size, req->bo_handle_count, (unsigned)msg->i.size);
-	/* TODO(v3d-srv-gpu): validate bo_handle_count <= V3D_RPC_MAX_BO_HANDLES;
-	 * read [descriptor][bo_handles[]] from msg->i.data; rebind the descriptor's
-	 * bo_handles pointer to the appended array (client VAs are meaningless here);
-	 * run the existing synchronous ioc_submit_* and report completion in err. */
 	resp->err = -ENOSYS;
 }
 
@@ -134,7 +142,7 @@ static void v3d_srv_handleMsg(const msg_t *msg, v3d_rpc_resp_t *resp)
 			v3d_srv_submit(req, msg, resp, "SUBMIT_TFU");
 			break;
 		case V3D_RPC_SUBMIT_CSD:
-			v3d_srv_submit(req, msg, resp, "SUBMIT_CSD");
+			v3d_srv_submitCsd(req, resp);
 			break;
 		default:
 			printf("rpi4-v3d: unknown op %u\n", req->op);
@@ -197,15 +205,12 @@ int main(int argc, char **argv)
 	(void)argc;
 	(void)argv;
 
-	/* Take exclusive ownership of the GPU BEFORE serving: power-on once, map
-	 * HUB/CORE0, install the single MMU flat page table, arm the GPU-VA allocator
-	 * and BO table. Fail loud - a half-owned GPU must not start accepting clients. */
-	rc = v3d_gpu_init();
-	if (rc != 0) {
-		printf("rpi4-v3d: GPU init failed (%d); refusing to serve\n", rc);
-		return 3;
-	}
-
+	/* Claim the /dev/v3d-srv node FIRST: create_dev is the single-owner guard. A
+	 * second server instance must fail here BEFORE it powers on the GPU / installs
+	 * its own MMU page table - otherwise it would clobber the single global
+	 * MMU_PT_PA_BASE (exactly the conflict this daemon exists to prevent) before the
+	 * duplicate-node error fired. Clients that msgSend before the serve loop starts
+	 * simply block until we enter msgRecv. */
 	if (portCreate(&port) != EOK) {
 		printf("rpi4-v3d: portCreate failed\n");
 		return 1;
@@ -214,11 +219,20 @@ int main(int argc, char **argv)
 	dev.port = port;
 	dev.id = 0;
 	if (create_dev(&dev, V3D_RPC_DEV_NAME) < 0) {
-		printf("rpi4-v3d: could not create /dev/%s\n", V3D_RPC_DEV_NAME);
+		printf("rpi4-v3d: could not create /dev/%s (already owned?)\n", V3D_RPC_DEV_NAME);
 		return 2;
 	}
 
-	printf("rpi4-v3d: registered /dev/%s (GPU owned; BO management live, submit stubbed)\n",
+	/* Now take exclusive ownership of the GPU: power-on once, map HUB/CORE0, install
+	 * the single MMU flat page table, arm the GPU-VA allocator and BO table. Fail
+	 * loud - a half-owned GPU must not start accepting clients. */
+	rc = v3d_gpu_init();
+	if (rc != 0) {
+		printf("rpi4-v3d: GPU init failed (%d); refusing to serve\n", rc);
+		return 3;
+	}
+
+	printf("rpi4-v3d: registered /dev/%s (GPU owned; BO + CSD live, CL/TFU stubbed)\n",
 		V3D_RPC_DEV_NAME);
 
 	v3d_srv_thread(port);

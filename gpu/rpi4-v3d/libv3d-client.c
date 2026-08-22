@@ -12,21 +12,21 @@
  * lives in the server; a client sees only this API. Patterned on libvcmbox.c.
  *
  * ===========================================================================
- * SCAFFOLD INCREMENT (M1 step 1) - RPC PLUMBING ONLY.
+ * M1 step 2b - BO SHARING + CSD (compute) forwarding LIVE.
  * ===========================================================================
- * The message pack/send/unpack path is real and build-verified. The GPU-facing
- * halves that depend on a server that actually allocates BOs are marked
- * TODO(v3d-cli-gpu): the client-side handle table and the CREATE_BO/MMAP_BO
- * mmap(MAP_PHYSMEM) of the server-returned physical address are declared but not
- * wired, because the server returns -ENOSYS for every forwarded op this
- * increment (no runtime path exists to exercise them yet). The in-process
- * winsys (tools/v3d-driver-port/v3d_phoenix_winsys.c) is UNTOUCHED and remains
- * the working default; this library is an opt-in alternative backend.
+ * CREATE_BO / GET_BO_OFFSET / MMAP_BO / GEM_CLOSE and SUBMIT_CSD are fully
+ * wired: CREATE_BO forwards the request, mmap(MAP_PHYSMEM)s the server-returned
+ * physical address into a client BO table, and MMAP_BO returns that CPU VA;
+ * SUBMIT_CSD extracts the 7 dispatch words from drm_v3d_submit_csd.cfg[] and
+ * forwards them in msg.i.raw (the synchronous CSD dispatch consumes only cfg[],
+ * never the BO handles). SUBMIT_CL / SUBMIT_TFU are still forwarded to the
+ * server's stubs (step 2c). The in-process winsys
+ * (tools/v3d-driver-port/v3d_phoenix_winsys.c) is UNTOUCHED and remains the
+ * working default; this library is an opt-in alternative backend.
  *
- * The include of the DRM UAPI headers (v3d_drm.h -> drm.h) mirrors the winsys:
- * the integrated GPU-app build already has drm-uapi/ on its include path, and
- * the standalone build-verify adds -I to tools/v3d-driver-port (+ its
- * shim-include for sys/ioccom.h).
+ * The DRM UAPI headers (v3d_drm.h -> drm.h) are the vendored snapshot under
+ * uapi/ (added to the include path by the Makefile); no coord-repo tools/ -I
+ * dependency.
  *
  * Copyright 2026 Phoenix Systems
  * Author: Witold Bołt
@@ -43,6 +43,7 @@
 
 #include <sys/msg.h>
 #include <sys/types.h>
+#include <sys/mman.h>      /* mmap(MAP_PHYSMEM) - the Phoenix BO-sharing mechanism */
 
 #include "v3d_drm.h"        /* DRM_V3D_* commands + drm_v3d_* arg structs (UAPI) */
 #include "v3d_rpc.h"        /* shared client/server wire contract */
@@ -57,14 +58,22 @@ static struct {
 
 
 /*
- * TODO(v3d-cli-gpu): client-side BO table. When the server starts returning
- * real BOs, CREATE_BO must record {handle, pa, size, gpuva} here and
- * mmap(MAP_PHYSMEM, pa) the physical page for CPU access; MMAP_BO returns that
- * CPU VA; GEM_CLOSE munmaps + drops the entry. Not wired this increment (the
- * server returns -ENOSYS), so it is only declared, to fix the shape.
- *
- * struct v3d_cli_bo { uint32_t handle; uint64_t pa; void *cpu; uint32_t gpuva, size; };
+ * Client-side BO table. CREATE_BO records the server-returned {pa, gpuva, size}
+ * and mmap(MAP_PHYSMEM, pa)s the BO's physical pages into THIS process for CPU
+ * access; MMAP_BO returns that CPU VA (matching the winsys, whose MMAP_BO returns
+ * its in-process CPU pointer); GEM_CLOSE munmaps + drops the entry. Server BO
+ * handles are dense (slot+1, 1..server MAX_BOS) so the table is indexed by
+ * handle-1. A BO is physically-contiguous DRAM shared by PA - the bytes never
+ * cross IPC (see v3d_rpc.h). Mapped MAP_UNCACHED to match the server's default
+ * (non-cacheable) BO mapping so CPU and GPU views stay coherent.
  */
+#define V3D_CLI_MAX_BOS 4096u
+static struct {
+	void    *cpu;    /* MAP_PHYSMEM view of the BO's physical pages (NULL = free slot) */
+	uint64_t pa;     /* BO physical address (as returned by the server) */
+	uint32_t gpuva;  /* assigned GPU VA (== drm offset) */
+	uint32_t size;   /* BO byte size (page-rounded) */
+} v3d_cli_bo[V3D_CLI_MAX_BOS];
 
 
 /* Resolve the server node directly through the `devfs` named port (pre-`bind
@@ -256,11 +265,16 @@ int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
 	}
 
 	/* DRM core GEM_CLOSE (NR 0x09, below DRM_COMMAND_BASE so not a DRM_V3D_*
-	 * cmd): Mesa's bufmgr issues it to free a BO. Forward to the server, which
-	 * owns the BO table. */
+	 * cmd): Mesa's bufmgr issues it to free a BO. Drop our MAP_PHYSMEM view, then
+	 * forward to the server, which owns the BO table + GPU VA. */
 	if (_IOC_NR(request) == _IOC_NR(DRM_IOCTL_GEM_CLOSE)) {
 		struct drm_gem_close *gc = arg;
 		v3d_rpc_req_t req;
+		if (gc->handle >= 1u && gc->handle <= V3D_CLI_MAX_BOS &&
+		    v3d_cli_bo[gc->handle - 1u].cpu != NULL) {
+			munmap(v3d_cli_bo[gc->handle - 1u].cpu, v3d_cli_bo[gc->handle - 1u].size);
+			memset(&v3d_cli_bo[gc->handle - 1u], 0, sizeof(v3d_cli_bo[0]));
+		}
 		memset(&req, 0, sizeof(req));
 		req.op = V3D_RPC_GEM_CLOSE;
 		req.handle = gc->handle;
@@ -278,14 +292,30 @@ int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
 			req.size = c->size;
 			req.flags = c->flags;
 			rc = v3d_cli_call(&req, &resp);
-			if (rc == 0) {
-				c->handle = resp.handle;
-				c->offset = resp.gpuva;
-				/* TODO(v3d-cli-gpu): record {handle, resp.pa, resp.size, gpuva} in
-				 * the client BO table and mmap(MAP_PHYSMEM, resp.pa) for CPU access
-				 * so MMAP_BO can return the CPU VA. */
+			if (rc != 0)
+				return rc;
+			/* Map the BO's physical pages into THIS process for CPU access. Uncached
+			 * to match the server's default BO mapping (coherent CPU+GPU view). */
+			if (resp.handle >= 1u && resp.handle <= V3D_CLI_MAX_BOS) {
+				void *cpu = mmap(NULL, resp.size, PROT_READ | PROT_WRITE,
+					MAP_PHYSMEM | MAP_ANONYMOUS | MAP_UNCACHED, -1, (addr_t)resp.pa);
+				if (cpu == MAP_FAILED) {
+					/* Roll back the server-side BO so it is not leaked. */
+					v3d_rpc_req_t cl;
+					memset(&cl, 0, sizeof(cl));
+					cl.op = V3D_RPC_GEM_CLOSE;
+					cl.handle = resp.handle;
+					(void)v3d_cli_call(&cl, NULL);
+					return -ENOMEM;
+				}
+				v3d_cli_bo[resp.handle - 1u].cpu = cpu;
+				v3d_cli_bo[resp.handle - 1u].pa = resp.pa;
+				v3d_cli_bo[resp.handle - 1u].gpuva = resp.gpuva;
+				v3d_cli_bo[resp.handle - 1u].size = resp.size;
 			}
-			return rc;
+			c->handle = resp.handle;
+			c->offset = resp.gpuva;
+			return 0;
 		}
 		case DRM_V3D_GET_BO_OFFSET: {
 			struct drm_v3d_get_bo_offset *g = arg;
@@ -302,21 +332,40 @@ int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
 			return rc;
 		}
 		case DRM_V3D_MMAP_BO: {
+			/* The winsys returns a CPU VA as the mmap offset (its libdrm shim mmaps it
+			 * directly); the caller then dereferences m.offset as a pointer. We return
+			 * the MAP_PHYSMEM CPU VA recorded at CREATE_BO - same contract, no edit to
+			 * the GPU app. Served locally (the mapping already exists); if the handle
+			 * is unknown (e.g. never created via this client) fall back to an RPC that
+			 * fetches the PA and maps it now. */
 			struct drm_v3d_mmap_bo *m = arg;
 			v3d_rpc_req_t req;
 			v3d_rpc_resp_t resp;
+			void *cpu;
 			int rc;
+			if (m->handle < 1u || m->handle > V3D_CLI_MAX_BOS)
+				return -EINVAL;
+			if (v3d_cli_bo[m->handle - 1u].cpu != NULL) {
+				m->offset = (uint64_t)(uintptr_t)v3d_cli_bo[m->handle - 1u].cpu;
+				return 0;
+			}
+			/* Not in the local table (BO not created via this client): fetch its PA
+			 * from the server and map it now. */
 			memset(&req, 0, sizeof(req));
 			req.op = V3D_RPC_MMAP_BO;
 			req.handle = m->handle;
 			rc = v3d_cli_call(&req, &resp);
-			if (rc == 0) {
-				/* TODO(v3d-cli-gpu): the winsys returns a CPU VA as the mmap offset;
-				 * here that VA comes from the client-side MAP_PHYSMEM(resp.pa) set up
-				 * in CREATE_BO. Placeholder: echo the (unusable) offset 0. */
-				m->offset = 0;
-			}
-			return rc;
+			if (rc != 0)
+				return rc;
+			cpu = mmap(NULL, resp.size, PROT_READ | PROT_WRITE,
+				MAP_PHYSMEM | MAP_ANONYMOUS | MAP_UNCACHED, -1, (addr_t)resp.pa);
+			if (cpu == MAP_FAILED)
+				return -ENOMEM;
+			v3d_cli_bo[m->handle - 1u].cpu = cpu;
+			v3d_cli_bo[m->handle - 1u].pa = resp.pa;
+			v3d_cli_bo[m->handle - 1u].size = resp.size;
+			m->offset = (uint64_t)(uintptr_t)cpu;
+			return 0;
 		}
 		case DRM_V3D_SUBMIT_CL: {
 			struct drm_v3d_submit_cl *s = arg;
@@ -331,9 +380,18 @@ int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
 			return v3d_cli_submit(V3D_RPC_SUBMIT_TFU, t, sizeof(*t), NULL, 0);
 		}
 		case DRM_V3D_SUBMIT_CSD: {
+			/* The synchronous CSD dispatch consumes only cfg[0..6]; it never
+			 * dereferences the BO handles (those are Linux async-fencing only). So
+			 * forward just the 7 dispatch words in msg.i.raw - no i.data, no handle
+			 * marshaling. */
 			struct drm_v3d_submit_csd *s = arg;
-			return v3d_cli_submit(V3D_RPC_SUBMIT_CSD, s, sizeof(*s),
-				(const uint32_t *)(uintptr_t)s->bo_handles, s->bo_handle_count);
+			v3d_rpc_req_t req;
+			int i;
+			memset(&req, 0, sizeof(req));
+			req.op = V3D_RPC_SUBMIT_CSD;
+			for (i = 0; i < 7; i++)
+				req.cfg[i] = s->cfg[i];
+			return v3d_cli_call(&req, NULL);
 		}
 		default:
 			return 0; /* perfmon etc.: no-op, matches the winsys */

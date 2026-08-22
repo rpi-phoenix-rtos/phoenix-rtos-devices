@@ -98,15 +98,19 @@ enum v3d_rpc_op {
  *   GET_BO_OFFSET  : handle
  *   MMAP_BO        : handle
  *   GEM_CLOSE      : handle
- *   SUBMIT_*       : desc_size, bo_handle_count (payload rides msg.i.data)
+ *   SUBMIT_CSD     : cfg[0..6] (the 7 CSD dispatch words; NO i.data - the CSD
+ *                    dispatch is synchronous and consumes only cfg[], it never
+ *                    dereferences the BO handles, so nothing rides i.data)
+ *   SUBMIT_CL/TFU  : desc_size, bo_handle_count (payload rides msg.i.data)
  */
 typedef struct {
 	uint32_t op;               /* enum v3d_rpc_op */
 	uint32_t handle;           /* GET_BO_OFFSET / MMAP_BO / GEM_CLOSE */
 	uint32_t size;             /* CREATE_BO: requested byte size */
 	uint32_t flags;            /* CREATE_BO: DRM create flags (e.g. SCANOUT bit) */
-	uint32_t desc_size;        /* SUBMIT_*: sizeof(drm_v3d_submit_*) at head of i.data */
-	uint32_t bo_handle_count;  /* SUBMIT_*: number of u32 handles appended in i.data */
+	uint32_t desc_size;        /* SUBMIT_CL/TFU: sizeof(drm_v3d_submit_*) at head of i.data */
+	uint32_t bo_handle_count;  /* SUBMIT_CL/TFU: number of u32 handles appended in i.data */
+	uint32_t cfg[7];           /* SUBMIT_CSD: the 7 CSD_QUEUED_CFG0..6 dispatch words */
 } v3d_rpc_req_t;
 
 

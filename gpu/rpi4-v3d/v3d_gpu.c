@@ -62,11 +62,27 @@
 #define MMU_CTL_CAPEXC_INT      (1u<<25)
 #define MMUC_CONTROL        0x1000u
 #define MMUC_ENABLE         (1u<<0)
+#define MMUC_FLUSH          (1u<<1)    /* flush the MMU PTE cache */
+#define MMUC_FLUSHING       (1u<<2)    /* set while the PTE-cache flush is in progress */
+#define MMU_CTL_TLB_CLEAR   (1u<<2)    /* clear the MMU TLB */
+#define MMU_CTL_TLB_CLEARING (1u<<7)   /* set while the TLB clear is in progress */
 #define MMU_ILLEGAL_ADDR    0x1230u
 #define MMU_ILLEGAL_ENABLE  (1u<<31)
 #define PTE_W               (1u<<29)
 #define PTE_V               (1u<<28)
 #define PAGE_SHIFT          12u
+/* CORE0-relative submit/sync + CSD dispatch (V3D 4.2, ver<71) - see winsys. */
+#define CTL_INT_STS         0x0050u
+#define CTL_INT_CLR         0x0058u
+#define INT_CSDDONE         (1u<<7)   /* compute-shader dispatch done */
+#define CSD_STATUS          0x0900u   /* NUM_COMPLETED[11:4], HAVE_CURRENT(1), HAVE_QUEUED(0) */
+#define CSD_QUEUED_CFG0     0x0904u   /* CFG1..6 follow at +4 each; CFG0 write kicks the job */
+#define CTL_L2TCACTL        0x0030u
+#define L2TCACTL_L2TFLS     (1u<<0)
+#define L2TCACTL_FLM_CLEAN  (2u<<1)    /* FLM field = CLEAN (write back dirty L2T lines to RAM) */
+#define L2TCACTL_TMUWCF     (1u<<8)    /* TMU write-combiner flush (drain partial tiled writes) */
+#define CTL_SLCACTL         0x0024u    /* slices cache control (V3D 4.x) */
+#define SLCACTL_INVAL_ALL   0x0f0f0f0fu /* invalidate TVCCS/TDCCS/UCC(uniform)/ICC(instr) */
 /* CORE0-relative core init regs (see winsys apply_core_regs). */
 #define CTL_L2CACTL         0x0020u    /* general L2 cache control (V3D 4.x) */
 #define L2CACTL_L2CENA      (1u<<0)    /* enable the L2 cache */
@@ -659,4 +675,79 @@ int v3d_gpu_closeBo(uint32_t handle)
 	memset(&gc, 0, sizeof(gc));
 	gc.handle = handle;
 	return ioc_close_bo(&gc);
+}
+
+
+/* ========================================================================= */
+/* CSD (compute) submit - copied verbatim from v3d_phoenix_winsys.c            */
+/* (l2t_flush_wait / mmu_flush_tlb helpers + ioc_submit_csd body). The submit  */
+/* consumes only cfg[0..6]; it never touches the binner, overflow pool or the  */
+/* reset path, so it lifts cleanly ahead of the CL/TFU paths (step 2c).        */
+/* ========================================================================= */
+
+static inline void l2t_flush_wait(volatile uint32_t *c0)
+{
+	uint32_t spins;
+	for (spins = 1000000u; spins && (c0[CTL_L2TCACTL/4] & L2TCACTL_L2TFLS); spins--) {}
+}
+
+/* Flush the MMU PTE cache + clear the TLB (mirror linux v3d_mmu_flush_all): a job
+ * whose BOs were just mapped at new GPU VAs would otherwise be fetched through a
+ * stale TLB. */
+static void mmu_flush_tlb(volatile uint32_t *h)
+{
+	uint32_t spins;
+	h[MMUC_CONTROL/4] = MMUC_FLUSH | MMUC_ENABLE;
+	for (spins = 1000000u; spins && (h[MMUC_CONTROL/4] & MMUC_FLUSHING); spins--) {}
+	h[MMU_CTL/4] |= MMU_CTL_TLB_CLEAR;
+	for (spins = 1000000u; spins && (h[MMU_CTL/4] & MMU_CTL_TLB_CLEARING); spins--) {}
+}
+
+int v3d_gpu_submitCsd(const uint32_t cfg[7])
+{
+	volatile uint32_t *c0 = W.core0;
+	volatile uint32_t *h = W.hub;
+	uint32_t spins, sts = 0, csd_status;
+	int i, timed_out = 0;
+
+	if (!W.inited)
+		return -EIO;
+
+	__asm__ volatile("dsb sy" ::: "memory");
+	c0[CTL_SLCACTL / 4] = SLCACTL_INVAL_ALL;
+	mmu_flush_tlb(h);
+	l2t_flush_wait(c0);
+	c0[CTL_L2TCACTL / 4] = L2TCACTL_L2TFLS;
+	l2t_flush_wait(c0);
+
+	/* Kick: write CFG1..6, then CFG0 (the CFG0 write starts the dispatch). */
+	c0[CTL_INT_CLR / 4] = INT_CSDDONE;
+	for (i = 1; i <= 6; i++)
+		c0[(CSD_QUEUED_CFG0 + 4u * (uint32_t)i) / 4] = cfg[i];
+	c0[CSD_QUEUED_CFG0 / 4] = cfg[0];
+
+	/* Synchronous wait for the dispatch to finish (INT_CSDDONE), like CL/TFU. */
+	for (spins = 8000000u; spins; spins--) {
+		sts = c0[CTL_INT_STS / 4];
+		if (sts & INT_CSDDONE)
+			break;
+	}
+	if (!spins)
+		timed_out = 1;
+	csd_status = c0[CSD_STATUS / 4];
+	c0[CTL_INT_CLR / 4] = INT_CSDDONE;
+
+	/* Write back the compute's dirty L2T lines to DRAM so the output is visible to
+	 * the CPU. Match linux v3d_clean_caches: FIRST drain the TMU write-combiner into
+	 * L2T with TMUWCF *alone*, THEN flush L2T to RAM with L2TFLS + FLM=CLEAN. */
+	l2t_flush_wait(c0);                       /* GFXH-1897: pending L2TFLS must be idle */
+	c0[CTL_L2TCACTL / 4] = L2TCACTL_TMUWCF;   /* drain TMU write-combiner -> L2T */
+	for (spins = 1000000u; spins && (c0[CTL_L2TCACTL / 4] & L2TCACTL_TMUWCF); spins--) {}
+	c0[CTL_L2TCACTL / 4] = L2TCACTL_L2TFLS | L2TCACTL_FLM_CLEAN; /* write dirty L2T -> RAM */
+	l2t_flush_wait(c0);
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	fprintf(stderr, "rpi4-v3d: CSD %s cfg0=0x%08x int_sts=0x%08x status=0x%08x num_completed=%u\n",
+	        timed_out ? "TIMEOUT" : "done", cfg[0], sts, csd_status, (csd_status >> 4) & 0xffu);
+	return 0;
 }
