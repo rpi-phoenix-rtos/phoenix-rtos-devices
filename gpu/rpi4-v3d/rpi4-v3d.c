@@ -15,26 +15,20 @@
  * (exactly how rpi4-vcmbox de-races the single VideoCore mailbox FIFO).
  *
  * ===========================================================================
- * SCAFFOLD INCREMENT (M1 step 1) - IPC + RPC ONLY, NO GPU LOGIC YET.
+ * M1 step 2a - GPU OWNERSHIP + BO LIFECYCLE (submit still stubbed).
  * ===========================================================================
- * This file currently implements the message-port server skeleton and the RPC
- * decode/dispatch only. Every opcode handler is a STUB that logs and returns
- * -ENOSYS. NONE of the GPU bring-up exists yet: no v3d_phoenix_powerOn(), no
- * MMIO map, no MMU page table, no VA allocator, no BO table, no real submit.
+ * main() now takes exclusive ownership of the GPU before serving (v3d_gpu_init:
+ * power-on once, map HUB/CORE0, install the single flat MMU page table + VA
+ * allocator + BO table). The GPU-owning + BO logic lives in v3d_gpu.c, copied
+ * essentially verbatim from the in-process winsys (state struct W, power-on,
+ * apply_core_regs, va_alloc, BO table, ioc_create_bo/ioc_close_bo); this file is
+ * the RPC/message-loop half only. The CREATE_BO / GET_BO_OFFSET / MMAP_BO /
+ * GEM_CLOSE handlers call into v3d_gpu and hand back the BO physical address so
+ * a client can share the BO via mmap(MAP_PHYSMEM).
  *
- * The NEXT increment must (see TODO(v3d-srv-gpu) markers below):
- *   - move the winsys state struct `W`, winsys_init()/apply_core_regs()/power,
- *     va_alloc, the BO table and the ioc_* bodies (ioc_create_bo,
- *     ioc_close_bo, ioc_submit_cl/tfu/csd) from tools/v3d-driver-port/
- *     v3d_phoenix_winsys.c into this server essentially verbatim - they already
- *     ARE the server logic (all state is process-local static today);
- *   - wire the BO physical-address hand-off: CREATE_BO returns pa+gpuva+size,
- *     the client maps the PA with MAP_PHYSMEM;
- *   - decode the submit payload from msg.i.data ([descriptor][bo_handles[]]),
- *     rebind the descriptor's bo_handles pointer to the appended array, and run
- *     the existing synchronous submit.
- * The in-process winsys stays UNTOUCHED and keeps working; this daemon is a
- * separate, opt-in component.
+ * SUBMIT_CL/TFU/CSD stay stubs (return -ENOSYS): step 2b lifts ioc_submit_* and
+ * the wedge reset/overflow servicing. The in-process winsys stays UNTOUCHED and
+ * keeps working; this daemon is a separate, opt-in component.
  *
  * Copyright 2026 Phoenix Systems
  * Author: Witold Bołt
@@ -53,46 +47,46 @@
 #include <posix/utils.h>
 
 #include "v3d_rpc.h"
+#include "v3d_gpu.h"
 
 
 /* ------------------------------------------------------------------------- */
-/* Opcode handlers - STUBS for this increment.                               */
+/* BO-management opcode handlers (M1 step 2a).                               */
 /*                                                                           */
-/* Each logs the decoded request and returns -ENOSYS. The response `err` is  */
-/* set here; the o.raw payload fields (pa/gpuva/handle/size) stay zero until  */
-/* the real GPU logic lands. TODO(v3d-srv-gpu): replace each body with the   */
-/* corresponding winsys ioc_* implementation.                               */
+/* Each decodes the request from msg.i.raw (v3d_rpc_req_t), calls into the   */
+/* GPU-owning core (v3d_gpu.c) and fills the response in msg.o.raw           */
+/* (v3d_rpc_resp_t). resp->err is 0 or a negative errno. SUBMIT_* remain     */
+/* stubs; step 2b lifts the submit path.                                     */
 /* ------------------------------------------------------------------------- */
 
 static void v3d_srv_createBo(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
 {
-	printf("rpi4-v3d: CREATE_BO size=%u flags=0x%x (stub)\n", req->size, req->flags);
-	/* TODO(v3d-srv-gpu): va_alloc + PT map; return {handle, pa, size, gpuva}. */
-	resp->err = -ENOSYS;
+	v3d_gpu_bo_t bo;
+	resp->err = v3d_gpu_createBo(req->size, req->flags, &bo);
+	if (resp->err == 0) {
+		resp->handle = bo.handle;
+		resp->pa = bo.pa;
+		resp->size = bo.size;
+		resp->gpuva = bo.gpuva;
+	}
 }
 
 
 static void v3d_srv_getBoOffset(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
 {
-	printf("rpi4-v3d: GET_BO_OFFSET handle=%u (stub)\n", req->handle);
-	/* TODO(v3d-srv-gpu): look up the BO; return its gpuva. */
-	resp->err = -ENOSYS;
+	resp->err = v3d_gpu_getBoOffset(req->handle, &resp->gpuva);
 }
 
 
 static void v3d_srv_mmapBo(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
 {
-	printf("rpi4-v3d: MMAP_BO handle=%u (stub)\n", req->handle);
-	/* TODO(v3d-srv-gpu): look up the BO; return its pa + size for MAP_PHYSMEM. */
-	resp->err = -ENOSYS;
+	resp->err = v3d_gpu_mmapBo(req->handle, &resp->pa, &resp->size);
 }
 
 
 static void v3d_srv_gemClose(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
 {
-	printf("rpi4-v3d: GEM_CLOSE handle=%u (stub)\n", req->handle);
-	/* TODO(v3d-srv-gpu): free the BO slot + reclaim its GPU-VA range. */
-	resp->err = -ENOSYS;
+	resp->err = v3d_gpu_closeBo(req->handle);
 }
 
 
@@ -198,14 +192,19 @@ int main(int argc, char **argv)
 {
 	uint32_t port;
 	oid_t dev;
+	int rc;
 
 	(void)argc;
 	(void)argv;
 
-	/* TODO(v3d-srv-gpu): before serving, take exclusive ownership of the GPU:
-	 * v3d_phoenix_powerOn() once, map HUB/CORE0, allocate + install the single
-	 * MMU flat page table, init the GPU-VA allocator and BO table. Fail loud if
-	 * any step fails - a half-owned GPU must not start accepting clients. */
+	/* Take exclusive ownership of the GPU BEFORE serving: power-on once, map
+	 * HUB/CORE0, install the single MMU flat page table, arm the GPU-VA allocator
+	 * and BO table. Fail loud - a half-owned GPU must not start accepting clients. */
+	rc = v3d_gpu_init();
+	if (rc != 0) {
+		printf("rpi4-v3d: GPU init failed (%d); refusing to serve\n", rc);
+		return 3;
+	}
 
 	if (portCreate(&port) != EOK) {
 		printf("rpi4-v3d: portCreate failed\n");
@@ -219,7 +218,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	printf("rpi4-v3d: registered /dev/%s (RPC scaffold; GPU logic not yet wired)\n",
+	printf("rpi4-v3d: registered /dev/%s (GPU owned; BO management live, submit stubbed)\n",
 		V3D_RPC_DEV_NAME);
 
 	v3d_srv_thread(port);
