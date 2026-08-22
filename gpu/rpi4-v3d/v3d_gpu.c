@@ -573,6 +573,23 @@ int v3d_gpu_init(void)
 		}
 	}
 
+	/* PT-PERSISTENCE PROBE (TODO(v3d-pt-probe): remove after the open 2c-server
+	 * question is answered). 2b/2c-server saw fresh client VAs read garbage PTEs on HW
+	 * despite the init full-PT zero loop provably covering them ("init clear did not
+	 * survive to first use"). va_alloc now clears the ALLOCATED range at hand-out, but
+	 * whether the ~57k UNALLOCATED entries persist as 0 is load-bearing for CL's MMU
+	 * fault net. Log a few unallocated slots (at/above next_gpuva) right before serving:
+	 * all-zero => the init zero persists (fault net intact); non-zero => full-PT-zero
+	 * persistence, not just at-hand-out clearing, is the real fix. */
+	{
+		uint32_t base = W.next_gpuva >> PAGE_SHIFT;
+		uint32_t probe[4] = { base, base + 16u, base + 0x1000u, GPUVA_PT_ENTRIES - 1u };
+		fprintf(stderr, "rpi4-v3d: PT-PROBE unallocated slots (expect 0): "
+			"[%u]=0x%08x [%u]=0x%08x [%u]=0x%08x [%u]=0x%08x\n",
+			probe[0], W.pt[probe[0]], probe[1], W.pt[probe[1]],
+			probe[2], W.pt[probe[2]], probe[3], W.pt[probe[3]]);
+	}
+
 	W.inited = 1;
 	return 0;
 }
@@ -1113,16 +1130,37 @@ static int ioc_submit_tfu(struct drm_v3d_submit_tfu *t)
 
 int v3d_gpu_submitCl(const struct drm_v3d_submit_cl *s)
 {
+	int rc;
+	static unsigned cl_n = 0;
+
 	if (!W.inited)
 		return -EIO;
 	/* ioc_submit_cl only reads the descriptor; the cast drops const to keep its
 	 * verbatim (non-const) winsys signature. */
-	return ioc_submit_cl((struct drm_v3d_submit_cl *)s);
+	rc = ioc_submit_cl((struct drm_v3d_submit_cl *)s);
+	/* Bounded positive confirmation on the server UART that a render CL actually ran
+	 * through the daemon (ioc_submit_cl is silent on success; it only logs on a wedge).
+	 * First few only, so a real per-frame workload doesn't flood the log. */
+	if (cl_n < 8u) {
+		cl_n++;
+		fprintf(stderr, "rpi4-v3d: CL submit #%u done bcl=0x%08x..0x%08x rcl=0x%08x..0x%08x rc=%d\n",
+			cl_n, s->bcl_start, s->bcl_end, s->rcl_start, s->rcl_end, rc);
+	}
+	return rc;
 }
 
 int v3d_gpu_submitTfu(const struct drm_v3d_submit_tfu *t)
 {
+	int rc;
+	static unsigned tfu_n = 0;
+
 	if (!W.inited)
 		return -EIO;
-	return ioc_submit_tfu((struct drm_v3d_submit_tfu *)t);
+	rc = ioc_submit_tfu((struct drm_v3d_submit_tfu *)t);
+	if (tfu_n < 8u) {
+		tfu_n++;
+		fprintf(stderr, "rpi4-v3d: TFU submit #%u done iia=0x%08x ioa=0x%08x ios=0x%08x rc=%d\n",
+			tfu_n, t->iia, t->ioa, t->ios, rc);
+	}
+	return rc;
 }
