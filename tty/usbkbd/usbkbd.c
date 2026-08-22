@@ -876,7 +876,8 @@ static int usbkbd_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, u
 
 	event->deviceCreated = true;
 	event->dev = oid;
-	strncpy(event->devPath, dev->path, sizeof(event->devPath));
+	strncpy(event->devPath, dev->path, sizeof(event->devPath) - 1);
+	event->devPath[sizeof(event->devPath) - 1] = '\0';
 
 	return EOK;
 }
