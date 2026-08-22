@@ -41,6 +41,16 @@ DEFAULT_COMPONENTS += rpi4-audio
 # Boot system-info banner: build stamp, uptime, a hardware-RNG entropy sample, and a
 # Pi 4 device-node inventory. Bounded/non-blocking (stat/getentropy/clock); "alive" touch.
 DEFAULT_COMPONENTS += rpi4-sysinfo
+# Concurrent-GPU V3D server (/dev/v3d-srv): sole owner of the single V3D GPU
+# (power + MMU page table + VA allocator + BO table), serializing GPU submits from
+# multiple clients over a message port so an accelerated X desktop and a second GPU
+# app can run at once (HW-proven end-to-end, docs/inprogress/2026-08-22-concurrent-
+# gpu-v3d-server-feasibility.md). Built as a first-class component here; the client
+# lib (libv3d-client) is consumed by daemon-client apps. NOT auto-launched from
+# user.plo.yaml yet: launching it takes exclusive GPU ownership, which conflicts with
+# the current in-process-winsys GPU apps (Xphoenix-glamor, quakes). Auto-start lands
+# together with daemon-client builds of those apps (productization follow-on).
+DEFAULT_COMPONENTS += rpi4-v3d
 # Kernel-log capture daemon (task #31): reads the klog ring and appends it to
 # /var/log/messages. Always bundled (a few KB); only LAUNCHED in the USER logging
 # mode (RPI4_LOG_TO_FILE), where it is the file-capture half of suppressing the
