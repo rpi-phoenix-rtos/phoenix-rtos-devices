@@ -96,6 +96,50 @@
 #define MISCCFG_OVRTMUOUT   (1u<<0)
 #define MISCCFG_QRMAXCNT_SHIFT 1u    /* QRMAXCNT = MISCCFG bits 3:1 (QPU reserve bin-vs-render split) */
 #define V3D_QRMAXCNT        (2)
+/* CL (render) submit: CT0 (bin) / CT1 (render) queue regs + binner overflow, CORE0-relative. */
+#define INT_FRDONE          (1u<<0)
+#define INT_FLDONE          (1u<<1)
+#define INT_OUTOMEM         (1u<<2)   /* binner exhausted its tile-allocation pool */
+#define CLE_CT0QTS          0x015cu
+#define CT0QTS_ENABLE       (1u<<1)
+#define CLE_CT0QBA          0x0160u
+#define CLE_CT1QBA          0x0164u
+#define CLE_CT0QEA          0x0168u
+#define CLE_CT1QEA          0x016cu
+#define CLE_CT0QMA          0x0170u
+#define CLE_CT0QMS          0x0174u
+#define PTB_BPCA            0x0300u   /* binner primitive-list current address */
+#define PTB_BPCS            0x0304u   /* binner primitive-list current status */
+#define PTB_BPOA            0x0308u   /* binner pool overflow address (GPU VA) */
+#define PTB_BPOS            0x030cu   /* binner pool overflow size (bytes) */
+/* GMP (global memory protection) - used by the AXI drain in the reset path. */
+#define GMP_STATUS          0x0800u
+#define GMP_CFG             0x0804u
+#define GMP_CFG_STOP_REQ    (1u<<1)   /* request the GMP to quiesce outstanding AXI transactions */
+#define GMP_STATUS_RD_WR_CNT 0x7f7f0000u /* RD_COUNT(22:16)|WR_COUNT(30:24) - nonzero = txns in flight */
+#define GMP_STATUS_CFG_BUSY (1u<<3)
+/* HUB interrupt status/clear + TFU (HUB block; h[] not c0[]). TFU raises HUB_INT bit1. */
+#define HUB_INT_STS         0x0050u
+#define HUB_INT_CLR         0x0058u
+#define HUB_INT_MSK_STS     0x005cu   /* mask status (diagnostic only; STS is raw) */
+#define HUB_INT_TFUC        (1u<<1)   /* TFU conversion complete */
+#define HUB_INT_TFUF        (1u<<0)   /* TFU conversion failed */
+/* Texture Formatting Unit (HUB block, V3D 4.2 / ver<71) - see winsys / linux v3d_tfu_job_run. */
+#define TFU_CS              0x0400u   /* control/status: bit0 BUSY */
+#define TFU_CS_BUSY         (1u<<0)
+#define TFU_ICFG            0x0408u   /* input config (format/tiling/ttype/opad); write kicks */
+#define TFU_ICFG_IOC        (1u<<0)   /* raise the done interrupt when the job completes */
+#define TFU_IIA             0x040cu   /* input image address (GPU VA) */
+#define TFU_ICA             0x0410u   /* input chroma address (GPU VA; 0 for non-planar) */
+#define TFU_IIS             0x0414u   /* input image stride */
+#define TFU_IUA             0x0418u   /* input u-plane address (GPU VA; 0 for non-planar) */
+#define TFU_IOA             0x041cu   /* output image address (GPU VA) + dest tiling format */
+#define TFU_IOS             0x0420u   /* output image size: (height<<16)|width */
+#define TFU_COEF0           0x0424u   /* YUV coefficient 0 (bit31 USECOEF gates COEF1..3) */
+#define TFU_COEF0_USECOEF   (1u<<31)
+#define TFU_COEF1           0x0428u
+#define TFU_COEF2           0x042cu
+#define TFU_COEF3           0x0430u
 
 /* Binner tile-allocation overflow/spill pool. Pre-allocated at init to match the
  * winsys winsys_init ordering exactly (it maps this pool into the flat MMU right
@@ -275,6 +319,20 @@ static int asbEnable(volatile uint32_t *asb, uint32_t reg)
 	return -1;
 }
 
+/* Stop a V3D async-AXI bridge (set REQ_STOP, wait for ACK) - the power-off direction,
+ * mirror of asbEnable. Used by v3d_gpu_reset to quiesce the bridges before reset. */
+static int asbStop(volatile uint32_t *asb, uint32_t reg)
+{
+	uint32_t val = asb[reg / 4] | ASB_REQ_STOP;
+	uint32_t spins;
+	asb[reg / 4] = PM_PASSWORD | val;
+	for (spins = ASB_ACK_SPINS; spins != 0u; spins--) {
+		if ((asb[reg / 4] & ASB_ACK) != 0u)
+			return 0;
+	}
+	return -1;
+}
+
 /* Full HW-proven V3D power-on. Returns 0 on success (both ASB bridges ACK). */
 static int v3d_gpu_powerOn(void)
 {
@@ -320,6 +378,41 @@ static int v3d_gpu_powerOn(void)
 	return (rcM == 0 && rcS == 0) ? 0 : -1;
 }
 
+/* TRUE V3D reset cycle (copied from v3d_phoenix_power.c:v3d_phoenix_reset): quiesce the
+ * AXI bridges, assert PM_V3DRSTN (hold the V3D in reset), then power back on. Used by the
+ * CL wedge-recovery path (reset_reinit_core). Returns 0 on success. */
+static int v3d_gpu_reset(void)
+{
+	volatile uint32_t *pm, *asb;
+	void *pm_page, *asb_page;
+	uint32_t grafx;
+
+	pm_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (addr_t)PM_BASE);
+	if (pm_page == MAP_FAILED)
+		return -1;
+	pm = (volatile uint32_t *)pm_page;
+	asb_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (addr_t)RPIVID_ASB_BASE);
+	if (asb_page == MAP_FAILED) {
+		munmap(pm_page, _PAGE_SIZE);
+		return -1;
+	}
+	asb = (volatile uint32_t *)asb_page;
+
+	(void)asbStop(asb, ASB_V3D_M_CTRL);
+	(void)asbStop(asb, ASB_V3D_S_CTRL);
+	grafx = pm[PM_GRAFX / 4];
+	pm[PM_GRAFX / 4] = PM_PASSWORD | (grafx & ~PM_V3DRSTN);   /* assert reset (hold in reset) */
+	usleep(100);
+
+	munmap(asb_page, _PAGE_SIZE);
+	munmap(pm_page, _PAGE_SIZE);
+
+	/* power back on (clock toggle + RSTN deassert + ASB enable) */
+	return v3d_gpu_powerOn();
+}
+
 
 /* ========================================================================= */
 /* GPU-VA allocator + BO table - copied verbatim from v3d_phoenix_winsys.c.    */
@@ -356,6 +449,19 @@ static uint32_t va_alloc(uint32_t pages)
 		return 0;   /* window exhausted */
 	uint32_t va = W.next_gpuva;
 	W.next_gpuva += pages * _PAGE_SIZE;
+	/* DAEMON-SPECIFIC (diverges from the in-process winsys): clear the PTEs of this
+	 * freshly bump-allocated range before returning. On HW the daemon's PT-backing
+	 * DRAM was observed NON-zero at first-ever-used client VAs (the 2b run logged
+	 * false "VA COLLISION" at 0x2100000+ with garbage PTEs, unlike the in-process
+	 * winsys which reads them zero) - i.e. the one-time init clear did not survive
+	 * to first use in the standalone server process. Clearing the exact range at
+	 * hand-out, immediately before the caller's collision check + PTE writes,
+	 * guarantees a never-before-used VA always presents invalid PTEs. The hole-reuse
+	 * path above needs no clear: va_free() already zeroed those PTEs. This makes the
+	 * collision detector report only genuine live-BO overlaps and ensures the binner
+	 * can never fetch a stale PTE for a freshly-mapped tile-list/overflow BO. */
+	for (uint32_t i = 0; i < pages; i++)
+		W.pt[(va >> PAGE_SHIFT) + i] = 0;
 	return va;
 }
 
@@ -750,4 +856,273 @@ int v3d_gpu_submitCsd(const uint32_t cfg[7])
 	fprintf(stderr, "rpi4-v3d: CSD %s cfg0=0x%08x int_sts=0x%08x status=0x%08x num_completed=%u\n",
 	        timed_out ? "TIMEOUT" : "done", cfg[0], sts, csd_status, (csd_status >> 4) & 0xffu);
 	return 0;
+}
+
+
+/* ========================================================================= */
+/* CL (render) + TFU submit - copied from v3d_phoenix_winsys.c (step 2c).      */
+/*                                                                             */
+/* The register/flush/kick/wait sequences (incl. binner OUT-OF-MEMORY          */
+/* servicing from the persistent overflow pool, the bin->render coherency      */
+/* handoff, and the wedge true-reset mitigation) are lifted VERBATIM. Only the */
+/* post-wedge diagnostic DUMP sub-blocks that depended on the winsys           */
+/* gpuva_describe / gpuva_to_cpu / bincrc helpers (and the #ifdef VKQ_CPU_TILE */
+/* discriminator + the gated TFU striping probe) were trimmed - they run only  */
+/* after a wedge/on a debug env and never touch the MMIO sequence, so removing  */
+/* them keeps the delicate register path byte-identical while dropping a large  */
+/* diagnostic cluster (and its Mesa-free-but-verbose helpers) from the server. */
+/* The register-only wedge one-liners (int_sts/ct0ca/ct1ca/gmp/mmu_ill/PTB/    */
+/* fdbg) are kept.                                                             */
+/* ========================================================================= */
+
+/* Wedge counters (verbatim names; file-static here - no external harness reads them
+ * in the server). render_timeouts counts CT1 spin-timeouts; render_recoveries counts
+ * true-reset recoveries. */
+static volatile unsigned v3d_phoenix_render_timeouts = 0;
+static volatile unsigned v3d_phoenix_render_recoveries = 0;
+
+/* Best-effort safe AXI drain before a reset: ask the GMP to quiesce any outstanding
+ * transaction (mirror linux v3d_idle_axi). Bounded spin. */
+static void idle_axi(volatile uint32_t *c0)
+{
+	uint32_t spins;
+	c0[GMP_CFG/4] = GMP_CFG_STOP_REQ;
+	for (spins = 1000000u; spins; spins--) {
+		if ((c0[GMP_STATUS/4] & (GMP_STATUS_RD_WR_CNT | GMP_STATUS_CFG_BUSY)) == 0u)
+			break;
+	}
+}
+
+/* Reset the V3D and re-establish core register state (drain GMP, true reset, re-apply
+ * core regs over the surviving page table), so the caller can proceed with the next
+ * job. Mirrors v3d_phoenix_winsys.c:reset_reinit_core. */
+static void reset_reinit_core(void)
+{
+	if (W.core0)
+		idle_axi(W.core0);
+	(void)v3d_gpu_reset();
+	apply_core_regs();
+}
+
+static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
+{
+	volatile uint32_t *c0 = W.core0;
+	volatile uint32_t *h = W.hub;
+	uint32_t spins;
+	int job_failed = 0;     /* set if bin or render wedged */
+	int attempt = 0;        /* kept for the timeout-dump "attempt" field (always 0 now: no resubmit) */
+	W.binovf_used = 0;      /* re-armable binner overflow: reset the per-job hand-out cursor */
+	/* Drain CPU stores into uncached GPU BOs to DRAM BEFORE the first GPU MMIO poke below
+	 * (aarch64 Normal-NC vs Device ordering); MUST be dsb (completion), not dmb - the V3D is a
+	 * non-coherent external DMA master reading these BOs straight from DRAM. */
+	__asm__ volatile("dsb sy" ::: "memory");
+	/* #67 ORDERING FIX: issue the fire-and-forget SLCACTL slice-cache invalidate as EARLY as
+	 * possible so the subsequent spin-waits become free settle latency before the CT0 kick. */
+	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;
+	/* Flush the MMU PTE cache + TLB before the job (fresh PTEs from ioc_create_bo). */
+	mmu_flush_tlb(h);
+	/* L2T flush (clean+invalidate) then the SLCACTL slice invalidate already issued above -
+	 * outside-in order matching linux v3d_invalidate_caches. */
+	l2t_flush_wait(c0);                       /* wait-old: prior L2T flush must be idle first */
+	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS;
+	l2t_flush_wait(c0);                       /* wait-new: flush must complete before the bin reads its CL/vertex data */
+	/* "fix-A": an extra waited-L2T-flush before the CT0 kick - provides timing margin that
+	 * suppresses a separate binner->render tile-list wedge (removal regressed on HW). KEEP. */
+	l2t_flush_wait(c0);
+	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS;
+	l2t_flush_wait(c0);
+	/* --- bin (CT0); wait FLDONE --- */
+	c0[CTL_INT_CLR/4] = INT_FLDONE|INT_FRDONE;
+	c0[PTB_BPOS/4] = 0;
+	if (s->qma) { c0[CLE_CT0QMA/4]=s->qma; c0[CLE_CT0QMS/4]=s->qms; }
+	if (s->qts) { c0[CLE_CT0QTS/4]=CT0QTS_ENABLE|s->qts; }
+	c0[CLE_CT0QBA/4]=s->bcl_start; c0[CLE_CT0QEA/4]=s->bcl_end;
+	/* Wait for bin done, servicing binner OUT-OF-MEMORY from the persistent overflow pool. */
+	{
+		int ovf_armed = 0;
+		uint32_t sts;
+		uint32_t last_ca = c0[0x0110/4];   /* ct0ca - frozen = binner wedged (fast wedge detect) */
+		unsigned frozen = 0;
+		for (spins=8000000u; spins; spins--) {
+			sts = c0[CTL_INT_STS/4];
+			if (sts & INT_FLDONE) break;
+			/* Re-armable overflow servicer: hand successive chunks of the persistent pool on each
+			 * OUTOMEM until it is exhausted (OUTOMEM is edge-signalled, so clear it after each). */
+			if ((sts & INT_OUTOMEM) && W.binovf_gpuva) {
+				if (W.binovf_used < W.binovf_bytes) {
+					uint32_t chunk = W.binovf_bytes - W.binovf_used;
+					if (chunk > BINOVF_CHUNK_BYTES) chunk = BINOVF_CHUNK_BYTES;
+					c0[PTB_BPOA/4] = W.binovf_gpuva + W.binovf_used;
+					c0[PTB_BPOS/4] = chunk;
+					c0[CTL_INT_CLR/4] = INT_OUTOMEM;
+					W.binovf_used += chunk;
+					ovf_armed = 1;
+					frozen = 0; last_ca = c0[0x0110/4];   /* binner just re-armed; restart frozen window */
+				}
+				else if (ovf_armed != 2) {
+					ovf_armed = 2;   /* pool exhausted - record once; binner will wedge */
+					fprintf(stderr, "rpi4-v3d: binner overflow pool EXHAUSTED (%u KiB) - grow BINOVF_PAGES\n",
+						W.binovf_bytes / 1024u);
+				}
+			}
+			if ((spins & 0xfffffu) == 0u) {            /* sample ct0ca ~every 1M spins (~160 ms) */
+				uint32_t ca = c0[0x0110/4];
+				if (ca == last_ca) {
+					if (++frozen >= 5u) { spins = 0; break; }   /* frozen ~0.8 s -> wedged */
+				}
+				else { frozen = 0; last_ca = ca; }
+			}
+		}
+		if (spins == 0) {
+			job_failed = 1;
+			fprintf(stderr, "rpi4-v3d: BIN TIMEOUT int_sts=0x%08x ct0cs=0x%08x "
+				"ct0ca=0x%08x[%x..%x] gmp=0x%08x gmpvio=0x%08x mmu_ill=0x%08x ovf_armed=%d (attempt %d)\n",
+				c0[CTL_INT_STS/4], c0[0x0100/4], c0[0x0110/4], s->bcl_start, s->bcl_end,
+				c0[GMP_STATUS/4], c0[0x0808/4], W.hub[MMU_ILLEGAL_ADDR/4], ovf_armed, attempt);
+			fprintf(stderr, "rpi4-v3d: BIN PTB bpca=0x%08x bpcs=0x%08x bpoa=0x%08x bpos=0x%08x "
+				"hub_axicfg=0x%08x int_qpu=0x%03x\n",
+				c0[PTB_BPCA/4], c0[PTB_BPCS/4], c0[PTB_BPOA/4], c0[PTB_BPOS/4],
+				W.hub[HUB_AXICFG/4], (c0[CTL_INT_STS/4] >> 16) & 0xfffu);
+		}
+	}
+	/* If the binner wedged, don't kick the render against a bad tile state - reset+retry. */
+	if (job_failed)
+		goto job_retry;
+	c0[CTL_INT_CLR/4]=INT_FLDONE|INT_FRDONE;
+	/* Bin->render coherency handoff: clean + WAIT (binner tile-list output to RAM), then
+	 * invalidate the render-side slice caches, then kick CT1. */
+	l2t_flush_wait(c0);                       /* wait-old: any prior L2T flush must be idle */
+	c0[CTL_L2TCACTL/4]=L2TCACTL_L2TFLS;       /* clean the binner's tile-list output to RAM */
+	l2t_flush_wait(c0);                       /* wait-new: it must COMPLETE before CT1 fetches */
+	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;    /* then drop stale render-side slice-cache lines */
+	/* --- render (CT1); wait FRDONE --- */
+	c0[CLE_CT1QBA/4]=s->rcl_start; c0[CLE_CT1QEA/4]=s->rcl_end;
+	{
+		uint32_t last_ca = c0[0x0114/4];
+		unsigned frozen = 0;
+		for (spins = 16000000u; spins; spins--) {
+			if (c0[CTL_INT_STS/4] & INT_FRDONE)
+				break;                                  /* render done */
+			if ((spins & 0xfffffu) == 0u) {             /* sample ct1ca ~every 1M spins (~160 ms) */
+				uint32_t ca = c0[0x0114/4];
+				if (ca == last_ca) {
+					if (++frozen >= 5u) { spins = 0; break; }   /* frozen ~0.8 s -> wedged */
+				}
+				else { frozen = 0; last_ca = ca; }
+			}
+		}
+	}
+	if (spins == 0) {
+		uint32_t ca1 = c0[0x0114/4];
+		v3d_phoenix_render_timeouts++;   /* stall counter */
+		job_failed = 1;
+		fprintf(stderr, "rpi4-v3d: RENDER TIMEOUT int_sts=0x%08x ct1cs=0x%08x "
+			"ct1ca=0x%08x[%x..%x] ct1ea=0x%08x gmp=0x%08x gmpvio=0x%08x mmu_ill=0x%08x\n",
+			c0[CTL_INT_STS/4], c0[0x0104/4], ca1, s->rcl_start, s->rcl_end,
+			c0[0x010c/4], c0[0x0800/4], c0[0x0808/4], W.hub[MMU_ILLEGAL_ADDR/4]);
+		/* V3D error-debug registers localize the wedged render pipeline stage. */
+		fprintf(stderr, "rpi4-v3d: RENDER DBG fdbgo=0x%08x fdbgs=0x%08x errstat=0x%08x "
+			"ct1ca recheck=0x%08x\n",
+			c0[0x0f04/4], c0[0x0f10/4], c0[0x0f20/4], c0[0x0114/4]);
+	}
+job_retry:
+	/* MITIGATION. The wedge is DATA-dependent (re-submitting the same frame re-hangs across
+	 * true resets, HW-confirmed), so do NOT re-submit: do ONE true reset to clean the core for
+	 * the next (different) frame and DROP this frame. */
+	if (job_failed) {
+		v3d_phoenix_render_recoveries++;
+		fprintf(stderr, "rpi4-v3d: GPU wedged - true reset + drop this frame "
+			"(mitigation; drops=%u).\n", v3d_phoenix_render_recoveries);
+		reset_reinit_core();   /* clean the wedged core so the next (different) frame renders */
+		(void)attempt;
+	}
+	/* L2T flush so RT stores reach RAM before CPU readback (scout finding). */
+	l2t_flush_wait(c0);                       /* GFXH-1897: render flush must complete first */
+	c0[CTL_L2TCACTL/4]=L2TCACTL_L2TFLS|L2TCACTL_FLM_CLEAN;
+	return 0;
+}
+
+static int ioc_submit_tfu(struct drm_v3d_submit_tfu *t)
+{
+	volatile uint32_t *c0 = W.core0;
+	volatile uint32_t *h = W.hub;
+	uint32_t spins;
+
+	/* --- prologue: make the source coherent + translations fresh (mirror the CL pre-bin
+	 * sequence): flush MMU TLB, invalidate slice caches, flush L2T + WAIT. --- */
+	mmu_flush_tlb(h);
+	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;
+	l2t_flush_wait(c0);                        /* prior L2T flush must be idle (GFXH-1897) */
+	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS;
+	l2t_flush_wait(c0);                        /* and complete before the TFU reads source */
+
+	/* Clear any stale TFU done/fail latch so our post-kick poll sees only this job. */
+	h[HUB_INT_CLR/4] = HUB_INT_TFUC | HUB_INT_TFUF;
+
+	/* --- kick: program the TFU regs (ICFG last, with IOC). Verbatim from v3d_tfu_job_run. --- */
+	h[TFU_IIA/4]  = t->iia;
+	h[TFU_IIS/4]  = t->iis;
+	h[TFU_ICA/4]  = t->ica;
+	h[TFU_IUA/4]  = t->iua;
+	h[TFU_IOA/4]  = t->ioa;
+	h[TFU_IOS/4]  = t->ios;
+	h[TFU_COEF0/4] = t->coef[0];
+	if (t->coef[0] & TFU_COEF0_USECOEF) {      /* YUV: COEF1..3 valid only when USECOEF set */
+		h[TFU_COEF1/4] = t->coef[1];
+		h[TFU_COEF2/4] = t->coef[2];
+		h[TFU_COEF3/4] = t->coef[3];
+	}
+	h[TFU_ICFG/4] = t->icfg | TFU_ICFG_IOC;    /* this write starts the job */
+
+	/* --- wait for done. Primary: HUB_INT TFUC/TFUF (sticky, raw STS). Fallback: CS BUSY
+	 * clearing AFTER we observed it set (mask-independent). Bounded spin. --- */
+	{
+		int saw_busy = 0;
+		for (spins = 8000000u; spins; spins--) {
+			if (h[HUB_INT_STS/4] & (HUB_INT_TFUC | HUB_INT_TFUF))
+				break;
+			uint32_t cs = h[TFU_CS/4];
+			if (cs & TFU_CS_BUSY) saw_busy = 1;
+			else if (saw_busy) break;   /* completed (mask-independent fallback) */
+		}
+	}
+	{
+		uint32_t isr = h[HUB_INT_STS/4];
+		int failed = (spins == 0) || (isr & HUB_INT_TFUF);
+		h[HUB_INT_CLR/4] = HUB_INT_TFUC | HUB_INT_TFUF;
+		if (failed) {
+			fprintf(stderr, "rpi4-v3d: TFU TIMEOUT/FAIL hub_int=0x%08x mskts=0x%08x cs=0x%08x "
+				"iia=0x%08x ioa=0x%08x ios=0x%08x icfg=0x%08x\n",
+				isr, h[HUB_INT_MSK_STS/4], h[TFU_CS/4], t->iia, t->ioa, t->ios, t->icfg);
+			/* Don't abort the client - return success so rendering proceeds (a failed upload
+			 * leaves the image zero, same as before, just visible in the log). */
+		}
+	}
+
+	/* --- epilogue: make the TFU-written tiled image visible to the TMU. Mirror linux
+	 * v3d_clean_caches EXACTLY: wait any in-flight L2T flush (GFXH-1897), TMU write-combiner
+	 * flush + WAIT, L2T clean + WAIT, then slice invalidate. --- */
+	l2t_flush_wait(c0);                                  /* GFXH-1897: any prior L2T flush idle */
+	c0[CTL_L2TCACTL/4] = L2TCACTL_TMUWCF;                /* drain the TMU write combiner... */
+	for (spins = 1000000u; spins && (c0[CTL_L2TCACTL/4] & L2TCACTL_TMUWCF); spins--) {}  /* ...and wait */
+	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS | L2TCACTL_FLM_CLEAN;   /* write back dirty L2T lines... */
+	l2t_flush_wait(c0);                                  /* ...and wait for the clean to complete */
+	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;              /* drop stale read-only slice/TMU cache view */
+	return 0;
+}
+
+int v3d_gpu_submitCl(const struct drm_v3d_submit_cl *s)
+{
+	if (!W.inited)
+		return -EIO;
+	/* ioc_submit_cl only reads the descriptor; the cast drops const to keep its
+	 * verbatim (non-const) winsys signature. */
+	return ioc_submit_cl((struct drm_v3d_submit_cl *)s);
+}
+
+int v3d_gpu_submitTfu(const struct drm_v3d_submit_tfu *t)
+{
+	if (!W.inited)
+		return -EIO;
+	return ioc_submit_tfu((struct drm_v3d_submit_tfu *)t);
 }

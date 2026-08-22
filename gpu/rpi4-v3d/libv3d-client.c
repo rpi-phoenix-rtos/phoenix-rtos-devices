@@ -368,14 +368,15 @@ int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
 			return 0;
 		}
 		case DRM_V3D_SUBMIT_CL: {
+			/* Forward only the descriptor (i.data); NO bo_handle array. The server's
+			 * synchronous submit consumes the descriptor's baked GPU-VA scalars
+			 * (bcl/rcl start/end, qma/qms/qts) and never dereferences bo_handles. */
 			struct drm_v3d_submit_cl *s = arg;
-			return v3d_cli_submit(V3D_RPC_SUBMIT_CL, s, sizeof(*s),
-				(const uint32_t *)(uintptr_t)s->bo_handles, s->bo_handle_count);
+			return v3d_cli_submit(V3D_RPC_SUBMIT_CL, s, sizeof(*s), NULL, 0);
 		}
 		case DRM_V3D_SUBMIT_TFU: {
-			/* TFU handles are an inline bo_handles[4] in the descriptor itself, so
-			 * no separate handle array is appended (count = 0); the server reads
-			 * them from its copy of the descriptor. */
+			/* TFU addresses are baked into the descriptor's iia/ica/iua/ioa regs, so no
+			 * separate handle array is appended (count = 0). */
 			struct drm_v3d_submit_tfu *t = arg;
 			return v3d_cli_submit(V3D_RPC_SUBMIT_TFU, t, sizeof(*t), NULL, 0);
 		}

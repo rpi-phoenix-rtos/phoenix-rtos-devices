@@ -15,22 +15,23 @@
  * (exactly how rpi4-vcmbox de-races the single VideoCore mailbox FIFO).
  *
  * ===========================================================================
- * M1 step 2a+2b - GPU OWNERSHIP + BO LIFECYCLE + CSD (compute) SUBMIT.
+ * M1 step 2a+2b+2c - GPU OWNERSHIP + BO LIFECYCLE + FULL SUBMIT (CSD/CL/TFU).
  * ===========================================================================
  * main() takes exclusive ownership of the GPU before serving (v3d_gpu_init:
  * power-on once, map HUB/CORE0, install the single flat MMU page table + VA
- * allocator + BO table). The GPU-owning + BO + CSD logic lives in v3d_gpu.c,
+ * allocator + BO table). The GPU-owning + BO + submit logic lives in v3d_gpu.c,
  * copied essentially verbatim from the in-process winsys (state struct W,
- * power-on, apply_core_regs, va_alloc, BO table, ioc_create_bo/ioc_close_bo, and
- * ioc_submit_csd + its cache-flush helpers); this file is the RPC/message-loop
- * half only. CREATE_BO / GET_BO_OFFSET / MMAP_BO / GEM_CLOSE hand back the BO
- * physical address so a client can share the BO via mmap(MAP_PHYSMEM); SUBMIT_CSD
- * forwards the 7 dispatch words in msg.i.raw and runs the synchronous dispatch.
+ * power-on/reset, apply_core_regs, va_alloc, BO table, ioc_create_bo/close, and
+ * ioc_submit_csd/cl/tfu + their cache-flush + binner-overflow + wedge-reset
+ * helpers); this file is the RPC/message-loop half only. CREATE_BO /
+ * GET_BO_OFFSET / MMAP_BO / GEM_CLOSE hand back the BO physical address so a
+ * client can share the BO via mmap(MAP_PHYSMEM). SUBMIT_CSD forwards the 7
+ * dispatch words in msg.i.raw; SUBMIT_CL/TFU forward the (larger) drm_v3d_submit_*
+ * descriptor in msg.i.data - no bo_handle array (the synchronous submit consumes
+ * only the descriptor's baked GPU-VA scalars, never the handles).
  *
- * SUBMIT_CL/TFU stay stubs (return -ENOSYS): step 2c lifts the binner + CL/TFU
- * paths and their [descriptor][bo_handles[]] i.data marshaling. The in-process
- * winsys stays UNTOUCHED and keeps working; this daemon is a separate, opt-in
- * component.
+ * The in-process winsys stays UNTOUCHED and keeps working; this daemon is a
+ * separate, opt-in component.
  *
  * Copyright 2026 Phoenix Systems
  * Author: Witold Bołt
@@ -48,6 +49,9 @@
 #include <sys/types.h>
 #include <posix/utils.h>
 
+#include <string.h>
+
+#include "v3d_drm.h"   /* vendored UAPI: drm_v3d_submit_cl / drm_v3d_submit_tfu */
 #include "v3d_rpc.h"
 #include "v3d_gpu.h"
 
@@ -100,14 +104,33 @@ static void v3d_srv_submitCsd(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
 }
 
 
-/* SUBMIT_CL / SUBMIT_TFU: still stubbed (step 2c lifts the binner + CL/TFU paths
- * and the [descriptor][bo_handles[]] i.data marshaling). */
-static void v3d_srv_submit(const v3d_rpc_req_t *req, const msg_t *msg, v3d_rpc_resp_t *resp,
-	const char *what)
+/* SUBMIT_CL: the drm_v3d_submit_cl descriptor rides in msg.i.data (too big for
+ * i.raw). No bo_handle array is appended - the synchronous submit consumes only
+ * the descriptor's baked GPU-VA scalars, never the handles. */
+static void v3d_srv_submitCl(const v3d_rpc_req_t *req, const msg_t *msg, v3d_rpc_resp_t *resp)
 {
-	printf("rpi4-v3d: %s desc_size=%u bo_handle_count=%u data_size=%u (stub)\n",
-		what, req->desc_size, req->bo_handle_count, (unsigned)msg->i.size);
-	resp->err = -ENOSYS;
+	struct drm_v3d_submit_cl cl;
+
+	if (msg->i.data == NULL || req->desc_size != sizeof(cl) || msg->i.size < sizeof(cl)) {
+		resp->err = -EINVAL;
+		return;
+	}
+	memcpy(&cl, msg->i.data, sizeof(cl));
+	resp->err = v3d_gpu_submitCl(&cl);
+}
+
+
+/* SUBMIT_TFU: the drm_v3d_submit_tfu descriptor rides in msg.i.data. */
+static void v3d_srv_submitTfu(const v3d_rpc_req_t *req, const msg_t *msg, v3d_rpc_resp_t *resp)
+{
+	struct drm_v3d_submit_tfu tfu;
+
+	if (msg->i.data == NULL || req->desc_size != sizeof(tfu) || msg->i.size < sizeof(tfu)) {
+		resp->err = -EINVAL;
+		return;
+	}
+	memcpy(&tfu, msg->i.data, sizeof(tfu));
+	resp->err = v3d_gpu_submitTfu(&tfu);
 }
 
 
@@ -136,10 +159,10 @@ static void v3d_srv_handleMsg(const msg_t *msg, v3d_rpc_resp_t *resp)
 			v3d_srv_gemClose(req, resp);
 			break;
 		case V3D_RPC_SUBMIT_CL:
-			v3d_srv_submit(req, msg, resp, "SUBMIT_CL");
+			v3d_srv_submitCl(req, msg, resp);
 			break;
 		case V3D_RPC_SUBMIT_TFU:
-			v3d_srv_submit(req, msg, resp, "SUBMIT_TFU");
+			v3d_srv_submitTfu(req, msg, resp);
 			break;
 		case V3D_RPC_SUBMIT_CSD:
 			v3d_srv_submitCsd(req, resp);
@@ -232,7 +255,7 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
-	printf("rpi4-v3d: registered /dev/%s (GPU owned; BO + CSD live, CL/TFU stubbed)\n",
+	printf("rpi4-v3d: registered /dev/%s (GPU owned; BO + CSD/CL/TFU submit live)\n",
 		V3D_RPC_DEV_NAME);
 
 	v3d_srv_thread(port);

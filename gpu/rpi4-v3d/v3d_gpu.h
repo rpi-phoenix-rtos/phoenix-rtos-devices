@@ -32,6 +32,9 @@
 
 #include <stdint.h>
 
+struct drm_v3d_submit_cl;   /* from the vendored v3d UAPI (uapi/v3d_drm.h) */
+struct drm_v3d_submit_tfu;
+
 
 /* Result of a CREATE_BO: what the server hands back to the client so the BO can
  * be shared by physical address (client mmap(MAP_PHYSMEM, pa)) and referenced in
@@ -78,6 +81,19 @@ int v3d_gpu_closeBo(uint32_t handle);
  * BO is CPU-visible. The dispatch consumes only cfg[]; it never dereferences the
  * BO handles (Phoenix submit is synchronous, no async fencing). Returns 0. */
 int v3d_gpu_submitCsd(const uint32_t cfg[7]);
+
+/* SUBMIT_CL: run one synchronous bin (CT0) + render (CT1) job from a
+ * drm_v3d_submit_cl descriptor (bcl/rcl start/end, qma/qms/qts baked GPU VAs).
+ * Services binner OUT-OF-MEMORY from the persistent overflow pool and, on a
+ * wedge, does one true GPU reset and drops the job. The descriptor's bo_handles
+ * pointer is NEVER dereferenced (Phoenix submit is synchronous). Returns 0. */
+int v3d_gpu_submitCl(const struct drm_v3d_submit_cl *s);
+
+/* SUBMIT_TFU: run one Texture Formatting Unit job (buffer/image -> tiled image)
+ * from a drm_v3d_submit_tfu descriptor (iia/ica/iis/iua/ioa/ios/icfg/coef[] baked
+ * GPU-VA + register images). Returns 0 (a failed convert leaves the image zero,
+ * logged - the client is not aborted). */
+int v3d_gpu_submitTfu(const struct drm_v3d_submit_tfu *t);
 
 
 #endif /* _V3D_GPU_H_ */
