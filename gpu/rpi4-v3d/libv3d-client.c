@@ -248,6 +248,28 @@ static int v3d_cli_getParam(struct drm_v3d_get_param *gp)
 }
 
 
+/*
+ * v3d_phoenix_powerOn - winsys-as-client seam stub.
+ *
+ * The in-process winsys backend (v3d_phoenix_power.c) exports v3d_phoenix_powerOn()
+ * to bring the V3D power/clock/reset domain up; some GPU clients call it directly at
+ * bring-up (e.g. the glamor X-server shim glamor_phoenix_ctx.c, and gl_det_harness).
+ * When those clients link libv3d-client INSTEAD of the winsys, the daemon
+ * (/dev/v3d-srv) already owns power - it ran the real power-on once at startup and is
+ * the SOLE writer of the V3D power domain. A client re-running power-on would toggle
+ * the V3D clock/reset under the live server (exactly the destructive conflict the
+ * daemon exists to prevent). So the client's power-on is a deliberate no-op: power is
+ * the daemon's responsibility, established before it registers /dev/v3d-srv. Returns 0
+ * (success) so client bring-up proceeds. NOT a loud-abort: this IS called at runtime
+ * and returning success is the correct behaviour.
+ */
+int v3d_phoenix_powerOn(void);
+int v3d_phoenix_powerOn(void)
+{
+	return 0;
+}
+
+
 int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
 {
 	/* Mesa builds requests as DRM_IOWR(DRM_COMMAND_BASE + DRM_V3D_*, ...); strip
