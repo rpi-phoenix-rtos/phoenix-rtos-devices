@@ -857,8 +857,14 @@ int v3d_gpu_submitCsd(const uint32_t cfg[7])
 	l2t_flush_wait(c0);
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	fprintf(stderr, "rpi4-v3d: CSD %s cfg0=0x%08x int_sts=0x%08x status=0x%08x num_completed=%u\n",
-	        timed_out ? "TIMEOUT" : "done", cfg[0], sts, csd_status, (csd_status >> 4) & 0xffu);
+	/* Only report the CSD completion on TIMEOUT/error. The former unconditional
+	 * per-dispatch "CSD done" line went to UART on EVERY compute dispatch, which at
+	 * serial baud (~6 ms/line) dominated any compute-perf measurement (an empty
+	 * kernel "measured" slower than a real matmul) and spammed the console during
+	 * any GPU-compute workload. The success path is silent now; TIMEOUT still logs. */
+	if (timed_out)
+		fprintf(stderr, "rpi4-v3d: CSD TIMEOUT cfg0=0x%08x int_sts=0x%08x status=0x%08x num_completed=%u\n",
+		        cfg[0], sts, csd_status, (csd_status >> 4) & 0xffu);
 	return 0;
 }
 
