@@ -270,6 +270,32 @@ int v3d_phoenix_powerOn(void)
 }
 
 
+/*
+ * v3d_phoenix_{peek,set}_next_scanout - winsys-as-client seam stubs.
+ *
+ * The in-process winsys (v3d_phoenix_winsys.c) exports these to steer the Mesa v3d
+ * resource tiling gate: a scanout render target must be forced to RASTER (the HVS
+ * display can only scan a linear surface), while sampled textures stay UIF-tiled.
+ * v3d_resource_create() consults peek_next_scanout() during EVERY BO alloc, so the
+ * symbol must resolve when a GPU client links libv3d-client INSTEAD of the winsys.
+ * A daemon CLIENT (e.g. gl-x11-window-daemon) renders only to offscreen FBOs and
+ * never owns scanout - the X server / fb owns the display surface - so the next BO
+ * is never scanout-backed: peek returns 0 (normal tiling) and set is a no-op. This
+ * mirrors the powerOn seam above (the daemon owns the real state). Added 2026-08-26
+ * after v3d_resource.c began calling peek_next_scanout unconditionally.
+ */
+int v3d_phoenix_peek_next_scanout(void);
+int v3d_phoenix_peek_next_scanout(void)
+{
+	return 0;
+}
+
+void v3d_phoenix_set_next_scanout(void);
+void v3d_phoenix_set_next_scanout(void)
+{
+}
+
+
 int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
 {
 	/* Mesa builds requests as DRM_IOWR(DRM_COMMAND_BASE + DRM_V3D_*, ...); strip
