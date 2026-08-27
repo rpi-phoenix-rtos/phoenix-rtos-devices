@@ -154,7 +154,13 @@
 #if V3D_VA_NO_RECYCLE
 #define GPUVA_PT_PAGES      512u   /* 512 * 4 MiB = 2 GiB monotonic VA window (no reclaim) */
 #else
-#define GPUVA_PT_PAGES      64u    /* 64 * 4 MiB = 256 MiB GPU VA window */
+/* 256 * 4 MiB = 1 GiB GPU VA window (was 64 = 256 MiB). A full SuperTuxKart race
+ * exhausts 256 MiB (deferred-render RTs + track + all-kart working set, uncompressed
+ * textures) -> NULL BO -> Data Abort. 1 GiB is ~4x the measured need and stays under
+ * the 32-bit VA sign bit. VAs still recycle on free (V3D_VA_NO_RECYCLE=0). Costs 1 MiB
+ * contiguous PT RAM; mmap fails loudly at init if unavailable. Synced with the
+ * in-process winsys (tools/v3d-driver-port/v3d_phoenix_winsys.c). */
+#define GPUVA_PT_PAGES      256u   /* 256 * 4 MiB = 1 GiB GPU VA window */
 #endif
 #define GPUVA_PT_ENTRIES    (GPUVA_PT_PAGES * (_PAGE_SIZE / 4u))   /* total PTEs */
 
