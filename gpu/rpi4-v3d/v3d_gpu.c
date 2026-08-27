@@ -100,6 +100,7 @@
 #define INT_FRDONE          (1u<<0)
 #define INT_FLDONE          (1u<<1)
 #define INT_OUTOMEM         (1u<<2)   /* binner exhausted its tile-allocation pool */
+#define INT_QPU_MASK        (0xfffu<<16) /* CTL_INT QPU-interrupt bits 27:16 (Linux V3D_INT_QPU_MASK) */
 #define CLE_CT0QTS          0x015cu
 #define CT0QTS_ENABLE       (1u<<1)
 #define CLE_CT0QBA          0x0160u
@@ -948,7 +949,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS;
 	l2t_flush_wait(c0);
 	/* --- bin (CT0); wait FLDONE --- */
-	c0[CTL_INT_CLR/4] = INT_FLDONE|INT_FRDONE;
+	c0[CTL_INT_CLR/4] = INT_FLDONE|INT_FRDONE|INT_QPU_MASK;   /* +QPU bits: Linux-parity full-status clear */
 	c0[PTB_BPOS/4] = 0;
 	if (s->qma) { c0[CLE_CT0QMA/4]=s->qma; c0[CLE_CT0QMS/4]=s->qms; }
 	if (s->qts) { c0[CLE_CT0QTS/4]=CT0QTS_ENABLE|s->qts; }
@@ -1004,7 +1005,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	/* If the binner wedged, don't kick the render against a bad tile state - reset+retry. */
 	if (job_failed)
 		goto job_retry;
-	c0[CTL_INT_CLR/4]=INT_FLDONE|INT_FRDONE;
+	c0[CTL_INT_CLR/4]=INT_FLDONE|INT_FRDONE|INT_QPU_MASK;   /* +QPU bits: Linux-parity full-status clear */
 	/* Bin->render coherency handoff: clean + WAIT (binner tile-list output to RAM), then
 	 * invalidate the render-side slice caches, then kick CT1. */
 	l2t_flush_wait(c0);                       /* wait-old: any prior L2T flush must be idle */
@@ -1013,6 +1014,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;    /* then drop stale render-side slice-cache lines */
 	/* --- render (CT1); wait FRDONE --- */
 	c0[CLE_CT1QBA/4]=s->rcl_start; c0[CLE_CT1QEA/4]=s->rcl_end;
+	unsigned qpu_acks = 0;   /* # of poll-samples that found QPU int bits latched + cleared them */
 	{
 		uint32_t last_ca = c0[0x0114/4];
 		unsigned frozen = 0;
@@ -1020,6 +1022,12 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 			if (c0[CTL_INT_STS/4] & INT_FRDONE)
 				break;                                  /* render done */
 			if ((spins & 0xfffffu) == 0u) {             /* sample ct1ca ~every 1M spins (~160 ms) */
+				/* Service latched QPU-interrupt bits mid-render (Linux clears them every IRQ;
+				 * we poll). W1C only the QPU bits — never bit0 — so FRDONE can't be lost. An
+				 * unacknowledged QPU int otherwise stalls fragment dispatch (in-process winsys
+				 * HW-verified: this collapsed the STK in-game render wedge 330->0). */
+				uint32_t sts = c0[CTL_INT_STS/4];
+				if (sts & INT_QPU_MASK) { c0[CTL_INT_CLR/4] = sts & INT_QPU_MASK; qpu_acks++; }
 				uint32_t ca = c0[0x0114/4];
 				if (ca == last_ca) {
 					if (++frozen >= 5u) { spins = 0; break; }   /* frozen ~0.8 s -> wedged */
@@ -1033,9 +1041,9 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 		v3d_phoenix_render_timeouts++;   /* stall counter */
 		job_failed = 1;
 		fprintf(stderr, "rpi4-v3d: RENDER TIMEOUT int_sts=0x%08x ct1cs=0x%08x "
-			"ct1ca=0x%08x[%x..%x] ct1ea=0x%08x gmp=0x%08x gmpvio=0x%08x mmu_ill=0x%08x\n",
+			"ct1ca=0x%08x[%x..%x] ct1ea=0x%08x gmp=0x%08x gmpvio=0x%08x mmu_ill=0x%08x qpu_int_acks=%u\n",
 			c0[CTL_INT_STS/4], c0[0x0104/4], ca1, s->rcl_start, s->rcl_end,
-			c0[0x010c/4], c0[0x0800/4], c0[0x0808/4], W.hub[MMU_ILLEGAL_ADDR/4]);
+			c0[0x010c/4], c0[0x0800/4], c0[0x0808/4], W.hub[MMU_ILLEGAL_ADDR/4], qpu_acks);
 		/* V3D error-debug registers localize the wedged render pipeline stage. */
 		fprintf(stderr, "rpi4-v3d: RENDER DBG fdbgo=0x%08x fdbgs=0x%08x errstat=0x%08x "
 			"ct1ca recheck=0x%08x\n",
