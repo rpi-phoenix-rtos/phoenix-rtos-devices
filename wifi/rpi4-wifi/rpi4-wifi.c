@@ -1252,6 +1252,67 @@ static void diag_setWindow18(volatile uint8_t *sdhci)
 	(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
 }
 
+/* SDPCM flow control. The firmware advertises, in EVERY frame it sends us, how
+ * far our transmit sequence may advance -- a credit window. It lives in the
+ * SECOND software-header dword: byte 0 (buf[8]) is the flow-control mask and
+ * byte 1 (buf[9]) is the maximum transmit sequence (brcmfmac: SDPCM_FCMASK_MASK
+ * and SDPCM_WINDOW_MASK >> SDPCM_WINDOW_SHIFT). We used to write those bytes as
+ * zero and ignore them on receive, i.e. transmit with no regard for credits at
+ * all. The firmware then silently drops what it cannot take, TCP retransmits,
+ * and throughput decays the longer a session runs -- measured as TX falling
+ * 1.02 -> 0.45 -> 0.26 MB/s across three back-to-back transfers in one boot. */
+static uint8_t g_tx_max = 0;      /* highest sequence the fw will accept */
+static uint8_t g_fc_mask = 0;     /* fw flow-control mask (non-zero = throttled) */
+static uint32_t g_tx_blocked = 0; /* transmits refused because the window was shut */
+static uint32_t g_rx_badhdr_run = 0; /* consecutive malformed headers */
+#define WIFI_RX_RESYNC_AFTER 64u
+static uint32_t g_fc_updates = 0;
+
+static uint8_t g_data_seq = 0;
+
+
+/* Resynchronise the F2 read path after the stream has gone out of step,
+ * mirroring brcmf_sdio_rxfail: abort function 2 through CCCR, terminate the
+ * read frame via FRAMECTRL, then wait for the device's pending read byte count
+ * to drain. Without any recovery we keep reading from wherever the stream
+ * desynchronised, so every following header is garbage too.
+ *
+ * Only call this after SEVERAL consecutive bad headers. A single one is also
+ * what an empty FIFO looks like (it returns bytes that fail the header check),
+ * and aborting F2 on every idle poll would be far worse than the problem. */
+static uint32_t g_rx_resyncs = 0;
+
+static void diag_f2RxFail(volatile uint8_t *sdhci)
+{
+	uint32_t r[4], last = 0xffffu;
+	int tries;
+
+	(void)diag_sdioCmd52(sdhci, 1, 0, 0x06u, 0x02u, NULL);    /* CCCR abort, function 2 */
+	(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Du, 0x01u, NULL); /* FRAMECTRL: SFC_RF_TERM */
+
+	/* Wait for the read frame byte count to drain or stop moving. */
+	for (tries = 0; tries < 50; ++tries) {
+		uint32_t hi, lo, bc;
+
+		if (diag_sdioCmd52(sdhci, 0, 1, 0x1001Cu, 0u, r) != 0) {
+			break;
+		}
+		hi = r[0] & 0xffu;
+		if (diag_sdioCmd52(sdhci, 0, 1, 0x1001Bu, 0u, r) != 0) {
+			break;
+		}
+		lo = r[0] & 0xffu;
+		bc = (hi << 8) | lo;
+		if ((bc == 0u) || (bc == last)) {
+			break;
+		}
+		last = bc;
+	}
+	diag_sdhciResetCmdDat(sdhci);
+	g_rx_resyncs++;
+}
+
+
 /* ---- F2 data transfers of ANY length -------------------------------------
  *
  * The byte-mode helpers cap at 512 bytes, which is fine for control frames and
@@ -1378,6 +1439,21 @@ static int diag_f2RecvFrame(volatile uint8_t *sdhci, uint8_t *buf,
 			return -33;
 		}
 	}
+	/* Credits ride along on every frame, whatever its channel. */
+	{
+		uint8_t fc = buf[8];
+		uint8_t tx_max = buf[9];
+
+		/* brcmf_sdio_hdparse's sanity clamp: a window more than 0x40 ahead of
+		 * our sequence is a garbled header, not a generous firmware. */
+		if ((uint8_t)(tx_max - g_data_seq) > 0x40u) {
+			tx_max = (uint8_t)(g_data_seq + 2u);
+		}
+		g_tx_max = tx_max;
+		g_fc_mask = fc;
+		g_fc_updates++;
+	}
+
 	*outlen = len;
 	*outchan = (uint8_t)(buf[5] & 0x0fu);
 	return 0;
@@ -2162,7 +2238,6 @@ static void diag_wifiDataTx(volatile uint8_t *sdhci, uint32_t sdio_core, uint8_t
  * per-bus stream the control/event paths advance, and the join+DHCP flow seeds
  * it (see g_data_seq = seq there). An out-of-sequence data frame is dropped by
  * the firmware without any error surfacing to the host. */
-static uint8_t g_data_seq = 0;
 static uint32_t g_frame_tx_ok = 0, g_frame_tx_err = 0;
 static uint32_t g_frame_rx_ok = 0, g_frame_rx_err = 0, g_frame_rx_garbage = 0;
 
@@ -2176,6 +2251,21 @@ static int diag_wifiFrameTx(volatile uint8_t *sdhci, const uint8_t *eth, uint32_
 	if ((sdhci == NULL) || (eth == NULL) || (elen < 14u) || ((elen + 16u) > F2_FRAME_MAX)) {
 		return -1060;
 	}
+	/* Respect the credit window: brcmfmac's test is that (tx_max - tx_seq) is
+	 * non-zero and has not wrapped past 0x80. Refusing here is much better than
+	 * handing the firmware a frame it will drop -- the caller (TCP) retransmits,
+	 * and the window reopens as soon as the fw sends us anything. g_fc_updates
+	 * stays 0 until the first frame arrives, so do not gate before that or a
+	 * fresh link could never send its first packet. */
+	if (g_fc_updates != 0u) {
+		uint8_t avail = (uint8_t)(g_tx_max - g_data_seq);
+
+		if ((avail == 0u) || ((avail & 0x80u) != 0u)) {
+			g_tx_blocked++;
+			return -1070;
+		}
+	}
+
 	total = 16u + elen;
 	padded = ((total + F2_BLKSZ - 1u) / F2_BLKSZ) * F2_BLKSZ;
 	if (padded > F2_FRAME_MAX) {
@@ -2236,11 +2326,16 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 
 	rc = diag_f2RecvFrame(sdhci, g_rxf, &flen, &chan);
 	if (rc != 0) {
-		/* -31 is an inconsistent SDPCM header, i.e. the FIFO handed back
-		 * something that is not a frame boundary. Count it apart from real
-		 * transport failures: conflating the two hid which was happening. */
+		/* -31 is an inconsistent SDPCM header: either an empty FIFO (the common,
+		 * harmless case) or a stream that has lost frame alignment. They look
+		 * identical one at a time, so distinguish by persistence -- a long run of
+		 * them is desynchronisation, and only then is a resync worth its cost. */
 		if (rc == -31) {
 			g_frame_rx_garbage++;
+			if (++g_rx_badhdr_run >= WIFI_RX_RESYNC_AFTER) {
+				g_rx_badhdr_run = 0;
+				diag_f2RxFail(sdhci);
+			}
 			return 1;
 		}
 		if (rc < 0) {
@@ -2263,6 +2358,7 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 		g_frame_rx_err++;
 		return -1062;
 	}
+	g_rx_badhdr_run = 0; /* a good frame means the stream is in step again */
 	n = (uint32_t)flen - ethoff;
 	if (n > cap) {
 		g_frame_rx_err++;
@@ -4008,14 +4104,17 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS tx_calls=%u tx_us_total=%llu tx_us_avg=%llu\n"
 		"WIFISTATS rx_hits=%u rx_hit_us_total=%llu rx_hit_us_avg=%llu\n"
 		"WIFISTATS rx_misses=%u rx_miss_us_total=%llu rx_miss_us_avg=%llu\n"
-		"WIFISTATS frames tx_ok=%u tx_err=%u rx_ok=%u rx_err=%u rx_garbage=%u\n",
+		"WIFISTATS frames tx_ok=%u tx_err=%u rx_ok=%u rx_err=%u rx_garbage=%u\n"
+		"WIFISTATS flowctl tx_seq=%u tx_max=%u avail=%u fc_mask=0x%02x blocked=%u updates=%u resyncs=%u\n",
 		g_tx_calls, (unsigned long long)g_tx_us,
 		(unsigned long long)(g_tx_calls ? g_tx_us / g_tx_calls : 0u),
 		g_rx_hits, (unsigned long long)g_rx_hit_us,
 		(unsigned long long)(g_rx_hits ? g_rx_hit_us / g_rx_hits : 0u),
 		g_rx_misses, (unsigned long long)g_rx_miss_us,
 		(unsigned long long)(g_rx_misses ? g_rx_miss_us / g_rx_misses : 0u),
-		g_frame_tx_ok, g_frame_tx_err, g_frame_rx_ok, g_frame_rx_err, g_frame_rx_garbage);
+		g_frame_tx_ok, g_frame_tx_err, g_frame_rx_ok, g_frame_rx_err, g_frame_rx_garbage,
+		g_data_seq, g_tx_max, (unsigned)(uint8_t)(g_tx_max - g_data_seq), g_fc_mask,
+		g_tx_blocked, g_fc_updates, g_rx_resyncs);
 }
 
 
