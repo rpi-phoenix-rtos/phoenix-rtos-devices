@@ -2614,6 +2614,11 @@ static volatile uint8_t *g_sdhci = NULL;   /* SDHCI (Arasan) mapping, kept live 
 static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (set by bring-up) */
 
 #define WIFI_RESP_CAP (8u * 1024u)
+/* Two device ids on one port: 0 = /dev/wifi (text commands + text result),
+ * 1 = /dev/wifidata (raw 802.3 frames, the lwip netif seam). */
+#define WIFI_DEV_TEXT_ID 0
+#define WIFI_DEV_DATA_ID 1
+
 static char g_resp[WIFI_RESP_CAP]; /* most recent scan result text, served over mtRead */
 static int g_resp_len = 0;
 
@@ -3918,6 +3923,58 @@ static int wifi_readResp(off_t offs, char *dst, size_t size)
 }
 
 
+/* ---- /dev/wifidata: the raw-frame seam for an lwip netif ----------------
+ *
+ * /dev/wifi (id 0) is unchanged -- scan/join/netup plus a text result. This
+ * second device carries frames:
+ *
+ *   write(fd, eth_frame, len)  -> transmit it            (netif->linkoutput)
+ *   read(fd, buf, cap)         -> next RX frame, 0 if none queued
+ *
+ * Why a device instead of moving the driver into the lwip process: the whole
+ * SDIO/SDPCM stack lives here and ONE process must own the bus, because
+ * control, event and data frames share a single F2 FIFO -- two drainers would
+ * steal each other's frames. This keeps the bus owner intact and hands lwip a
+ * frame pipe; the WiFi ceiling (a few MB/s over SDIO) leaves ample room for one
+ * message per frame.
+ *
+ * read() MUST NOT block: this daemon has a single message thread, so blocking
+ * in a read would stall every other request, TX included.
+ */
+static int wifi_frameWrite(const void *data, size_t len)
+{
+	if (g_sdhci == NULL) {
+		return -EIO;
+	}
+	if ((len < 14u) || (len > (size_t)(F2_FRAME_MAX - 16u))) {
+		return -EINVAL;
+	}
+	if (diag_wifiFrameTx(g_sdhci, (const uint8_t *)data, (uint32_t)len) != 0) {
+		return -EIO;
+	}
+	return (int)len;
+}
+
+
+static int wifi_frameRead(void *dst, size_t cap)
+{
+	static uint8_t frame[F2_FRAME_MAX];
+	uint32_t elen = 0u;
+
+	if (g_sdhci == NULL) {
+		return -EIO;
+	}
+	if (diag_wifiFrameRx(g_sdhci, frame, sizeof(frame), &elen) != 0) {
+		return 0; /* nothing queued, or a non-data frame was drained */
+	}
+	if ((size_t)elen > cap) {
+		return -EMSGSIZE;
+	}
+	memcpy(dst, frame, elen);
+	return (int)elen;
+}
+
+
 static void wifi_thread(void *arg)
 {
 	uint32_t port = (uint32_t)(uintptr_t)arg;
@@ -3932,6 +3989,39 @@ static void wifi_thread(void *arg)
 				continue;
 			}
 			break;
+		}
+
+		if (msg.oid.id == WIFI_DEV_DATA_ID) {
+			switch (msg.type) {
+				case mtOpen:
+				case mtClose:
+					msg.o.err = EOK;
+					break;
+
+				case mtWrite:
+					msg.o.err = wifi_frameWrite(msg.i.data, msg.i.size);
+					break;
+
+				case mtRead:
+					msg.o.err = wifi_frameRead(msg.o.data, msg.o.size);
+					break;
+
+				case mtGetAttr:
+					if (msg.i.attr.type == atMode) {
+						msg.o.attr.val = S_IFCHR | 0600;
+						msg.o.err = EOK;
+					}
+					else {
+						msg.o.err = -EINVAL;
+					}
+					break;
+
+				default:
+					msg.o.err = -ENOSYS;
+					break;
+			}
+			msgRespond(port, &msg, rid);
+			continue;
 		}
 
 		switch (msg.type) {
@@ -4101,10 +4191,15 @@ int main(int argc, char **argv)
 		return 3;
 	}
 	dev.port = port;
-	dev.id = 0;
+	dev.id = WIFI_DEV_TEXT_ID;
 	if (create_dev(&dev, "wifi") < 0) {
 		printf("rpi4-wifi: could not create /dev/wifi\n");
 		return 4;
+	}
+	dev.id = WIFI_DEV_DATA_ID;
+	if (create_dev(&dev, "wifidata") < 0) {
+		/* Not fatal: the text device still works, only the netif seam is gone. */
+		printf("rpi4-wifi: WARNING could not create /dev/wifidata (frame seam unavailable)\n");
 	}
 	printf("rpi4-wifi: registered /dev/wifi (write \"scan\", then read the AP list)\n");
 	fflush(stdout);
