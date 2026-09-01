@@ -1273,16 +1273,38 @@ static int diag_f2Write(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t le
 }
 
 
-/* RX is chunked BYTE mode, never block mode: a block-mode read must transfer
- * whole blocks, so it pops ceil(len/64)*64 bytes off the FIFO and eats into the
- * NEXT frame -- after which every following header read returns garbage. That
- * showed up as ~597 of 600 drain polls failing with a bad header checksum.
- * Byte mode pops exactly what is asked for, and the 512-byte cap is handled by
- * looping, so a frame is consumed precisely. */
+/* RX transfer mode is a measured throughput decision.
+ *
+ * Byte mode caps at 512 bytes, so a 1514-byte frame needs three chunk transfers
+ * on top of the header read -- four commands per frame, each spinning on SDHCI
+ * status in PIO. Block mode moves the whole remainder in ONE command.
+ *
+ * So one command per frame should be faster -- and MEASURED ON HARDWARE IT IS
+ * NOT. Block mode has to move whole blocks, which pops ceil(len/64)*64 bytes and
+ * eats past the end of the frame; the stream then desynchronises. Same TCP test,
+ * only this line changed:
+ *
+ *   chunked byte mode : TX 1.73 MB/s, RX 0.14 MB/s, rx_err 1
+ *   one block command : TX 1.07 MB/s, RX 0.03 MB/s, rx_err 433
+ *
+ * Byte mode pops exactly what is asked for, so a frame is consumed precisely.
+ * Keep it. F2_RX_ONE_CMD stays only so the comparison can be re-run. */
+#define F2_RX_ONE_CMD 0
+
 static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
 {
+#if !F2_RX_ONE_CMD
 	uint32_t done = 0u;
+#endif
 
+	if (len <= 512u) {
+		return diag_sdioCmd53ReadByteMode(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
+			(len + 3u) & ~3u, buf);
+	}
+#if F2_RX_ONE_CMD
+	return diag_sdioCmd53Read(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
+		(len + F2_BLKSZ - 1u) / F2_BLKSZ, F2_BLKSZ, buf);
+#else
 	while (done < len) {
 		uint32_t chunk = len - done;
 		int rc;
@@ -1290,7 +1312,7 @@ static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
 		if (chunk > 512u) {
 			chunk = 512u;
 		}
-		chunk = (chunk + 3u) & ~3u; /* the PIO loop moves whole words */
+		chunk = (chunk + 3u) & ~3u;
 		rc = diag_sdioCmd53ReadByteMode(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
 			chunk, buf + done);
 		if (rc != 0) {
@@ -1299,6 +1321,7 @@ static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
 		done += chunk;
 	}
 	return 0;
+#endif
 }
 
 
