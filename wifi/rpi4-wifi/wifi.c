@@ -121,6 +121,16 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
+	if (argc >= 2 && strcmp(argv[1], "stats") == 0) {
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		rc = cmd_run(fd, "stats", 5);
+		close(fd);
+		return rc;
+	}
 	if (argc >= 2 && strcmp(argv[1], "mac") == 0) {
 		fd = open(WIFI_DEV, O_RDWR);
 		if (fd < 0) {
@@ -220,7 +230,7 @@ int main(int argc, char **argv)
 		return rc;
 	}
 	printf("usage: wifi scan | wifi join <ssid> | wifi netup <ssid> <psk> |\n"
-	       "       wifi joinwpa <ssid> <psk> | wifi mac | wifi mtu | wifi up\n");
+	       "       wifi joinwpa <ssid> <psk> | wifi mac | wifi stats | wifi mtu | wifi up\n");
 	printf("  netup: WPA2-PSK join + DHCP lease (reports the bound IP)\n");
 	printf("  up: join the ssid configured in %s\n", WIFI_CONF);
 	return 2;

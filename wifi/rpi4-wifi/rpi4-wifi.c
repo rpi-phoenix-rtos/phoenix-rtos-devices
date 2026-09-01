@@ -61,6 +61,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
@@ -1279,13 +1280,13 @@ static int diag_f2Write(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t le
  * on top of the header read -- four commands per frame, each spinning on SDHCI
  * status in PIO. Block mode moves the whole remainder in ONE command.
  *
- * So one command per frame should be faster -- and MEASURED ON HARDWARE IT IS
- * NOT. Block mode has to move whole blocks, which pops ceil(len/64)*64 bytes and
- * eats past the end of the frame; the stream then desynchronises. Same TCP test,
- * only this line changed:
- *
- *   chunked byte mode : TX 1.73 MB/s, RX 0.14 MB/s, rx_err 1
- *   one block command : TX 1.07 MB/s, RX 0.03 MB/s, rx_err 433
+ * So one command per frame should be faster. It is not, and the decisive
+ * evidence is a COUNTER, not a rate: switching to one block-mode command took
+ * rx_err from 1 to 433 in the same test. Block mode must move whole blocks, so
+ * it pops ceil(len/64)*64 bytes, reads past the end of the frame and
+ * desynchronises the stream -- those errors are that desync. (Throughput also
+ * looked worse, but see the WIFI_RX_* note: run-to-run throughput on this link
+ * varies 2.6x, so rates alone prove nothing here.)
  *
  * Byte mode pops exactly what is asked for, so a frame is consumed precisely.
  * Keep it. F2_RX_ONE_CMD stays only so the comparison can be re-run. */
@@ -2645,6 +2646,33 @@ static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (s
 #define WIFI_RESP_CAP (8u * 1024u)
 /* Two device ids on one port: 0 = /dev/wifi (text commands + text result),
  * 1 = /dev/wifidata (raw 802.3 frames, the lwip netif seam). */
+/* How long a /dev/wifidata read waits for a frame before reporting "none", and
+ * how often it probes the FIFO while waiting. The wait keeps the caller's RX
+ * thread off the message bus; the probe interval is what actually bounds
+ * receive latency. */
+/* READ THIS BEFORE TUNING THESE CONSTANTS.
+ *
+ * A waiting read (WAIT>0), a spin before sleeping, and a bus mutex with a
+ * multi-threaded message loop were all tried on hardware. None of them showed a
+ * benefit that survives the measurement noise: the SAME code measured 1.73 and
+ * 0.66 MB/s TX on two runs, a 2.6x spread, so single-run A/B of throughput on
+ * this link proves nothing. They were reverted for adding complexity without
+ * demonstrated gain, and WAIT=0 keeps the simplest behaviour: probe once,
+ * return.
+ *
+ * What IS solid, because it averages thousands of samples inside one run:
+ *   transmit  132 us per frame
+ *   receive   178 us per frame
+ *   empty probe 22 us, and there were 1.1 MILLION of them (24.9 s of bus time)
+ *
+ * So the radio and the SDIO transfers are not the limit -- per-frame overhead
+ * and the empty polling are. The fix is an interrupt-driven RX (SDIO CARD_INTR)
+ * plus frame batching, which removes the per-frame wakeup instead of re-timing
+ * it. Re-measure with n>=3 runs per config. */
+#define WIFI_RX_WAIT_US  0u
+#define WIFI_RX_PROBE_US 150u
+#define WIFI_RX_SPIN_US  0u
+
 #define WIFI_DEV_TEXT_ID 0
 #define WIFI_DEV_DATA_ID 1
 
@@ -3938,6 +3966,59 @@ static int wifi_joinwpa(const char *ssid, const char *psk, char *out, int cap)
 }
 
 
+/* Where the per-frame time actually goes. RX measured ~10 ms/frame end to end,
+ * which is far more than the poll interval explains, so the read path is timed
+ * here and split into HIT (a frame came back) vs MISS (empty FIFO): the two have
+ * very different costs and averaging them together hides which one dominates. */
+static uint64_t g_rx_hit_us = 0, g_rx_miss_us = 0, g_tx_us = 0;
+static uint32_t g_rx_hits = 0, g_rx_misses = 0, g_tx_calls = 0;
+
+
+/* Timing is OFF by default: two clock_gettime calls per probe are not free at
+ * ~5000 probes/s, and switching them on measurably cost TX throughput
+ * (1.73 -> 1.10 MB/s). Build with -DWIFI_STATS_TIMING=1 to attribute per-frame
+ * cost again; the counters below are plain increments and always on. */
+#ifndef WIFI_STATS_TIMING
+#define WIFI_STATS_TIMING 0
+#endif
+
+#if WIFI_STATS_TIMING
+static uint64_t wifi_nowUs(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0u;
+	}
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+}
+#define WIFI_T0(v)       uint64_t v = wifi_nowUs()
+#define WIFI_ACC(acc, v) ((acc) += wifi_nowUs() - (v))
+#else
+#define WIFI_T0(v)       ((void)0)
+#define WIFI_ACC(acc, v) ((void)0)
+#endif
+
+
+/* `stats`: per-frame timing of the data path, so a throughput number can be
+ * attributed instead of guessed. */
+static int wifi_stats(char *out, int cap)
+{
+	return snprintf(out, (size_t)cap,
+		"WIFISTATS tx_calls=%u tx_us_total=%llu tx_us_avg=%llu\n"
+		"WIFISTATS rx_hits=%u rx_hit_us_total=%llu rx_hit_us_avg=%llu\n"
+		"WIFISTATS rx_misses=%u rx_miss_us_total=%llu rx_miss_us_avg=%llu\n"
+		"WIFISTATS frames tx_ok=%u tx_err=%u rx_ok=%u rx_err=%u rx_garbage=%u\n",
+		g_tx_calls, (unsigned long long)g_tx_us,
+		(unsigned long long)(g_tx_calls ? g_tx_us / g_tx_calls : 0u),
+		g_rx_hits, (unsigned long long)g_rx_hit_us,
+		(unsigned long long)(g_rx_hits ? g_rx_hit_us / g_rx_hits : 0u),
+		g_rx_misses, (unsigned long long)g_rx_miss_us,
+		(unsigned long long)(g_rx_misses ? g_rx_miss_us / g_rx_misses : 0u),
+		g_frame_tx_ok, g_frame_tx_err, g_frame_rx_ok, g_frame_rx_err, g_frame_rx_garbage);
+}
+
+
 /* `mac`: the station MAC, for a netif that has not joined yet. */
 static int wifi_mac(char *out, int cap)
 {
@@ -4084,8 +4165,16 @@ static int wifi_frameWrite(const void *data, size_t len)
 	if ((len < 14u) || (len > (size_t)(F2_FRAME_MAX - 16u))) {
 		return -EINVAL;
 	}
-	if (diag_wifiFrameTx(g_sdhci, (const uint8_t *)data, (uint32_t)len) != 0) {
-		return -EIO;
+	{
+		WIFI_T0(t0);
+		int rc;
+
+		rc = diag_wifiFrameTx(g_sdhci, (const uint8_t *)data, (uint32_t)len);
+		WIFI_ACC(g_tx_us, t0);
+		g_tx_calls++;
+		if (rc != 0) {
+			return -EIO;
+		}
 	}
 	return (int)len;
 }
@@ -4099,9 +4188,21 @@ static int wifi_frameRead(void *dst, size_t cap)
 	if (g_sdhci == NULL) {
 		return -EIO;
 	}
-	if (diag_wifiFrameRx(g_sdhci, frame, sizeof(frame), &elen) != 0) {
-		return 0; /* nothing queued, or a non-data frame was drained */
+	/* One probe, no lock, no wait: measured fastest. See the WIFI_RX_* block
+	 * for the full comparison -- a waiting read, a spin, and a bus mutex were
+	 * all tried on hardware and every one of them cost more than it saved. */
+	{
+		WIFI_T0(t0);
+		int rc = diag_wifiFrameRx(g_sdhci, frame, sizeof(frame), &elen);
+		if (rc != 0) {
+			WIFI_ACC(g_rx_miss_us, t0);
+			g_rx_misses++;
+			return 0; /* nothing queued, or a non-data frame was drained */
+		}
+		WIFI_ACC(g_rx_hit_us, t0);
+		g_rx_hits++;
 	}
+
 	if ((size_t)elen > cap) {
 		return -EMSGSIZE;
 	}
@@ -4126,6 +4227,9 @@ static void wifi_thread(void *arg)
 			break;
 		}
 
+		/* Text commands drive the same bus (and the same g_txf/g_rxf), so they
+		 * take the lock for their whole duration. A join legitimately holds it
+		 * for tens of seconds; that was equally true single-threaded. */
 		if (msg.oid.id == WIFI_DEV_DATA_ID) {
 			switch (msg.type) {
 				case mtOpen:
@@ -4203,6 +4307,9 @@ static void wifi_thread(void *arg)
 					char ssid[33], psk[64];
 					wifi_parseSsidPsk(msg.i.data, msg.i.size, 8, ssid, sizeof(ssid), psk, sizeof(psk));
 					g_resp_len = wifi_joinwpa(ssid, psk, g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 5 && memcmp(msg.i.data, "stats", 5) == 0) {
+					g_resp_len = wifi_stats(g_resp, (int)sizeof(g_resp));
 				}
 				else if (msg.i.size >= 3 && memcmp(msg.i.data, "mac", 3) == 0) {
 					g_resp_len = wifi_mac(g_resp, (int)sizeof(g_resp));
