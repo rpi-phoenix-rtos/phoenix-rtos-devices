@@ -1410,6 +1410,9 @@ static int diag_bcdcCmd(volatile uint8_t *sdhci, uint32_t sdio_core, int is_set,
  * channel 1 and extract each AP. See tools/wifi-probe/SCAN-SPEC.md. */
 #define WLC_UP_CMD 2u
 #define BRCMF_C_SET_INFRA 20u
+#define WLC_SET_SSID_CMD 26u       /* BRCMF_C_SET_SSID: brcmf_ssid_le (broadcast WPA2 join) */
+#define WLC_SET_WSEC_PMK_CMD 268u  /* BRCMF_C_SET_WSEC_PMK: brcmf_wsec_pmk_le (passphrase) */
+#define BRCMF_C_GET_PKTCNTS 137u   /* brcmf_pktcnt_le { rx_good, rx_bad, tx_good, tx_bad, rx_ocast } */
 #define SET_VAR_CMD 263u
 #define GET_VAR_CMD 262u
 #define SCAN_MAX_APS 16
@@ -1699,6 +1702,619 @@ static void diag_wifiScan(volatile uint8_t *sdhci, uint32_t sdio_core)
 
 	/* Re-read the fw console: any escan rejection is logged there by the fw. */
 	diag_readShared(sdhci, g_ram_size);
+}
+
+
+/* ---- #91 WPA2-PSK join + DHCP over the SDPCM data plane ------------------
+ * Ported from the hardware-proven tools/wifi-probe `jointxcnt` flow (join a
+ * WPA2 AP, then DISCOVER -> OFFER -> REQUEST -> ACK to BIND a real lease). The
+ * BCM43455 is fullmac with an in-dongle supplicant (FWSUP): we set the security
+ * params, enable sup_wpa, hand the firmware the ASCII passphrase (it derives the
+ * PMK + runs the 4-way handshake itself), issue a broadcast WLC_SET_SSID join,
+ * then watch WLC_E_SET_SSID(0)/status0 + WLC_E_PSK_SUP(46)/status6 for success.
+ * Mirrors diag_wifiScan's prelude + event demux. Spec:
+ * docs/inprogress/2026-08-12-wifi-join-design.md (from Linux brcmfmac).
+ *
+ * The ordering below was established over many hardware cycles; it is a
+ * faithful copy of the probe's proven sequence and must not be reordered. */
+static int g_join_ran = 0;
+static int g_join_em_rc = -100, g_join_infra_rc = -100, g_join_up_rc = -100;
+static int g_join_wsec_rc = -100, g_join_wpaauth_rc = -100, g_join_sup_rc = -100;
+static int g_join_pmk_rc = -100, g_join_ssid_rc = -100;
+static int g_join_attempts = 0;          /* SET_SSID attempts (retry on no-network) */
+static int g_join_setssid_status = -100; /* WLC_E_SET_SSID status (0 = assoc ok) */
+static int g_join_psksup_status = -100;  /* WLC_E_PSK_SUP status (6 = 4-way keyed) */
+static int g_join_link_up = 0;           /* last WLC_E_LINK flags&0x01 */
+static int g_join_evt_total = 0;
+static char g_join_ssid[33] = { 0 };     /* credentials, filled by wifi_netup() */
+static char g_join_psk[64] = { 0 };
+
+static int g_tx_ran = 0;
+static int g_tx_mac_rc = -100;
+static int g_tx_rc = -100;
+static int g_tx_len = 0;
+/* STA MAC read in non-glom mode before any data TX (rxglom breaks our
+ * single-frame RX reader, so the MAC must be fetched first). */
+static uint8_t g_txmac[6] = { 0 };
+static int g_txmac_valid = 0;
+
+/* fw pktcnt: GET the firmware's packet counters (BRCMF_C_GET_PKTCNTS = 137 ->
+ * brcmf_pktcnt_le { rx_good, rx_bad, tx_good, tx_bad, rx_ocast }, all le32).
+ * Snapshotting them before the DHCP burst localizes where a frame dies:
+ * tx_good climbs => the fw TX'd it; tx_bad climbs => the fw TX path failed;
+ * both flat => the fw never queued the frame (host->fw ingest gate). Uses the
+ * proven BCDC GET-ioctl path, NON-glom so the single-frame control-reply RX
+ * stays intact. */
+static int g_pktcnt_pre_rc = -100;
+static uint32_t g_pktcnt_pre[5] = { 0 };
+static int g_dtx_burst = 0;            /* # of data frames actually TX'd */
+
+static int diag_wifiPktcnt(volatile uint8_t *sdhci, uint32_t sdio_core,
+	uint32_t out[5], uint32_t reqid, uint8_t seq)
+{
+	uint8_t buf[32];
+	uint32_t rxlen = 0u;
+	int rc, i;
+
+	for (i = 0; i < 32; ++i) {
+		buf[i] = 0u;
+	}
+	rc = diag_bcdcCmd(sdhci, sdio_core, /*is_set=*/0, BRCMF_C_GET_PKTCNTS,
+		NULL, 20u, buf, sizeof(buf), &rxlen, reqid, seq);
+	if (rc >= 0 && rxlen >= 20u) {
+		for (i = 0; i < 5; ++i) {
+			out[i] = diag_le32(buf + 4 * i);
+		}
+		return 0;
+	}
+	return (rc < 0) ? rc : -1;
+}
+
+/* RX data-plane: read SDPCM channel-2 DATA frames from the F2 FIFO and parse a
+ * BOOTP/DHCP reply out of one. Frame layout (RX):
+ *   SDPCM HW[0-3] + SW[4-11] (data_offset = buf[7]) then BDC[buf[7]..] whose
+ *   byte 3 = data_offset in 4-byte words (brcmf_proto_bcdc_hdrpull: <<2); the
+ *   802.3 frame follows at buf[7] + 4 + (bdc[3]<<2). Then eth(14)+IP(20)+UDP(8)+
+ *   BOOTP: op@0(=2 reply), xid@4, yiaddr@16. Non-glom only (single frame RX;
+ *   glom RX is a separate de-glom reader we deliberately avoid). */
+static int g_rx_offer_seen = 0;        /* a ch2 DHCP reply (op=2) was parsed */
+static int g_rx_ch2_frames = 0;        /* ch2 data frames observed */
+static uint8_t g_rx_offer_yiaddr[4] = { 0 };
+static uint8_t g_rx_offer_msgtype = 0; /* DHCP opt53 (2=OFFER, 5=ACK) */
+static uint32_t g_rx_offer_xid = 0u;
+static uint8_t g_dhcp_serverid[4] = { 0 }; /* opt54, needed for the REQUEST */
+static uint8_t g_rx_want = 0u;         /* required DHCP msgtype (0 = any) */
+
+/* Poll SDPCM ch2 for a BOOTP/DHCP reply whose opt53 == want (want==0 => any).
+ * Records msgtype/xid/yiaddr and captures opt54 (server-id). Sets
+ * g_rx_offer_seen on a matching reply. */
+static void diag_wifiRxDhcp(volatile uint8_t *sdhci, uint32_t sdio_core)
+{
+	int iter;
+
+	(void)sdio_core;
+	g_rx_offer_seen = 0;
+	for (iter = 0; iter < 400 && g_rx_offer_seen == 0; ++iter) {
+		uint16_t flen = 0u;
+		uint8_t chan = 0xffu;
+		int rc = diag_f2RecvFrame(sdhci, g_rxf, &flen, &chan);
+		if (rc < 0) {
+			continue; /* transient transport wedge; diag_f2RecvFrame reset DAT/CMD */
+		}
+		if (rc == 1) {
+			usleep(5000); /* FIFO empty: pace the poll so the ~400-iter window
+			               * spans ~2s (the DHCP round-trip + fw->host delivery),
+			               * instead of burning through in milliseconds. */
+			continue;
+		}
+		if (chan != 2u) {
+			continue; /* control (0) / event (1): not our data path */
+		}
+		g_rx_ch2_frames++;
+		{
+			uint32_t sdoff = g_rxf[7];
+			uint32_t eth, ip, udp, bootp, opt, end;
+			if (sdoff < 12u || sdoff + 4u > flen) {
+				continue;
+			}
+			eth = sdoff + 4u + ((uint32_t)g_rxf[sdoff + 3u] << 2);
+			/* diagnostic: dump the first few ch2 frames so we can identify what
+			 * the fw forwarded (ARP vs the IPv4 DHCP OFFER) and verify offsets. */
+			if (g_rx_ch2_frames <= 3) {
+				uint32_t d, dn = (eth + 42u <= flen) ? (eth + 42u) : flen;
+				printf("wifi: RX-CH2[%d] flen=%u sdoff=%u bdc=%02x %02x %02x %02x eth@%u etype=%02x%02x bytes[%u..]=",
+					g_rx_ch2_frames, flen, sdoff,
+					g_rxf[sdoff], g_rxf[sdoff + 1u], g_rxf[sdoff + 2u], g_rxf[sdoff + 3u],
+					eth, (eth + 13u < flen) ? g_rxf[eth + 12u] : 0u, (eth + 13u < flen) ? g_rxf[eth + 13u] : 0u, sdoff);
+				for (d = sdoff; d < dn; ++d) {
+					printf("%02x ", g_rxf[d]);
+				}
+				printf("\n");
+				fflush(stdout);
+			}
+			/* need eth(14)+IP(20)+UDP(8)+BOOTP(240 min incl magic) in-frame */
+			if (eth + 14u + 20u + 8u + 240u > flen) {
+				continue;
+			}
+			/* ethertype IPv4, IP proto UDP, UDP dst port 68 (BOOTP client) */
+			if (g_rxf[eth + 12u] != 0x08u || g_rxf[eth + 13u] != 0x00u) {
+				continue;
+			}
+			ip = eth + 14u;
+			if (g_rxf[ip + 9u] != 0x11u) {
+				continue; /* not UDP */
+			}
+			udp = ip + 20u;
+			if (g_rxf[udp + 2u] != 0x00u || g_rxf[udp + 3u] != 0x44u) {
+				continue; /* not ->68 */
+			}
+			bootp = udp + 8u;
+			if (g_rxf[bootp] != 0x02u) {
+				continue; /* not a BOOTP reply */
+			}
+			g_rx_offer_xid = diag_le32(&g_rxf[bootp + 4u]);
+			g_rx_offer_yiaddr[0] = g_rxf[bootp + 16u];
+			g_rx_offer_yiaddr[1] = g_rxf[bootp + 17u];
+			g_rx_offer_yiaddr[2] = g_rxf[bootp + 18u];
+			g_rx_offer_yiaddr[3] = g_rxf[bootp + 19u];
+			/* DHCP options: magic cookie @ bootp+236, then TLV; find opt53
+			 * (msg type) + opt54 (server-id, needed for the REQUEST). */
+			g_rx_offer_msgtype = 0u;
+			opt = bootp + 236u + 4u; /* skip the 4-byte magic cookie */
+			end = flen;
+			while (opt + 1u < end) {
+				uint8_t t = g_rxf[opt];
+				uint8_t l;
+				if (t == 0xffu) {
+					break; /* end option */
+				}
+				if (t == 0x00u) {
+					opt++; /* pad */
+					continue;
+				}
+				l = g_rxf[opt + 1u];
+				if (t == 53u && l >= 1u && opt + 2u < end) {
+					g_rx_offer_msgtype = g_rxf[opt + 2u];
+				}
+				if (t == 54u && l >= 4u && opt + 5u < end) {
+					g_dhcp_serverid[0] = g_rxf[opt + 2u];
+					g_dhcp_serverid[1] = g_rxf[opt + 3u];
+					g_dhcp_serverid[2] = g_rxf[opt + 4u];
+					g_dhcp_serverid[3] = g_rxf[opt + 5u];
+				}
+				opt += 2u + l;
+			}
+			/* only a reply of the wanted type ends the poll (a late OFFER while
+			 * we wait for the ACK must not stop us). */
+			if (g_rx_want == 0u || g_rx_offer_msgtype == g_rx_want) {
+				g_rx_offer_seen = 1;
+			}
+		}
+	}
+	printf("wifi: RX-DHCP want=%u seen=%d msgtype=%u xid=0x%08x yiaddr=%u.%u.%u.%u serverid=%u.%u.%u.%u ch2=%d\n",
+		(unsigned)g_rx_want, g_rx_offer_seen, (unsigned)g_rx_offer_msgtype, (unsigned)g_rx_offer_xid,
+		g_rx_offer_yiaddr[0], g_rx_offer_yiaddr[1], g_rx_offer_yiaddr[2], g_rx_offer_yiaddr[3],
+		g_dhcp_serverid[0], g_dhcp_serverid[1], g_dhcp_serverid[2], g_dhcp_serverid[3], g_rx_ch2_frames);
+	fflush(stdout);
+}
+
+/* IPv4 header checksum (16-bit ones-complement over the 20-byte header, cksum
+ * field pre-zeroed). Needed because the DHCP REQUEST's option block differs in
+ * length from the DISCOVER, changing the IP total-length. */
+static uint16_t diag_ipcksum(const uint8_t *p, int len)
+{
+	uint32_t sum = 0u;
+	int i;
+	for (i = 0; i + 1 < len; i += 2) {
+		sum += ((uint32_t)p[i] << 8) | (uint32_t)p[i + 1];
+	}
+	if ((len & 1) != 0) {
+		sum += (uint32_t)p[len - 1] << 8;
+	}
+	while ((sum >> 16) != 0u) {
+		sum = (sum & 0xffffu) + (sum >> 16);
+	}
+	return (uint16_t)(~sum);
+}
+
+/* DHCP message type this frame carries: 1 = DISCOVER (default), 3 = REQUEST
+ * (adds opt50 requested-IP = g_dhcp_reqip + opt54 server-id). */
+static int g_tx_dhcp_type = 1;
+static uint8_t g_dhcp_reqip[4] = { 0 };  /* offered IP, snapshotted for the REQUEST's opt50 */
+static int g_dhcp_ack_seen = 0;
+static int g_dhcp_offered = 0;           /* an OFFER (opt53=2) was accepted */
+static uint8_t g_dhcp_bound[4] = { 0 };  /* IP confirmed by the ACK */
+
+/* TX a DHCP DISCOVER/REQUEST 802.3 frame as an SDPCM channel-2 DATA frame
+ * (4-byte BDC header), driving the data-plane TX path end-to-end. Mirrors
+ * diag_bcdcCmd's F2 write but channel=2 and the BDC header instead of the
+ * 16-byte BCDC dcmd. The eth frame is built directly into g_txf at +16 (after
+ * SDPCM[12]+BDC[4]). Design: docs/inprogress/2026-08-13-wifi-dataplane-design.md.
+ *
+ * Bare NON-glom SDPCM data frame (the fw's DEFAULT mode form, before any
+ * bus:rxglom): HW[0-3] + SW[4-11] (seq/chan2/nextlen0/doff12) + BDC[12-15] +
+ * eth@16. This is the format every non-scatter-gather brcmfmac host uses for
+ * data, and the one the proven DHCP exchange used. (The probe also carried a
+ * HWEXT txglom variant; that hypothesis was disproved -- the glom matrix was
+ * flat -- so the driver only ever builds the non-glom form.) */
+static void diag_wifiDataTx(volatile uint8_t *sdhci, uint32_t sdio_core, uint8_t seq)
+{
+	uint8_t mac[8];
+	uint32_t ml = 0u;
+	int i, elen;
+	uint32_t total, wlen;
+	int rc;
+
+	g_tx_ran = 1;
+	for (i = 0; i < 8; ++i) {
+		mac[i] = 0u;
+	}
+	if (g_txmac_valid) {
+		/* use the MAC read earlier in non-glom mode (see the DHCP block) */
+		for (i = 0; i < 6; ++i) {
+			mac[i] = g_txmac[i];
+		}
+		g_tx_mac_rc = 0;
+	} else {
+		g_tx_mac_rc = diag_iovar(sdhci, sdio_core, 0, "cur_etheraddr", NULL, 6u,
+			mac, sizeof(mac), &ml, 200u, seq);
+	}
+
+	for (i = 0; i < (int)F2_FRAME_MAX; ++i) {
+		g_txf[i] = 0u;
+	}
+	/* --- 802.3 Ethernet header @16 --- */
+	for (i = 0; i < 6; ++i) {
+		g_txf[16 + i] = 0xffu; /* dst broadcast */
+	}
+	for (i = 0; i < 6; ++i) {
+		g_txf[22 + i] = mac[i]; /* src = Pi wifi MAC */
+	}
+	g_txf[28] = 0x08u; g_txf[29] = 0x00u; /* ethertype IPv4 */
+	/* --- IP header @30 (20B), src 0.0.0.0 dst 255.255.255.255 --- */
+	g_txf[30] = 0x45u; g_txf[31] = 0x00u; /* ver/ihl, tos */
+	g_txf[32] = 0x01u; g_txf[33] = 0x13u; /* total length 275 */
+	g_txf[38] = 0x40u;                    /* ttl 64 */
+	g_txf[39] = 0x11u;                    /* proto UDP */
+	g_txf[40] = 0x79u; g_txf[41] = 0xdbu; /* IP header checksum */
+	g_txf[46] = 0xffu; g_txf[47] = 0xffu; g_txf[48] = 0xffu; g_txf[49] = 0xffu; /* dst */
+	/* --- UDP header @50 (8B), 68->67 --- */
+	g_txf[50] = 0x00u; g_txf[51] = 0x44u; /* src port 68 */
+	g_txf[52] = 0x00u; g_txf[53] = 0x43u; /* dst port 67 */
+	g_txf[54] = 0x00u; g_txf[55] = 0xffu; /* udp length 255 (checksum 0) */
+	/* --- DHCP/BOOTP @58 --- */
+	g_txf[58] = 0x01u; g_txf[59] = 0x01u; g_txf[60] = 0x06u; /* op/htype/hlen */
+	g_txf[62] = 0x12u; g_txf[63] = 0x34u; g_txf[64] = 0x56u; g_txf[65] = 0x78u; /* xid */
+	g_txf[68] = 0x80u; g_txf[69] = 0x00u; /* flags: broadcast */
+	for (i = 0; i < 6; ++i) {
+		g_txf[86 + i] = mac[i]; /* chaddr = MAC */
+	}
+	g_txf[294] = 0x63u; g_txf[295] = 0x82u; g_txf[296] = 0x53u; g_txf[297] = 0x63u; /* DHCP magic */
+	{
+		/* DHCP options (cursor p = absolute g_txf offset), then patch the IP
+		 * total-length / UDP length / IP checksum from the actual options end so
+		 * DISCOVER and the longer REQUEST are both well-formed. */
+		uint32_t p = 298u;
+		uint32_t udp_len, ip_total;
+		uint16_t cks;
+		g_txf[p++] = 53u; g_txf[p++] = 1u; g_txf[p++] = (uint8_t)g_tx_dhcp_type; /* opt53 msg type */
+		if (g_tx_dhcp_type == 3) {
+			g_txf[p++] = 50u; g_txf[p++] = 4u;                 /* opt50 requested IP = offered yiaddr */
+			g_txf[p++] = g_dhcp_reqip[0]; g_txf[p++] = g_dhcp_reqip[1];
+			g_txf[p++] = g_dhcp_reqip[2]; g_txf[p++] = g_dhcp_reqip[3];
+			g_txf[p++] = 54u; g_txf[p++] = 4u;                 /* opt54 server identifier */
+			g_txf[p++] = g_dhcp_serverid[0]; g_txf[p++] = g_dhcp_serverid[1];
+			g_txf[p++] = g_dhcp_serverid[2]; g_txf[p++] = g_dhcp_serverid[3];
+		}
+		g_txf[p++] = 55u; g_txf[p++] = 1u; g_txf[p++] = 1u;    /* opt55 param req (subnet) */
+		g_txf[p++] = 0xffu;                                    /* end */
+		udp_len = p - 50u;   /* UDP hdr(8) + BOOTP(236)+magic(4)+options */
+		ip_total = p - 30u;  /* IP hdr(20) + UDP */
+		g_txf[54] = (uint8_t)((udp_len >> 8) & 0xffu); g_txf[55] = (uint8_t)(udp_len & 0xffu);
+		g_txf[32] = (uint8_t)((ip_total >> 8) & 0xffu); g_txf[33] = (uint8_t)(ip_total & 0xffu);
+		g_txf[40] = 0u; g_txf[41] = 0u;
+		cks = diag_ipcksum(&g_txf[30], 20);
+		g_txf[40] = (uint8_t)((cks >> 8) & 0xffu); g_txf[41] = (uint8_t)(cks & 0xffu);
+		elen = (int)(p - 16u); /* eth payload length */
+	}
+	g_tx_len = elen;
+
+	{
+		uint32_t ng_total = 16u + (uint32_t)elen;
+		g_txf[0] = (uint8_t)(ng_total & 0xffu);
+		g_txf[1] = (uint8_t)((ng_total >> 8) & 0xffu);
+		g_txf[2] = (uint8_t)((~ng_total) & 0xffu);
+		g_txf[3] = (uint8_t)(((~ng_total) >> 8) & 0xffu);
+		g_txf[4] = seq;
+		g_txf[5] = 0x02u; /* channel = DATA */
+		g_txf[6] = 0u;    /* nextlen */
+		g_txf[7] = 12u;   /* data_offset = SDPCM_HWHDR+SWHDR = 12 (no HWEXT) */
+		g_txf[8] = 0u; g_txf[9] = 0u; g_txf[10] = 0u; g_txf[11] = 0u;
+		/* BDC header [12-15]: flags = BCDC proto ver 2 << 4; prio/flags2/doff = 0 */
+		g_txf[12] = 0x20u;
+		g_txf[13] = 0u; g_txf[14] = 0u; g_txf[15] = 0u;
+		total = ng_total;
+	}
+
+	diag_setWindow18(sdhci);
+	wlen = (total + 3u) & ~3u;
+	/* dump the on-wire TX frame header so it can be diffed byte-for-byte
+	 * against Linux's captured data frame (measure, don't infer). */
+	printf("wifi: TXFRAME wlen=%u total=%u hdr=", (unsigned)wlen, (unsigned)total);
+	for (i = 0; i < 28; ++i) {
+		printf("%02x ", (unsigned)g_txf[i]);
+	}
+	printf("\n");
+	fflush(stdout);
+	rc = diag_sdioCmd53WriteByteMode(sdhci, 2, /*incr=*/1, IOCTL_F2_ADDR, wlen, g_txf);
+	if (rc != 0) {
+		diag_sdhciResetDatCmd(sdhci);
+	}
+	g_tx_rc = rc;
+}
+
+/* WPA2-PSK join of g_join_ssid/g_join_psk, then (on success) the full DHCP
+ * exchange over SDPCM channel 2. Faithful copy of the probe's proven
+ * diag_wifiJoin + its `jointxcnt` DHCP block; results land in the g_join_* /
+ * g_dhcp_* globals, which wifi_netup() renders. */
+static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
+{
+	uint8_t emask[16];
+	uint8_t val4[4];
+	uint8_t pmk[132];
+	uint8_t ssidbuf[36];
+	uint32_t reqid = 1u;
+	uint8_t seq = 0u;
+	int i, t, slen, plen;
+	int got_setssid = 0, got_psksup = 0;
+	int attempt = 0;
+
+	g_join_ran = 1;
+	printf("wifi: JOIN-START (ssid=%s)\n", g_join_ssid);
+	fflush(stdout);
+	diag_sdhciResetDatCmd(sdhci);
+
+	/* event_msgs: enable join events 0(SET_SSID),5,6,7(ASSOC),11,12,16(LINK),
+	 * 46(PSK_SUP) + keep 69(escan, harmless). mask[i/8] |= 1<<(i%8). */
+	for (i = 0; i < 16; ++i) {
+		emask[i] = 0u;
+	}
+	emask[0] = (1u << 0) | (1u << 5) | (1u << 6) | (1u << 7); /* 0,5,6,7 */
+	emask[1] = (1u << 3) | (1u << 4);                         /* 11,12 */
+	emask[2] = (1u << 0);                                     /* 16 */
+	emask[5] = (1u << 6);                                     /* 46 */
+	emask[8] = 0x20u;                                        /* 69 (escan) */
+	g_join_em_rc = diag_iovar(sdhci, sdio_core, 1, "event_msgs", emask, 16u,
+		NULL, 0u, NULL, reqid++, seq++);
+
+	/* CLM (regulatory) before UP so the radio has channels (same as scan). */
+	(void)diag_clmLoad(sdhci, sdio_core, &reqid, &seq);
+
+	/* infra=1 then WLC_UP */
+	val4[0] = 1u; val4[1] = 0u; val4[2] = 0u; val4[3] = 0u;
+	g_join_infra_rc = diag_bcdcCmd(sdhci, sdio_core, 1, BRCMF_C_SET_INFRA,
+		val4, 4u, NULL, 0u, NULL, reqid++, seq++);
+	g_join_up_rc = diag_bcdcCmd(sdhci, sdio_core, 1, WLC_UP_CMD,
+		val4, 4u, NULL, 0u, NULL, reqid++, seq++);
+	usleep(500 * 1000); /* let PHY finish coming up before security/join */
+
+	/* wsec = 4 (AES/CCMP) */
+	val4[0] = 4u; val4[1] = 0u; val4[2] = 0u; val4[3] = 0u;
+	g_join_wsec_rc = diag_iovar(sdhci, sdio_core, 1, "wsec", val4, 4u,
+		NULL, 0u, NULL, reqid++, seq++);
+	/* wpa_auth = 0x80 (WPA2_AUTH_PSK) */
+	val4[0] = 0x80u;
+	g_join_wpaauth_rc = diag_iovar(sdhci, sdio_core, 1, "wpa_auth", val4, 4u,
+		NULL, 0u, NULL, reqid++, seq++);
+	/* sup_wpa = 1 (enable firmware supplicant) -- MUST precede WSEC_PMK */
+	val4[0] = 1u;
+	g_join_sup_rc = diag_iovar(sdhci, sdio_core, 1, "sup_wpa", val4, 4u,
+		NULL, 0u, NULL, reqid++, seq++);
+
+	/* WLC_SET_WSEC_PMK (268): brcmf_wsec_pmk_le { le16 key_len; le16 flags;
+	 * u8 key[128] } = 132 bytes. Passphrase path: flags=0x0001, key=ASCII. */
+	for (i = 0; i < 132; ++i) {
+		pmk[i] = 0u;
+	}
+	plen = 0;
+	while (g_join_psk[plen] != '\0' && plen < 63) {
+		plen++;
+	}
+	pmk[0] = (uint8_t)(plen & 0xff);
+	pmk[1] = (uint8_t)((plen >> 8) & 0xff);
+	pmk[2] = 0x01u; /* BRCMF_WSEC_PASSPHRASE */
+	pmk[3] = 0x00u;
+	for (i = 0; i < plen; ++i) {
+		pmk[4 + i] = (uint8_t)g_join_psk[i];
+	}
+	g_join_pmk_rc = diag_bcdcCmd(sdhci, sdio_core, 1, WLC_SET_WSEC_PMK_CMD,
+		pmk, 132u, NULL, 0u, NULL, reqid++, seq++);
+
+	/* WLC_SET_SSID (26): brcmf_ssid_le { le32 SSID_len; u8 SSID[32] } = 36 B
+	 * broadcast join -> fw associates + runs the handshake. */
+	for (i = 0; i < 36; ++i) {
+		ssidbuf[i] = 0u;
+	}
+	slen = 0;
+	while (g_join_ssid[slen] != '\0' && slen < 32) {
+		slen++;
+	}
+	ssidbuf[0] = (uint8_t)(slen & 0xff);
+	ssidbuf[1] = (uint8_t)((slen >> 8) & 0xff);
+	for (i = 0; i < slen; ++i) {
+		ssidbuf[4 + i] = (uint8_t)g_join_ssid[i];
+	}
+	/* Retry the join: at good RSSI a broadcast WLC_SET_SSID can still intermittently
+	 * miss the AP in the fw's join-scan (WLC_E_SET_SSID status=3 NO_NETWORKS); a
+	 * few retries reliably associate. Stop as soon as connected. */
+	for (attempt = 0; attempt < 5; ++attempt) {
+	got_setssid = 0;
+	got_psksup = 0;
+	g_join_setssid_status = -100;
+	g_join_psksup_status = -100;
+	g_join_ssid_rc = diag_bcdcCmd(sdhci, sdio_core, 1, WLC_SET_SSID_CMD,
+		ssidbuf, 36u, NULL, 0u, NULL, reqid++, seq++);
+
+	/* Watch events off SDPCM channel 1 (same demux as escan): WLC_E_SET_SSID
+	 * (type 0) status, WLC_E_PSK_SUP (type 46) status, WLC_E_LINK (16) flags.
+	 * event_msg fields relative to ehdr (ethhdr@0 + 10B bcmeth + event_msg@24):
+	 * flags be16 @ehdr+26, event_type be32 @ehdr+28, status be32 @ehdr+32. */
+	for (t = 0; t < 3000 && !(got_setssid && got_psksup); ++t) {
+		uint16_t len;
+		uint8_t chan;
+		int fr;
+		uint32_t sdoff, ehdr, etype, status, flags;
+
+		fr = diag_f2RecvFrame(sdhci, g_rxf, &len, &chan);
+		if (fr == 1) {
+			usleep(3000);
+			continue;
+		}
+		if (fr < 0) {
+			usleep(2000);
+			continue;
+		}
+		{
+			uint32_t st = diag_bpRead32(sdhci, sdio_core + 0x20u);
+			if (st != 0u && st != 0xffffffffu) {
+				diag_bpWrite32(sdhci, sdio_core + 0x20u, st);
+			}
+		}
+		if (chan != 1u) {
+			continue;
+		}
+		g_join_evt_total++;
+		sdoff = g_rxf[7];
+		if (sdoff + 4u > len) {
+			continue;
+		}
+		ehdr = sdoff + 4u + 4u * (uint32_t)g_rxf[sdoff + 3u];
+		if (ehdr + 48u > (uint32_t)len) {
+			continue;
+		}
+		if (diag_be16(g_rxf + ehdr + 12u) != 0x886Cu) {
+			continue; /* not ETH_P_LINK_CTL (event) */
+		}
+		flags = diag_be16(g_rxf + ehdr + 26u);
+		etype = diag_be32(g_rxf + ehdr + 28u);
+		status = diag_be32(g_rxf + ehdr + 32u);
+		if (etype == 0u) { /* WLC_E_SET_SSID */
+			g_join_setssid_status = (int)status;
+			got_setssid = 1;
+			if (status != 0u) {
+				break; /* association failed */
+			}
+		}
+		else if (etype == 46u) { /* WLC_E_PSK_SUP */
+			g_join_psksup_status = (int)status;
+			got_psksup = 1;
+		}
+		else if (etype == 16u) { /* WLC_E_LINK */
+			g_join_link_up = (flags & 0x01u) ? 1 : 0;
+		}
+	}
+
+	g_join_attempts = attempt + 1;
+	if (g_join_setssid_status == 0 && g_join_psksup_status == 6) {
+		break; /* connected -- stop retrying */
+	}
+	if (attempt < 4) {
+		usleep(700 * 1000); /* brief settle before the next join attempt */
+	}
+	}
+	printf("wifi: JOIN-DONE attempts=%d setssid=%d psksup=%d link=%d\n",
+		g_join_attempts, g_join_setssid_status, g_join_psksup_status, g_join_link_up);
+	fflush(stdout);
+
+	/* Only an associated + 4-way-keyed STA can carry data frames, so skip the
+	 * DHCP exchange on a failed join (the probe's one-shot run always fell
+	 * through here; the resident driver classifies it as JOIN-FAILED instead). */
+	if (!(g_join_setssid_status == 0 && g_join_psksup_status == 6)) {
+		return;
+	}
+
+	/* NON-glom data TX with an fw pktcnt snapshot (localizes where a frame dies
+	 * if the exchange stalls). Stays non-glom so the pktcnt GET's control-reply
+	 * RX is unperturbed. */
+	{
+		uint8_t macbuf[8] = { 0 };
+		uint32_t maclen = 0u;
+		int k;
+		g_tx_mac_rc = diag_iovar(sdhci, sdio_core, 0, "cur_etheraddr", NULL, 6u,
+			macbuf, sizeof(macbuf), &maclen, reqid++, seq++);
+		for (k = 0; k < 6; ++k) {
+			g_txmac[k] = macbuf[k];
+		}
+		g_txmac_valid = 1;
+
+		g_pktcnt_pre_rc = diag_wifiPktcnt(sdhci, sdio_core, g_pktcnt_pre, reqid++, seq++);
+		printf("wifi: PKTCNT-PRE rc=%d rx_good=%u rx_bad=%u tx_good=%u tx_bad=%u\n",
+			g_pktcnt_pre_rc, g_pktcnt_pre[0], g_pktcnt_pre[1], g_pktcnt_pre[2], g_pktcnt_pre[3]);
+		fflush(stdout);
+
+		/* Full DHCP over Wi-Fi (SELECTING): DISCOVER->OFFER->REQUEST->ACK, in
+		 * DHCP-client-like rounds (send a few, then a paced ch2 poll -- the
+		 * fw->host RX delivery + round-trip is timing-sensitive). */
+		{
+			int round, offered = 0;
+
+			/* Phase A: DISCOVER -> OFFER (opt53=2); capture yiaddr + server-id. */
+			g_tx_dhcp_type = 1;
+			g_rx_want = 2u;
+			for (round = 0; round < 4 && g_rx_offer_seen == 0; ++round) {
+				for (k = 0; k < 4; ++k) {
+					diag_wifiDataTx(sdhci, sdio_core, (uint8_t)(seq + k));
+					if (g_tx_rc == 0) {
+						g_dtx_burst++;
+					}
+				}
+				seq = (uint8_t)(seq + 4);
+				printf("wifi: DHCP-DISCOVER round=%d frames=%d last_rc=%d\n", round, g_dtx_burst, g_tx_rc);
+				fflush(stdout);
+				diag_wifiRxDhcp(sdhci, sdio_core);
+			}
+
+			if (g_rx_offer_seen != 0 && g_rx_offer_msgtype == 2u) {
+				offered = 1;
+				g_dhcp_reqip[0] = g_rx_offer_yiaddr[0]; g_dhcp_reqip[1] = g_rx_offer_yiaddr[1];
+				g_dhcp_reqip[2] = g_rx_offer_yiaddr[2]; g_dhcp_reqip[3] = g_rx_offer_yiaddr[3];
+				printf("wifi: DHCP-OFFER accepted yiaddr=%u.%u.%u.%u serverid=%u.%u.%u.%u\n",
+					g_dhcp_reqip[0], g_dhcp_reqip[1], g_dhcp_reqip[2], g_dhcp_reqip[3],
+					g_dhcp_serverid[0], g_dhcp_serverid[1], g_dhcp_serverid[2], g_dhcp_serverid[3]);
+				fflush(stdout);
+
+				/* Phase B: REQUEST (opt50 reqip + opt54 serverid) -> ACK (opt53=5). */
+				g_tx_dhcp_type = 3;
+				g_rx_want = 5u;
+				for (round = 0; round < 5 && g_dhcp_ack_seen == 0; ++round) {
+					for (k = 0; k < 4; ++k) {
+						diag_wifiDataTx(sdhci, sdio_core, (uint8_t)(seq + k));
+						if (g_tx_rc == 0) {
+							g_dtx_burst++;
+						}
+					}
+					seq = (uint8_t)(seq + 4);
+					printf("wifi: DHCP-REQUEST round=%d reqip=%u.%u.%u.%u\n", round,
+						g_dhcp_reqip[0], g_dhcp_reqip[1], g_dhcp_reqip[2], g_dhcp_reqip[3]);
+					fflush(stdout);
+					diag_wifiRxDhcp(sdhci, sdio_core);
+					if (g_rx_offer_seen != 0 && g_rx_offer_msgtype == 5u) {
+						g_dhcp_ack_seen = 1;
+						g_dhcp_bound[0] = g_rx_offer_yiaddr[0]; g_dhcp_bound[1] = g_rx_offer_yiaddr[1];
+						g_dhcp_bound[2] = g_rx_offer_yiaddr[2]; g_dhcp_bound[3] = g_rx_offer_yiaddr[3];
+					}
+				}
+			}
+
+			printf("wifi: DHCP-RESULT offer=%d ack=%d bound_ip=%u.%u.%u.%u => %s\n",
+				offered, g_dhcp_ack_seen,
+				g_dhcp_bound[0], g_dhcp_bound[1], g_dhcp_bound[2], g_dhcp_bound[3],
+				g_dhcp_ack_seen ? "BOUND (full DHCP lease over WiFi)" :
+					(offered ? "OFFER-ONLY (REQUEST/ACK incomplete)" : "NO-OFFER"));
+			fflush(stdout);
+			g_dhcp_offered = offered;
+		}
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -2778,6 +3394,87 @@ static int wifi_join(const char *ssid, char *out, int cap)
 }
 
 
+/* ---- WiFi netup (WPA2 join + DHCP lease) -------------------------------- */
+/* Bring the interface all the way up on a WPA2-PSK network: run the proven
+ * firmware-supplicant join, then the DISCOVER/OFFER/REQUEST/ACK exchange over
+ * the SDPCM data plane, and render the outcome into `out`. Wraps
+ * diag_wifiJoinWpa2() the same way wifi_scan() wraps diag_wifiScan(): the diag
+ * function only fills globals, this formats them. Returns bytes written.
+ *
+ * The probe this was ported from ran once per boot, so every result global has
+ * to be reset here for the command to be repeatable (a stale g_dhcp_serverid
+ * would otherwise be baked into the next REQUEST). */
+static int wifi_netup(const char *ssid, const char *psk, char *out, int cap)
+{
+	int off = 0, r;
+	size_t k;
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	}
+	if (ssid[0] == '\0' || psk[0] == '\0') {
+		return snprintf(out, (size_t)cap, "netup: usage: netup <ssid> <psk>\n");
+	}
+
+	for (k = 0; k + 1 < sizeof(g_join_ssid) && ssid[k] != '\0'; ++k) {
+		g_join_ssid[k] = ssid[k];
+	}
+	g_join_ssid[k] = '\0';
+	for (k = 0; k + 1 < sizeof(g_join_psk) && psk[k] != '\0'; ++k) {
+		g_join_psk[k] = psk[k];
+	}
+	g_join_psk[k] = '\0';
+
+	/* join accumulators */
+	g_join_attempts = 0;
+	g_join_setssid_status = -100;
+	g_join_psksup_status = -100;
+	g_join_link_up = 0;
+	g_join_evt_total = 0;
+	/* data-plane + DHCP accumulators */
+	g_txmac_valid = 0;
+	g_dtx_burst = 0;
+	g_tx_dhcp_type = 1;
+	g_rx_want = 0u;
+	g_rx_offer_seen = 0;
+	g_rx_ch2_frames = 0;
+	g_rx_offer_msgtype = 0u;
+	g_rx_offer_xid = 0u;
+	for (k = 0; k < 4u; ++k) {
+		g_rx_offer_yiaddr[k] = 0u;
+		g_dhcp_serverid[k] = 0u;
+		g_dhcp_reqip[k] = 0u;
+		g_dhcp_bound[k] = 0u;
+	}
+	g_dhcp_ack_seen = 0;
+	g_dhcp_offered = 0;
+
+	diag_wifiJoinWpa2(g_sdhci, g_sdio_core);
+
+	r = snprintf(out + off, (size_t)(cap - off),
+		"netup: join ssid=%s setssid=%d psksup=%d link=%d\n",
+		g_join_ssid, g_join_setssid_status, g_join_psksup_status, g_join_link_up);
+	if (r > 0 && r < cap - off) {
+		off += r;
+	}
+	r = snprintf(out + off, (size_t)(cap - off),
+		"netup: dhcp offer=%d ack=%d bound_ip=%u.%u.%u.%u serverid=%u.%u.%u.%u\n",
+		g_dhcp_offered, g_dhcp_ack_seen,
+		g_dhcp_bound[0], g_dhcp_bound[1], g_dhcp_bound[2], g_dhcp_bound[3],
+		g_dhcp_serverid[0], g_dhcp_serverid[1], g_dhcp_serverid[2], g_dhcp_serverid[3]);
+	if (r > 0 && r < cap - off) {
+		off += r;
+	}
+	r = snprintf(out + off, (size_t)(cap - off), "netup: RESULT %s\n",
+		(g_join_setssid_status != 0 || g_join_psksup_status != 6) ? "JOIN-FAILED" :
+			(g_dhcp_ack_seen ? "BOUND" : (g_dhcp_offered ? "OFFER-ONLY" : "NO-OFFER")));
+	if (r > 0 && r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* ---- /dev/wifi message loop -------------------------------------------- */
 /* Offset-aware slice of the most recent scan result (cf. rpi4-gpio's read). */
 static int wifi_readResp(off_t offs, char *dst, size_t size)
@@ -2822,8 +3519,10 @@ static void wifi_thread(void *arg)
 			case mtWrite:
 				/* write("scan") triggers a fresh escan into g_resp; write("join
 				 * <ssid>") exercises the association control path (run after a
-				 * scan, which loads the CLM channel data). A client read()s the
-				 * result. Any other payload is accepted but ignored. */
+				 * scan, which loads the CLM channel data); write("netup <ssid>
+				 * <psk>") runs the WPA2-PSK join plus the full DHCP exchange. A
+				 * client read()s the result. Any other payload is accepted but
+				 * ignored. */
 				if (msg.i.size >= 4 && memcmp(msg.i.data, "scan", 4) == 0) {
 					g_resp_len = wifi_scan(g_resp, (int)sizeof(g_resp));
 				}
@@ -2839,6 +3538,40 @@ static void wifi_thread(void *arg)
 						ssid[--n] = '\0';
 					}
 					g_resp_len = wifi_join(ssid, g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 7 && memcmp(msg.i.data, "netup ", 6) == 0) {
+					/* "netup <ssid> <psk>": ssid is the first space-separated
+					 * token, the psk is the rest of the line (a WPA2 passphrase
+					 * may contain spaces). msg.i.data is NOT NUL-terminated. */
+					char line[160], ssid[33], psk[64];
+					int n = (int)msg.i.size - 6, i, sn = 0, pn = 0;
+					if (n > (int)sizeof(line) - 1) {
+						n = (int)sizeof(line) - 1;
+					}
+					memcpy(line, (const char *)msg.i.data + 6, (size_t)n);
+					line[n] = '\0';
+					while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' ')) {
+						line[--n] = '\0';
+					}
+					i = 0;
+					while (line[i] == ' ') {
+						i++;
+					}
+					while (line[i] != '\0' && line[i] != ' ' && sn < 32) {
+						ssid[sn++] = line[i++];
+					}
+					ssid[sn] = '\0';
+					while (line[i] != '\0' && line[i] != ' ') {
+						i++; /* discard an over-long ssid tail */
+					}
+					while (line[i] == ' ') {
+						i++;
+					}
+					while (line[i] != '\0' && pn < 63) {
+						psk[pn++] = line[i++];
+					}
+					psk[pn] = '\0';
+					g_resp_len = wifi_netup(ssid, psk, g_resp, (int)sizeof(g_resp));
 				}
 				msg.o.err = (int)msg.i.size;
 				break;

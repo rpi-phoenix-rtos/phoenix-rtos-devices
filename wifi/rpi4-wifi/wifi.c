@@ -108,7 +108,7 @@ static int cmd_run(int fd, const char *cmd, int cmdlen)
 int main(int argc, char **argv)
 {
 	int fd, rc;
-	char cmd[64];
+	char cmd[160]; /* "netup <ssid(32)> <psk(63)>" needs more than 64 */
 
 	if (argc >= 2 && strcmp(argv[1], "scan") == 0) {
 		printf("wifi: scanning (~10-20s while the radio sweeps channels)...\n");
@@ -159,7 +159,27 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
-	printf("usage: wifi scan | wifi join <ssid> | wifi up\n");
+	if (argc >= 4 && strcmp(argv[1], "netup") == 0) {
+		/* WPA2-PSK join + full DHCP exchange, entirely inside the resident
+		 * driver. Takes ~20-40s: firmware join + 4-way handshake, then the
+		 * DHCP rounds (DISCOVER/OFFER, REQUEST/ACK). */
+		int n = snprintf(cmd, sizeof(cmd), "netup %s %s", argv[2], argv[3]);
+		if (n < 0 || n >= (int)sizeof(cmd)) {
+			printf("wifi: ssid/psk too long\n");
+			return 2;
+		}
+		printf("wifi: WPA2 join + DHCP on \"%s\" (~20-40s)...\n", argv[2]);
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		rc = cmd_run(fd, cmd, n);
+		close(fd);
+		return rc;
+	}
+	printf("usage: wifi scan | wifi join <ssid> | wifi netup <ssid> <psk> | wifi up\n");
+	printf("  netup: WPA2-PSK join + DHCP lease (reports the bound IP)\n");
 	printf("  up: join the ssid configured in %s\n", WIFI_CONF);
 	return 2;
 }
