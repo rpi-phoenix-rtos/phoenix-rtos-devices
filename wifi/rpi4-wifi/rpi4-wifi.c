@@ -1273,15 +1273,32 @@ static int diag_f2Write(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t le
 }
 
 
+/* RX is chunked BYTE mode, never block mode: a block-mode read must transfer
+ * whole blocks, so it pops ceil(len/64)*64 bytes off the FIFO and eats into the
+ * NEXT frame -- after which every following header read returns garbage. That
+ * showed up as ~597 of 600 drain polls failing with a bad header checksum.
+ * Byte mode pops exactly what is asked for, and the 512-byte cap is handled by
+ * looping, so a frame is consumed precisely. */
 static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
 {
-	uint32_t rlen = (len + 3u) & ~3u;
+	uint32_t done = 0u;
 
-	if (rlen <= 512u) {
-		return diag_sdioCmd53ReadByteMode(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR, rlen, buf);
+	while (done < len) {
+		uint32_t chunk = len - done;
+		int rc;
+
+		if (chunk > 512u) {
+			chunk = 512u;
+		}
+		chunk = (chunk + 3u) & ~3u; /* the PIO loop moves whole words */
+		rc = diag_sdioCmd53ReadByteMode(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
+			chunk, buf + done);
+		if (rc != 0) {
+			return rc;
+		}
+		done += chunk;
 	}
-	return diag_sdioCmd53Read(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
-		(len + F2_BLKSZ - 1u) / F2_BLKSZ, F2_BLKSZ, buf);
+	return 0;
 }
 
 
@@ -2119,7 +2136,7 @@ static void diag_wifiDataTx(volatile uint8_t *sdhci, uint32_t sdio_core, uint8_t
  * the firmware without any error surfacing to the host. */
 static uint8_t g_data_seq = 0;
 static uint32_t g_frame_tx_ok = 0, g_frame_tx_err = 0;
-static uint32_t g_frame_rx_ok = 0, g_frame_rx_err = 0;
+static uint32_t g_frame_rx_ok = 0, g_frame_rx_err = 0, g_frame_rx_garbage = 0;
 
 
 /* Transmit one 802.3 frame. Returns 0 on success, <0 on a transport error. */
@@ -2191,6 +2208,13 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 
 	rc = diag_f2RecvFrame(sdhci, g_rxf, &flen, &chan);
 	if (rc != 0) {
+		/* -31 is an inconsistent SDPCM header, i.e. the FIFO handed back
+		 * something that is not a frame boundary. Count it apart from real
+		 * transport failures: conflating the two hid which was happening. */
+		if (rc == -31) {
+			g_frame_rx_garbage++;
+			return 1;
+		}
 		if (rc < 0) {
 			g_frame_rx_err++;
 		}
@@ -3794,7 +3818,7 @@ static int wifi_mtu(char *out, int cap)
 		"  RX ch2 frames=%u max_eth_len=%u\n"
 		"  RX tagged(:9997) len=%u pattern=%s\n"
 		"  fw pktcnt tx_good %u -> %u (delta %d), tx_bad %u -> %u\n"
-		"  counters: tx_ok=%u tx_err=%u rx_ok=%u rx_err=%u\n"
+		"  counters: tx_ok=%u tx_err=%u rx_ok=%u rx_err=%u rx_garbage=%u\n"
 		"RESULT %s\n",
 		(unsigned)rx_frames, (unsigned)rx_max,
 		(unsigned)rx_pat_len,
@@ -3802,7 +3826,7 @@ static int wifi_mtu(char *out, int cap)
 		(unsigned)pre[2], (unsigned)post[2], (int)(post[2] - pre[2]),
 		(unsigned)pre[3], (unsigned)post[3],
 		(unsigned)g_frame_tx_ok, (unsigned)g_frame_tx_err,
-		(unsigned)g_frame_rx_ok, (unsigned)g_frame_rx_err,
+		(unsigned)g_frame_rx_ok, (unsigned)g_frame_rx_err, (unsigned)g_frame_rx_garbage,
 		((rc[0] == 0) && (rc[1] == 0) && (rc[2] == 0)) ? "TX-ALL-SIZES-SENT" : "TX-FAILED");
 	return n;
 }
