@@ -121,6 +121,19 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
+	if (argc >= 2 && strcmp(argv[1], "mtu") == 0) {
+		/* Full-MTU data-path proof. Requires a prior successful `netup`, and
+		 * takes ~3 s while it drains the RX FIFO. */
+		printf("wifi: full-MTU data-path test (~3s)...\n");
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		rc = cmd_run(fd, "mtu", 3);
+		close(fd);
+		return rc;
+	}
 	if (argc >= 3 && strcmp(argv[1], "join") == 0) {
 		int n = snprintf(cmd, sizeof(cmd), "join %s", argv[2]);
 		if (n < 0 || n >= (int)sizeof(cmd)) {
@@ -178,7 +191,7 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
-	printf("usage: wifi scan | wifi join <ssid> | wifi netup <ssid> <psk> | wifi up\n");
+	printf("usage: wifi scan | wifi join <ssid> | wifi netup <ssid> <psk> | wifi mtu | wifi up\n");
 	printf("  netup: WPA2-PSK join + DHCP lease (reports the bound IP)\n");
 	printf("  up: join the ssid configured in %s\n", WIFI_CONF);
 	return 2;

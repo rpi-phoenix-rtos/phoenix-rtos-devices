@@ -580,6 +580,14 @@ static int diag_sdioCmd53Read(volatile uint8_t *sdhci, int fn,
 static int diag_sdioCmd53ReadByteMode(volatile uint8_t *sdhci, int fn,
 	int incr_addr, uint32_t reg_addr, uint32_t nbytes, uint8_t *buf)
 {
+	/* CMD53 byte mode encodes the count in a 9-bit field (below), so 512 is
+	 * the hard maximum. A larger request used to wrap that field silently
+	 * while BLOCK_SIZE_CNT got the full length -- a host/card length
+	 * mismatch that corrupted the transfer with no error reported anywhere.
+	 * Refuse instead; callers needing more use block mode (diag_f2Read). */
+	if (nbytes > 512u) {
+		return -1050;
+	}
 	uint32_t arg, cmd_word, st, data;
 	uint32_t words_total = (nbytes + 3u) / 4u;
 	uint32_t i;
@@ -656,6 +664,10 @@ static int diag_sdioCmd53ReadByteMode(volatile uint8_t *sdhci, int fn,
 static int diag_sdioCmd53WriteByteMode(volatile uint8_t *sdhci, int fn,
 	int incr_addr, uint32_t reg_addr, uint32_t nbytes, const uint8_t *buf)
 {
+	/* See diag_sdioCmd53ReadByteMode: 9-bit count field, 512 byte maximum. */
+	if (nbytes > 512u) {
+		return -1051;
+	}
 	uint32_t arg, cmd_word, st, data;
 	uint32_t words_total = (nbytes + 3u) / 4u;
 	uint32_t i;
@@ -1216,6 +1228,11 @@ static void diag_sdhciResetDatCmd(volatile uint8_t *sdhci)
  * Was 512, which silently TRUNCATED anything larger. */
 #define F2_FRAME_MAX 2048u
 #define F2_HDR_LEN   12u     /* SDPCM HW(4) + SW(8): enough to learn the length */
+/* SDIO function-2 block size, programmed into FBR 0x210 during bring-up.
+ * Block mode is the ONLY way to move more than 512 bytes (see the guards in
+ * the byte-mode helpers), so every MTU-sized data frame goes through it.
+ * 64 is what brcmfmac uses for this chip. */
+#define F2_BLKSZ     64u
 static int g_evt_seen = 0;             /* chan-1 (event) frames demuxed past */
 static int g_ctrl_seen = 0;            /* chan-0 (control) frames read */
 static uint16_t g_last_evt_len = 0u;
@@ -1233,6 +1250,40 @@ static void diag_setWindow18(volatile uint8_t *sdhci)
 	(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
 	(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
 }
+
+/* ---- F2 data transfers of ANY length -------------------------------------
+ *
+ * The byte-mode helpers cap at 512 bytes, which is fine for control frames and
+ * for the DHCP exchange but cannot carry a 1514-byte ethernet frame -- the
+ * prerequisite for an lwip netif. These wrappers pick the addressing mode by
+ * length: byte mode below the cap (the HW-proven path, untouched), block mode
+ * above it. Block mode moves whole blocks, so the length is rounded up to
+ * F2_BLKSZ; the SDPCM header still tells both sides where the real frame ends,
+ * and the TX tail padding is zeroed so nothing stale goes on the air.
+ */
+static int diag_f2Write(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t len)
+{
+	uint32_t wlen = (len + 3u) & ~3u; /* pad to 4 for the PIO word loop */
+
+	if (wlen <= 512u) {
+		return diag_sdioCmd53WriteByteMode(sdhci, 2, /*incr=*/1, IOCTL_F2_ADDR, wlen, buf);
+	}
+	return diag_sdioCmd53Write(sdhci, 2, /*incr=*/1, IOCTL_F2_ADDR,
+		(len + F2_BLKSZ - 1u) / F2_BLKSZ, F2_BLKSZ, buf);
+}
+
+
+static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
+{
+	uint32_t rlen = (len + 3u) & ~3u;
+
+	if (rlen <= 512u) {
+		return diag_sdioCmd53ReadByteMode(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR, rlen, buf);
+	}
+	return diag_sdioCmd53Read(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
+		(len + F2_BLKSZ - 1u) / F2_BLKSZ, F2_BLKSZ, buf);
+}
+
 
 /* Read one SDPCM frame from the F2 FIFO into buf (>= F2_FRAME_MAX). Reads a
  * fixed F2_FRAME_MAX bytes: a short read (< frame length) CRCs the SDIO data
@@ -1269,7 +1320,7 @@ static int diag_f2RecvFrame(volatile uint8_t *sdhci, uint8_t *buf,
 	 * fw-controlled 16-bit field, and every downstream offset check (event
 	 * stack: ehdr = sdoff + 4 + 4*data_offset, bss = ehdr+84, ...) is bounded
 	 * against *outlen -- an unclamped len would let a malformed large frame
-	 * drive those indices past g_rxf[512]. We only ever read one 512B frame. */
+	 * drive those indices past the end of the caller's F2_FRAME_MAX buffer. */
 	if (len > (uint16_t)F2_FRAME_MAX) {
 		diag_sdhciResetCmdDat(sdhci);
 		return -32;
@@ -1277,8 +1328,10 @@ static int diag_f2RecvFrame(volatile uint8_t *sdhci, uint8_t *buf,
 	/* phase 2: exactly the rest of this frame (4-byte aligned request) */
 	if (len > (uint16_t)F2_HDR_LEN) {
 		uint32_t rest = ((uint32_t)len - F2_HDR_LEN + 3u) & ~3u;
-		rc = diag_sdioCmd53ReadByteMode(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
-			rest, buf + F2_HDR_LEN);
+		/* diag_f2Read, not the byte-mode helper: a frame over 524 bytes
+		 * total needs block mode. Requesting it in byte mode is what
+		 * silently corrupted every larger RX frame before. */
+		rc = diag_f2Read(sdhci, buf + F2_HDR_LEN, rest);
 		if (rc != 0) {
 			diag_sdhciResetCmdDat(sdhci);
 			return -33;
@@ -2053,6 +2106,211 @@ static void diag_wifiDataTx(volatile uint8_t *sdhci, uint32_t sdio_core, uint8_t
 	g_tx_rc = rc;
 }
 
+
+/* ---- generic data path (the lwip netif TX/RX primitives) ------------------
+ *
+ * diag_wifiDataTx above can only synthesize a DHCP packet. A netif needs
+ * "send THIS frame" / "give me the next frame", so these two are the generic
+ * form. They are deliberately free of printf: this is a data plane.
+ */
+/* SDPCM sequence for the generic data path. NOT independent: it is the same
+ * per-bus stream the control/event paths advance, and the join+DHCP flow seeds
+ * it (see g_data_seq = seq there). An out-of-sequence data frame is dropped by
+ * the firmware without any error surfacing to the host. */
+static uint8_t g_data_seq = 0;
+static uint32_t g_frame_tx_ok = 0, g_frame_tx_err = 0;
+static uint32_t g_frame_rx_ok = 0, g_frame_rx_err = 0;
+
+
+/* Transmit one 802.3 frame. Returns 0 on success, <0 on a transport error. */
+static int diag_wifiFrameTx(volatile uint8_t *sdhci, const uint8_t *eth, uint32_t elen)
+{
+	uint32_t total, padded, i;
+	int rc;
+
+	if ((sdhci == NULL) || (eth == NULL) || (elen < 14u) || ((elen + 16u) > F2_FRAME_MAX)) {
+		return -1060;
+	}
+	total = 16u + elen;
+	padded = ((total + F2_BLKSZ - 1u) / F2_BLKSZ) * F2_BLKSZ;
+	if (padded > F2_FRAME_MAX) {
+		padded = F2_FRAME_MAX;
+	}
+
+	for (i = 0; i < 16u; ++i) {
+		g_txf[i] = 0u;
+	}
+	for (i = 0; i < elen; ++i) {
+		g_txf[16u + i] = eth[i];
+	}
+	/* zero the block-mode tail padding rather than shipping stale bytes */
+	for (i = total; i < padded; ++i) {
+		g_txf[i] = 0u;
+	}
+
+	/* SDPCM HW header: length + its one's complement as the check word. */
+	g_txf[0] = (uint8_t)(total & 0xffu);
+	g_txf[1] = (uint8_t)((total >> 8) & 0xffu);
+	g_txf[2] = (uint8_t)((~total) & 0xffu);
+	g_txf[3] = (uint8_t)(((~total) >> 8) & 0xffu);
+	/* SDPCM SW header: seq, channel 2 (DATA), no nextlen, data_offset 12. */
+	g_txf[4] = g_data_seq++;
+	g_txf[5] = 0x02u;
+	g_txf[6] = 0u;
+	g_txf[7] = 12u;
+	/* BDC header: BCDC proto ver 2 << 4; prio/flags2/doff = 0 (eth at +16). */
+	g_txf[12] = 0x20u;
+
+	diag_setWindow18(sdhci);
+	rc = diag_f2Write(sdhci, g_txf, total);
+	if (rc != 0) {
+		diag_sdhciResetDatCmd(sdhci);
+		g_frame_tx_err++;
+		return rc;
+	}
+	g_frame_tx_ok++;
+	return 0;
+}
+
+
+/* Receive one 802.3 frame. Returns 0 with *elen set, 1 if nothing is ready (or
+ * the frame was not DATA), <0 on error.
+ *
+ * NOTE for the netif work: a non-channel-2 frame read here is DISCARDED, and
+ * the control/event paths drain the same FIFO into the same g_rxf. That is
+ * survivable for a one-shot command but NOT for a continuous RX thread, which
+ * would steal control replies. The netif attach needs one central demux
+ * (ch0 -> control waiter, ch1 -> events, ch2 -> lwip input) plus a bus mutex. */
+static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
+	uint32_t *elen)
+{
+	uint16_t flen = 0u;
+	uint8_t chan = 0u;
+	uint32_t sdoff, ethoff, n, i;
+	int rc;
+
+	rc = diag_f2RecvFrame(sdhci, g_rxf, &flen, &chan);
+	if (rc != 0) {
+		if (rc < 0) {
+			g_frame_rx_err++;
+		}
+		return rc;
+	}
+	if (chan != 2u) {
+		return 1;
+	}
+	/* eth offset = SDPCM data_offset + BDC(4) + BDC.doff words (<<2), exactly
+	 * as brcmf_proto_bcdc_hdrpull computes it. Never assume a fixed 16. */
+	sdoff = g_rxf[7];
+	if ((sdoff < 12u) || ((sdoff + 4u) > (uint32_t)flen)) {
+		g_frame_rx_err++;
+		return -1061;
+	}
+	ethoff = sdoff + 4u + ((uint32_t)g_rxf[sdoff + 3u] << 2);
+	if ((ethoff + 14u) > (uint32_t)flen) {
+		g_frame_rx_err++;
+		return -1062;
+	}
+	n = (uint32_t)flen - ethoff;
+	if (n > cap) {
+		g_frame_rx_err++;
+		return -1063;
+	}
+	if (eth != NULL) {
+		for (i = 0; i < n; ++i) {
+			eth[i] = g_rxf[ethoff + i];
+		}
+	}
+	if (elen != NULL) {
+		*elen = n;
+	}
+	g_frame_rx_ok++;
+	return 0;
+}
+
+
+/* UDP checksum over the IPv4 pseudo-header + UDP header + payload (RFC 768).
+ * Worth computing: it makes the HOST verify payload integrity for us, since
+ * tcpdump only prints "udp sum ok" when every byte survived the air. */
+static uint16_t diag_udpcksum(const uint8_t *ip, const uint8_t *udp, uint32_t udplen)
+{
+	uint32_t sum = 0u, i;
+
+	for (i = 0; i < 4u; i += 2u) { /* src + dst addresses */
+		sum += ((uint32_t)ip[12 + i] << 8) | (uint32_t)ip[13 + i];
+		sum += ((uint32_t)ip[16 + i] << 8) | (uint32_t)ip[17 + i];
+	}
+	sum += 17u;     /* pseudo-header protocol */
+	sum += udplen;  /* pseudo-header UDP length */
+	for (i = 0; (i + 1u) < udplen; i += 2u) {
+		sum += ((uint32_t)udp[i] << 8) | (uint32_t)udp[i + 1u];
+	}
+	if ((udplen & 1u) != 0u) {
+		sum += (uint32_t)udp[udplen - 1u] << 8;
+	}
+	while ((sum >> 16) != 0u) {
+		sum = (sum & 0xffffu) + (sum >> 16);
+	}
+	sum = (~sum) & 0xffffu;
+	return (uint16_t)((sum == 0u) ? 0xffffu : sum); /* 0 means "no checksum" */
+}
+
+
+/* Build and send one UDP broadcast carrying `plen` pattern bytes, so a
+ * host-side capture can confirm both the length and (via the checksum) the
+ * integrity of a full-MTU frame. Broadcast on purpose: no ARP needed. */
+static uint8_t g_udpf[F2_FRAME_MAX]; /* last frame built by diag_wifiUdpTx */
+
+static int diag_wifiUdpTx(volatile uint8_t *sdhci, uint32_t plen, uint16_t dport)
+{
+	uint32_t i, iptot, udplen, elen;
+	uint16_t cks;
+
+	if ((42u + plen) > 1514u) {
+		return -1064;
+	}
+	for (i = 0; i < (42u + plen); ++i) {
+		g_udpf[i] = 0u;
+	}
+	for (i = 0; i < 6u; ++i) {
+		g_udpf[i] = 0xffu;          /* dst: broadcast */
+		g_udpf[6u + i] = g_txmac[i]; /* src: our WiFi MAC */
+	}
+	g_udpf[12] = 0x08u;
+	g_udpf[13] = 0x00u;             /* ethertype IPv4 */
+
+	udplen = 8u + plen;
+	iptot = 20u + udplen;
+	g_udpf[14] = 0x45u;             /* IPv4, ihl 5 */
+	g_udpf[16] = (uint8_t)((iptot >> 8) & 0xffu);
+	g_udpf[17] = (uint8_t)(iptot & 0xffu);
+	g_udpf[22] = 64u;               /* ttl */
+	g_udpf[23] = 17u;               /* proto UDP */
+	for (i = 0; i < 4u; ++i) {
+		g_udpf[26u + i] = g_dhcp_bound[i];  /* src: our lease */
+		g_udpf[30u + i] = 0xffu;            /* dst: 255.255.255.255 */
+	}
+	cks = diag_ipcksum(&g_udpf[14], 20);
+	g_udpf[24] = (uint8_t)((cks >> 8) & 0xffu);
+	g_udpf[25] = (uint8_t)(cks & 0xffu);
+
+	g_udpf[34] = 0x27u;             /* src port 9999 */
+	g_udpf[35] = 0x0fu;
+	g_udpf[36] = (uint8_t)((dport >> 8) & 0xffu);
+	g_udpf[37] = (uint8_t)(dport & 0xffu);
+	g_udpf[38] = (uint8_t)((udplen >> 8) & 0xffu);
+	g_udpf[39] = (uint8_t)(udplen & 0xffu);
+	for (i = 0; i < plen; ++i) {
+		g_udpf[42u + i] = (uint8_t)(i ^ 0x5au); /* the pattern the host checks */
+	}
+	cks = diag_udpcksum(&g_udpf[14], &g_udpf[34], udplen);
+	g_udpf[40] = (uint8_t)((cks >> 8) & 0xffu);
+	g_udpf[41] = (uint8_t)(cks & 0xffu);
+
+	elen = 42u + plen;
+	return diag_wifiFrameTx(sdhci, g_udpf, elen);
+}
+
 /* WPA2-PSK join of g_join_ssid/g_join_psk, then (on success) the full DHCP
  * exchange over SDPCM channel 2. Faithful copy of the probe's proven
  * diag_wifiJoin + its `jointxcnt` DHCP block; results land in the g_join_* /
@@ -2313,6 +2571,13 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 					(offered ? "OFFER-ONLY (REQUEST/ACK incomplete)" : "NO-OFFER"));
 			fflush(stdout);
 			g_dhcp_offered = offered;
+
+			/* Hand the bus sequence over to the generic data path. SDPCM seq is
+			 * ONE per-bus stream shared by control, event and data frames, so a
+			 * later `wifi mtu` (or an lwip netif TX) must CONTINUE it. Starting
+			 * a second counter at 0 makes the fw silently drop every frame --
+			 * the SDIO write still returns 0, so it looks like a working TX. */
+			g_data_seq = seq;
 		}
 	}
 }
@@ -2527,6 +2792,13 @@ static int wifi_bringup(void)
 
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);
+
+		/* Function 2 (WLAN data) block size. F1's was programmed just above;
+		 * F2's never was, because nothing used block mode on the data path --
+		 * which is precisely why data frames were stuck under the 512-byte
+		 * byte-mode cap. FBR2's block size lives at 0x210/0x211. */
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x210u, (uint8_t)(F2_BLKSZ & 0xffu), NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x211u, (uint8_t)((F2_BLKSZ >> 8) & 0xffu), NULL);
 
 		/* #91: enumerate cores over the backplane (read-only) now that the
 		 * ALP clock is up, so the report can replace the hardcoded core-
@@ -3404,6 +3676,138 @@ static int wifi_join(const char *ssid, char *out, int cap)
  * The probe this was ported from ran once per boot, so every result global has
  * to be reset here for the command to be repeatable (a stale g_dhcp_serverid
  * would otherwise be baked into the next REQUEST). */
+/* `wifi mtu`: prove the data path carries FULL-MTU frames, which is the real
+ * prerequisite for an lwip netif. The proven DHCP exchange only ever moved
+ * ~340-byte frames -- comfortably under the 512-byte byte-mode ceiling -- so
+ * it said nothing about MTU. Sends one UDP broadcast per size with correct IP
+ * AND UDP checksums (so a host capture verifies integrity, not just arrival),
+ * then drains channel 2 for a few seconds and reports the largest frame seen
+ * plus a pattern check for a datagram the host sends to port 9997.
+ *
+ * Run `wifi netup <ssid> <psk>` first: this deliberately does not re-join,
+ * since a second join against already-associated firmware is untested. */
+static int wifi_mtu(char *out, int cap)
+{
+	static const uint32_t sizes[3] = { 400u, 1000u, 1472u };
+	static uint8_t rxeth[F2_FRAME_MAX];
+	int rc[3];
+	int n = 0, i, tries;
+	uint32_t rx_frames = 0u, rx_max = 0u, rx_pat_len = 0u, elen = 0u;
+	uint32_t pre[5] = { 0 }, post[5] = { 0 };
+	int rx_pat_ok = -1; /* -1 = no tagged frame seen, 1 = match, 0 = mismatch */
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	}
+	if (!((g_join_setssid_status == 0) && (g_join_psksup_status == 6))) {
+		return snprintf(out, (size_t)cap,
+			"WiFi MTU: NOT-JOINED (setssid=%d psksup=%d)\n"
+			"  run `wifi netup <ssid> <psk>` first -- only an associated, 4-way-keyed\n"
+			"  STA may carry data frames.\n",
+			g_join_setssid_status, g_join_psksup_status);
+	}
+	if (!g_txmac_valid) {
+		uint8_t mac[8];
+		uint32_t ml = 0u;
+		if (diag_iovar(g_sdhci, g_sdio_core, 0, "cur_etheraddr", NULL, 6u,
+				mac, sizeof(mac), &ml, 200u, g_data_seq++) == 0) {
+			for (i = 0; i < 6; ++i) {
+				g_txmac[i] = mac[i];
+			}
+			g_txmac_valid = 1;
+		}
+	}
+
+	/* --- TX: one broadcast per size, smallest first ---
+	 * Bracketed by the firmware's OWN packet counters: a 0 rc from the SDIO
+	 * write only proves the bytes reached the chip, not that the radio sent
+	 * them. tx_good tells us which of the two happened. */
+	(void)diag_wifiPktcnt(g_sdhci, g_sdio_core, pre, 300u, g_data_seq++);
+	for (i = 0; i < 3; ++i) {
+		rc[i] = diag_wifiUdpTx(g_sdhci, sizes[i], 9998u);
+		usleep(20000);
+	}
+	usleep(200000);
+	(void)diag_wifiPktcnt(g_sdhci, g_sdio_core, post, 301u, g_data_seq++);
+
+	/* Dump the head of the last frame built, so it can be diffed byte-for-byte
+	 * against the DHCP frame the AP demonstrably accepts. */
+	printf("wifi: MTUFRAME eth=");
+	for (i = 0; i < 48; ++i) {
+		printf("%02x ", (unsigned)g_udpf[i]);
+	}
+	printf("\n");
+	fflush(stdout);
+
+	/* --- RX: drain channel 2 for ~3 s --- */
+	for (tries = 0; tries < 600; ++tries) {
+		int r = diag_wifiFrameRx(g_sdhci, rxeth, sizeof(rxeth), &elen);
+		if (r == 1) {
+			usleep(5000);
+			continue;
+		}
+		if (r != 0) {
+			continue; /* transport error already counted; keep draining */
+		}
+		rx_frames++;
+		if (elen > rx_max) {
+			rx_max = elen;
+		}
+		/* Is this the host's tagged probe? IPv4 + UDP + dport 9997, and if so
+		 * does the payload still carry the pattern byte-for-byte? */
+		if ((elen > 42u) && (rxeth[12] == 0x08u) && (rxeth[13] == 0x00u) &&
+				((rxeth[14] & 0xf0u) == 0x40u) && (rxeth[23] == 17u)) {
+			uint32_t ihl = (uint32_t)(rxeth[14] & 0x0fu) * 4u;
+			uint32_t uoff = 14u + ihl;
+			if ((uoff + 8u) < elen) {
+				uint32_t dport = ((uint32_t)rxeth[uoff + 2u] << 8) | (uint32_t)rxeth[uoff + 3u];
+				if (dport == 9997u) {
+					uint32_t poff = uoff + 8u;
+					uint32_t plen = elen - poff;
+					uint32_t k;
+					rx_pat_len = plen;
+					rx_pat_ok = 1;
+					for (k = 0; k < plen; ++k) {
+						if (rxeth[poff + k] != (uint8_t)(k ^ 0x5au)) {
+							rx_pat_ok = 0;
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	n += snprintf(out + n, (size_t)(cap - n),
+		"WiFi MTU test (bound %u.%u.%u.%u, F2 block size %u)\n",
+		g_dhcp_bound[0], g_dhcp_bound[1], g_dhcp_bound[2], g_dhcp_bound[3],
+		(unsigned)F2_BLKSZ);
+	for (i = 0; i < 3; ++i) {
+		n += snprintf(out + n, (size_t)(cap - n),
+			"  TX udp payload=%4u eth=%4u frame=%4u mode=%-5s rc=%d %s\n",
+			(unsigned)sizes[i], (unsigned)(42u + sizes[i]),
+			(unsigned)(58u + sizes[i]),
+			((58u + sizes[i] + 3u) & ~3u) <= 512u ? "byte" : "block",
+			rc[i], (rc[i] == 0) ? "OK" : "FAIL");
+	}
+	n += snprintf(out + n, (size_t)(cap - n),
+		"  RX ch2 frames=%u max_eth_len=%u\n"
+		"  RX tagged(:9997) len=%u pattern=%s\n"
+		"  fw pktcnt tx_good %u -> %u (delta %d), tx_bad %u -> %u\n"
+		"  counters: tx_ok=%u tx_err=%u rx_ok=%u rx_err=%u\n"
+		"RESULT %s\n",
+		(unsigned)rx_frames, (unsigned)rx_max,
+		(unsigned)rx_pat_len,
+		(rx_pat_ok < 0) ? "none-seen" : ((rx_pat_ok == 1) ? "OK" : "MISMATCH"),
+		(unsigned)pre[2], (unsigned)post[2], (int)(post[2] - pre[2]),
+		(unsigned)pre[3], (unsigned)post[3],
+		(unsigned)g_frame_tx_ok, (unsigned)g_frame_tx_err,
+		(unsigned)g_frame_rx_ok, (unsigned)g_frame_rx_err,
+		((rc[0] == 0) && (rc[1] == 0) && (rc[2] == 0)) ? "TX-ALL-SIZES-SENT" : "TX-FAILED");
+	return n;
+}
+
+
 static int wifi_netup(const char *ssid, const char *psk, char *out, int cap)
 {
 	int off = 0, r;
@@ -3520,7 +3924,8 @@ static void wifi_thread(void *arg)
 				/* write("scan") triggers a fresh escan into g_resp; write("join
 				 * <ssid>") exercises the association control path (run after a
 				 * scan, which loads the CLM channel data); write("netup <ssid>
-				 * <psk>") runs the WPA2-PSK join plus the full DHCP exchange. A
+				 * <psk>") runs the WPA2-PSK join plus the full DHCP exchange;
+				 * write("mtu") proves the data path at full MTU after that. A
 				 * client read()s the result. Any other payload is accepted but
 				 * ignored. */
 				if (msg.i.size >= 4 && memcmp(msg.i.data, "scan", 4) == 0) {
@@ -3572,6 +3977,10 @@ static void wifi_thread(void *arg)
 					}
 					psk[pn] = '\0';
 					g_resp_len = wifi_netup(ssid, psk, g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 3 && memcmp(msg.i.data, "mtu", 3) == 0) {
+					/* full-MTU data-path proof; needs a prior successful netup */
+					g_resp_len = wifi_mtu(g_resp, (int)sizeof(g_resp));
 				}
 				msg.o.err = (int)msg.i.size;
 				break;
