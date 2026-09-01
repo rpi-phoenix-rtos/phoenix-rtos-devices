@@ -121,6 +121,34 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
+	if (argc >= 2 && strcmp(argv[1], "mac") == 0) {
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		rc = cmd_run(fd, "mac", 3);
+		close(fd);
+		return rc;
+	}
+	if (argc >= 4 && strcmp(argv[1], "joinwpa") == 0) {
+		/* Associate + 4-way key only, no DHCP -- what an lwip netif wants,
+		 * since lwip runs DHCP itself over /dev/wifidata. */
+		int n = snprintf(cmd, sizeof(cmd), "joinwpa %s %s", argv[2], argv[3]);
+		if (n < 0 || n >= (int)sizeof(cmd)) {
+			printf("wifi: ssid/psk too long\n");
+			return 2;
+		}
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		printf("wifi: WPA2 join (no DHCP) on \"%s\" (~20-40s)...\n", argv[2]);
+		rc = cmd_run(fd, cmd, n);
+		close(fd);
+		return rc;
+	}
 	if (argc >= 2 && strcmp(argv[1], "mtu") == 0) {
 		/* Full-MTU data-path proof. Requires a prior successful `netup`, and
 		 * takes ~3 s while it drains the RX FIFO. */
@@ -191,7 +219,8 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
-	printf("usage: wifi scan | wifi join <ssid> | wifi netup <ssid> <psk> | wifi mtu | wifi up\n");
+	printf("usage: wifi scan | wifi join <ssid> | wifi netup <ssid> <psk> |\n"
+	       "       wifi joinwpa <ssid> <psk> | wifi mac | wifi mtu | wifi up\n");
 	printf("  netup: WPA2-PSK join + DHCP lease (reports the bound IP)\n");
 	printf("  up: join the ssid configured in %s\n", WIFI_CONF);
 	return 2;

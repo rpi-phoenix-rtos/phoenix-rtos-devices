@@ -1792,6 +1792,10 @@ static int g_join_em_rc = -100, g_join_infra_rc = -100, g_join_up_rc = -100;
 static int g_join_wsec_rc = -100, g_join_wpaauth_rc = -100, g_join_sup_rc = -100;
 static int g_join_pmk_rc = -100, g_join_ssid_rc = -100;
 static int g_join_attempts = 0;          /* SET_SSID attempts (retry on no-network) */
+/* Set by the `joinwpa` command: associate + 4-way-key only, and leave IP to the
+ * caller. An lwip netif must own DHCP itself, so the daemon's built-in exchange
+ * has to be skippable. */
+static int g_join_skip_dhcp = 0;
 static int g_join_setssid_status = -100; /* WLC_E_SET_SSID status (0 = assoc ok) */
 static int g_join_psksup_status = -100;  /* WLC_E_PSK_SUP status (6 = 4-way keyed) */
 static int g_join_link_up = 0;           /* last WLC_E_LINK flags&0x01 */
@@ -2536,8 +2540,9 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 
 		/* Full DHCP over Wi-Fi (SELECTING): DISCOVER->OFFER->REQUEST->ACK, in
 		 * DHCP-client-like rounds (send a few, then a paced ch2 poll -- the
-		 * fw->host RX delivery + round-trip is timing-sensitive). */
-		{
+		 * fw->host RX delivery + round-trip is timing-sensitive).
+		 * Skipped for `joinwpa`, where lwip runs DHCP over the frame seam. */
+		if (g_join_skip_dhcp == 0) {
 			int round, offered = 0;
 
 			/* Phase A: DISCOVER -> OFFER (opt53=2); capture yiaddr + server-id. */
@@ -2595,14 +2600,15 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 					(offered ? "OFFER-ONLY (REQUEST/ACK incomplete)" : "NO-OFFER"));
 			fflush(stdout);
 			g_dhcp_offered = offered;
-
-			/* Hand the bus sequence over to the generic data path. SDPCM seq is
-			 * ONE per-bus stream shared by control, event and data frames, so a
-			 * later `wifi mtu` (or an lwip netif TX) must CONTINUE it. Starting
-			 * a second counter at 0 makes the fw silently drop every frame --
-			 * the SDIO write still returns 0, so it looks like a working TX. */
-			g_data_seq = seq;
 		}
+
+		/* Hand the bus sequence over to the generic data path, on BOTH paths
+		 * (join-only included -- the netif transmits from there). SDPCM seq is
+		 * ONE per-bus stream shared by control, event and data frames, so a
+		 * later data TX must CONTINUE it. Starting a second counter at 0 makes
+		 * the fw silently drop every frame while the SDIO write still returns
+		 * 0, so it looks like a working TX. */
+		g_data_seq = seq;
 	}
 }
 
@@ -3837,17 +3843,18 @@ static int wifi_mtu(char *out, int cap)
 }
 
 
-static int wifi_netup(const char *ssid, const char *psk, char *out, int cap)
+/* Shared by `netup` and `joinwpa`: validate, reset every result global (the
+ * probe this came from ran once per boot, so a repeatable command has to clear
+ * them), then run the WPA2 join -- with or without the built-in DHCP.
+ * Returns 0, or -1 if the arguments are unusable. */
+static int wifi_joinRun(const char *ssid, const char *psk, int do_dhcp)
 {
-	int off = 0, r;
 	size_t k;
 
-	if (g_sdhci == NULL) {
-		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	if ((ssid[0] == '\0') || (psk[0] == '\0')) {
+		return -1;
 	}
-	if (ssid[0] == '\0' || psk[0] == '\0') {
-		return snprintf(out, (size_t)cap, "netup: usage: netup <ssid> <psk>\n");
-	}
+	g_join_skip_dhcp = (do_dhcp != 0) ? 0 : 1;
 
 	for (k = 0; k + 1 < sizeof(g_join_ssid) && ssid[k] != '\0'; ++k) {
 		g_join_ssid[k] = ssid[k];
@@ -3883,6 +3890,68 @@ static int wifi_netup(const char *ssid, const char *psk, char *out, int cap)
 	g_dhcp_offered = 0;
 
 	diag_wifiJoinWpa2(g_sdhci, g_sdio_core);
+	g_join_skip_dhcp = 0;
+	return 0;
+}
+
+
+/* `joinwpa <ssid> <psk>`: associate + 4-way key ONLY, no DHCP -- the form an
+ * lwip netif needs, because lwip runs DHCP itself over /dev/wifidata. Reports
+ * the MAC too, so the netif can set its hwaddr without a second command. */
+static int wifi_joinwpa(const char *ssid, const char *psk, char *out, int cap)
+{
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	}
+	if (wifi_joinRun(ssid, psk, 0) != 0) {
+		return snprintf(out, (size_t)cap, "joinwpa: usage: joinwpa <ssid> <psk>\n");
+	}
+	return snprintf(out, (size_t)cap,
+		"JOINWPA %s setssid=%d psksup=%d link=%d\n"
+		"MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+		((g_join_setssid_status == 0) && (g_join_psksup_status == 6)) ? "ok" : "fail",
+		g_join_setssid_status, g_join_psksup_status, g_join_link_up,
+		g_txmac[0], g_txmac[1], g_txmac[2], g_txmac[3], g_txmac[4], g_txmac[5]);
+}
+
+
+/* `mac`: the station MAC, for a netif that has not joined yet. */
+static int wifi_mac(char *out, int cap)
+{
+	uint8_t mac[8];
+	uint32_t ml = 0u;
+	int i;
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	}
+	if (!g_txmac_valid) {
+		if (diag_iovar(g_sdhci, g_sdio_core, 0, "cur_etheraddr", NULL, 6u,
+				mac, sizeof(mac), &ml, 210u, g_data_seq++) == 0) {
+			for (i = 0; i < 6; ++i) {
+				g_txmac[i] = mac[i];
+			}
+			g_txmac_valid = 1;
+		}
+		else {
+			return snprintf(out, (size_t)cap, "MAC unavailable\n");
+		}
+	}
+	return snprintf(out, (size_t)cap, "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+		g_txmac[0], g_txmac[1], g_txmac[2], g_txmac[3], g_txmac[4], g_txmac[5]);
+}
+
+
+static int wifi_netup(const char *ssid, const char *psk, char *out, int cap)
+{
+	int off = 0, r;
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	}
+	if (wifi_joinRun(ssid, psk, 1) != 0) {
+		return snprintf(out, (size_t)cap, "netup: usage: netup <ssid> <psk>\n");
+	}
 
 	r = snprintf(out + off, (size_t)(cap - off),
 		"netup: join ssid=%s setssid=%d psksup=%d link=%d\n",
@@ -3905,6 +3974,49 @@ static int wifi_netup(const char *ssid, const char *psk, char *out, int cap)
 		off += r;
 	}
 	return off;
+}
+
+
+/* Parse "<cmd> <ssid> <psk>" out of a write payload that is NOT NUL-terminated:
+ * the ssid is the first space-separated token, the psk is the rest of the line
+ * (a WPA2 passphrase may contain spaces). An over-long ssid tail is discarded. */
+static void wifi_parseSsidPsk(const void *data, size_t size, size_t skip,
+	char *ssid, size_t ssid_cap, char *psk, size_t psk_cap)
+{
+	char line[160];
+	size_t n, i = 0, sn = 0, pn = 0;
+
+	ssid[0] = '\0';
+	psk[0] = '\0';
+	if (size <= skip) {
+		return;
+	}
+	n = size - skip;
+	if (n > (sizeof(line) - 1)) {
+		n = sizeof(line) - 1;
+	}
+	memcpy(line, (const char *)data + skip, n);
+	line[n] = '\0';
+	while ((n > 0) && ((line[n - 1] == '\n') || (line[n - 1] == '\r') || (line[n - 1] == ' '))) {
+		line[--n] = '\0';
+	}
+	while (line[i] == ' ') {
+		i++;
+	}
+	while ((line[i] != '\0') && (line[i] != ' ') && (sn < (ssid_cap - 1))) {
+		ssid[sn++] = line[i++];
+	}
+	ssid[sn] = '\0';
+	while ((line[i] != '\0') && (line[i] != ' ')) {
+		i++; /* discard an over-long ssid tail */
+	}
+	while (line[i] == ' ') {
+		i++;
+	}
+	while ((line[i] != '\0') && (pn < (psk_cap - 1))) {
+		psk[pn++] = line[i++];
+	}
+	psk[pn] = '\0';
 }
 
 
@@ -4059,38 +4171,18 @@ static void wifi_thread(void *arg)
 					g_resp_len = wifi_join(ssid, g_resp, (int)sizeof(g_resp));
 				}
 				else if (msg.i.size >= 7 && memcmp(msg.i.data, "netup ", 6) == 0) {
-					/* "netup <ssid> <psk>": ssid is the first space-separated
-					 * token, the psk is the rest of the line (a WPA2 passphrase
-					 * may contain spaces). msg.i.data is NOT NUL-terminated. */
-					char line[160], ssid[33], psk[64];
-					int n = (int)msg.i.size - 6, i, sn = 0, pn = 0;
-					if (n > (int)sizeof(line) - 1) {
-						n = (int)sizeof(line) - 1;
-					}
-					memcpy(line, (const char *)msg.i.data + 6, (size_t)n);
-					line[n] = '\0';
-					while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' ')) {
-						line[--n] = '\0';
-					}
-					i = 0;
-					while (line[i] == ' ') {
-						i++;
-					}
-					while (line[i] != '\0' && line[i] != ' ' && sn < 32) {
-						ssid[sn++] = line[i++];
-					}
-					ssid[sn] = '\0';
-					while (line[i] != '\0' && line[i] != ' ') {
-						i++; /* discard an over-long ssid tail */
-					}
-					while (line[i] == ' ') {
-						i++;
-					}
-					while (line[i] != '\0' && pn < 63) {
-						psk[pn++] = line[i++];
-					}
-					psk[pn] = '\0';
+					char ssid[33], psk[64];
+					wifi_parseSsidPsk(msg.i.data, msg.i.size, 6, ssid, sizeof(ssid), psk, sizeof(psk));
 					g_resp_len = wifi_netup(ssid, psk, g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 9 && memcmp(msg.i.data, "joinwpa ", 8) == 0) {
+					/* join + 4-way key only; the caller (an lwip netif) runs DHCP */
+					char ssid[33], psk[64];
+					wifi_parseSsidPsk(msg.i.data, msg.i.size, 8, ssid, sizeof(ssid), psk, sizeof(psk));
+					g_resp_len = wifi_joinwpa(ssid, psk, g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 3 && memcmp(msg.i.data, "mac", 3) == 0) {
+					g_resp_len = wifi_mac(g_resp, (int)sizeof(g_resp));
 				}
 				else if (msg.i.size >= 3 && memcmp(msg.i.data, "mtu", 3) == 0) {
 					/* full-MTU data-path proof; needs a prior successful netup */
