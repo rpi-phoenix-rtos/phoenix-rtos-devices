@@ -21,7 +21,7 @@
  * forwards them in msg.i.raw (the synchronous CSD dispatch consumes only cfg[],
  * never the BO handles). SUBMIT_CL / SUBMIT_TFU are still forwarded to the
  * server's stubs (step 2c). The in-process winsys
- * (tools/v3d-driver-port/v3d_phoenix_winsys.c) is UNTOUCHED and remains the
+ * (mesa/v3d_phoenix_winsys.c) is UNTOUCHED and remains the
  * working default; this library is an opt-in alternative backend.
  *
  * The DRM UAPI headers (v3d_drm.h -> drm.h) are the vendored snapshot under
@@ -225,7 +225,7 @@ static int v3d_cli_submit(uint32_t op, const void *desc, uint32_t desc_size,
 /* GET_PARAM: served client-local (device-info constants, no MMIO). Copied    */
 /* verbatim from the winsys ioc_get_param so a client that only creates a     */
 /* screen (GET_PARAM-only) needs no server round-trip. Keep in sync with      */
-/* tools/v3d-driver-port/v3d_phoenix_winsys.c:ioc_get_param.                  */
+/* mesa/v3d_phoenix_winsys.c:ioc_get_param.                  */
 /* ------------------------------------------------------------------------- */
 static int v3d_cli_getParam(struct drm_v3d_get_param *gp)
 {

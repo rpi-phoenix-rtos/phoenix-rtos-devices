@@ -1,6 +1,8 @@
-/* VENDORED shim, origin: mesa/shim-include/sys/ioccom.h (Phoenix sysroot has no <sys/ioccom.h>). */
 /* sys/ioccom.h shim — Linux-style _IOC macros for the DRM UAPI on Phoenix.
- * The encoding must be self-consistent with the winsys backend's _IOC_NR(). */
+ * The encoding must be self-consistent with the winsys backend's _IOC_NR().
+ *
+ * Copyright 2026 Phoenix Systems  %LICENSE%
+ */
 #ifndef PHX_SYS_IOCCOM_H
 #define PHX_SYS_IOCCOM_H
 #define _IOC_NRBITS    8

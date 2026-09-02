@@ -5,10 +5,10 @@
  *
  * The GPU-owning + BO-lifecycle logic for the rpi4-v3d daemon, copied
  * essentially verbatim from the in-process winsys backend
- * (tools/v3d-driver-port/v3d_phoenix_winsys.c, the register #defines, state
+ * (mesa/v3d_phoenix_winsys.c, the register #defines, state
  * struct W, va_alloc/va_free/bo_find, apply_core_regs and the ioc_create_bo /
  * ioc_close_bo bodies) and its self-contained BCM2711 power-on
- * (tools/v3d-driver-port/v3d_phoenix_power.c: mboxProp / asbEnable /
+ * (mesa/v3d_phoenix_power.c: mboxProp / asbEnable /
  * v3d_phoenix_powerOn). That code is all process-local static state in the
  * winsys, so moving it into the sole GPU owner is a copy, not a rewrite; the
  * winsys copy stays byte-for-byte untouched and keeps working in-process.
@@ -160,7 +160,7 @@
  * textures) -> NULL BO -> Data Abort. 1 GiB is ~4x the measured need and stays under
  * the 32-bit VA sign bit. VAs still recycle on free (V3D_VA_NO_RECYCLE=0). Costs 1 MiB
  * contiguous PT RAM; mmap fails loudly at init if unavailable. Synced with the
- * in-process winsys (tools/v3d-driver-port/v3d_phoenix_winsys.c). */
+ * in-process winsys (mesa/v3d_phoenix_winsys.c). */
 #define GPUVA_PT_PAGES      256u   /* 256 * 4 MiB = 1 GiB GPU VA window */
 #endif
 #define GPUVA_PT_ENTRIES    (GPUVA_PT_PAGES * (_PAGE_SIZE / 4u))   /* total PTEs */

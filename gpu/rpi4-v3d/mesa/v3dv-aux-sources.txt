@@ -1,0 +1,27 @@
+# V3DV link-drive aux list — mesa-relative .c paths the linker pulls members from.
+# Seeded from the Tier-0 link-drive; the linker pulls only referenced members.
+# spirv_to_nir (vkQuake ships SPIR-V; the GL build deliberately excluded this subtree)
+src/compiler/spirv/spirv_to_nir.c
+src/compiler/spirv/vtn_alu.c
+src/compiler/spirv/vtn_cfg.c
+src/compiler/spirv/vtn_structured_cfg.c
+src/compiler/spirv/vtn_gather_types.c
+src/compiler/spirv/vtn_glsl450.c
+src/compiler/spirv/vtn_subgroup.c
+src/compiler/spirv/vtn_variables.c
+src/compiler/spirv/vtn_cmat.c
+src/compiler/spirv/vtn_amd.c
+src/compiler/spirv/vtn_opencl.c
+src/compiler/spirv/vtn_debug.c
+src/compiler/spirv/spirv_info.c
+# Vulkan runtime sync provider (drmSyncobj* vtable) + util gaps.
+# (build_id.c needs ELF Nhdr/dl_phdr walking Phoenix lacks -> build_id_length/
+#  copy_build_id_to_sha1 stubbed in v3dv_gap_stubs.c. xmlconfig.c needs expat ->
+#  driconf option machinery stubbed in v3dv_gap_stubs.c.)
+src/util/u_sync_provider.c
+# os_misc.c NOT added: it collides with v3d_phoenix_stubs.c's os_* stubs (already in
+# libv3d-phoenix.a). The only symbol V3DV needs from it (os_get_option_secure) is
+# stubbed in v3dv_gap_stubs.c instead.
+# C11 threads entry points (cnd_*/thrd_* — header maps to pthread inline, but the
+# function bodies live in this TU; the GL build pulled the same file)
+src/c11/impl/threads_posix.c

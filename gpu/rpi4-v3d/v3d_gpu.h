@@ -5,7 +5,7 @@
  *
  * Server-side GPU logic for the rpi4-v3d daemon. The implementation (v3d_gpu.c)
  * is copied essentially verbatim from the in-process winsys backend
- * (tools/v3d-driver-port/v3d_phoenix_winsys.c) + its power-on
+ * (mesa/v3d_phoenix_winsys.c) + its power-on
  * (v3d_phoenix_power.c): the same state struct, BCM2711 power-on, apply_core_regs
  * (single global MMU_PT_PA_BASE + fault config), flat MMU page table, GPU-VA
  * bump/hole allocator, BO table and the CREATE_BO / GET_BO_OFFSET / MMAP_BO /
