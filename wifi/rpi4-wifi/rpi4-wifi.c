@@ -1226,7 +1226,26 @@ static void diag_sdhciResetDatCmd(volatile uint8_t *sdhci)
  * a 64-byte block (F2 blocksize set to 64 via CCCR FBR to reuse block-mode). */
 #define IOCTL_F2_ADDR 0x8000u
 /* Max F2 frame we can hold: SDPCM(12) + BDC(4) + full-MTU eth(1514) + slack.
- * Was 512, which silently TRUNCATED anything larger. */
+ *
+ * Do not raise this without reading the following. Instrumenting the RX errors
+ * showed that ALL of them were this cap rejecting frames the firmware had
+ * announced (-32), up to 9248 bytes -- 184 of 1016 receives, ~18% of inbound
+ * frames dropped. That looks exactly like an undersized buffer, so the obvious
+ * fix is a bigger one. Measured on hardware, 16384:
+ *
+ *   cap  2048: rx_err 184, rx_garbage 876, RX 0.10-0.29 MB/s
+ *   cap 16384: rx_err   0, rx_garbage   0, RX 0.03 MB/s in three runs running
+ *              -- and max_announced_len 0, i.e. NO oversize frame ever arrived
+ *
+ * The 9248-byte headers simply stopped occurring once the cap changed, so they
+ * were never real aggregation: they are a symptom of the receive stream losing
+ * alignment, and the -32 path's controller reset was what recovered it. A
+ * bigger buffer removes the symptom, the recovery with it, and RX gets an order
+ * of magnitude worse.
+ *
+ * So this stays at 2048 (the better-measured behaviour) and the real fix is the
+ * stream itself: SDPCM glom handling or a proper resync strategy, not a wider
+ * buffer. The rxxfer/rxbig counters exist to re-run this comparison. */
 #define F2_FRAME_MAX 2048u
 #define F2_HDR_LEN   12u     /* SDPCM HW(4) + SW(8): enough to learn the length */
 /* SDIO function-2 block size, programmed into FBR 0x210 during bring-up.
@@ -1265,6 +1284,21 @@ static uint8_t g_tx_max = 0;      /* highest sequence the fw will accept */
 static uint8_t g_fc_mask = 0;     /* fw flow-control mask (non-zero = throttled) */
 static uint32_t g_tx_blocked = 0; /* transmits refused because the window was shut */
 static uint32_t g_rx_badhdr_run = 0; /* consecutive malformed headers */
+/* rx_err lumped six different failures together, which is useless for deciding
+ * what to fix: -30/-32/-33 are transport (the transfer itself failed), while
+ * -1061/-1062/-1063 mean the frame arrived but its SDPCM/BDC offsets did not
+ * make sense. Count them apart. */
+static uint32_t g_rxe_xfer = 0;   /* any of the three below */
+static uint32_t g_rxe_hdr = 0;    /* -30 phase-1 header read failed */
+static uint32_t g_rxe_big = 0;    /* -32 fw announced a frame larger than F2_FRAME_MAX */
+static uint32_t g_rxe_body = 0;   /* -33 phase-2 body read failed */
+static uint16_t g_rxe_big_len = 0;/* the largest such announced length, to size the buffer */
+static uint8_t g_rxe_big_chan = 0xff; /* and which SDPCM channel it came in on */
+static uint32_t g_rx_big_ok = 0;      /* frames > 2048 that were read successfully */
+static uint16_t g_rx_big_ok_len = 0;
+static uint32_t g_rxe_sdoff = 0;  /* -1061 implausible SDPCM data_offset */
+static uint32_t g_rxe_ethoff = 0; /* -1062 ethernet offset past the frame end */
+static uint32_t g_rxe_toobig = 0; /* -1063 frame larger than the caller's buffer */
 #define WIFI_RX_RESYNC_AFTER 64u
 static uint32_t g_fc_updates = 0;
 
@@ -1424,6 +1458,12 @@ static int diag_f2RecvFrame(volatile uint8_t *sdhci, uint8_t *buf,
 	 * against *outlen -- an unclamped len would let a malformed large frame
 	 * drive those indices past the end of the caller's F2_FRAME_MAX buffer. */
 	if (len > (uint16_t)F2_FRAME_MAX) {
+		/* Remember how big the firmware actually wanted to hand us: if this is
+		 * the dominant RX failure then the buffer, not the bus, is the problem. */
+		if (len > g_rxe_big_len) {
+			g_rxe_big_len = len;
+		}
+		g_rxe_big_chan = (uint8_t)(buf[5] & 0x0fu);
 		diag_sdhciResetCmdDat(sdhci);
 		return -32;
 	}
@@ -2340,6 +2380,16 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 		}
 		if (rc < 0) {
 			g_frame_rx_err++;
+			g_rxe_xfer++;
+			if (rc == -30) {
+				g_rxe_hdr++;
+			}
+			else if (rc == -32) {
+				g_rxe_big++;
+			}
+			else if (rc == -33) {
+				g_rxe_body++;
+			}
 		}
 		return rc;
 	}
@@ -2351,17 +2401,26 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 	sdoff = g_rxf[7];
 	if ((sdoff < 12u) || ((sdoff + 4u) > (uint32_t)flen)) {
 		g_frame_rx_err++;
+		g_rxe_sdoff++;
 		return -1061;
 	}
 	ethoff = sdoff + 4u + ((uint32_t)g_rxf[sdoff + 3u] << 2);
 	if ((ethoff + 14u) > (uint32_t)flen) {
 		g_frame_rx_err++;
+		g_rxe_ethoff++;
 		return -1062;
 	}
 	g_rx_badhdr_run = 0; /* a good frame means the stream is in step again */
+	if (flen > 2048u) {
+		g_rx_big_ok++;
+		if (flen > g_rx_big_ok_len) {
+			g_rx_big_ok_len = flen;
+		}
+	}
 	n = (uint32_t)flen - ethoff;
 	if (n > cap) {
 		g_frame_rx_err++;
+		g_rxe_toobig++;
 		return -1063;
 	}
 	if (eth != NULL) {
@@ -4105,7 +4164,10 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS rx_hits=%u rx_hit_us_total=%llu rx_hit_us_avg=%llu\n"
 		"WIFISTATS rx_misses=%u rx_miss_us_total=%llu rx_miss_us_avg=%llu\n"
 		"WIFISTATS frames tx_ok=%u tx_err=%u rx_ok=%u rx_err=%u rx_garbage=%u\n"
-		"WIFISTATS flowctl tx_seq=%u tx_max=%u avail=%u fc_mask=0x%02x blocked=%u updates=%u resyncs=%u\n",
+		"WIFISTATS flowctl tx_seq=%u tx_max=%u avail=%u fc_mask=0x%02x blocked=%u updates=%u resyncs=%u\n"
+		"WIFISTATS rxerr xfer=%u sdoff=%u ethoff=%u toobig=%u\n"
+		"WIFISTATS rxxfer hdr=%u oversize=%u body=%u max_announced_len=%u chan=%u (cap %u)\n"
+		"WIFISTATS rxbig ok=%u max_len=%u\n",
 		g_tx_calls, (unsigned long long)g_tx_us,
 		(unsigned long long)(g_tx_calls ? g_tx_us / g_tx_calls : 0u),
 		g_rx_hits, (unsigned long long)g_rx_hit_us,
@@ -4114,7 +4176,10 @@ static int wifi_stats(char *out, int cap)
 		(unsigned long long)(g_rx_misses ? g_rx_miss_us / g_rx_misses : 0u),
 		g_frame_tx_ok, g_frame_tx_err, g_frame_rx_ok, g_frame_rx_err, g_frame_rx_garbage,
 		g_data_seq, g_tx_max, (unsigned)(uint8_t)(g_tx_max - g_data_seq), g_fc_mask,
-		g_tx_blocked, g_fc_updates, g_rx_resyncs);
+		g_tx_blocked, g_fc_updates, g_rx_resyncs,
+		g_rxe_xfer, g_rxe_sdoff, g_rxe_ethoff, g_rxe_toobig,
+		g_rxe_hdr, g_rxe_big, g_rxe_body, g_rxe_big_len, g_rxe_big_chan, (unsigned)F2_FRAME_MAX,
+		g_rx_big_ok, g_rx_big_ok_len);
 }
 
 
