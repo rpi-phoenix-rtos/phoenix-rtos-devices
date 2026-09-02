@@ -1468,8 +1468,23 @@ static int diag_f2RecvFrame(volatile uint8_t *sdhci, uint8_t *buf, uint32_t cap,
 		diag_sdhciResetCmdDat(sdhci);
 		return -32;
 	}
-	/* phase 2: exactly the rest of this frame (4-byte aligned request) */
+	/* phase 2: the rest of this frame.
+	 *
+	 * Normal frames are word-aligned, but a GLOM frame (channel 3) is padded up
+	 * to the SDIO block size -- brcmf_sdio_hdparse treats
+	 * roundup(len, blocksize) != read_len as an error. Reading only to a word
+	 * boundary leaves the pad in the FIFO, and every following header read then
+	 * starts mid-pad: the stream desynchronises. */
 	if (len > (uint16_t)F2_HDR_LEN) {
+		/* Word alignment for every channel, including glom.
+		 *
+		 * brcmf_sdio_hdparse expects a superframe transfer of
+		 * roundup(len, blocksize), so padding to the F2 block size looks right --
+		 * and measured on hardware it is WRONG here: with it, receive dies within
+		 * a handful of frames (rx_ok 5, no glom frame ever seen). That padding
+		 * belongs to block-mode transfers; this driver reads the FIFO in byte
+		 * mode, which pops exactly what is asked for, so rounding up to 64 reads
+		 * past the frame and desynchronises the stream. */
 		uint32_t rest = ((uint32_t)len - F2_HDR_LEN + 3u) & ~3u;
 		/* diag_f2Read, not the byte-mode helper: a frame over 524 bytes
 		 * total needs block mode. Requesting it in byte mode is what
@@ -2361,11 +2376,23 @@ static int diag_wifiFrameTx(volatile uint8_t *sdhci, const uint8_t *eth, uint32_
  * read the superframe once and then hand out its channel-2 subframes one read()
  * at a time, which also amortises the per-frame cost that limits this driver:
  * one bus transfer now feeds several frames instead of one. */
+/* Bisect switch. 0 keeps every change EXCEPT the superframe walk (buffer, the
+ * capacity parameter, the copy-out), so a run tells us whether the regression is
+ * in the plumbing or in the de-aggregation itself. */
+#define WIFI_GLOM_ENABLE 1
+
 #define F2_GLOM_MAX 32768u
 
 static uint8_t g_glomf[F2_GLOM_MAX];
 static uint32_t g_glom_off = 0, g_glom_end = 0;
 static uint32_t g_glom_supers = 0, g_glom_subs = 0, g_glom_bad = 0;
+static int g_glom_dumped = 0;
+static uint32_t g_glom_descs = 0;
+static int g_super_dumped = 0;
+/* Subframe strides from the most recent glom descriptor. */
+#define WIFI_GLOM_MAX_SUBS 64u
+static uint16_t g_glom_lens[WIFI_GLOM_MAX_SUBS];
+static uint32_t g_glom_nlens = 0, g_glom_idx = 0;
 
 
 /* Next channel-2 subframe of the superframe in hand. 0 with *elen set, or 1 when
@@ -2389,7 +2416,20 @@ static int diag_glomNext(uint8_t *eth, uint32_t cap, uint32_t *elen)
 		}
 		schan = (uint8_t)(q[5] & 0x0fu);
 		sdoff = q[7];
-		g_glom_off += (uint32_t)slen;
+
+		/* Advance by the DESCRIPTOR's length for this subframe, not by the
+		 * subframe's own header length. They differ: a subframe announcing 72
+		 * bytes of content sits in a 96-byte slot, so stepping by 72 lands
+		 * mid-header -- measured as exactly one good subframe per superframe and
+		 * then a bad one, every time. brcmfmac has the same split: it sizes the
+		 * packet chain from the descriptor and validates headers within it. */
+		if (g_glom_idx < g_glom_nlens) {
+			g_glom_off += (uint32_t)g_glom_lens[g_glom_idx];
+			g_glom_idx++;
+		}
+		else {
+			g_glom_off += ((uint32_t)slen + 3u) & ~3u;
+		}
 
 		if (schan != 2u) {
 			continue; /* control/event subframe: skip, keep walking */
@@ -2470,7 +2510,66 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 		}
 		return rc;
 	}
-	if (chan == 3u) {
+	if ((chan == 3u) && ((g_glomf[5] & 0x80u) != 0u)) {
+		/* Glom DESCRIPTOR (brcmfmac SDPCM_GLOMDESC): its payload is a list of
+		 * u16 lengths for the subframes of the superframe that follows, not the
+		 * data itself. Walking it as data was the bug -- a 22-byte descriptor
+		 * listing 5 x 96 bytes was being parsed as if it held frames. Nothing to
+		 * deliver here; the superframe arrives as the next channel-3 frame. */
+		uint32_t d = g_glomf[7];
+
+		g_glom_nlens = 0u;
+		while (((d + 1u) < (uint32_t)flen) && (g_glom_nlens < WIFI_GLOM_MAX_SUBS)) {
+			uint16_t sl = (uint16_t)(g_glomf[d] | (g_glomf[d + 1u] << 8));
+
+			if (sl == 0u) {
+				break;
+			}
+			g_glom_lens[g_glom_nlens++] = sl;
+			d += 2u;
+		}
+		g_glom_descs++;
+		return 1;
+	}
+	if ((chan == 3u) && (g_super_dumped == 0)) {
+		/* One-shot dump of a SUPERFRAME (channel 3 without the descriptor bit):
+		 * its own header, then the bytes at data_offset where the subframes are
+		 * supposed to start. The walker gets exactly one subframe out of each
+		 * superframe and then hits a bad header, so the spacing assumption is
+		 * wrong and this shows what is actually there. */
+		int k;
+		uint32_t d = g_glomf[7];
+
+		g_super_dumped = 1;
+		printf("wifi: SUPERHEAD len=%u doff=%u hdr=", (unsigned)flen, (unsigned)d);
+		for (k = 0; k < 12; ++k) {
+			printf("%02x ", (unsigned)g_glomf[k]);
+		}
+		printf("| sub=");
+		for (k = 0; k < 64 && (d + (uint32_t)k) < (uint32_t)flen; ++k) {
+			printf("%02x ", (unsigned)g_glomf[d + k]);
+		}
+		printf("\n");
+		fflush(stdout);
+	}
+	if (chan == 3u && g_glom_dumped == 0) {
+		/* One-shot: dump the head of the first superframe. Two things decide how
+		 * to split it -- whether the SW header's glom-descriptor bit (buf[5] &
+		 * 0x80, brcmfmac SDPCM_GLOMDESC) is set, meaning this is a LIST of
+		 * subframe lengths rather than the data, and what the first subframe's
+		 * own HW header looks like at data_offset. */
+		int k;
+
+		g_glom_dumped = 1;
+		printf("wifi: GLOMHEAD len=%u doff=%u glomdesc=%u hdr=",
+			(unsigned)flen, (unsigned)g_glomf[7], (unsigned)((g_glomf[5] & 0x80u) != 0u));
+		for (k = 0; k < 48; ++k) {
+			printf("%02x ", (unsigned)g_glomf[k]);
+		}
+		printf("\n");
+		fflush(stdout);
+	}
+	if ((WIFI_GLOM_ENABLE != 0) && (chan == 3u)) {
 		/* Glom superframe: start walking it, and return its first data subframe. */
 		uint32_t soff = g_glomf[7];
 
@@ -2480,6 +2579,7 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 		}
 		g_glom_off = soff;
 		g_glom_end = (uint32_t)flen;
+		g_glom_idx = 0u; /* strides come from the descriptor that preceded this */
 		g_glom_supers++;
 		if (diag_glomNext(eth, cap, elen) == 0) {
 			g_frame_rx_ok++;
@@ -4294,7 +4394,7 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS rxerr xfer=%u sdoff=%u ethoff=%u toobig=%u\n"
 		"WIFISTATS rxxfer hdr=%u oversize=%u body=%u max_announced_len=%u chan=%u (cap %u)\n"
 		"WIFISTATS rxbig ok=%u max_len=%u rxglom_off_rc=%d\n"
-		"WIFISTATS glom supers=%u subframes=%u bad=%u\n",
+		"WIFISTATS glom descs=%u supers=%u subframes=%u bad=%u\n",
 		g_tx_calls, (unsigned long long)g_tx_us,
 		(unsigned long long)(g_tx_calls ? g_tx_us / g_tx_calls : 0u),
 		g_rx_hits, (unsigned long long)g_rx_hit_us,
@@ -4307,7 +4407,7 @@ static int wifi_stats(char *out, int cap)
 		g_rxe_xfer, g_rxe_sdoff, g_rxe_ethoff, g_rxe_toobig,
 		g_rxe_hdr, g_rxe_big, g_rxe_body, g_rxe_big_len, g_rxe_big_chan, (unsigned)F2_FRAME_MAX,
 		g_rx_big_ok, g_rx_big_ok_len, g_join_rxglom_rc,
-		g_glom_supers, g_glom_subs, g_glom_bad);
+		g_glom_descs, g_glom_supers, g_glom_subs, g_glom_bad);
 }
 
 
