@@ -1377,16 +1377,36 @@ job_retry:
 		 * A one-shot upload CL re-wedges on a freshly reset core, every time:
 		 * ct1ca parks at the SAME offset (0x43 of a 98-byte RCL) on all 3
 		 * attempts, int_sts=0, gmpvio=0. So the wedge on these jobs is
-		 * DETERMINISTIC, not a marginal stall -- which means the CL itself is
-		 * malformed or contains something this V3D revision will not execute, and
-		 * no amount of resetting will make it run. The retry cost ~10 s of futile
+		 * DETERMINISTIC, not a marginal stall. The retry cost ~10 s of futile
 		 * resets per boot and moved the #67 rate 0/2, so it was reverted.
 		 *
-		 * That reframes the fix: the dropped upload IS the geometry loss (every
-		 * dropped job observed is a 14 B BCL / ~100 B RCL meta-copy), but the cure
-		 * is to make the copy executable -- decode the RCL packet at the park
-		 * offset -- not to re-submit it. Left as a comment so nobody re-tries the
-		 * retry. */
+		 * CORRECTION (2026-09-03, later): this comment used to conclude from that
+		 * determinism that "the CL itself is malformed". That is WRONG, and the
+		 * wrong diagnosis matters because it points the fix at Mesa instead of at
+		 * us. The 98-byte RCL was decoded packet by packet against
+		 * v3dvx_meta_common.c and it matches what upstream Mesa emits, byte for
+		 * byte. Offset 0x43 is the second dummy STORE_TILE_BUFFER_GENERAL
+		 * (buffer_to_store = NONE, address 0) of Mesa's GFXH-1742 workaround --
+		 * a no-op tile store that upstream issues on every Linux Pi 4, and which
+		 * sits BEFORE the generic tile list, so the copy never even begins. The
+		 * list is well-formed; what wedges is THIS PORT's tile-store path on a
+		 * w x 1 raster frame (the recorded case is w=183, item_size=1 -- an odd
+		 * width, i.e. the same RT-coherency wall this file records at :1296).
+		 *
+		 * So the dropped upload IS the data loss (every decodable dropped job is
+		 * a 14 B BCL / ~100 B RCL meta-copy, and rcl_len == 92 + 3*n_supertiles
+		 * accounts for every size on record: 98, 101, 122, 143), and the cure is
+		 * to perform the copy on the CPU rather than re-submit it.
+		 *
+		 * SECOND, SEPARATE DEFECT, also on record: only about HALF the drops have
+		 * a decodable list at all. Of 56 RCLBYTES dumps in artifacts/, 27 begin
+		 * with 0x79 (TILE_RENDERING_MODE_CFG, a valid RCL) and 29 begin with RGBA
+		 * pixel data or zeros, all parked at offset 0. For those there is no LOAD,
+		 * no STORE, no address and no extent to recover -- the RCL BO is holding
+		 * image data. That is a different bug from this one and a CPU fallback
+		 * cannot help it; see docs/misc/2026-09-03-v3d-dropped-metacopy-fix-plan.md.
+		 *
+		 * Left as a comment so nobody re-tries the retry. */
 	}
 	/* L2T flush so RT stores reach RAM before CPU readback (scout finding). */
 	l2t_flush_wait(c0);                       /* GFXH-1897: render flush must complete first */
