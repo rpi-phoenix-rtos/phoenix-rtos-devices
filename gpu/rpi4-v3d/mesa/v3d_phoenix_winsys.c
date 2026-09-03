@@ -327,6 +327,25 @@ void v3d_phoenix_logColdState(void);  /* v3d_phoenix_power.c — STEP-3 cold-pow
  * count stalls across many in-boot submits instead of one-boot-per-sample roulette. */
 volatile unsigned v3d_phoenix_render_timeouts = 0;
 
+/* V3D_BO_TRACE=1: one line per BO create / mmap / close, so the lifetime of the
+ * memory behind a corrupt control list can be reconstructed from a single boot.
+ *
+ * Needed because DRM_V3D_MMAP_BO hands Mesa `b->cpu` itself and ioc_close_bo then
+ * munmaps it, so the same CPU address can legitimately be handed out twice with a
+ * free in between -- and that is the leading explanation for control lists that
+ * arrive full of texels. Guessing which of create/mmap/close ordering does it is
+ * how the last few wrong fixes happened; this prints the ordering instead. */
+static int bo_trace_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("V3D_BO_TRACE");
+		on = (e != NULL && *e == '1') ? 1 : 0;
+	}
+	return on;
+}
+
 /* Count of render lists that were ALREADY not a control list when we were handed
  * them (see the entry-time check in ioc_submit_cl). Exported for the same reason
  * as the timeout counter: so a harness can read a rate instead of grepping UART. */
@@ -724,6 +743,10 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 		(W.scanout_pa3 != 0 && pa == W.scanout_pa3)));   /* this BO aliases a scanout buffer */
 	c->handle = b->handle;
 	c->offset = gpuva;          /* V3D address-space offset (nonzero) */
+	if (bo_trace_on() != 0) {
+		fprintf(stderr, "v3d-bo: CREATE handle=%u gpuva=0x%08x size=%u cpu=%p\n",
+			b->handle, b->gpuva, b->size, b->cpu);
+	}
 	return 0;
 }
 
@@ -744,6 +767,11 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 		}
 		b->scanout = 0;
 	}
+	if (bo_trace_on() != 0) {
+		fprintf(stderr, "v3d-bo: CLOSE  handle=%u gpuva=0x%08x size=%u cpu=%p\n",
+			b->handle, b->gpuva, b->size, b->cpu);
+	}
+
 	/* Invalidate this BO's page-table entries BEFORE the VA and the memory go back.
 	 *
 	 * The old code freed the VA range and munmap'd the pages but left W.pt still
@@ -2099,6 +2127,10 @@ static int v3d_ioctl_locked(int fd, unsigned long request, void *arg)
 		if (!b)
 			return -EINVAL;
 		m->offset = (uint64_t)(uintptr_t)b->cpu;
+		if (bo_trace_on() != 0) {
+			fprintf(stderr, "v3d-bo: MMAP   handle=%u gpuva=0x%08x size=%u cpu=%p\n",
+				b->handle, b->gpuva, b->size, b->cpu);
+		}
 		return 0;
 	}
 	case DRM_V3D_SUBMIT_CL:
