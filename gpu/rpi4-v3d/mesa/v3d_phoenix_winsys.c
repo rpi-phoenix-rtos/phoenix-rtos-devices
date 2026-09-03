@@ -420,6 +420,54 @@ static void bo_neighbours_report(const struct pbo *b)
 	}
 }
 
+/* Search the WHOLE BO for the remainder of a truncated control list.
+ *
+ * Measured: 15 of 15 partial-corrupt lists stop at exactly offset 66, right after
+ * the second tile's TILE_COORDINATES packet, and everything past it is the BO's
+ * previous content. An invariant structural boundary is truncation or diversion of
+ * the WRITE, not an overwrite by somebody else -- so the question is no longer
+ * "who scribbled on it" but "where did the rest of the list go".
+ *
+ * In a clean copy RCL the tail carries FLUSH_VCD_CACHE followed by
+ * START_ADDRESS_OF_GENERIC_TILE_LIST (0x13 0x14) at offsets 81..82, and ends with
+ * END_OF_RENDERING (0x0d). If either turns up elsewhere in the page, the list was
+ * written at a shifted offset and this is an addressing bug; if neither appears at
+ * all, the emission genuinely stopped early. Two answers, one boot, no guessing. */
+static void rcl_find_remainder(const struct pbo *b, uint32_t declared_len)
+{
+	const uint8_t *p = (const uint8_t *)b->cpu;
+	uint32_t limit = b->size;
+	uint32_t i;
+	uint32_t n_sig = 0;
+	uint32_t n_eor = 0;
+
+	if (p == NULL) {
+		return;
+	}
+	if (limit > 4096u) {
+		limit = 4096u;   /* one page is plenty and bounds the scan cost */
+	}
+	for (i = 0; (i + 1u) < limit; i++) {
+		if ((p[i] == 0x13u) && (p[i + 1u] == 0x14u)) {
+			fprintf(stderr, "v3d-winsys:   RCL tail signature (13 14) found at offset %u "
+				"(declared list len %u)\n", i, declared_len);
+			n_sig++;
+			if (n_sig >= 4u) {
+				break;
+			}
+		}
+	}
+	for (i = 0; i < limit; i++) {
+		if (p[i] == 0x0du) {
+			n_eor++;
+		}
+	}
+	if (n_sig == 0u) {
+		fprintf(stderr, "v3d-winsys:   RCL tail signature (13 14) ABSENT from the whole %u-byte BO "
+			"-- the emission stopped, it was not displaced (0x0d bytes seen: %u)\n", limit, n_eor);
+	}
+}
+
 static void bo_hist_report(const char *label, const struct pbo *b)
 {
 	uint32_t i;
@@ -1291,6 +1339,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 						if (rb != NULL) {
 							bo_hist_report("RCL-AT-ENTRY", rb);
 							bo_neighbours_report(rb);
+							rcl_find_remainder(rb, rn);
 						}
 					}
 					if (v3d_phoenix_rcl_bad_at_entry == 8u) {
