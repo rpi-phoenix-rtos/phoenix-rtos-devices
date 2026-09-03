@@ -1665,7 +1665,14 @@ static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
 	c0[CSD_QUEUED_CFG0 / 4] = s->cfg[0];
 
 	/* Synchronous wait for the dispatch to finish (INT_CSDDONE), like CL/TFU. */
-	for (spins = 8000000u; spins; spins--) {
+	/* The budget has to cover V3DV's LARGE compute dispatches, not just the
+	 * small ones the standalone probe issues. vkQuake's lightmap passes submit
+	 * jobs with CFG0 up to ~0x00570000 (vs 0x00010000 for the probe) and were
+	 * hitting this limit hundreds of times per run, each time returning with
+	 * num_completed=0 -- so the caller proceeded without its lightmaps and the
+	 * world rendered black. Raised 10x; still bounded so a genuinely wedged
+	 * dispatch cannot hang the process. */
+	for (spins = 80000000u; spins; spins--) {
 		sts = c0[CTL_INT_STS / 4];
 		if (sts & INT_CSDDONE)
 			break;
