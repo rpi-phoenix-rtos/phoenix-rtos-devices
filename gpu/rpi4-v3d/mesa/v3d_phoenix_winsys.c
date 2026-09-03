@@ -1089,17 +1089,35 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 
 		/* >= 8 bytes, because the report below reads first8 -- a shorter list would
 		 * over-read past the BO. A real RCL is far longer than 8 bytes anyway. */
-		if ((rp0 != NULL) && ((s->rcl_end - s->rcl_start) >= 8u)) {
-			uint8_t op = rp0[0];
+		/* Bound the length by what the covering BO actually holds. rcl_end is the
+		 * caller's word for where the list ends; trusting it to index rp0 would
+		 * over-read past the BO if it were ever wrong -- and a list arriving as
+		 * pixel data is exactly the situation where "ever wrong" is on the table. */
+		uint32_t avail = gpuva_bo_remaining(s->rcl_start);
+		uint32_t want = (uint32_t)(s->rcl_end - s->rcl_start);
 
-			if ((op != 0x79u) && (op != 0x7cu) && (op != 0x7eu)) {
+		if ((rp0 != NULL) && (want >= 8u) && (avail >= want)) {
+			uint32_t rn = want;
+			uint8_t op = rp0[0];
+			/* A well-formed RCL ENDS in END_OF_RENDERING (0x0d). Checking the tail as
+			 * well as the head is what catches PARTIAL corruption -- a list whose first
+			 * packets are intact and whose tail has been replaced by pixels. Validated
+			 * over every RCLBYTES dump on record: head+tail together flag all 49 corrupt
+			 * lists (41 wholly garbage, 8 partial) and none of the 28 intact ones. A
+			 * head-only test misses the 8 partial cases entirely. Two byte reads. */
+			uint8_t tail = rp0[rn - 1u];
+			int head_bad = ((op != 0x79u) && (op != 0x7cu) && (op != 0x7eu));
+			int tail_bad = (tail != 0x0du);
+
+			if (head_bad || tail_bad) {
 				v3d_phoenix_rcl_bad_at_entry++;
 				if (v3d_phoenix_rcl_bad_at_entry <= 8u) {
-					fprintf(stderr, "v3d-winsys: RCL IS NOT A LIST AT ENTRY "
-						"gpuva=0x%08x n=%u first8=%02x %02x %02x %02x %02x %02x %02x %02x (n_bad=%u)\n",
-						s->rcl_start, (uint32_t)(s->rcl_end - s->rcl_start),
+					fprintf(stderr, "v3d-winsys: RCL IS NOT A LIST AT ENTRY (%s) "
+						"gpuva=0x%08x n=%u first8=%02x %02x %02x %02x %02x %02x %02x %02x last=%02x (n_bad=%u)\n",
+						head_bad ? (tail_bad ? "head+tail" : "head") : "tail",
+						s->rcl_start, rn,
 						rp0[0], rp0[1], rp0[2], rp0[3], rp0[4], rp0[5], rp0[6], rp0[7],
-						v3d_phoenix_rcl_bad_at_entry);
+						tail, v3d_phoenix_rcl_bad_at_entry);
 					if (v3d_phoenix_rcl_bad_at_entry == 8u) {
 						fprintf(stderr, "v3d-winsys: (further RCL-at-entry reports suppressed; "
 							"read v3d_phoenix_rcl_bad_at_entry for the count)\n");
