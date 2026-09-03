@@ -183,6 +183,15 @@
  * overruns ct1ea regardless of memory content -> the wedge is not a memory/VA/cache effect.
  * Pivoted to STEP-3 first: instrument cold-power-on HW state (clock cfg-vs-measured, PLL,
  * temp) and correlate clean-vs-stalled boots for a deterministic discriminator. */
+/* EXPERIMENT RUN AND REVERTED (2026-09-03, #67): flipping this to 1 does NOT fix
+ * the upload wedge, so VA recycling is not the cause. With recycling off, one
+ * wedged job's RCL read back as a perfectly VALID control list (opcodes 0x79,
+ * 0x7e, 0x7b, 0x7a, 0x7c, 0x1a, 0x1d STORE_TILE_BUFFER_GENERAL, with addresses
+ * inside its own BO) -- while another still read back as RGBA image data at the
+ * same address as before the change. So there are (at least) TWO failure modes
+ * here, and "the GPU is executing pixels" is not the whole story. Left at 0: the
+ * flag doubles the PT to 2 GiB and risks VA exhaustion in long runs, for no
+ * measured benefit. */
 #define V3D_VA_NO_RECYCLE   0
 #if V3D_VA_NO_RECYCLE
 #define GPUVA_PT_PAGES      512u   /* 512 * 4 MiB = 2 GiB monotonic VA window (no reclaim) */
