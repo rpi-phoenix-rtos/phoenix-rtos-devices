@@ -73,6 +73,8 @@
  * cfg[0..6] map to CSD_QUEUED_CFG0..6; writing CFG0 KICKS the dispatch. See linux
  * v3d_regs.h (V3D_CSD_*) and v3d_sched.c v3d_csd_job_run. */
 #define CSD_STATUS          0x0900u   /* NUM_COMPLETED[11:4], HAVE_CURRENT(1), HAVE_QUEUED(0) */
+#define CSD_STATUS_HAVE_QUEUED  (1u<<0)  /* linux V3D_CSD_STATUS_HAVE_QUEUED_DISPATCH */
+#define CSD_STATUS_HAVE_CURRENT (1u<<1)  /* linux V3D_CSD_STATUS_HAVE_CURRENT_DISPATCH */
 #define CSD_QUEUED_CFG0     0x0904u   /* CFG1..6 follow at +4 each; CFG0 write kicks the job */
 #define CLE_CT0QTS          0x015cu
 #define CT0QTS_ENABLE       (1u<<1)
@@ -1742,6 +1744,32 @@ static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
 	c0[CTL_L2TCACTL / 4] = L2TCACTL_L2TFLS;
 	l2t_flush_wait(c0);
 
+	/* Do NOT kick while a dispatch is still current: V3D 4.2's CSD holds one
+	 * CURRENT plus one QUEUED dispatch, so writing CFG0 into a busy unit merely
+	 * enqueues behind work we are not waiting on, and our INT_CSDDONE wait then
+	 * belongs to the wrong dispatch.
+	 *
+	 * Measured on hardware (2026-09-03): at a CSD TIMEOUT, CSD_STATUS reads
+	 * 0x00000007 = HAVE_QUEUED_DISPATCH | HAVE_CURRENT_DISPATCH | NUM_ACTIVE=1,
+	 * NUM_COMPLETED=0 (decoded against linux v3d_regs.h V3D_CSD_STATUS_*). So a
+	 * stuck dispatch stayed current and everything piled up behind it: 14
+	 * timeouts per bad boot and vkQuake's presentation frozen forever at frame 26
+	 * while the engine kept rendering. That is ~3/8 boots.
+	 *
+	 * Linux never hits this because the DRM scheduler keeps one CSD job in flight
+	 * per queue; this poll-based winsys has no such serialization. */
+	{
+		uint32_t spins = 8000000u;
+		while ((c0[CSD_STATUS / 4] & CSD_STATUS_HAVE_CURRENT) != 0u && spins != 0u)
+			spins--;
+		if (spins == 0u) {
+			fprintf(stderr, "v3d-winsys: CSD BUSY before kick (status=0x%08x) -- "
+				"resetting so this dispatch is not queued behind stuck work\n",
+				c0[CSD_STATUS / 4]);
+			reset_reinit_core();
+		}
+	}
+
 	/* Kick: write CFG1..6, then CFG0 (the CFG0 write starts the dispatch). */
 	c0[CTL_INT_CLR / 4] = INT_CSDDONE;
 	for (i = 1; i <= 6; i++)
@@ -1783,9 +1811,18 @@ static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
 	 * line went to UART on every compute dispatch; at serial baud that dominated any
 	 * compute-perf measurement (an empty kernel timed slower than a real matmul).
 	 * Gated now that CSD dispatch is validated (matches rpi4-v3d.c v3d_gpu.c). */
-	if (timed_out)
+	if (timed_out) {
 		fprintf (stderr, "v3d-winsys: CSD TIMEOUT cfg0=0x%08x int_sts=0x%08x status=0x%08x num_completed=%u\n",
 		         s->cfg[0], sts, csd_status, (csd_status >> 4) & 0xffu);
+		/* Drain the unit. Leaving the timed-out dispatch CURRENT is what turned a
+		 * single slow dispatch into a permanent freeze: every later dispatch
+		 * queued behind it and never ran. Resetting costs one dispatch; not
+		 * resetting cost the whole process's presentation. */
+		if ((csd_status & (CSD_STATUS_HAVE_CURRENT | CSD_STATUS_HAVE_QUEUED)) != 0u) {
+			fprintf(stderr, "v3d-winsys: CSD still busy after timeout -- reset to drain\n");
+			reset_reinit_core();
+		}
+	}
 	return 0;
 }
 
