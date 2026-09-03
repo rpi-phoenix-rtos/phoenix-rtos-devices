@@ -744,6 +744,40 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 		}
 		b->scanout = 0;
 	}
+	/* Invalidate this BO's page-table entries BEFORE the VA and the memory go back.
+	 *
+	 * The old code freed the VA range and munmap'd the pages but left W.pt still
+	 * mapping that VA to them. munmap returns the physical pages to the Phoenix
+	 * kernel, which hands them to the next allocation -- so a stale PTE points the
+	 * GPU at memory that now belongs to somebody else, and the GPU reads or writes
+	 * it SILENTLY. Two ways that bites, both live here:
+	 *
+	 *  - va_free() returns N pages to the pool and a later, SMALLER BO takes the
+	 *    same VA. Its own mapping loop rewrites only the pages it uses; the tail
+	 *    pages keep pointing at the recycled memory.
+	 *  - anything that still holds the old VA (a pointer left inside a reused
+	 *    control list, say) resolves through a translation that is no longer ours.
+	 *
+	 * With the PTEs invalid instead, either case becomes a REPORTED MMU fault --
+	 * MMU_CTL_PTI_ABORT is already enabled -- rather than a quiet read of foreign
+	 * data. That matters right now: dropped jobs have been found holding RGBA pixel
+	 * data where their control list should be, and this is one of the few paths that
+	 * can put a live GPU address on memory owned by something else.
+	 *
+	 * Safe against a free-while-referenced: submits here are synchronous (the ioctl
+	 * spin-waits the job to completion), so no job is in flight when Mesa's bufmgr
+	 * evicts a BO. The TLB needs no explicit clear -- every submit path already
+	 * calls mmu_flush_tlb() before kicking work. */
+	{
+		uint32_t first = b->gpuva >> PAGE_SHIFT;
+		uint32_t npages = b->size / _PAGE_SIZE;
+		uint32_t i;
+
+		for (i = 0; i < npages; i++) {
+			W.pt[first + i] = 0u;   /* !PTE_V => PT_INVALID abort if ever touched */
+		}
+	}
+
 	va_free(b->gpuva, b->size / _PAGE_SIZE);
 	if (b->cpu != NULL) munmap(b->cpu, b->size);
 	b->used = 0;
