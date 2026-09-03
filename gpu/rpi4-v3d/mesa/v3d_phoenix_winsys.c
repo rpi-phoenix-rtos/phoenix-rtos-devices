@@ -1252,6 +1252,32 @@ job_retry:
 		fprintf(stderr, "v3d-winsys: GPU wedged — true reset + drop this frame "
 			"(mitigation; drops=%u). Wedge is HW-marginal depth-pipeline drain stall.\n",
 			v3d_phoenix_render_recoveries);
+		/* Identify WHAT was dropped. "Drop the frame" is a sound trade for a
+		 * frame that will be redrawn next tick, which is what this mitigation
+		 * was written for -- but the same path also swallows ONE-SHOT jobs, and
+		 * for those a drop is silent, permanent data loss.
+		 *
+		 * On V3D 4.2 that is not hypothetical: vkCmdCopyBuffer is a CL RENDER
+		 * job, not a TFU blit (v3dvx_meta_common.c gates TFU on V3D_VERSION>=71),
+		 * so V3DV's buffer uploads come through here. Drop one and the
+		 * destination BO keeps the zeros it was created with, for the rest of the
+		 * process -- which is the current best explanation for #67, where one
+		 * alias model's geometry is missing for a whole boot while the frame is
+		 * otherwise perfect (docs/misc/2026-09-03-torch-intermittency-driver-analysis.md,
+		 * KNOWN-ISSUES #67; the torch verdict is predicted 26/26 by whether a
+		 * wedge was logged on this control-list page).
+		 *
+		 * A tiny CL is the tell: a real render frame has a substantial binner
+		 * list, whereas a meta-copy is a handful of words. Print the extents so
+		 * the two classes can be told apart in a UART log instead of guessed at.
+		 * Cheap: this runs only on a wedge, which already costs a reset. */
+		fprintf(stderr, "v3d-winsys: DROPPED job bcl=[0x%08x..0x%08x] %u B  "
+			"rcl=[0x%08x..0x%08x] %u B%s\n",
+			s->bcl_start, s->bcl_end, (unsigned)(s->bcl_end - s->bcl_start),
+			s->rcl_start, s->rcl_end, (unsigned)(s->rcl_end - s->rcl_start),
+			((s->bcl_end - s->bcl_start) < 256u)
+				? "  <-- TINY CL: likely a one-shot upload/meta-copy, NOT a redrawable frame"
+				: "");
 		reset_reinit_core();   /* clean the wedged core so the next (different) frame renders */
 		(void)attempt;
 	}
