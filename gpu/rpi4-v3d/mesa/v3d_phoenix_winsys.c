@@ -347,6 +347,69 @@ static int bo_trace_on(void)
 	return on;
 }
 
+/* Recently CLOSED BOs, so a corrupt control list can name the BO that previously
+ * owned its memory -- in the report itself, at the moment of failure.
+ *
+ * The full V3D_BO_TRACE log can reconstruct this, but only if corruption happens
+ * to occur in a traced boot; the first traced boot recorded none. This keeps the
+ * last few closes in memory always, so a single hit answers the question that
+ * decides the remaining half of the bug: was this memory or this address just
+ * handed back by a different BO?
+ *
+ * Small, fixed, no allocation. Handles are monotonic now, so a matching handle
+ * would itself be a bug worth shouting about. */
+#define BO_HIST 16
+
+struct bo_hist_ent {
+	uint32_t handle;
+	uint32_t gpuva;
+	uint32_t size;
+	void    *cpu;
+};
+
+static struct bo_hist_ent bo_hist[BO_HIST];
+static uint32_t bo_hist_next;
+
+static void bo_hist_record(const struct pbo *b)
+{
+	struct bo_hist_ent *e = &bo_hist[bo_hist_next % BO_HIST];
+
+	e->handle = b->handle;
+	e->gpuva = b->gpuva;
+	e->size = b->size;
+	e->cpu = b->cpu;
+	bo_hist_next++;
+}
+
+/* Report any recently-closed BO that overlapped this one's GPU VA or CPU address.
+ * Overlap, not equality: a smaller BO reusing part of a bigger one's range is the
+ * dangerous case and an equality test would miss it. */
+static void bo_hist_report(const char *label, const struct pbo *b)
+{
+	uint32_t i;
+
+	for (i = 0; i < BO_HIST; i++) {
+		const struct bo_hist_ent *e = &bo_hist[i];
+		int va_overlap;
+		int cpu_overlap;
+
+		if (e->size == 0u) {
+			continue;
+		}
+		va_overlap = ((b->gpuva < (e->gpuva + e->size)) && (e->gpuva < (b->gpuva + b->size)));
+		cpu_overlap = ((b->cpu != NULL) && (e->cpu != NULL) &&
+			((char *)b->cpu < ((char *)e->cpu + e->size)) &&
+			((char *)e->cpu < ((char *)b->cpu + b->size)));
+		if (va_overlap || cpu_overlap) {
+			fprintf(stderr, "v3d-winsys: %s this BO (handle=%u gpuva=0x%08x cpu=%p size=%u) REUSES "
+				"memory of recently CLOSED handle=%u gpuva=0x%08x cpu=%p size=%u [%s%s]\n",
+				label, b->handle, b->gpuva, b->cpu, b->size,
+				e->handle, e->gpuva, e->cpu, e->size,
+				va_overlap ? "gpuva" : "", cpu_overlap ? (va_overlap ? "+cpu" : "cpu") : "");
+		}
+	}
+}
+
 /* Count of render lists that were ALREADY not a control list when we were handed
  * them (see the entry-time check in ioc_submit_cl). Exported for the same reason
  * as the timeout counter: so a harness can read a rate instead of grepping UART. */
@@ -792,6 +855,7 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 		fprintf(stderr, "v3d-bo: CLOSE  handle=%u gpuva=0x%08x size=%u cpu=%p\n",
 			b->handle, b->gpuva, b->size, b->cpu);
 	}
+	bo_hist_record(b);
 
 	/* Invalidate this BO's page-table entries BEFORE the VA and the memory go back.
 	 *
@@ -877,6 +941,22 @@ static void *gpuva_to_cpu(uint32_t gpuva)
 		struct pbo *b = &W.bos[i];
 		if (b->used && b->cpu != NULL && gpuva >= b->gpuva && gpuva < b->gpuva + b->size)
 			return (char *)b->cpu + (gpuva - b->gpuva);
+	}
+	return NULL;
+}
+
+/* Same scan, but hand back the BO itself -- the diagnostics need its handle, size
+ * and CPU address, not just a translated pointer. */
+static const struct pbo *bo_find_covering(uint32_t gpuva)
+{
+	uint32_t i;
+
+	for (i = 0; i < W.nbos; i++) {
+		const struct pbo *b = &W.bos[i];
+
+		if (b->used && (gpuva >= b->gpuva) && (gpuva < (b->gpuva + b->size))) {
+			return b;
+		}
 	}
 	return NULL;
 }
@@ -1167,6 +1247,13 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 						s->rcl_start, rn,
 						rp0[0], rp0[1], rp0[2], rp0[3], rp0[4], rp0[5], rp0[6], rp0[7],
 						tail, v3d_phoenix_rcl_bad_at_entry);
+					{
+						const struct pbo *rb = bo_find_covering(s->rcl_start);
+
+						if (rb != NULL) {
+							bo_hist_report("RCL-AT-ENTRY", rb);
+						}
+					}
 					if (v3d_phoenix_rcl_bad_at_entry == 8u) {
 						fprintf(stderr, "v3d-winsys: (further RCL-at-entry reports suppressed; "
 							"read v3d_phoenix_rcl_bad_at_entry for the count)\n");
