@@ -1272,6 +1272,39 @@ job_retry:
 		 * list, whereas a meta-copy is a handful of words. Print the extents so
 		 * the two classes can be told apart in a UART log instead of guessed at.
 		 * Cheap: this runs only on a wedge, which already costs a reset. */
+		/* Which BO actually backs this job's lists? The RCL byte dump below
+		 * showed RGBA pixel data (every 4th byte 0xff) where control-list packets
+		 * belong, with real packets only appearing ~0x40 later -- so the address
+		 * V3DV handed us resolves into a DATA buffer, not into its RCL. Name the
+		 * BOs so an aliasing/VA-reuse bug is visible instead of inferred: >1 match
+		 * means two BOs overlap, 0 means the address is not mapped at all. */
+		gpuva_describe("DROP-BCLSTART", s->bcl_start);
+		gpuva_describe("DROP-RCLSTART", s->rcl_start);
+		/* For a SMALL wedged RCL, dump the whole list as BYTES with the park
+		 * offset marked. These lists wedge deterministically at the same offset
+		 * on a freshly reset core (measured: ct1ca parks at 0x43 of a 98-byte
+		 * RCL, every attempt), so the stalling packet is identifiable by reading
+		 * the bytes -- which is cheaper and more certain than inferring what
+		 * V3DV emitted. Only for tiny lists and only on a wedge: a full render
+		 * RCL would flood the UART. */
+		if ((s->rcl_end - s->rcl_start) <= 256u) {
+			uint8_t *rp = (uint8_t *)gpuva_to_cpu(s->rcl_start);
+			uint32_t rn = (uint32_t)(s->rcl_end - s->rcl_start);
+			uint32_t park = (c0[0x0114/4] & ~0xfu) >= s->rcl_start
+				? (uint32_t)((c0[0x0114/4] & 0xfffffffu) - (s->rcl_start & 0xfffffffu))
+				: 0xffffffffu;
+			fprintf(stderr, "v3d-winsys: RCLBYTES gpuva=0x%08x n=%u park_off=0x%x:",
+				s->rcl_start, rn, park);
+			if (rp != NULL) {
+				for (uint32_t i = 0; i < rn; i++) {
+					fprintf(stderr, "%s%02x", (i == park) ? " >" : " ", rp[i]);
+				}
+			}
+			else {
+				fprintf(stderr, " (no BO)");
+			}
+			fprintf(stderr, "\n");
+		}
 		fprintf(stderr, "v3d-winsys: DROPPED job bcl=[0x%08x..0x%08x] %u B  "
 			"rcl=[0x%08x..0x%08x] %u B%s\n",
 			s->bcl_start, s->bcl_end, (unsigned)(s->bcl_end - s->bcl_start),
