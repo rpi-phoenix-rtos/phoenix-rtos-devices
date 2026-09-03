@@ -1355,6 +1355,20 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 
 	int attempt = 0;        /* kept for the timeout-dump "attempt" field (always 0 now: no resubmit) */
 
+	/* Drain CPU stores BEFORE reading the list below. Mesa writes control lists
+	 * through an uncached (Normal-NC) mapping, where stores may still sit in the
+	 * write buffer until a `dsb`. The check that follows reads that memory, so
+	 * without this barrier it can report a truncation that is merely a too-early
+	 * read -- an instrument bug, and exactly the kind that manufactures a phantom
+	 * root cause. The submit path already does this before kicking the GPU (see the
+	 * dsb further down); doing it here too costs one barrier per submit and makes
+	 * the diagnostic read the same state the hardware will.
+	 *
+	 * NOTE the underlying finding does not rest on this read alone: the RCLBYTES
+	 * dumps taken after a wedge -- seconds later, long past any drain -- show the
+	 * same truncated content. */
+	__asm__ volatile("dsb sy" ::: "memory");
+
 	/* ENTRY-TIME RCL SANITY CHECK (2026-09-03). Decoding the wedged jobs showed that
 	 * only about HALF of them have a control list at all: over
 	 * artifacts/rpi4b-uart/*.log, 65 recorded RCLBYTES dumps split 29 opening with
