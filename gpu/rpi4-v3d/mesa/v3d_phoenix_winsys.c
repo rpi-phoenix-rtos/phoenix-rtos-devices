@@ -266,6 +266,7 @@ struct pbo {            /* Phoenix BO */
 	uint32_t size;
 	int      used;      /* slot in use (freed by GEM_CLOSE -> reusable) */
 	int      scanout;   /* this BO aliases the scanout surface (clear W.scanout_claimed on close) */
+	uint32_t nmaps;     /* times MMAP_BO handed this BO's pointer to Mesa (see the corrupt-list report) */
 };
 
 /* Freed GPU-VA range, available for reuse. Without this the GPU VA + the BO slot
@@ -961,6 +962,7 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 	 * created control list ends up holding texture data. With a monotonic id, that
 	 * same stale reference fails cleanly in bo_find() (-EINVAL) instead. 32 bits at
 	 * a few hundred BOs per boot cannot wrap in any plausible session. */
+	b->nmaps = 0;
 	b->handle = ++W.next_handle;
 	b->cpu = cpu; b->pa = pa; b->gpuva = gpuva; b->size = pages*_PAGE_SIZE;
 	b->scanout = (W.scanout_pa != 0 && (pa == W.scanout_pa ||
@@ -1407,6 +1409,15 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 						const struct pbo *rb = bo_find_covering(s->rcl_start);
 
 						if (rb != NULL) {
+							/* Did Mesa ever ASK for a pointer to the BO we are about to
+							 * submit? Mesa writes a control list through the address
+							 * MMAP_BO returns, so if this count is 0 it never held a
+							 * pointer to this memory and cannot have written the list
+							 * here -- which would explain a submitted BO containing only
+							 * its prior content, with no spill and no second CL BO. */
+							fprintf(stderr, "v3d-winsys:   submitted BO handle=%u was MMAP_BO'd %u time(s)%s\n",
+								rb->handle, rb->nmaps,
+								(rb->nmaps == 0u) ? "  *** NEVER MAPPED -- Mesa never had this pointer ***" : "");
 							bo_hist_report("RCL-AT-ENTRY", rb);
 							bo_neighbours_report(rb);
 							rcl_find_remainder(rb, rn);
@@ -2421,6 +2432,7 @@ static int v3d_ioctl_locked(int fd, unsigned long request, void *arg)
 		if (!b)
 			return -EINVAL;
 		m->offset = (uint64_t)(uintptr_t)b->cpu;
+		b->nmaps++;
 		if (bo_trace_on() != 0) {
 			fprintf(stderr, "v3d-bo: MMAP   handle=%u gpuva=0x%08x size=%u cpu=%p\n",
 				b->handle, b->gpuva, b->size, b->cpu);
