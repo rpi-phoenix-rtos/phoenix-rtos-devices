@@ -462,10 +462,44 @@ static void rcl_find_remainder(const struct pbo *b, uint32_t declared_len)
 			n_eor++;
 		}
 	}
-	if (n_sig == 0u) {
-		fprintf(stderr, "v3d-winsys:   RCL tail signature (13 14) ABSENT from the whole %u-byte BO "
-			"-- the emission stopped, it was not displaced (0x0d bytes seen: %u)\n", limit, n_eor);
+	if (n_sig != 0u) {
+		return;
 	}
+	fprintf(stderr, "v3d-winsys:   RCL tail signature (13 14) ABSENT from this %u-byte BO "
+		"(0x0d bytes seen: %u) -- searching every other live BO\n", limit, n_eor);
+
+	/* Not in this BO. The remaining possibility that fits a boundary landing
+	 * mid-loop-iteration is that Mesa's CL grew into a SECOND BO part-way through
+	 * emission, leaving exactly the first 66 bytes here while the rest went
+	 * elsewhere -- with our submit still describing this BO. If the tail turns up
+	 * in another live BO, that is the answer and it is an integration bug, not a
+	 * scribble. Bounded: at most one page scanned per BO. */
+	{
+		uint32_t bi;
+
+		for (bi = 0; bi < W.nbos; bi++) {
+			const struct pbo *o = &W.bos[bi];
+			const uint8_t *q;
+			uint32_t olim;
+			uint32_t k;
+
+			if (!o->used || (o == b) || (o->cpu == NULL)) {
+				continue;
+			}
+			q = (const uint8_t *)o->cpu;
+			olim = (o->size > 4096u) ? 4096u : o->size;
+			for (k = 0; (k + 1u) < olim; k++) {
+				if ((q[k] == 0x13u) && (q[k + 1u] == 0x14u)) {
+					fprintf(stderr, "v3d-winsys:   *** RCL tail found in a DIFFERENT BO: "
+						"handle=%u gpuva=0x%08x size=%u at offset %u -- the list was SPLIT "
+						"across BOs and we submitted only the first\n",
+						o->handle, o->gpuva, o->size, k);
+					return;
+				}
+			}
+		}
+	}
+	fprintf(stderr, "v3d-winsys:   RCL tail not found in ANY live BO -- the emission truly stopped\n");
 }
 
 static void bo_hist_report(const char *label, const struct pbo *b)
