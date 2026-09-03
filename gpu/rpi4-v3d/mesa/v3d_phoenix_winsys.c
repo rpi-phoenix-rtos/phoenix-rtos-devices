@@ -940,6 +940,35 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 		 * CT1 branch to a wild address past rcl_end and wedge (the intermittent render stall).
 		 * The huge scanout-backed RT (above) is excluded — it is fully rendered each frame and
 		 * claimed once, and zeroing 8 MB of uncached fb memory per frame would tank fps. */
+		/* Clean+invalidate the CPU caches over this range BEFORE using it as an
+		 * uncached BO.
+		 *
+		 * Phoenix hands out MAP_CONTIGUOUS pages that may have been in use by
+		 * something else through a CACHED mapping. Those lines can still be dirty
+		 * in L1/L2, and there is nothing to stop them being evicted LATER -- on top
+		 * of the uncached writes Mesa makes into this BO. That is a mismatched-
+		 * attribute alias, and its fingerprint is exactly what the corrupt control
+		 * lists show: damage at 64-BYTE granularity, in BOTH directions (a list
+		 * with a correct terminator but a zeroed head; another with a correct head
+		 * and a missing tail), holding either zeros or a previous owner's texels,
+		 * while Mesa demonstrably wrote the whole list into the correct BO
+		 * (MMAP_BO'd once, one CL BO in the job).
+		 *
+		 * `dc civac` writes back and invalidates, so any stale dirty line is
+		 * retired here, before the memset below and long before Mesa emits. EL0
+		 * cache maintenance is already relied on elsewhere in this stack (the
+		 * gallium v3d_resource.c Phoenix patch uses `dc civac` for readback). */
+		{
+			char *p = (char *)cpu;
+			size_t len = (size_t)pages * _PAGE_SIZE;
+			size_t off;
+
+			for (off = 0; off < len; off += 64u) {
+				__asm__ volatile("dc civac, %0" :: "r"(p + off) : "memory");
+			}
+			__asm__ volatile("dsb sy" ::: "memory");
+		}
+
 		memset(cpu, 0, pages*_PAGE_SIZE);
 		pa = (uintptr_t)va2pa(cpu);
 		/* Map each page by its ACTUAL physical address rather than assuming pa+i.
