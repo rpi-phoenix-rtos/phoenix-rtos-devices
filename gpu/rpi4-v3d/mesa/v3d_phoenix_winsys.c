@@ -306,6 +306,7 @@ static struct {
 	                           * own BO-alloc path, e.g. the V3DV present image). Cleared on use. */
 	struct pbo bos[MAX_BOS];
 	uint32_t nbos;            /* high-water mark of slots ever used */
+	uint32_t next_handle;     /* monotonic BO handle source; handles are never reused */
 	struct vahole holes[MAX_HOLES];
 	uint32_t nholes;
 	int inited;
@@ -568,11 +569,23 @@ int v3d_phoenix_peek_next_scanout(void)
 	return W.next_scanout;
 }
 
+/* Handles are NEVER recycled -- see the comment on W.next_handle in ioc_create_bo --
+ * so this is a scan by id rather than an index. MAX_BOS is small and this runs on
+ * ioctl paths that already take the submit lock, so the cost is irrelevant next to
+ * silently resolving a stale handle onto a live, unrelated BO. */
 static struct pbo *bo_find(uint32_t handle)
 {
-	if (handle == 0 || handle > W.nbos) return NULL;
-	struct pbo *b = &W.bos[handle - 1];   /* handle == slot index + 1 */
-	return (b->used && b->handle == handle) ? b : NULL;
+	uint32_t i;
+
+	if (handle == 0) {
+		return NULL;
+	}
+	for (i = 0; i < W.nbos; i++) {
+		if (W.bos[i].used && (W.bos[i].handle == handle)) {
+			return &W.bos[i];
+		}
+	}
+	return NULL;
 }
 
 /* Allocate a page-aligned GPU VA range: first-fit a freed hole (so reclaimed VA is
@@ -736,7 +749,15 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 
 	struct pbo *b = &W.bos[slot];
 	b->used = 1;
-	b->handle = slot + 1;       /* nonzero, stable per slot */
+	/* Monotonic, NEVER reused. It used to be slot + 1, which recycles a handle the
+	 * moment its slot is reclaimed -- measured in one traced boot: handles 118, 122,
+	 * 124, 125, 139 and 284 were each created twice, and handle 122's second life
+	 * took 95 more MMAP_BO calls. Any Mesa reference surviving the close therefore
+	 * resolved onto a DIFFERENT live BO and wrote into it, which is how a freshly
+	 * created control list ends up holding texture data. With a monotonic id, that
+	 * same stale reference fails cleanly in bo_find() (-EINVAL) instead. 32 bits at
+	 * a few hundred BOs per boot cannot wrap in any plausible session. */
+	b->handle = ++W.next_handle;
 	b->cpu = cpu; b->pa = pa; b->gpuva = gpuva; b->size = pages*_PAGE_SIZE;
 	b->scanout = (W.scanout_pa != 0 && (pa == W.scanout_pa ||
 		(W.scanout_pa2 != 0 && pa == W.scanout_pa2) ||
