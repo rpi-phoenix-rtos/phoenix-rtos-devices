@@ -490,10 +490,25 @@ static void rcl_find_remainder(const struct pbo *b, uint32_t declared_len)
 			olim = (o->size > 4096u) ? 4096u : o->size;
 			for (k = 0; (k + 1u) < olim; k++) {
 				if ((q[k] == 0x13u) && (q[k + 1u] == 0x14u)) {
+					uint32_t d;
+
 					fprintf(stderr, "v3d-winsys:   *** RCL tail found in a DIFFERENT BO: "
-						"handle=%u gpuva=0x%08x size=%u at offset %u -- the list was SPLIT "
-						"across BOs and we submitted only the first\n",
-						o->handle, o->gpuva, o->size, k);
+						"handle=%u gpuva=0x%08x size=%u at offset %u (declared len %u)\n",
+						o->handle, o->gpuva, o->size, k, declared_len);
+					/* Print that BO's bytes across the SAME window where this one went
+					 * bad. Two readings must be told apart and the bytes do it:
+					 *  - if 62..80 here hold the packets missing from the offending BO
+					 *    (7c coords, 1a END_OF_LOADS, 1d STORE, 1b END_OF_TILE), the
+					 *    remainder was written at the SAME offsets into the WRONG BO,
+					 *    i.e. the list really was split mid-emission;
+					 *  - if instead this BO holds an independent complete list from a
+					 *    previous job, that is a long-lived CL BO and the match is
+					 *    incidental -- which would make "split" the wrong conclusion. */
+					fprintf(stderr, "v3d-winsys:   other BO bytes 56..%u:", (k + 4u));
+					for (d = 56u; (d <= (k + 4u)) && (d < olim); d++) {
+						fprintf(stderr, " %02x", q[d]);
+					}
+					fprintf(stderr, "\n");
 					return;
 				}
 			}
