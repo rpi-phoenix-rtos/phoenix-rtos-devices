@@ -384,6 +384,42 @@ static void bo_hist_record(const struct pbo *b)
 /* Report any recently-closed BO that overlapped this one's GPU VA or CPU address.
  * Overlap, not equality: a smaller BO reusing part of a bigger one's range is the
  * dangerous case and an equality test would miss it. */
+/* Report the LIVE BOs adjacent to this one in GPU VA space.
+ *
+ * The closed-BO history above answered its question with a clean negative: across
+ * a full bench it never fired, so no recently-closed BO overlaps a corrupt list.
+ * What remains is an out-of-bounds write from a neighbour that is still OPEN --
+ * which fits the evidence exactly: the arena is densely packed with no gaps, a
+ * copy RCL uses ~101 bytes of its 4096, and the corruption comes in two flavours,
+ * tail-only (a small overrun) and whole-BO (a larger one).
+ *
+ * This driver has already been bitten by that class once: gpuva_bo_remaining()
+ * exists so the CPU UIF tiler "can never write past the dest image BO into an
+ * adjacent texture in the contiguous dmammap pool". So print who the neighbours
+ * are and how big they are; across enough hits the overrunning role identifies
+ * itself. */
+static void bo_neighbours_report(const struct pbo *b)
+{
+	uint32_t i;
+
+	for (i = 0; i < W.nbos; i++) {
+		const struct pbo *n = &W.bos[i];
+
+		if (!n->used || (n == b)) {
+			continue;
+		}
+		if ((n->gpuva + n->size) == b->gpuva) {
+			fprintf(stderr, "v3d-winsys:   LIVE neighbour BELOW: handle=%u gpuva=0x%08x..0x%08x "
+				"size=%u (ends exactly at the corrupt BO)\n",
+				n->handle, n->gpuva, n->gpuva + n->size, n->size);
+		}
+		else if (n->gpuva == (b->gpuva + b->size)) {
+			fprintf(stderr, "v3d-winsys:   LIVE neighbour ABOVE: handle=%u gpuva=0x%08x..0x%08x size=%u\n",
+				n->handle, n->gpuva, n->gpuva + n->size, n->size);
+		}
+	}
+}
+
 static void bo_hist_report(const char *label, const struct pbo *b)
 {
 	uint32_t i;
@@ -1254,6 +1290,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 
 						if (rb != NULL) {
 							bo_hist_report("RCL-AT-ENTRY", rb);
+							bo_neighbours_report(rb);
 						}
 					}
 					if (v3d_phoenix_rcl_bad_at_entry == 8u) {
