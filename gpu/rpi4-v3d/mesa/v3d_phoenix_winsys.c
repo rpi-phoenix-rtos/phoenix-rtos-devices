@@ -495,6 +495,14 @@ static void rcl_find_remainder(const struct pbo *b, uint32_t declared_len)
 					fprintf(stderr, "v3d-winsys:   *** RCL tail found in a DIFFERENT BO: "
 						"handle=%u gpuva=0x%08x size=%u at offset %u (declared len %u)\n",
 						o->handle, o->gpuva, o->size, k, declared_len);
+					/* The one question left. Mesa writes the list through the pointer
+					 * MMAP_BO handed it for the SUBMITTED bo. If that pointer is this
+					 * other BO's memory, then we gave two BOs the same CPU mapping and
+					 * the bug is ours, right here. If the pointers differ, Mesa wrote
+					 * somewhere we did not give it and the bug is above us. */
+					fprintf(stderr, "v3d-winsys:   cpu: submitted BO handle=%u -> %p | other BO handle=%u -> %p | %s\n",
+						b->handle, b->cpu, o->handle, o->cpu,
+						(b->cpu == o->cpu) ? "*** SAME CPU MAPPING -- our bug ***" : "different mappings");
 					/* Print that BO's bytes across the SAME window where this one went
 					 * bad. Two readings must be told apart and the bytes do it:
 					 *  - if 62..80 here hold the packets missing from the offending BO
