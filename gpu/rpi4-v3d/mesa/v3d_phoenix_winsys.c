@@ -73,6 +73,53 @@
  * cfg[0..6] map to CSD_QUEUED_CFG0..6; writing CFG0 KICKS the dispatch. See linux
  * v3d_regs.h (V3D_CSD_*) and v3d_sched.c v3d_csd_job_run. */
 #define CSD_STATUS          0x0900u   /* NUM_COMPLETED[11:4], HAVE_CURRENT(1), HAVE_QUEUED(0) */
+/* SUBMIT SERIALIZATION.
+ *
+ * Every path below programs SHARED V3D MMIO (the CT0/CT1 control-list queues, the
+ * CSD dispatch queue, the MMU and the cache-control registers) and mutates global
+ * state (the BO table, the VA allocator, the page table). None of that was ever
+ * guarded, and it is reachable from more than one thread: vkQuake runs its render
+ * and compute work through a task system whose workers are DETACHED threads
+ * (Quake/tasks.c: SDL_DetachThread(SDL_CreateThread(Task_Worker, ...))), driven from
+ * gl_rmain.c / r_world.c.
+ *
+ * Linux never needs this lock: its kernel driver holds its own, and the DRM
+ * scheduler keeps a single job per queue in flight. A poll-based winsys in the
+ * client process has neither, so two threads could interleave register writes --
+ * pairing one job's control-list address with another job's buffer, or kicking a
+ * CSD dispatch into a unit that already had one CURRENT and one QUEUED.
+ *
+ * The race is as old as the file; what changed is the exposure. libphoenix altered
+ * detached-thread exit and stack reclamation on 2026-09-01 (4c97a79, c8ee89e),
+ * which shifted the interleaving, and the symptoms appeared in the 08-28..09-03
+ * window: CSD timeouts with status=0x7 and presentation frozen at frame 26, plus
+ * (suspected) #67's "GPU executing image data".
+ *
+ * The lock is created on the first ioctl, which happens on the main thread during
+ * device creation -- long before any worker thread exists -- so the lazy init is
+ * not itself a race in practice. */
+static handle_t v3d_submit_lock;
+static int v3d_submit_lock_ready;
+
+static void v3d_submit_lock_acquire(void)
+{
+	if (v3d_submit_lock_ready == 0) {
+		if (mutexCreate(&v3d_submit_lock) != 0) {
+			fprintf(stderr, "v3d-winsys: mutexCreate failed -- submits UNSERIALIZED\n");
+			return;
+		}
+		v3d_submit_lock_ready = 1;
+	}
+	(void)mutexLock(v3d_submit_lock);
+}
+
+static void v3d_submit_lock_release(void)
+{
+	if (v3d_submit_lock_ready != 0) {
+		(void)mutexUnlock(v3d_submit_lock);
+	}
+}
+
 #define CSD_STATUS_HAVE_QUEUED  (1u<<0)  /* linux V3D_CSD_STATUS_HAVE_QUEUED_DISPATCH */
 #define CSD_STATUS_HAVE_CURRENT (1u<<1)  /* linux V3D_CSD_STATUS_HAVE_CURRENT_DISPATCH */
 #define CSD_QUEUED_CFG0     0x0904u   /* CFG1..6 follow at +4 each; CFG0 write kicks the job */
@@ -1829,7 +1876,30 @@ static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
 /* The single entry the libdrm shim's drmIoctl() dispatches into. */
 int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg);
 
+/* Thin locking wrapper. The body is a separate function so that no early return
+ * inside it can leak the lock -- there are many, and adding an unlock to each is
+ * exactly the sort of edit that goes wrong later. */
+static int v3d_ioctl_locked(int fd, unsigned long request, void *arg);
+
 int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
+{
+	int ret;
+
+	/* GET_PARAM and WAIT_BO return constants and touch neither MMIO nor global
+	 * state, so they stay outside the lock: serializing them would put every
+	 * screen-create query behind in-flight GPU work for no benefit. */
+	unsigned cmd_nr = _IOC_NR(request) - DRM_COMMAND_BASE;
+	if ((cmd_nr == DRM_V3D_GET_PARAM) || (cmd_nr == DRM_V3D_WAIT_BO)) {
+		return v3d_ioctl_locked(fd, request, arg);
+	}
+
+	v3d_submit_lock_acquire();
+	ret = v3d_ioctl_locked(fd, request, arg);
+	v3d_submit_lock_release();
+	return ret;
+}
+
+static int v3d_ioctl_locked(int fd, unsigned long request, void *arg)
 {
 	(void)fd;
 	/* Mesa builds requests as DRM_IOWR(DRM_COMMAND_BASE + DRM_V3D_*, ...), so the
