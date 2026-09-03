@@ -331,11 +331,11 @@ volatile unsigned v3d_phoenix_render_timeouts = 0;
 /* V3D_BO_TRACE=1: one line per BO create / mmap / close, so the lifetime of the
  * memory behind a corrupt control list can be reconstructed from a single boot.
  *
- * Needed because DRM_V3D_MMAP_BO hands Mesa `b->cpu` itself and ioc_close_bo then
- * munmaps it, so the same CPU address can legitimately be handed out twice with a
- * free in between -- and that is the leading explanation for control lists that
- * arrive full of texels. Guessing which of create/mmap/close ordering does it is
- * how the last few wrong fixes happened; this prints the ordering instead. */
+ * Needed because DRM_V3D_MMAP_BO hands Mesa `b->cpu` itself and ioc_close_bo USED
+ * TO munmap it, so the same CPU address could be handed out twice with a free in
+ * between -- the cause of control lists arriving full of texels. Kept after the
+ * fix: it is how that class of bug is recognised, and how V3D_UNMAP_CLOSED_BO=1
+ * A/B runs are read. */
 static int bo_trace_on(void)
 {
 	static int on = -1;
@@ -892,38 +892,40 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 	}
 
 	va_free(b->gpuva, b->size / _PAGE_SIZE);
-	/* V3D_KEEP_CLOSED_BO=1 -- deliberately DO NOT unmap on close.
+	/* DO NOT unmap a closed BO's CPU mapping. This is deliberate and it is the fix
+	 * for control lists that arrived at submit already full of RGBA pixel data.
 	 *
-	 * This exists to prove, by suppression, the leading explanation for control
-	 * lists that arrive already full of RGBA pixel data (see the entry-time check
-	 * in ioc_submit_cl). DRM_V3D_MMAP_BO hands Mesa `b->cpu` ITSELF, and this
-	 * function then munmaps it. Real DRM does not work that way: closing a GEM
-	 * handle never invalidates a CPU mapping the process already holds. So a Mesa
-	 * bufmgr that still has the BO mapped -- its cache keeps mappings alive across
-	 * handle churn -- is left with a dangling pointer, and the NEXT BO's mmap is
-	 * handed the same address back. Mesa's writes then land inside a freshly
-	 * created BO, which is how a brand-new control list ends up holding texels.
+	 * Mesa's contract, from its own source: v3dv_bo.c:303 takes the pointer
+	 * DRM_V3D_MMAP_BO returns and CACHES it on the BO, and v3dv_bo.c:359 states
+	 * that the mapping "was not produced by libc mmap(), so there is nothing to
+	 * munmap" and merely nulls the field. So Mesa never releases it, and it is
+	 * entitled to assume the pointer stays valid. Real DRM agrees: closing a GEM
+	 * handle does not invalidate a CPU mapping the process already holds.
 	 *
-	 * Leaving the mapping in place denies the address to the next allocation. If
-	 * that makes `v3d_phoenix_rcl_bad_at_entry` go to zero, the mechanism is
-	 * confirmed and the real fix is to give Mesa its OWN mapping of the BO's
-	 * physical pages (MAP_PHYSMEM, as the scanout path already does) so neither
-	 * side can pull the rug from under the other.
+	 * We were the ones breaking that. MMAP_BO hands out `b->cpu` itself, this
+	 * function munmap'd it, and the next BO's mmap was handed the same address --
+	 * so a write through any pointer Mesa still held landed inside a freshly
+	 * created BO. Measured in one traced boot: 5 CPU addresses served more than one
+	 * handle.
 	 *
-	 * Off by default: it leaks address space for the life of the process, which is
-	 * fine for a bench and not for shipping. */
+	 * Cost, measured rather than guessed: 439 creates per boot total 142 MiB, but
+	 * only 224 closes totalling 1.6 MiB -- the big buffers are never closed. So not
+	 * recycling costs ~1.6 MiB per process, reclaimed at exit. That is cheap enough
+	 * to be the default; silent GPU corruption is not.
+	 *
+	 * V3D_UNMAP_CLOSED_BO=1 restores the old behaviour, for A/B measurement only. */
 	if (b->cpu != NULL) {
-		static int keep = -1;
+		static int unmap = -1;
 
-		if (keep < 0) {
-			const char *e = getenv("V3D_KEEP_CLOSED_BO");
-			keep = (e != NULL && *e == '1') ? 1 : 0;
-			if (keep != 0) {
-				fprintf(stderr, "v3d-winsys: V3D_KEEP_CLOSED_BO=1 -- closed BOs keep their "
-					"CPU mapping (address never recycled); leaks VA by design\n");
+		if (unmap < 0) {
+			const char *e = getenv("V3D_UNMAP_CLOSED_BO");
+			unmap = (e != NULL && *e == '1') ? 1 : 0;
+			if (unmap != 0) {
+				fprintf(stderr, "v3d-winsys: V3D_UNMAP_CLOSED_BO=1 -- recycling closed BO "
+					"addresses again (pre-fix behaviour, for A/B only)\n");
 			}
 		}
-		if (keep == 0) {
+		if (unmap != 0) {
 			munmap(b->cpu, b->size);
 		}
 	}
