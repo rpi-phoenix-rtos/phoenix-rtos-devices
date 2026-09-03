@@ -1080,6 +1080,19 @@ static void *gpuva_to_cpu(uint32_t gpuva)
 	return NULL;
 }
 
+/* Handle lookup for the diagnostics (const, and does not care about ordering). */
+static const struct pbo *bo_find_by_handle_const(uint32_t handle)
+{
+	uint32_t i;
+
+	for (i = 0; i < W.nbos; i++) {
+		if (W.bos[i].used && (W.bos[i].handle == handle)) {
+			return &W.bos[i];
+		}
+	}
+	return NULL;
+}
+
 /* Same scan, but hand back the BO itself -- the diagnostics need its handle, size
  * and CPU address, not just a translated pointer. */
 static const struct pbo *bo_find_covering(uint32_t gpuva)
@@ -1389,6 +1402,34 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 							bo_hist_report("RCL-AT-ENTRY", rb);
 							bo_neighbours_report(rb);
 							rcl_find_remainder(rb, rn);
+						}
+						/* The job's own BO list. Mesa passes every BO the job
+						 * references, so if its control list spilled into a second
+						 * BO that BO is in here -- and this says so directly instead
+						 * of being inferred from a signature search. Both truncations
+						 * seen so far stop partway through a run of small packets
+						 * (offset 66 inside the GFXH-1742 tile loop, offset 128 inside
+						 * the supertile-coordinate loop, with the 13th packet's opcode
+						 * written and its payload not), which is what a mid-emission BO
+						 * switch looks like from here. */
+						if ((s->bo_handles != 0u) && (s->bo_handle_count != 0u) &&
+								(s->bo_handle_count < 64u)) {
+							const uint32_t *hs = (const uint32_t *)(uintptr_t)s->bo_handles;
+							uint32_t hi;
+
+							fprintf(stderr, "v3d-winsys:   job references %u BOs:", s->bo_handle_count);
+							for (hi = 0; hi < s->bo_handle_count; hi++) {
+								const struct pbo *jb = bo_find_by_handle_const(hs[hi]);
+
+								if (jb != NULL) {
+									fprintf(stderr, " %u@0x%08x/%u%s", hs[hi], jb->gpuva, jb->size,
+										(jb->gpuva == s->rcl_start) ? "(RCL)" : "");
+								}
+								else {
+									fprintf(stderr, " %u@?", hs[hi]);
+								}
+							}
+							fprintf(stderr, "\n");
 						}
 					}
 					if (v3d_phoenix_rcl_bad_at_entry == 8u) {
