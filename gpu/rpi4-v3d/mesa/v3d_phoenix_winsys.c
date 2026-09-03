@@ -326,6 +326,11 @@ void v3d_phoenix_logColdState(void);  /* v3d_phoenix_power.c — STEP-3 cold-pow
  * incremented every time a CT1 render submit hits the spin-timeout. Lets the harness
  * count stalls across many in-boot submits instead of one-boot-per-sample roulette. */
 volatile unsigned v3d_phoenix_render_timeouts = 0;
+
+/* Count of render lists that were ALREADY not a control list when we were handed
+ * them (see the entry-time check in ioc_submit_cl). Exported for the same reason
+ * as the timeout counter: so a harness can read a rate instead of grepping UART. */
+volatile unsigned v3d_phoenix_rcl_bad_at_entry = 0;
 static uint32_t va_alloc(uint32_t pages);   /* defined below; used by the init overflow pool */
 static void apply_core_regs(void);          /* defined below; used by winsys_init + reset path */
 
@@ -994,6 +999,48 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	int job_failed = 0;     /* set if bin or render wedged */
 
 	int attempt = 0;        /* kept for the timeout-dump "attempt" field (always 0 now: no resubmit) */
+
+	/* ENTRY-TIME RCL SANITY CHECK (2026-09-03). Decoding the wedged jobs showed that
+	 * only about HALF of them have a control list at all: over
+	 * artifacts/rpi4b-uart/*.log, 65 recorded RCLBYTES dumps split 29 opening with
+	 * 0x79 (TILE_RENDERING_MODE_CFG) and 36 opening with RGBA pixel data or zeros,
+	 * parked at offset 0. That leaves one question that decides where
+	 * the bug is, and it cannot be answered from the wedge dump alone:
+	 *
+	 *   is the list already garbage when Mesa hands it to us (a BO-lifetime/aliasing
+	 *   bug ABOVE this layer), or is it valid at entry and overwritten while the job
+	 *   runs (something in OUR submit path, or the GPU, scribbling on it)?
+	 *
+	 * Two byte reads per submit settle it. Cheap enough to leave on: no allocation, no
+	 * MMIO, and the print is capped so a per-frame failure cannot flood the UART.
+	 *
+	 * 0x79 TILE_RENDERING_MODE_CFG is the normal opener; 0x7c TILE_COORDINATES and
+	 * 0x7e TILE_LIST_INITIAL_BLOCK_SIZE are the other legitimate ones. */
+	{
+		const uint8_t *rp0 = (const uint8_t *)gpuva_to_cpu(s->rcl_start);
+
+		/* >= 8 bytes, because the report below reads first8 -- a shorter list would
+		 * over-read past the BO. A real RCL is far longer than 8 bytes anyway. */
+		if ((rp0 != NULL) && ((s->rcl_end - s->rcl_start) >= 8u)) {
+			uint8_t op = rp0[0];
+
+			if ((op != 0x79u) && (op != 0x7cu) && (op != 0x7eu)) {
+				v3d_phoenix_rcl_bad_at_entry++;
+				if (v3d_phoenix_rcl_bad_at_entry <= 8u) {
+					fprintf(stderr, "v3d-winsys: RCL IS NOT A LIST AT ENTRY "
+						"gpuva=0x%08x n=%u first8=%02x %02x %02x %02x %02x %02x %02x %02x (n_bad=%u)\n",
+						s->rcl_start, (uint32_t)(s->rcl_end - s->rcl_start),
+						rp0[0], rp0[1], rp0[2], rp0[3], rp0[4], rp0[5], rp0[6], rp0[7],
+						v3d_phoenix_rcl_bad_at_entry);
+					if (v3d_phoenix_rcl_bad_at_entry == 8u) {
+						fprintf(stderr, "v3d-winsys: (further RCL-at-entry reports suppressed; "
+							"read v3d_phoenix_rcl_bad_at_entry for the count)\n");
+					}
+				}
+			}
+		}
+	}
+
 	W.binovf_used = 0;      /* re-armable binner overflow: reset the per-job hand-out cursor */
 	/* Drain CPU stores into uncached GPU BOs to DRAM BEFORE the first GPU MMIO poke below.
 	 * On aarch64, writes to Normal-Non-Cacheable (our MAP_UNCACHED BOs) are NOT ordered
@@ -1399,9 +1446,12 @@ job_retry:
 		 * to perform the copy on the CPU rather than re-submit it.
 		 *
 		 * SECOND, SEPARATE DEFECT, also on record: only about HALF the drops have
-		 * a decodable list at all. Of 56 RCLBYTES dumps in artifacts/, 27 begin
-		 * with 0x79 (TILE_RENDERING_MODE_CFG, a valid RCL) and 29 begin with RGBA
-		 * pixel data or zeros, all parked at offset 0. For those there is no LOAD,
+		 * a decodable list at all. Counted over artifacts/rpi4b-uart/*.log:
+		 * 65 RCLBYTES dumps, 29 beginning with 0x79 (TILE_RENDERING_MODE_CFG, a
+		 * valid RCL) and 36 beginning with RGBA pixel data or zeros (0x74 x15,
+		 * 0x2a x13, 0xff x3, 0x90 x3, 0x00 x2 -- none a defined CLE opcode), all
+		 * parked at offset 0. Treat the totals as a moving target (every bench
+		 * adds logs); the RATIO has stayed near half. For those there is no LOAD,
 		 * no STORE, no address and no extent to recover -- the RCL BO is holding
 		 * image data. That is a different bug from this one and a CPU fallback
 		 * cannot help it; see docs/misc/2026-09-03-v3d-dropped-metacopy-fix-plan.md.
