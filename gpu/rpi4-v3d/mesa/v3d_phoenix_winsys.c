@@ -934,6 +934,13 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	volatile uint32_t *h = W.hub;
 	uint32_t spins;
 	int job_failed = 0;     /* set if bin or render wedged */
+	/* A ONE-SHOT job must never be silently dropped -- see the retry at job_retry.
+	 * A meta-copy (vkCmdCopyBuffer, which on V3D 4.2 is a CL render job, not a TFU
+	 * blit) has a trivial binner list: measured 14 B BCL / ~100 B RCL on hardware,
+	 * against thousands of bytes for a real scene. 256 B is far above the former
+	 * and far below the latter. */
+	const int one_shot_job = ((s->bcl_end - s->bcl_start) < 256u);
+	int oneshot_retries = 0;
 	int attempt = 0;        /* kept for the timeout-dump "attempt" field (always 0 now: no resubmit) */
 	W.binovf_used = 0;      /* re-armable binner overflow: reset the per-job hand-out cursor */
 	/* Drain CPU stores into uncached GPU BOs to DRAM BEFORE the first GPU MMIO poke below.
@@ -998,6 +1005,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	 * slice-cache invalidate. Doing SLCACTL first (as this used to) risked the read-only slice
 	 * caches being dropped while stale lines still sat in the not-yet-flushed L2T; harmless while
 	 * the core is idle here, but the contract order is safer and consistent. */
+job_submit_again:
 	l2t_flush_wait(c0);                       /* wait-old: prior L2T flush must be idle first */
 	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS;
 	l2t_flush_wait(c0);                       /* wait-new: flush must complete before the bin reads its CL/vertex data */
@@ -1280,6 +1288,39 @@ job_retry:
 				: "");
 		reset_reinit_core();   /* clean the wedged core so the next (different) frame renders */
 		(void)attempt;
+
+		/* Dropping a ONE-SHOT job is not a dropped frame, it is silent data loss.
+		 *
+		 * The drop-and-continue trade above was written for render frames, where
+		 * the next tick redraws what was lost, and where re-submitting is futile
+		 * because the wedge is data-dependent and re-hangs on the same geometry.
+		 * Neither half applies to a buffer upload: nothing redraws it, and a
+		 * 14-byte binner list is not the "specific complex geometry" that
+		 * provokes the depth-pipeline stall -- it is collateral damage from a
+		 * core that was already marginal.
+		 *
+		 * Measured consequence of dropping one (2026-09-03): the destination BO
+		 * keeps the zeros it was given at create, so a model's vertices decode to
+		 * a single point and it contributes no fragments for the REST OF THE BOOT
+		 * -- #67, per-boot latched, zero mixed boots in ~200 frames, and the
+		 * torch verdict predicted 26/26 by whether a wedge landed on this exact
+		 * control-list page. Every dropped job observed on hardware was tiny
+		 * (14 B BCL / 98-101 B RCL at VA 0x0acd0/0x0acd5) -- i.e. uploads are the
+		 * jobs that wedge, and dropping them is what loses geometry.
+		 *
+		 * So retry these, after the reset that cleaned the core. Bounded at 3: if
+		 * a trivial CL cannot land on a freshly reset core, retrying further is
+		 * not going to help and the loud timeout dump is the right outcome. */
+		if (one_shot_job && oneshot_retries < 3) {
+			oneshot_retries++;
+			fprintf(stderr, "v3d-winsys: RETRY one-shot job after reset "
+				"(attempt %d/3) bcl=%u B -- dropping an upload loses geometry "
+				"for the whole process, unlike dropping a frame\n",
+				oneshot_retries, (unsigned)(s->bcl_end - s->bcl_start));
+			job_failed = 0;
+			attempt = oneshot_retries;
+			goto job_submit_again;
+		}
 	}
 	/* L2T flush so RT stores reach RAM before CPU readback (scout finding). */
 	l2t_flush_wait(c0);                       /* GFXH-1897: render flush must complete first */
