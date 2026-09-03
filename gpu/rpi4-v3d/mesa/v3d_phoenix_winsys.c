@@ -779,7 +779,41 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 	}
 
 	va_free(b->gpuva, b->size / _PAGE_SIZE);
-	if (b->cpu != NULL) munmap(b->cpu, b->size);
+	/* V3D_KEEP_CLOSED_BO=1 -- deliberately DO NOT unmap on close.
+	 *
+	 * This exists to prove, by suppression, the leading explanation for control
+	 * lists that arrive already full of RGBA pixel data (see the entry-time check
+	 * in ioc_submit_cl). DRM_V3D_MMAP_BO hands Mesa `b->cpu` ITSELF, and this
+	 * function then munmaps it. Real DRM does not work that way: closing a GEM
+	 * handle never invalidates a CPU mapping the process already holds. So a Mesa
+	 * bufmgr that still has the BO mapped -- its cache keeps mappings alive across
+	 * handle churn -- is left with a dangling pointer, and the NEXT BO's mmap is
+	 * handed the same address back. Mesa's writes then land inside a freshly
+	 * created BO, which is how a brand-new control list ends up holding texels.
+	 *
+	 * Leaving the mapping in place denies the address to the next allocation. If
+	 * that makes `v3d_phoenix_rcl_bad_at_entry` go to zero, the mechanism is
+	 * confirmed and the real fix is to give Mesa its OWN mapping of the BO's
+	 * physical pages (MAP_PHYSMEM, as the scanout path already does) so neither
+	 * side can pull the rug from under the other.
+	 *
+	 * Off by default: it leaks address space for the life of the process, which is
+	 * fine for a bench and not for shipping. */
+	if (b->cpu != NULL) {
+		static int keep = -1;
+
+		if (keep < 0) {
+			const char *e = getenv("V3D_KEEP_CLOSED_BO");
+			keep = (e != NULL && *e == '1') ? 1 : 0;
+			if (keep != 0) {
+				fprintf(stderr, "v3d-winsys: V3D_KEEP_CLOSED_BO=1 -- closed BOs keep their "
+					"CPU mapping (address never recycled); leaks VA by design\n");
+			}
+		}
+		if (keep == 0) {
+			munmap(b->cpu, b->size);
+		}
+	}
 	b->used = 0;
 	b->cpu = NULL;
 	b->handle = 0;
