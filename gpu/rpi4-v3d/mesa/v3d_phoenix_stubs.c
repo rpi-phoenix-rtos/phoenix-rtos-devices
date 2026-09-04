@@ -114,11 +114,31 @@ void *disk_cache_create(const char *name, const char *renderer, uint64_t driver_
 		return NULL;                     /* path too long */
 	}
 
+	/* Say so when the cache is COLD, because the silence is expensive to read.
+	 *
+	 * With a warm cache vkQuake reaches its first frame in a few seconds; with a
+	 * cold one it compiles 67 shader modules first and the screen stays black for
+	 * ~67 s (measured 2026-09-04). That is indistinguishable from a hang unless
+	 * something says otherwise -- it was reported as "black screen and blocked"
+	 * the same week, on a build that in fact renders 3/3 with 1710 presents. A
+	 * fresh root (a newly flashed SD image, or a pristine NFS export, which wipes
+	 * the cache by design) makes every GL/VK app pay this once.
+	 */
+	struct stat cache_st;
+	int cold = (stat(c->dir, &cache_st) != 0);
+
 	/* If the dir can't be created, disable caching (Mesa treats NULL as "off"). */
 	if (v3d_cache_mkdir_p(c->dir) != 0) {
 		free(c);
 		return NULL;
 	}
+
+	if (cold != 0) {
+		printf("v3d: shader cache COLD (%s) — this run compiles shaders, so the "
+		       "first frame takes noticeably longer; later runs reuse it\n", c->dir);
+		fflush(stdout);
+	}
+
 	return c;
 }
 
