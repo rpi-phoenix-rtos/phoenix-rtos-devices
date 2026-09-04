@@ -3,3 +3,9 @@
 .idea/
 build/
 .vscode/*
+
+# Standalone-built driver binaries. bt/rpi4-hci/build-standalone.sh links these
+# in-tree (the Makefile build puts its objects under build/, already ignored),
+# so they are build output, not source.
+bt/rpi4-hci/btctl
+bt/rpi4-hci/rpi4-hci
