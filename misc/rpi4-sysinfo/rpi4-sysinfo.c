@@ -13,6 +13,7 @@
  * Author: Witold Bołt
  */
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/random.h>
@@ -33,6 +34,58 @@ static void sysinfo_inventory(void)
 		printf(" %s%s", nodes[i] + 5 /* skip "/dev/" */, (stat(nodes[i], &st) == 0) ? "+" : "-");
 	}
 	printf("  (+present -absent)\n");
+}
+
+
+/*
+ * Print WHICH COMMIT of every Phoenix repo went into this build.
+ *
+ * Owner request 2026-09-05: a UART log should say what the system IS, not only
+ * what it did -- otherwise triage starts by guessing which tree produced the
+ * binaries. scripts/gen-build-versions.sh writes the file at build time, one
+ * line per repo: "<repo> <short-sha>[+dirty] <date>". The dirty marker is the
+ * important half: a build from a modified tree is exactly where a bare commit
+ * id misleads.
+ *
+ * Bounded on purpose -- at most BUILDVER_MAX_LINES lines of at most
+ * BUILDVER_MAX_COLS characters -- so a truncated or corrupt file cannot flood
+ * the boot console, and a missing file just says so (the netboot RAM root has
+ * no /etc, and that is not a failure).
+ */
+#define BUILDVER_PATH      "/etc/build-versions"
+#define BUILDVER_MAX_LINES 32
+#define BUILDVER_MAX_COLS  110
+
+static void sysinfo_buildVersions(void)
+{
+	FILE *f;
+	char line[BUILDVER_MAX_COLS + 2];
+	int printed = 0;
+
+	f = fopen(BUILDVER_PATH, "r");
+	if (f == NULL) {
+		printf("rpi4-sysinfo: no %s (component commit ids unavailable)\n", BUILDVER_PATH);
+		return;
+	}
+
+	printf("rpi4-sysinfo: build components (%s):\n", BUILDVER_PATH);
+	while ((printed < BUILDVER_MAX_LINES) && (fgets(line, sizeof(line), f) != NULL)) {
+		size_t len = strlen(line);
+
+		while ((len > 0u) && ((line[len - 1u] == '\n') || (line[len - 1u] == '\r'))) {
+			line[--len] = '\0';
+		}
+		if ((len == 0u) || (line[0] == '#')) {
+			continue;
+		}
+		printf("  %s\n", line);
+		printed++;
+	}
+	if (printed == BUILDVER_MAX_LINES) {
+		printf("  ... (truncated at %d lines)\n", BUILDVER_MAX_LINES);
+	}
+
+	fclose(f);
 }
 
 
@@ -64,6 +117,7 @@ int main(int argc, char **argv)
 	}
 
 	sysinfo_inventory();
+	sysinfo_buildVersions();
 	printf("================================================================\n");
 
 	return 0;
