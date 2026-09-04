@@ -17,6 +17,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/random.h>
+#include <unistd.h>
 
 
 static void sysinfo_inventory(void)
@@ -49,23 +50,46 @@ static void sysinfo_inventory(void)
  *
  * Bounded on purpose -- at most BUILDVER_MAX_LINES lines of at most
  * BUILDVER_MAX_COLS characters -- so a truncated or corrupt file cannot flood
- * the boot console, and a missing file just says so (the netboot RAM root has
- * no /etc, and that is not a failure).
+ * the boot console.
+ *
+ * WAITS for the file, briefly. plo starts every syspage program concurrently,
+ * so on the nfsroot variant this banner runs while "/" is still the temporary
+ * dummyfs RAM root: the NFS export -- and with it /etc -- is spliced in a second
+ * or two later (measured 2026-09-05: banner at uptime 3.2 s, "nfs-fs: registered
+ * /" after it). Retrying for up to BUILDVER_WAIT_MS costs nothing on the boot
+ * path, because this is a one-shot program nothing waits for; the banner and
+ * device inventory are already printed by the time we get here. On the netboot
+ * RAM root the file never appears and we say so, which is not a failure.
  */
 #define BUILDVER_PATH      "/etc/build-versions"
 #define BUILDVER_MAX_LINES 32
 #define BUILDVER_MAX_COLS  110
+#define BUILDVER_WAIT_MS   8000
+#define BUILDVER_POLL_MS   200
 
 static void sysinfo_buildVersions(void)
 {
-	FILE *f;
+	FILE *f = NULL;
 	char line[BUILDVER_MAX_COLS + 2];
 	int printed = 0;
+	int waited;
 
-	f = fopen(BUILDVER_PATH, "r");
+	for (waited = 0; waited <= BUILDVER_WAIT_MS; waited += BUILDVER_POLL_MS) {
+		f = fopen(BUILDVER_PATH, "r");
+		if (f != NULL) {
+			break;
+		}
+		usleep((useconds_t)BUILDVER_POLL_MS * 1000u);
+	}
+
 	if (f == NULL) {
-		printf("rpi4-sysinfo: no %s (component commit ids unavailable)\n", BUILDVER_PATH);
+		printf("rpi4-sysinfo: no %s after %d ms (component commit ids unavailable)\n",
+			BUILDVER_PATH, BUILDVER_WAIT_MS);
 		return;
+	}
+	if (waited > 0) {
+		printf("rpi4-sysinfo: %s appeared after %d ms (root filesystem mounted late)\n",
+			BUILDVER_PATH, waited);
 	}
 
 	printf("rpi4-sysinfo: build components (%s):\n", BUILDVER_PATH);
