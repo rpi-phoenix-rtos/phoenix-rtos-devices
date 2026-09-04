@@ -68,6 +68,34 @@ HARNESS_BIN = "/tmp/v3dphx-harness"
 GPU_LIBS  = f"{ROOT}/tools/.gpu-libs"  # stable home for the prebuilt engine archives (was /tmp)
 FULL_LIB  = f"{GPU_LIBS}/libv3d-phoenix.a"  # one archive: core+aux+driver+winsys+shim+stubs
 
+# --- SYSROOT: compile against what the build produced, not the toolchain bundle ---
+#
+# Everything else in this project compiles against
+# .buildroot/_build/<target>/sysroot; these Mesa builds passed no --sysroot, so
+# ~400 objects resolved libc out of .toolchain/aarch64-phoenix/aarch64-phoenix/
+# usr/include -- a HAND-MAINTAINED bundle. Measured 2026-09-04
+# (docs/misc/2026-09-04-toolchain-header-skew.md): that snapshot was dated
+# 2026-07-23 and five macro VALUES disagreed with live libphoenix, with
+# PTHREAD_PROCESS_PRIVATE/SHARED and PTHREAD_PRIO_NONE/INHERIT *swapped* -- code
+# built there asking for priority inheritance would silently get NOINHERIT. Same
+# class as the recorded _SC_NPROCESSORS incident: a value skew warns about nothing.
+#
+# The rule is not new: scripts/build-rootfs-helpers.sh states it for the launcher
+# helpers and fails hard when the sysroot is absent. Do the same here, and do NOT
+# fall back to the bundle -- a silent fallback is exactly the trap being closed.
+# The three flags mirror phoenix-rtos-build/makes/setup-sysroot.mk:17-23 so the
+# include/link search order matches every other Phoenix component.
+TARGET    = os.environ.get("TARGET") or "aarch64a72-generic-rpi4b"
+BUILDROOT = os.environ.get("RPI4B_BUILDROOT") or f"{ROOT}/.buildroot"
+SYSROOT   = os.environ.get("PHOENIX_SYSROOT") or f"{BUILDROOT}/_build/{TARGET}/sysroot"
+if not os.path.isfile(f"{SYSROOT}/lib/libphoenix.a"):
+    sys.exit(f"no sysroot at {SYSROOT} (no lib/libphoenix.a).\n"
+             "The GPU archives must compile against the sysroot the CORE stage produces:\n"
+             "  ./scripts/rebuild-rpi4b-fast.sh --scope core   (or pass PHOENIX_SYSROOT=)\n"
+             "Refusing to fall back to the .toolchain bundle -- it is hand-maintained and\n"
+             "goes stale silently (docs/misc/2026-09-04-toolchain-header-skew.md).")
+SYSROOT_OPTS = [f"--sysroot={SYSROOT}/", f"-B{SYSROOT}/lib/", "-iprefix", f"{SYSROOT}/"]
+
 # Correct on-device ABI (matches sources/phoenix-rtos-build/target/aarch64.mk) +
 # section flags so the final --gc-sections strips code unreachable from main().
 ABI_FLAGS = ["-mcpu=cortex-a72", "-mtune=cortex-a72", "-mstrict-align",
@@ -116,7 +144,7 @@ def transform(entry, src, out):
     # default; downgrade to warnings for the port (Phoenix libc misses some decls).
     # ABI = the project's aarch64.mk flags (correct on-device); section flags let the
     # final link --gc-sections drop everything unreachable from main (shrinks the ELF).
-    return [TC, "-c", src, "-o", out, f"-I{SHIM}", f"-I{PORT}", f"-I{VCMBOX}"] + ABI_FLAGS + EXTRA_DEFINES + [
+    return [TC, "-c", src, "-o", out, f"-I{SHIM}", f"-I{PORT}", f"-I{VCMBOX}"] + SYSROOT_OPTS + ABI_FLAGS + EXTRA_DEFINES + [
             "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
             "-Wno-error=int-conversion",
             "-include", COMPAT] + keep
@@ -291,7 +319,7 @@ def main():
     stubs_c = f"{PORT}/v3d_phoenix_stubs.c"
     stubs_o = f"{DRVOBJ}/v3d_phoenix_stubs.o"
     stubs_cmd = [TC, "-c", stubs_c, "-o", stubs_o, "-std=gnu11", "-w",
-                 "-include", COMPAT]
+                 "-include", COMPAT] + SYSROOT_OPTS
     rc = subprocess.run(stubs_cmd, capture_output=True, text=True)
     print(f"[stubs] rc={rc.returncode}")
     if rc.returncode != 0:
@@ -311,7 +339,7 @@ def main():
     #     there is deliberately no second copy of libvcmbox.c beside this script.
     vcmbox_c = f"{VCMBOX}/libvcmbox.c"
     vcmbox_o = f"{DRVOBJ}/libvcmbox.o"
-    vcmbox_cmd = [TC, "-c", vcmbox_c, "-o", vcmbox_o, "-std=gnu11", "-w", f"-I{VCMBOX}"]
+    vcmbox_cmd = [TC, "-c", vcmbox_c, "-o", vcmbox_o, "-std=gnu11", "-w", f"-I{VCMBOX}"] + SYSROOT_OPTS
     rc = subprocess.run(vcmbox_cmd, capture_output=True, text=True)
     print(f"[vcmbox] rc={rc.returncode}")
     if rc.returncode != 0:
@@ -385,7 +413,7 @@ def main():
 
     # 5. link the harness against the combined lib with --gc-sections (drops everything
     #    unreachable from main -> measures the boot-bundle-able size).
-    link = [TC, "-o", HARNESS_BIN, harness_o,
+    link = [TC, "-o", HARNESS_BIN, harness_o] + SYSROOT_OPTS + [
             "-Wl,--gc-sections", "-Wl,--start-group", FULL_LIB,
             "-Wl,--end-group", "-lm"]
     r = subprocess.run(link, capture_output=True, text=True)

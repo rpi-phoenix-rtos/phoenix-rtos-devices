@@ -171,7 +171,7 @@ def main():
     # symbols (they supply what libGL/libv3d reference but lack).
     for shim, warn in (("v3d_phoenix_mathshim.c", []), ("gl_stubs.c", ["-w"])):
         out = f"{GLOBJ}/{shim}.o"
-        cmd = [TC, "-O2", "-c"] + warn + [f"{PORT}/{shim}", "-o", out]
+        cmd = [TC, "-O2", "-c"] + SYSROOT_OPTS + warn + [f"{PORT}/{shim}", "-o", out]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode == 0:
             objs.append(out)

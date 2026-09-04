@@ -197,7 +197,7 @@ def main():
     shim_objs = []
     out = f"{V3DV_OBJ}/v3dv_libdrm_shim.c.o"
     cmd = ([TC, "-c", f"{PORT}/v3dv_libdrm_shim.c", "-o", out, f"-I{SHIM}",
-            f"-I{PORT}", "-std=gnu11", "-include", COMPAT] + ABI_FLAGS + ["-w"])
+            f"-I{PORT}", "-std=gnu11", "-include", COMPAT] + SYSROOT_OPTS + ABI_FLAGS + ["-w"])
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode == 0:
         shim_objs.append(out); print("[v3dv-shim] v3dv_libdrm_shim.c OK")
@@ -218,7 +218,7 @@ def main():
     for shim in ("v3dv_v71_stubs.c", "v3dv_gap_stubs.c"):
         out = f"{V3DV_OBJ}/{shim}.o"
         cmd = ([TC, "-c", f"{PORT}/{shim}", "-o", out, f"-I{SHIM}", f"-I{PORT}",
-                "-std=gnu11", "-w"] + ABI_FLAGS)
+                "-std=gnu11", "-w"] + SYSROOT_OPTS + ABI_FLAGS)
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode == 0:
             shim_objs.append(out); print(f"[v3dv-shim] {shim} OK")
@@ -289,7 +289,7 @@ def main():
     #    use its own front-end helpers, not gallium's). CAVEAT for later tiers: this is
     #    tolerated ONLY for these 3 enumerated dups; any NEW multiple-definition during
     #    Tier 1-5 must be investigated, not absorbed. See the Tier-0 progress doc.
-    link = [TC, "-o", V3DV_HARNESS_BIN, harness_o,
+    link = [TC, "-o", V3DV_HARNESS_BIN, harness_o] + SYSROOT_OPTS + [
             "-Wl,--gc-sections", "-Wl,--allow-multiple-definition",
             "-Wl,--start-group", V3DV_LIB, V3D_LIB,
             "-Wl,--end-group", "-lm"]
