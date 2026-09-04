@@ -13,7 +13,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
 GCC="${GCC:-$REPO_ROOT/.toolchain/aarch64-phoenix/bin/aarch64-phoenix-gcc}"
 NM="${NM:-$REPO_ROOT/.toolchain/aarch64-phoenix/bin/aarch64-phoenix-nm}"
-NFSROOT="${NFSROOT:-/srv/phoenix-rpi4-nfs}"
+# Stage into the export the Pi actually mounts: the one carrying fsid=0, not a
+# hardcoded name. Hardcoding is how these two drivers came to be built, "staged",
+# and tested against /srv/phoenix-rpi4-nfs while the Pi mounted
+# /srv/phoenix-rpi4-nfs-gcc16 -- the driver was simply absent from the live root,
+# so every run exercised whatever was there before. Scan /etc/exports.d/*.exports
+# as well: the canonical entry lives there (declaring it in both files makes
+# `exportfs -ra` fail), and a detector reading only /etc/exports finds nothing and
+# falls back to the wrong directory. An explicit NFSROOT still wins.
+_fsid0="$(awk '$0 ~ /fsid=0/ && $1 ~ /^\// { print $1; exit }' /etc/exports /etc/exports.d/*.exports 2>/dev/null || true)"
+NFSROOT="${NFSROOT:-${_fsid0:-/srv/phoenix-rpi4-nfs}}"
 HCD_SRC="${HCD_SRC:-$REPO_ROOT/artifacts/linux-netboot/rootfs/usr/lib/firmware/brcm/BCM4345C0.raspberrypi,4-model-b.hcd}"
 CFLAGS="-O2 -Wall -Wextra -std=gnu11"
 

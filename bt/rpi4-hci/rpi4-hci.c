@@ -543,9 +543,17 @@ static int hci_bringup(const char *hcd)
 	printf("rpi4-hci: core_clk=%u Hz -> AUX_MU_BAUD=%u\n", core_hz, baud_reg);
 
 	/* Power the BT core on, route its UART to the mini-UART, bring it up. */
-	(void)hci_mbox(VC_PROP_SET_GPIO_STATE, EXPGPIO_BT_ON, 0u);
+	/* Report a failed toggle rather than discarding it: hci_mbox() returns
+	 * 0xFFFFFFFF on a mailbox timeout, and a silently unpowered radio surfaces
+	 * later as an unresponsive chip. The readback below already tells the truth;
+	 * these say WHICH step went wrong. */
+	if (hci_mbox(VC_PROP_SET_GPIO_STATE, EXPGPIO_BT_ON, 0u) == 0xFFFFFFFFu) {
+		printf("rpi4-hci: BT_REG_ON off failed (mailbox); chip may not reset\n");
+	}
 	usleep(50 * 1000);
-	(void)hci_mbox(VC_PROP_SET_GPIO_STATE, EXPGPIO_BT_ON, 1u);
+	if (hci_mbox(VC_PROP_SET_GPIO_STATE, EXPGPIO_BT_ON, 1u) == 0xFFFFFFFFu) {
+		printf("rpi4-hci: BT_REG_ON on failed (mailbox); chip will not power up\n");
+	}
 	usleep(500 * 1000);
 	printf("rpi4-hci: BT_REG_ON readback=%d (expect 1)\n",
 		(int)hci_mbox(VC_PROP_GET_GPIO_STATE, EXPGPIO_BT_ON, 0u));

@@ -101,6 +101,7 @@ static void diag_gpioSetFsel(volatile uint8_t *base, unsigned pin, unsigned fn)
 #define VC_MBOX_PROP_CHANNEL  8u
 
 #define VC_PROP_SET_GPIO_STATE  0x00038041u
+#define VC_PROP_GET_GPIO_STATE  0x00030041u
 
 #define EXPGPIO_WL_ON           129u  /* expgpio[1] = "WL_ON" per Pi 4 DT */
 
@@ -202,10 +203,23 @@ static uint32_t diag_mboxPower(uint32_t tag, uint32_t device_id, uint32_t state)
  * issue); 50/150 ms is the established, enumeration-tested baseline. */
 static void diag_wifiPowerCycle(void)
 {
-	(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+	/* Report a failed toggle instead of discarding it. diag_mboxPower() returns
+	 * 0xFFFFFFFF when the mailbox times out or the request cannot be addressed,
+	 * and dropping that made the consequence appear far downstream as a chip that
+	 * "does not respond" -- the shape of a hardware-marginality story rather than
+	 * of a diagnosable failure. Read the line back afterwards, as rpi4-hci does,
+	 * so the log says whether the radio is actually powered. */
+	if (diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u) == 0xFFFFFFFFu) {
+		printf("rpi4-wifi: WL_REG_ON off failed (mailbox); chip may not reset\n");
+	}
 	usleep(50 * 1000);
-	(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+	if (diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u) == 0xFFFFFFFFu) {
+		printf("rpi4-wifi: WL_REG_ON on failed (mailbox); chip will not power up\n");
+	}
 	usleep(150 * 1000);
+
+	printf("rpi4-wifi: WL_REG_ON readback=%d (expect 1)\n",
+		(int)diag_mboxPower(VC_PROP_GET_GPIO_STATE, EXPGPIO_WL_ON, 0u));
 }
 
 /* ------------------------------------------------------------------ */
