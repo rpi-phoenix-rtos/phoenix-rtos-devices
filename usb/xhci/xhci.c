@@ -186,6 +186,7 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_TRB_TYPE_DATA_STAGE 3u
 #define XHCI_TRB_TYPE_STATUS_STAGE 4u
 #define XHCI_TRB_TYPE_CMD_ENABLE_SLOT 9u
+#define XHCI_TRB_TYPE_CMD_DISABLE_SLOT 10u
 #define XHCI_TRB_TYPE_CMD_ADDRESS_DEVICE 11u
 #define XHCI_TRB_TYPE_CMD_CONFIGURE_ENDPOINT 12u
 #define XHCI_TRB_TYPE_CMD_NO_OP  23u
@@ -201,6 +202,7 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__MASK (0xffu << XHCI_TRANSFER_EVENT_TRB_CONTROL_SLOTID__SHIFT)
 #define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK (0xffu << XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__SHIFT)
+#define XHCI_CMD_TRB_DISABLE_SLOT_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_BSR (1u << 9)
 #define XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_DC (1u << 9)
@@ -1835,6 +1837,33 @@ static int xhci_cmdEnableSlot(xhci_t *xhci, uint8_t *slotId)
 	}
 
 	return EOK;
+}
+
+
+/* Release a slot back to the controller.
+ *
+ * This is the recovery half the driver was missing. A transfer error leaves the
+ * endpoint halted, and the controller then rejects any further work on that
+ * slot with Context State Error -- so an enumeration retry that recreates the
+ * pipe in software but leaves the slot alone retries onto a slot the hardware
+ * still considers broken. That is exactly the observed 1-in-3 no-input boot:
+ * one transient Split Transaction Error (code 36) on the first descriptor
+ * fetch, then Context State Error (19) on both retries.
+ *
+ * Disable Slot discards the whole slot context, so the retry's Enable Slot
+ * starts from a clean one. Best effort: on failure there is nothing further to
+ * unwind, and the caller is already on a teardown path. */
+static int xhci_cmdDisableSlot(xhci_t *xhci, uint8_t slotId)
+{
+	if ((slotId == 0u) || (slotId > xhci->nslots)) {
+		return -EINVAL;
+	}
+
+	return xhci_cmdExec(xhci, 0u,
+			0u,
+			(XHCI_TRB_TYPE_CMD_DISABLE_SLOT << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
+					((uint32_t)slotId << XHCI_CMD_TRB_DISABLE_SLOT_CONTROL_SLOTID__SHIFT),
+			NULL);
 }
 
 
@@ -3503,6 +3532,29 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
 			if (xhci->slots[s].interruptPriv == priv) {
 				xhci->slots[s].interruptPriv = NULL;
+			}
+		}
+	}
+
+	/* Tearing down the DEFAULT CONTROL endpoint (DCI 1) means the device is
+	 * going away -- either a disconnect or an enumeration retry. Release the
+	 * hardware slot as well, not just this software state: the framework's retry
+	 * (usb/hub.c) calls exactly this pipeDestroy and then re-enumerates, and
+	 * without a Disable Slot it re-drives a slot the controller may still hold
+	 * halted from the failure that triggered the retry, which comes back as
+	 * Context State Error every time. Only for DCI 1, so destroying a device's
+	 * interrupt pipe does not take its slot down with it. */
+	if ((priv->endpointId == 1u) && (priv->slotId != 0u)) {
+		unsigned s;
+
+		(void)xhci_cmdDisableSlot(xhci, priv->slotId);
+
+		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
+			if (xhci->slots[s].slotId == priv->slotId) {
+				/* Forget the addressed/fixed-up state with the slot it described,
+				 * so a later Enable Slot cannot inherit stale flags. */
+				xhci->slots[s].addressed = 0u;
+				xhci->slots[s].hubFixedUp = 0u;
 			}
 		}
 	}
