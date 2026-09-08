@@ -173,6 +173,7 @@ struct pbo {            /* Phoenix BO */
 	uint32_t size;
 	int      used;      /* slot in use (freed by GEM_CLOSE -> reusable) */
 	int      scanout;   /* this BO aliases the scanout surface (clear W.scanout_claimed on close) */
+	int      owner;     /* pid of the client that created it, 0 = unknown/untracked */
 };
 
 struct vahole {
@@ -732,6 +733,7 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 	b->used = 0;
 	b->cpu = NULL;
 	b->handle = 0;
+	b->owner = 0;   /* so a recycled slot never inherits a stale owner */
 	return 0;
 }
 
@@ -792,6 +794,59 @@ int v3d_gpu_closeBo(uint32_t handle)
 	memset(&gc, 0, sizeof(gc));
 	gc.handle = handle;
 	return ioc_close_bo(&gc);
+}
+
+
+void v3d_gpu_setBoOwner(uint32_t handle, int owner)
+{
+	struct pbo *b = bo_find(handle);
+	if (b != NULL) {
+		b->owner = owner;
+	}
+}
+
+
+/* Free every BO whose owning client `dead()` reports gone.
+ *
+ * A client that is killed rather than exiting cleanly never sends GEM_CLOSE, and
+ * the daemon gets no notification: the kernel's only client-death signal is a
+ * synthesized mtClose delivered to servers the dead process held an *fd* on, and
+ * the Mesa client never opens one (it msgSends the port directly). So without
+ * this sweep a killed client's BOs are held for the daemon's lifetime --
+ * measured at ~15.7 MB per X-desktop session.
+ *
+ * `dead()` is supplied by the server so the liveness policy stays out of the
+ * GPU core. It is asked at most once per distinct owner per sweep. */
+int v3d_gpu_reapOwners(int (*dead)(int owner))
+{
+	uint32_t i, j;
+	int freed = 0;
+
+	if (!W.inited || dead == NULL) {
+		return 0;
+	}
+
+	for (i = 0; i < W.nbos; i++) {
+		int owner = W.bos[i].owner;
+
+		if (!W.bos[i].used || owner == 0) {
+			continue;
+		}
+		if (!dead(owner)) {
+			continue;
+		}
+		/* Free this owner's whole set now, so a later slot with the same owner
+		 * does not trigger a second dead() probe. */
+		for (j = i; j < W.nbos; j++) {
+			if (W.bos[j].used && W.bos[j].owner == owner) {
+				if (v3d_gpu_closeBo(W.bos[j].handle) == 0) {
+					freed++;
+				}
+			}
+		}
+	}
+
+	return freed;
 }
 
 

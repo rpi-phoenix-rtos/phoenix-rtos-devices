@@ -44,6 +44,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <errno.h>
+#include <signal.h>
 
 #include <sys/msg.h>
 #include <sys/types.h>
@@ -65,7 +66,7 @@
 /* stubs; step 2b lifts the submit path.                                     */
 /* ------------------------------------------------------------------------- */
 
-static void v3d_srv_createBo(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
+static void v3d_srv_createBo(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp, int owner)
 {
 	v3d_gpu_bo_t bo;
 	resp->err = v3d_gpu_createBo(req->size, req->flags, &bo);
@@ -74,7 +75,26 @@ static void v3d_srv_createBo(const v3d_rpc_req_t *req, v3d_rpc_resp_t *resp)
 		resp->pa = bo.pa;
 		resp->size = bo.size;
 		resp->gpuva = bo.gpuva;
+		/* msg.pid is the true client pid for a client-SENT message (the kernel
+		 * stamps it in the sender's own context), which is what makes the
+		 * owner-sweep below possible. It is NOT reliable on a kernel-synthesized
+		 * mtClose, so it is only ever recorded here. */
+		v3d_gpu_setBoOwner(bo.handle, owner);
 	}
+}
+
+
+/* Liveness policy for v3d_gpu_reapOwners(): kill(pid, 0) probes existence
+ * without delivering a signal, and returns -ESRCH once the pid is unknown to
+ * the kernel. Both error directions are safe: a zombie (not yet waited for) and
+ * a recycled pid both read as ALIVE, so the sweep under-reclaims rather than
+ * ever freeing a live client's buffers. */
+static int v3d_srv_ownerDead(int owner)
+{
+	if (owner <= 0) {
+		return 0;
+	}
+	return (kill((pid_t)owner, 0) < 0 && errno == ESRCH) ? 1 : 0;
 }
 
 
@@ -147,7 +167,7 @@ static void v3d_srv_handleMsg(const msg_t *msg, v3d_rpc_resp_t *resp)
 
 	switch (req->op) {
 		case V3D_RPC_CREATE_BO:
-			v3d_srv_createBo(req, resp);
+			v3d_srv_createBo(req, resp, msg->pid);
 			break;
 		case V3D_RPC_GET_BO_OFFSET:
 			v3d_srv_getBoOffset(req, resp);
@@ -180,6 +200,7 @@ static void v3d_srv_thread(uint32_t port)
 	msg_t msg;
 	msg_rid_t rid;
 	int err;
+	unsigned msgs_seen = 0;
 
 	for (;;) {
 		err = msgRecv(port, &msg, &rid);
@@ -188,6 +209,25 @@ static void v3d_srv_thread(uint32_t port)
 				continue;
 			}
 			break; /* invalid/closed port or OOM - fatal */
+		}
+
+		/* Reclaim the BOs of clients that died without sending GEM_CLOSE.
+		 *
+		 * Safe here and only here: submits are synchronous (ioc_submit_cl waits
+		 * for FLDONE then FRDONE) and this loop is the daemon's only thread, so
+		 * at this point no GPU job can be in flight and nothing is reading the
+		 * memory being freed.
+		 *
+		 * Amortized: the probe costs one kill(2) per distinct live owner, so it
+		 * runs every 64th message rather than on every BO create. */
+		if (++msgs_seen >= 64u) {
+			int freed;
+
+			msgs_seen = 0;
+			freed = v3d_gpu_reapOwners(v3d_srv_ownerDead);
+			if (freed > 0) {
+				fprintf(stderr, "rpi4-v3d: reaped %d BO(s) from exited client(s)\n", freed);
+			}
 		}
 
 		switch (msg.type) {

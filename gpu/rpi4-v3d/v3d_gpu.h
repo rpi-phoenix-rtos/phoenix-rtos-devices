@@ -75,6 +75,17 @@ int v3d_gpu_mmapBo(uint32_t handle, uint64_t *pa, uint32_t *size);
  * an already-freed / never-ours handle, matching the winsys). */
 int v3d_gpu_closeBo(uint32_t handle);
 
+
+/* Record which client created a BO, so v3d_gpu_reapOwners() can reclaim the BOs
+ * of clients that died without sending GEM_CLOSE. owner 0 = untracked. */
+void v3d_gpu_setBoOwner(uint32_t handle, int owner);
+
+
+/* Free every BO whose owner `dead()` reports gone; returns the number freed.
+ * Call only when no GPU job is in flight -- the daemon's submits are synchronous
+ * and its message loop is single-threaded, so the top of that loop qualifies. */
+int v3d_gpu_reapOwners(int (*dead)(int owner));
+
 /* SUBMIT_CSD: run one synchronous compute-shader dispatch from the 7 CSD config
  * words (cfg[0..6] == CSD_QUEUED_CFG0..6; the CFG0 write kicks the job). Blocks
  * on INT_CSDDONE, then cleans the compute's dirty caches to DRAM so the output
