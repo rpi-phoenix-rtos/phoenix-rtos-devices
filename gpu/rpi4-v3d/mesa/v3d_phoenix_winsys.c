@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>   /* getpid (M0 concurrent-GPU instrumentation) */
+#include <time.h>     /* clock_gettime (submit accounting, diagnostic) */
 #include <string.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -692,15 +693,66 @@ int v3d_phoenix_scanout_init(uint32_t pa, uint32_t w, uint32_t h, uint32_t pitch
  * from the double-buffer era, so a THIRD buffer was mis-displayed as buffer 1 — buffer 2's
  * renders were never scanned out. Now scales to nbuf.) Records the displayed byte offset so
  * screenshot capture can read exactly the region HDMI shows. */
+/* TODO(diag): temporary per-frame submit accounting. STK renders at ~5.6 fps (~178 ms/frame)
+ * while its simulation alone runs at 259 fps (--no-graphics), and the cost is invariant to the
+ * number of render passes (disabling the whole deferred pipeline bought 1.7%). Since every
+ * submit here is SYNCHRONOUS -- the bin kick spin-waits for INT_FLDONE and the render kick for
+ * INT_FRDONE -- the open question is whether a frame issues many submits or few slow ones.
+ * This counts both and prints raw integers once per 128 frames, bounded. Remove once the
+ * frame cost is root-caused. */
+static unsigned dg_submits, dg_frames, dg_prints, dg_tfu, dg_csd, dg_ioctls;
+static uint64_t dg_flip_ns;
+static uint64_t dg_submit_ns, dg_tfu_ns, dg_csd_ns, dg_ioctl_ns, dg_window_t0;
+
+static uint64_t dg_now_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0;
+	}
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 extern void v3d_phoenix_fb_flip(unsigned yoff);
 void v3d_phoenix_flip(int buf);
 void v3d_phoenix_flip(int buf)
 {
+	/* TODO(diag): see the submit accounting above. Placed before the double-buffer branch so a
+	 * single-buffered run still reports. Raw counts only -- the ratios are computed off-target. */
+	dg_frames++;
+	if (dg_window_t0 == 0) {
+		dg_window_t0 = dg_now_ns();
+	}
+	else if ((dg_frames % 32u) == 0u && dg_prints < 24u) {
+		uint64_t now = dg_now_ns();
+
+		dg_prints++;
+		fprintf(stderr, "v3d-diag: win frames=32 wall_ms=%u | cl=%u cl_ms=%u | tfu=%u tfu_ms=%u | "
+				"csd=%u csd_ms=%u | ioctls=%u ioctl_ms=%u\n",
+				(unsigned)((now - dg_window_t0) / 1000000ull),
+				dg_submits, (unsigned)(dg_submit_ns / 1000000ull),
+				dg_tfu, (unsigned)(dg_tfu_ns / 1000000ull),
+				dg_csd, (unsigned)(dg_csd_ns / 1000000ull),
+				dg_ioctls, (unsigned)(dg_ioctl_ns / 1000000ull));
+		fprintf(stderr, "v3d-diag:     fb_flip_ms=%u (mailbox SET_VIRTUAL_OFFSET, 32 frames)\n",
+				(unsigned)(dg_flip_ns / 1000000ull));
+		dg_flip_ns = 0;
+		dg_window_t0 = now;
+		dg_submits = 0; dg_submit_ns = 0;
+		dg_tfu = 0; dg_tfu_ns = 0;
+		dg_csd = 0; dg_csd_ns = 0;
+		dg_ioctls = 0; dg_ioctl_ns = 0;
+	}
+
 	if (W.scanout_double) {
 		if (buf < 0) buf = 0;
 		if (buf >= W.scanout_nbuf) buf = W.scanout_nbuf - 1;
+		uint64_t dg_f0 = dg_now_ns();
+
 		W.scanout_disp_off = (uint32_t)buf * W.scanout_bytes;
 		v3d_phoenix_fb_flip((unsigned)buf * W.scanout_phys_h);
+		dg_flip_ns += dg_now_ns() - dg_f0;
 	}
 }
 
@@ -1355,7 +1407,19 @@ void v3d_phoenix_harness_reset(void)
  * clean the core for the next (different) frame and drops the current frame. See the job_failed
  * handling in ioc_submit_cl. */
 
+static int ioc_submit_cl_inner(struct drm_v3d_submit_cl *s);
+
 static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
+{
+	uint64_t t0 = dg_now_ns();
+	int ret = ioc_submit_cl_inner(s);
+
+	dg_submit_ns += dg_now_ns() - t0;
+	dg_submits++;
+	return ret;
+}
+
+static int ioc_submit_cl_inner(struct drm_v3d_submit_cl *s)
 {
 	volatile uint32_t *c0 = W.core0;
 	volatile uint32_t *h = W.hub;
@@ -1945,7 +2009,19 @@ static uint32_t uif_pixel_off(uint32_t image_h, uint32_t x, uint32_t y, int do_x
  * The submit struct's iia/ica/iua/ioa are already full GPU virtual addresses — Mesa folds
  * each BO's GPU-VA base (the winsys's create_bo c->offset) into them in meta_emit_tfu_job /
  * copy_*_tfu — and the TFU is behind the V3D MMU, so we write them verbatim (no va2pa). */
+static int ioc_submit_tfu_inner(struct drm_v3d_submit_tfu *t);
+
 static int ioc_submit_tfu(struct drm_v3d_submit_tfu *t)
+{
+	uint64_t t0 = dg_now_ns();
+	int ret = ioc_submit_tfu_inner(t);
+
+	dg_tfu_ns += dg_now_ns() - t0;
+	dg_tfu++;
+	return ret;
+}
+
+static int ioc_submit_tfu_inner(struct drm_v3d_submit_tfu *t)
 {
 	volatile uint32_t *c0 = W.core0;
 	volatile uint32_t *h = W.hub;
@@ -2289,7 +2365,19 @@ int v3d_phoenix_scanout_active(void)
  * AFTER (so the compute's image/SSBO writes reach DRAM and are visible to a CPU readback and the
  * next render job's TMU). BOs are already resident in the flat page table (ioc_create_bo), so no
  * per-submit MMU mapping is needed — this is register writes + a synchronous wait, like CL/TFU. */
+static int ioc_submit_csd_inner(struct drm_v3d_submit_csd *s);
+
 static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
+{
+	uint64_t t0 = dg_now_ns();
+	int ret = ioc_submit_csd_inner(s);
+
+	dg_csd_ns += dg_now_ns() - t0;
+	dg_csd++;
+	return ret;
+}
+
+static int ioc_submit_csd_inner(struct drm_v3d_submit_csd *s)
 {
 	volatile uint32_t *c0 = W.core0;
 	volatile uint32_t *h = W.hub;
@@ -2393,7 +2481,21 @@ int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg);
  * exactly the sort of edit that goes wrong later. */
 static int v3d_ioctl_locked(int fd, unsigned long request, void *arg);
 
+/* TODO(diag): total time in the driver per frame, nested -- includes the cl/tfu/csd
+ * figures above, so (ioctl_ms - cl_ms - tfu_ms - csd_ms) is BO/other ioctl overhead. */
+static int phoenix_v3d_ioctl_inner(int fd, unsigned long request, void *arg);
+
 int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
+{
+	uint64_t t0 = dg_now_ns();
+	int ret = phoenix_v3d_ioctl_inner(fd, request, arg);
+
+	dg_ioctl_ns += dg_now_ns() - t0;
+	dg_ioctls++;
+	return ret;
+}
+
+static int phoenix_v3d_ioctl_inner(int fd, unsigned long request, void *arg)
 {
 	int ret;
 
