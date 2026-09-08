@@ -714,22 +714,6 @@ static uint64_t dg_now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-
-/* TODO(diag): off unless a marker file exists. psh cannot set environment
- * variables, so the switch is a file rather than a getenv:
- *     touch /tmp/v3d-frame-stats
- * before starting the app. Shipped builds therefore stay silent, while the
- * instrument survives for the GPU-bound follow-up work. */
-static int dg_enabled(void)
-{
-	static int state = -1;
-
-	if (state < 0) {
-		state = (access("/tmp/v3d-frame-stats", F_OK) == 0) ? 1 : 0;
-	}
-	return state;
-}
-
 extern void v3d_phoenix_fb_flip(unsigned yoff);
 void v3d_phoenix_flip(int buf);
 void v3d_phoenix_flip(int buf)
@@ -740,7 +724,7 @@ void v3d_phoenix_flip(int buf)
 	if (dg_window_t0 == 0) {
 		dg_window_t0 = dg_now_ns();
 	}
-	else if ((dg_frames % 32u) == 0u && dg_prints < 24u && dg_enabled() != 0) {
+	else if ((dg_frames % 32u) == 0u && dg_prints < 24u) {
 		uint64_t now = dg_now_ns();
 
 		dg_prints++;
