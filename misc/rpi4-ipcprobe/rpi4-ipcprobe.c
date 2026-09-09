@@ -15,7 +15,9 @@
  * Author: Witold Bołt
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -199,6 +201,113 @@ static int probe_entropy(void)
 	return (diff > 0) ? 0 : -1;
 }
 
+
+/*
+ * AF_UNIX bulk THROUGHPUT, measured in isolation.
+ *
+ * Why this is here: the windowed-GL X client was measured spending 337 ms of a
+ * 376 ms frame inside XPutImage + XFlush -- 90% -- moving 1.2 MB, i.e. about
+ * 3.6 MB/s over a LOCAL socket, while NFS over gigabit manages 29.9 MB/s through
+ * a much longer path. XPutImage is nominally asynchronous, but a 1.2 MB request
+ * does not fit the socket buffer, so the client blocks until the server drains
+ * it -- which makes that 337 ms the COMBINED cost of the AF_UNIX copies and the
+ * server's per-chunk work. This separates the two: if the socket alone is slow,
+ * the bug is here and fixing it speeds up every X client; if the socket is fast,
+ * the cost is server-side and the next probe belongs in the PutImage path.
+ *
+ * Two chunk sizes, because they answer different questions: 64 KiB is what a
+ * bulk writer would use, and 4 KiB is closer to what a request stream looks like
+ * when it is drained piecemeal. Both over a socketpair (the pure data path) so
+ * no bind/accept cost is included.
+ */
+#define THR_TOTAL   (8u * 1024u * 1024u)   /* per run */
+
+static double thr_now(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+
+static int thr_one(size_t chunk)
+{
+	int sv[2];
+	pid_t pid;
+	char *buf;
+	size_t done;
+	double t0, dt;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+		printf("rpi4-ipcprobe: throughput socketpair failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	buf = malloc(chunk);
+	if (buf == NULL) {
+		printf("rpi4-ipcprobe: throughput OOM (%zu)\n", chunk);
+		close(sv[0]);
+		close(sv[1]);
+		return -1;
+	}
+	memset(buf, 0xa5, chunk);
+
+	pid = fork();
+	if (pid < 0) {
+		printf("rpi4-ipcprobe: throughput fork failed: %s\n", strerror(errno));
+		free(buf);
+		close(sv[0]);
+		close(sv[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		/* Reader: drain and discard, so the writer measures the real pipe. */
+		char *rb = malloc(chunk);
+		ssize_t n;
+
+		close(sv[0]);
+		if (rb != NULL) {
+			while ((n = read(sv[1], rb, chunk)) > 0)
+				;
+		}
+		_exit(0);
+	}
+
+	close(sv[1]);
+	t0 = thr_now();
+	for (done = 0; done < THR_TOTAL;) {
+		ssize_t n = write(sv[0], buf, chunk);
+
+		if (n <= 0) {
+			if (errno == EINTR)
+				continue;
+			printf("rpi4-ipcprobe: throughput write failed at %zu: %s\n",
+				done, strerror(errno));
+			break;
+		}
+		done += (size_t)n;
+	}
+	dt = thr_now() - t0;
+	close(sv[0]);
+	free(buf);
+
+	printf("rpi4-ipcprobe: AF_UNIX throughput  chunk=%6zu B  %6.2f MB in %6.3f s"
+		"  -> %7.2f MB/s\n",
+		chunk, (double)done / (1024.0 * 1024.0), dt,
+		(dt > 0.0) ? ((double)done / (1024.0 * 1024.0) / dt) : 0.0);
+	return 0;
+}
+
+
+static int probe_throughput(void)
+{
+	int rc = 0;
+
+	rc |= thr_one(64u * 1024u);
+	rc |= thr_one(4u * 1024u);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	int sp, nm, en;
@@ -209,6 +318,7 @@ int main(int argc, char **argv)
 	sp = probe_socketpair();
 	nm = probe_named();
 	en = probe_entropy();
+	(void)probe_throughput();
 
 	printf("rpi4-ipcprobe: VERDICT socketpair=%s named=%s entropy=%s -> AF_UNIX %s for X11; getrandom/getentropy %s\n",
 		(sp == 0) ? "PASS" : "FAIL", (nm == 0) ? "PASS" : "FAIL", (en == 0) ? "PASS" : "FAIL",
