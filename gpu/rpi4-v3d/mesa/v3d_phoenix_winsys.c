@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <unistd.h>   /* getpid (M0 concurrent-GPU instrumentation) */
 #include <string.h>
+#include <time.h>  /* clock_gettime for the flipstat window */
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/threads.h>
@@ -693,6 +694,51 @@ int v3d_phoenix_scanout_init(uint32_t pa, uint32_t w, uint32_t h, uint32_t pitch
  * renders were never scanned out. Now scales to nbuf.) Records the displayed byte offset so
  * screenshot capture can read exactly the region HDMI shows. */
 extern void v3d_phoenix_fb_flip(unsigned yoff);
+
+/* Presented-frame counter.
+ *
+ * Every GL and Vulkan app on this stack presents through this one function, so a
+ * counter here is the only frame-rate instrument we have that is independent of
+ * the application. That matters because the alternatives are all unsound:
+ *
+ *   - An engine's own on-screen readout has to be OCR'd out of an HDMI snapshot,
+ *     is a single instant, and mixes "slower code" with "busier frame". A 9 -> 7
+ *     fps question on SuperTuxKart went unresolved for two days on exactly that
+ *     confound (scene complexity differed 26-65 vs 45-78 KTris between samples).
+ *   - SuperTuxKart's --profile-* summary looks authoritative and is not: its
+ *     `Number of frames` is incremented in ProfileWorld::update(int ticks), whose
+ *     own comment reads "number of physics time steps", so its "Average FPS" is
+ *     the PHYSICS TICK RATE and is nearly constant however slowly you render.
+ *
+ * What this prints is frames actually scanned out, over a wall-clock window, on
+ * the UART -- no screenshot, no OCR, same units for every app.
+ *
+ * Cost: one increment and one clock read per presented frame, i.e. at most a few
+ * dozen per second, and one printf per interval. Off with V3D_FLIPSTAT=0; the
+ * interval is V3D_FLIPSTAT_MS (default 5000).
+ *
+ * ⚠ Only counts real page flips. In single-buffer (blit-resolve) mode the whole
+ * body below is skipped, so a silent counter means nbuf==1, NOT a stalled app --
+ * check the "scanout init" line for the buffer count before reading anything into
+ * silence. The glamor X server presents by GPU readback into /dev/fb0 and does
+ * not come through here either. */
+static unsigned long v3d_flip_total;
+static unsigned long v3d_flip_window;
+static uint64_t v3d_flip_t0_us;
+static int v3d_flipstat = -1;      /* -1 = not yet read from the environment */
+static unsigned v3d_flipstat_ms = 5000u;
+
+static uint64_t v3d_flip_now_us(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0;
+	}
+
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+}
+
 void v3d_phoenix_flip(int buf);
 void v3d_phoenix_flip(int buf)
 {
@@ -701,8 +747,49 @@ void v3d_phoenix_flip(int buf)
 		if (buf >= W.scanout_nbuf) buf = W.scanout_nbuf - 1;
 		W.scanout_disp_off = (uint32_t)buf * W.scanout_bytes;
 		v3d_phoenix_fb_flip((unsigned)buf * W.scanout_phys_h);
+
+		if (v3d_flipstat < 0) {
+			const char *e = getenv("V3D_FLIPSTAT");
+			const char *m = getenv("V3D_FLIPSTAT_MS");
+			v3d_flipstat = (e != NULL && e[0] == '0') ? 0 : 1;
+			if (m != NULL) {
+				int v = atoi(m);
+				if (v > 0) {
+					v3d_flipstat_ms = (unsigned)v;
+				}
+			}
+			v3d_flip_t0_us = v3d_flip_now_us();
+		}
+
+		v3d_flip_total++;
+
+		if (v3d_flipstat != 0) {
+			uint64_t now = v3d_flip_now_us();
+			uint64_t dt = now - v3d_flip_t0_us;
+
+			v3d_flip_window++;
+			if (dt >= (uint64_t)v3d_flipstat_ms * 1000u) {
+				/* Integer centi-fps so this needs no float formatting. dt is in
+				 * MICROseconds, so frames-per-second x 100 is frames * 1e8 / dt.
+				 * (First cut used 1e5 and printed 0.03 fps for a measured 30 --
+				 * caught by running the counter against a known 30 Hz source
+				 * before it ever reached the target.) 64-bit throughout: a frame
+				 * count large enough to overflow this would be ~1e11 frames. */
+				unsigned long cfps = (unsigned long)((v3d_flip_window * 100000000ull + dt / 2u) / dt);
+				fprintf(stderr, "v3d-winsys: flipstat %lu frames in %lu ms = %lu.%02lu fps (total %lu)\n",
+					v3d_flip_window, (unsigned long)(dt / 1000u),
+					cfps / 100u, cfps % 100u, v3d_flip_total);
+				v3d_flip_window = 0;
+				v3d_flip_t0_us = now;
+			}
+		}
 	}
 }
+
+/* Total frames presented since process start, for a caller that wants to compute
+ * its own rate over a window it chooses rather than reading the periodic line. */
+unsigned long v3d_phoenix_flip_count(void);
+unsigned long v3d_phoenix_flip_count(void) { return v3d_flip_total; }
 
 int v3d_phoenix_scanout_double(void);
 int v3d_phoenix_scanout_double(void) { return W.scanout_double; }
