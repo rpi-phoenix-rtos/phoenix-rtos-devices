@@ -36,6 +36,7 @@
 #define RPI_POWER_DOMAIN_V3D     10u
 #define VC_PROP_SET_CLOCK_STATE  0x00038001u
 #define RPI_CLOCK_V3D            5u
+#define V3D_CLOCK_ON_TRIES       20u   /* ~4 ms total; the race is lost rarely, never persistently */
 /* GET property tags for the cold-power-on state probe (render-stall STEP-3 discriminator). */
 #define VC_PROP_GET_CLOCK_RATE      0x00030002u   /* configured rate (Hz), w0=clock id */
 #define VC_PROP_GET_CLOCK_MEASURED  0x00030047u   /* actual measured rate (Hz) — reveals an unlocked/unsettled PLL */
@@ -183,13 +184,73 @@ int v3d_phoenix_reset(void)
 	return v3d_phoenix_powerOn();
 }
 
+/* Enable the V3D clock and CONFIRM it actually came on.
+ *
+ * Why this cannot be fire-and-forget: the sequence below deliberately switches the V3D
+ * clock OFF around the PM_V3DRSTN deassert (canonical bcm2835_asb_power_on) and back ON
+ * afterwards. Those calls used to go through the DIRECT mailbox FIFO with their result
+ * discarded by a (void) cast -- and the BCM2711 property FIFO has NO hardware
+ * arbitration, so a concurrent client (the vcmbox server, thermal, usb, genet) can pop
+ * our response. Lose that race on the final enable and the clock is left OFF, silently.
+ *
+ * The caller then reads V3D core MMIO. An MMIO read of an unclocked block never
+ * completes, and with SError masked on this target (TD-10) there is no abort to take:
+ * the process hangs forever, having printed nothing further. Observed 2026-09-11 while
+ * storming QuakeSpasm -- one launch in 24 stalled >=229 s, and it was the ONLY one whose
+ * cold-state probe reported clkstate=0x0 / meas=0 Hz (the other outliers read
+ * 0xffffffff = MBOX_FAIL, i.e. the query failed rather than the clock being off).
+ *
+ * So drive it through the SERIALIZED /dev/vcmbox (the established rule on this target),
+ * then read the state back and retry until the firmware agrees the clock is running.
+ */
+static int v3dClockEnableConfirmed(void)
+{
+	uint32_t in[2], out[2];
+	uint32_t st;
+	unsigned int try;
+
+	for (try = 0u; try < V3D_CLOCK_ON_TRIES; try++) {
+		in[0] = RPI_CLOCK_V3D;
+		in[1] = 1u;
+		out[0] = 0u;
+		out[1] = 0u;
+		if (vcmbox_call(VC_PROP_SET_CLOCK_STATE, 8u, in, 2u, out, 2u) != 0) {
+			/* /dev/vcmbox not registered (early boot, or the server is absent): the racy
+			 * direct FIFO is still better than leaving the clock off. */
+			(void)mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 1u);
+		}
+
+		/* Read back rather than trust the SET: that is the whole point. */
+		in[0] = RPI_CLOCK_V3D;
+		out[0] = 0u;
+		out[1] = 0u;
+		if (vcmbox_call(VC_PROP_GET_CLOCK_STATE, 8u, in, 1u, out, 2u) == 0) {
+			if ((out[1] & 1u) != 0u) {
+				return 0;
+			}
+		}
+		else {
+			st = mboxProp(VC_PROP_GET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 0u);
+			/* MBOX_FAIL is 0xffffffff, whose bit0 is set -- never mistake it for "on". */
+			if ((st != MBOX_FAIL) && ((st & 1u) != 0u)) {
+				return 0;
+			}
+		}
+
+		usleep(200);
+	}
+
+	return -1;
+}
+
+
 /* Full HW-proven V3D power-on. Returns 0 on success (both ASB bridges ACK). */
 int v3d_phoenix_powerOn(void)
 {
 	volatile uint32_t *pm, *asb;
 	void *pm_page, *asb_page;
 	uint32_t grafx;
-	int rcM, rcS;
+	int rcM, rcS, rcClk;
 
 	/* firmware-side enables (QPU + power domain + clock) */
 	(void)mboxProp(VC_PROP_SET_QPU_ENABLE, 1, 1u, 0u);
@@ -215,17 +276,20 @@ int v3d_phoenix_powerOn(void)
 	(void)mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 0u);
 	grafx = pm[PM_GRAFX / 4];
 	pm[PM_GRAFX / 4] = PM_PASSWORD | (grafx | PM_V3DRSTN);
-	(void)mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 1u);
+	rcClk = v3dClockEnableConfirmed();
 	usleep(50);
 
 	rcM = asbEnable(asb, ASB_V3D_M_CTRL);
 	rcS = asbEnable(asb, ASB_V3D_S_CTRL);
-	printf("v3d_phoenix_powerOn: PM_GRAFX 0x%08x->0x%08x asb M=%s S=%s\n",
-	       grafx, pm[PM_GRAFX / 4], rcM ? "TIMEOUT" : "ok", rcS ? "TIMEOUT" : "ok");
+	printf("v3d_phoenix_powerOn: PM_GRAFX 0x%08x->0x%08x asb M=%s S=%s clk=%s\n",
+	       grafx, pm[PM_GRAFX / 4], rcM ? "TIMEOUT" : "ok", rcS ? "TIMEOUT" : "ok",
+	       rcClk ? "NOT-CONFIRMED" : "on");
 	usleep(2000);
 	munmap(asb_page, _PAGE_SIZE);
 	munmap(pm_page, _PAGE_SIZE);
-	return (rcM == 0 && rcS == 0) ? 0 : -1;
+	/* An unconfirmed clock is fatal, not cosmetic: the caller's next act is a V3D MMIO
+	 * read, which never returns if the block is unclocked. Fail loudly instead. */
+	return (rcM == 0 && rcS == 0 && rcClk == 0) ? 0 : -1;
 }
 
 /* STEP-3 cold-power-on state probe (render-stall hunt, task #13). The render wedge is

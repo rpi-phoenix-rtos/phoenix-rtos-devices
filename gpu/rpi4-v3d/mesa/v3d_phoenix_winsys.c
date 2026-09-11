@@ -573,7 +573,16 @@ static int winsys_init(void)
 	/* Power on the V3D ourselves (self-contained; no dependency on a separate
 	 * scout process whose concurrent clock-toggle/reset would race our submit and
 	 * leave core0 reading 0xdeadbeef). Idempotent. */
-	v3d_phoenix_powerOn();
+	/* Check it. Everything below reads V3D core MMIO, and an MMIO read of an unpowered or
+	 * unclocked block NEVER COMPLETES -- with SError masked on this target (TD-10) there is
+	 * no abort to take, so the process hangs forever having printed nothing more. That is
+	 * exactly how an intermittent launch stall was reaching >=229 s with the log ending on
+	 * the cold-state line (2026-09-11). The return was being discarded here. */
+	if (v3d_phoenix_powerOn() != 0) {
+		fprintf(stderr, "v3d-winsys: V3D power-on FAILED -- refusing to read V3D MMIO "
+			"(an unclocked read would hang this process forever)\n");
+		return -ENODEV;
+	}
 	W.hub = map_dev(V3D_HUB_BASE, V3D_MMIO_LEN);
 	if (!W.hub) return -ENOMEM;
 	W.core0 = W.hub + (V3D_CORE0_OFFS/4);
