@@ -203,6 +203,8 @@ int v3d_phoenix_reset(void)
  * So drive it through the SERIALIZED /dev/vcmbox (the established rule on this target),
  * then read the state back and retry until the firmware agrees the clock is running.
  */
+static unsigned int v3dClockTries;   /* retries the last enable needed; 0 = first attempt took */
+
 static int v3dClockEnableConfirmed(void)
 {
 	uint32_t in[2], out[2];
@@ -224,6 +226,8 @@ static int v3dClockEnableConfirmed(void)
 		in[0] = RPI_CLOCK_V3D;
 		out[0] = 0u;
 		out[1] = 0u;
+		v3dClockTries = try;
+
 		if (vcmbox_call(VC_PROP_GET_CLOCK_STATE, 8u, in, 1u, out, 2u) == 0) {
 			if ((out[1] & 1u) != 0u) {
 				return 0;
@@ -284,6 +288,13 @@ int v3d_phoenix_powerOn(void)
 	printf("v3d_phoenix_powerOn: PM_GRAFX 0x%08x->0x%08x asb M=%s S=%s clk=%s\n",
 	       grafx, pm[PM_GRAFX / 4], rcM ? "TIMEOUT" : "ok", rcS ? "TIMEOUT" : "ok",
 	       rcClk ? "NOT-CONFIRMED" : "on");
+	/* A non-zero retry count is the race actually being caught -- without this the fix
+	 * would be invisible when it works, and indistinguishable from never being needed. */
+	if (v3dClockTries != 0u) {
+		printf("v3d_phoenix_powerOn: V3D clock needed %u retries to confirm ON "
+		       "(mailbox race caught; this would previously have hung on the next MMIO read)\n",
+		       v3dClockTries);
+	}
 	usleep(2000);
 	munmap(asb_page, _PAGE_SIZE);
 	munmap(pm_page, _PAGE_SIZE);
