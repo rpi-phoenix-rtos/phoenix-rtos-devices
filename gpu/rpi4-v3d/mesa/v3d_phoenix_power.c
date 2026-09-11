@@ -210,15 +210,21 @@ static int v3dClockEnableConfirmed(void)
 	uint32_t in[2], out[2];
 	uint32_t st;
 	unsigned int try;
+	/* vcmbox_call resolves /dev/vcmbox with a BOUNDED ~5 s retry budget, and that budget is
+	 * paid per call when the server is absent. Retrying it 20 times would therefore cost
+	 * ~200 s on a system with no vcmbox server -- bounded, but ruinous. So probe it once and
+	 * fall back to the direct FIFO for the remaining attempts. */
+	int useVcmbox = 1;
 
 	for (try = 0u; try < V3D_CLOCK_ON_TRIES; try++) {
 		in[0] = RPI_CLOCK_V3D;
 		in[1] = 1u;
 		out[0] = 0u;
 		out[1] = 0u;
-		if (vcmbox_call(VC_PROP_SET_CLOCK_STATE, 8u, in, 2u, out, 2u) != 0) {
+		if ((useVcmbox == 0) || (vcmbox_call(VC_PROP_SET_CLOCK_STATE, 8u, in, 2u, out, 2u) != 0)) {
 			/* /dev/vcmbox not registered (early boot, or the server is absent): the racy
 			 * direct FIFO is still better than leaving the clock off. */
+			useVcmbox = 0;
 			(void)mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 1u);
 		}
 
@@ -228,7 +234,7 @@ static int v3dClockEnableConfirmed(void)
 		out[1] = 0u;
 		v3dClockTries = try;
 
-		if (vcmbox_call(VC_PROP_GET_CLOCK_STATE, 8u, in, 1u, out, 2u) == 0) {
+		if ((useVcmbox != 0) && (vcmbox_call(VC_PROP_GET_CLOCK_STATE, 8u, in, 1u, out, 2u) == 0)) {
 			if ((out[1] & 1u) != 0u) {
 				return 0;
 			}
