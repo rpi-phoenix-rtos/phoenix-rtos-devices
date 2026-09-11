@@ -1430,7 +1430,15 @@ static void reset_reinit_core(void)
 	 * regs incl. the GFXH-1383 HUB_AXICFG burst cap. */
 	if (W.core0)
 		idle_axi(W.core0);
-	(void)v3d_phoenix_reset();
+	/* Same hazard as winsys_init, but on the RUNTIME path: apply_core_regs() writes V3D MMIO,
+	 * and if the reset left the block unclocked that access never completes -- a forever-hang
+	 * mid-render rather than at startup. v3d_phoenix_reset() ends in v3d_phoenix_powerOn(),
+	 * which now confirms the clock, so honour its result instead of discarding it. */
+	if (v3d_phoenix_reset() != 0) {
+		fprintf(stderr, "v3d-winsys: TRUE reset FAILED (clock/ASB not confirmed) -- skipping "
+			"core-reg re-init; touching V3D MMIO now would hang this process forever\n");
+		return;
+	}
 	apply_core_regs();
 }
 
@@ -1442,7 +1450,11 @@ static void reset_reinit_core(void)
 void v3d_phoenix_harness_reset(void);
 void v3d_phoenix_harness_reset(void)
 {
-	(void)v3d_phoenix_reset();
+	if (v3d_phoenix_reset() != 0) {
+		fprintf(stderr, "v3d-winsys: harness reset FAILED (clock/ASB not confirmed) -- "
+			"skipping core-reg re-init\n");
+		return;
+	}
 	apply_core_regs();
 }
 
