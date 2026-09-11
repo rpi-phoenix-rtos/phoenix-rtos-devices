@@ -313,15 +313,37 @@ int v3d_phoenix_powerOn(void)
  * clean one: a register that cleanly separates the two populations is the root cause, found in
  * far fewer boots than an underpowered rate A/B. KEY signal: clk_v3d configured-vs-measured
  * mismatch (an unlocked/unsettled V3D PLL would let the render control thread run wild). */
+/* One cold-state GET, through the SERIALIZED /dev/vcmbox with the racy direct FIFO as a
+ * fallback. These are diagnostics, but they were driving the direct FIFO and ~9% of them came
+ * back 0xffffffff (MBOX_FAIL) in measured runs -- readings that look like real hardware state.
+ * That nearly derailed the clock-race diagnosis: the ONLY reading that mattered was a genuine
+ * clkstate=0x0, and it had to be told apart from six MBOX_FAILs by hand. A diagnostic that
+ * reports garbage 9% of the time is worse than no diagnostic.
+ * Returns MBOX_FAIL if both paths fail, so the caller can still print an honest sentinel. */
+static uint32_t coldGet(uint32_t tag, uint32_t nIn, uint32_t w0)
+{
+	uint32_t in[1] = { 0u };
+	uint32_t out[2] = { 0u, 0u };
+
+	in[0] = w0;
+	if (vcmbox_call(tag, 8u, in, nIn, out, 2u) == 0) {
+		/* Single-value tags answer in out[0]; id+value tags (clock/voltage) in out[1]. */
+		return (nIn == 0u) ? out[0] : out[1];
+	}
+
+	return mboxProp(tag, (nIn == 0u) ? 1 : 2, w0, 0u);
+}
+
+
 void v3d_phoenix_logColdState(void);
 void v3d_phoenix_logColdState(void)
 {
-	uint32_t rate_cfg  = mboxProp(VC_PROP_GET_CLOCK_RATE,     2, RPI_CLOCK_V3D, 0u);
-	uint32_t rate_meas = mboxProp(VC_PROP_GET_CLOCK_MEASURED, 2, RPI_CLOCK_V3D, 0u);
-	uint32_t clk_state = mboxProp(VC_PROP_GET_CLOCK_STATE,    2, RPI_CLOCK_V3D, 0u);
-	uint32_t temp      = mboxProp(VC_PROP_GET_TEMPERATURE,    2, 0u, 0u);
-	uint32_t throttled = mboxProp(VC_PROP_GET_THROTTLED,      1, 0u, 0u);
-	uint32_t volt      = mboxProp(VC_PROP_GET_VOLTAGE,        2, 1u, 0u);   /* core voltage */
+	uint32_t rate_cfg  = coldGet(VC_PROP_GET_CLOCK_RATE,     1u, RPI_CLOCK_V3D);
+	uint32_t rate_meas = coldGet(VC_PROP_GET_CLOCK_MEASURED, 1u, RPI_CLOCK_V3D);
+	uint32_t clk_state = coldGet(VC_PROP_GET_CLOCK_STATE,    1u, RPI_CLOCK_V3D);
+	uint32_t temp      = coldGet(VC_PROP_GET_TEMPERATURE,    1u, 0u);
+	uint32_t throttled = coldGet(VC_PROP_GET_THROTTLED,      0u, 0u);
+	uint32_t volt      = coldGet(VC_PROP_GET_VOLTAGE,        1u, 1u);   /* core voltage */
 	uint32_t grafx = 0xffffffffu;
 	void *pm_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
 		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (addr_t)PM_BASE);
