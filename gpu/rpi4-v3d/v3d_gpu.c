@@ -240,6 +240,8 @@ static volatile uint32_t *map_dev(uint32_t pa, uint32_t len)
 #define VC_PROP_SET_DOMAIN_STATE 0x00038030u
 #define RPI_POWER_DOMAIN_V3D     10u
 #define VC_PROP_SET_CLOCK_STATE  0x00038001u
+#define VC_PROP_GET_CLOCK_STATE  0x00030001u   /* bit0 = on; read back, never trust the SET */
+#define V3D_CLOCK_ON_TRIES       20u
 #define RPI_CLOCK_V3D            5u
 /* PM + rpivid_asb (the BCM2711 V3D power/reset path) */
 #define PM_BASE                 0xfe100000u
@@ -341,13 +343,49 @@ static int asbStop(volatile uint32_t *asb, uint32_t reg)
 	return -1;
 }
 
+/* Enable the V3D clock and CONFIRM it came on.
+ *
+ * The power-on below deliberately switches the clock OFF around the PM_V3DRSTN deassert and
+ * back ON afterwards, and those calls discard their result. The BCM2711 property FIFO has NO
+ * hardware arbitration, so a concurrent client (the vcmbox server, thermal, usb, genet) can
+ * pop our response; lose that race on the final enable and the clock is left OFF silently.
+ * The caller then reads V3D MMIO -- which on an unclocked block NEVER COMPLETES, and with
+ * SError masked on this target (TD-10) there is no abort to take, so the process hangs
+ * forever having printed nothing. That exact failure was root-caused in the in-process winsys
+ * (v3d_phoenix_power.c) on 2026-09-11; this daemon carried the identical sequence.
+ *
+ * It cannot use the serialized /dev/vcmbox without adding a link dependency to a driver that
+ * is not currently launched, so instead it READS THE STATE BACK and retries. The race can
+ * still be lost; what it can no longer do is hang.
+ */
+static int v3dGpuClockEnableConfirmed(void)
+{
+	uint32_t st;
+	unsigned int try;
+
+	for (try = 0u; try < V3D_CLOCK_ON_TRIES; try++) {
+		(void)mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 1u);
+
+		st = mboxProp(VC_PROP_GET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 0u);
+		/* MBOX_FAIL is 0xffffffff, whose bit0 is set -- never mistake it for "on". */
+		if ((st != MBOX_FAIL) && ((st & 1u) != 0u)) {
+			return 0;
+		}
+
+		usleep(200);
+	}
+
+	return -1;
+}
+
+
 /* Full HW-proven V3D power-on. Returns 0 on success (both ASB bridges ACK). */
 static int v3d_gpu_powerOn(void)
 {
 	volatile uint32_t *pm, *asb;
 	void *pm_page, *asb_page;
 	uint32_t grafx;
-	int rcM, rcS;
+	int rcM, rcS, rcClk;
 
 	/* firmware-side enables (QPU + power domain + clock) */
 	(void)mboxProp(VC_PROP_SET_QPU_ENABLE, 1, 1u, 0u);
@@ -373,17 +411,20 @@ static int v3d_gpu_powerOn(void)
 	(void)mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 0u);
 	grafx = pm[PM_GRAFX / 4];
 	pm[PM_GRAFX / 4] = PM_PASSWORD | (grafx | PM_V3DRSTN);
-	(void)mboxProp(VC_PROP_SET_CLOCK_STATE, 2, RPI_CLOCK_V3D, 1u);
+	rcClk = v3dGpuClockEnableConfirmed();
 	usleep(50);
 
 	rcM = asbEnable(asb, ASB_V3D_M_CTRL);
 	rcS = asbEnable(asb, ASB_V3D_S_CTRL);
-	printf("rpi4-v3d: powerOn PM_GRAFX 0x%08x->0x%08x asb M=%s S=%s\n",
-	       grafx, pm[PM_GRAFX / 4], rcM ? "TIMEOUT" : "ok", rcS ? "TIMEOUT" : "ok");
+	printf("rpi4-v3d: powerOn PM_GRAFX 0x%08x->0x%08x asb M=%s S=%s clk=%s\n",
+	       grafx, pm[PM_GRAFX / 4], rcM ? "TIMEOUT" : "ok", rcS ? "TIMEOUT" : "ok",
+	       rcClk ? "NOT-CONFIRMED" : "on");
 	usleep(2000);
 	munmap(asb_page, _PAGE_SIZE);
 	munmap(pm_page, _PAGE_SIZE);
-	return (rcM == 0 && rcS == 0) ? 0 : -1;
+	/* An unconfirmed clock is fatal, not cosmetic: the caller's next act is a V3D MMIO
+	 * read, which never returns if the block is unclocked. */
+	return (rcM == 0 && rcS == 0 && rcClk == 0) ? 0 : -1;
 }
 
 /* TRUE V3D reset cycle (copied from v3d_phoenix_power.c:v3d_phoenix_reset): quiesce the
