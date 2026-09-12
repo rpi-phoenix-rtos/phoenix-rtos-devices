@@ -336,8 +336,9 @@ volatile unsigned v3d_phoenix_render_timeouts = 0;
  * Needed because DRM_V3D_MMAP_BO hands Mesa `b->cpu` itself and ioc_close_bo USED
  * TO munmap it, so the same CPU address could be handed out twice with a free in
  * between -- the cause of control lists arriving full of texels. Kept after the
- * fix: it is how that class of bug is recognised, and how V3D_UNMAP_CLOSED_BO=1
- * A/B runs are read. */
+ * fix: it is how that class of bug is recognised, and how V3D_KEEP_CLOSED_BO=1
+ * A/B runs are read. It is also how the 56 recycled CPU addresses that disproved
+ * the W36 premise were counted. */
 static int bo_trace_on(void)
 {
 	static int on = -1;
