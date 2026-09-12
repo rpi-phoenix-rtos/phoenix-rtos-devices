@@ -1161,19 +1161,47 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 	 * recycling costs ~1.6 MiB per process, reclaimed at exit. That is cheap enough
 	 * to be the default; silent GPU corruption is not.
 	 *
-	 * V3D_UNMAP_CLOSED_BO=1 restores the old behaviour, for A/B measurement only. */
+	 * V3D_UNMAP_CLOSED_BO=1 restores the old behaviour, for A/B measurement only.
+	 *
+	 * ---------------------------------------------------------------------------
+	 * CORRECTED 2026-09-12. The premise above -- "Mesa never releases it" -- was
+	 * read out of the VULKAN driver (v3dv_bo.c), and it is FALSE for the GL path
+	 * that SuperTuxKart uses: v3d_bufmgr.c:220 munmap'd b->cpu on every BO free.
+	 *
+	 * So the address recycling this function was disabled to prevent never
+	 * stopped. Measured on that build, with this unmap OFF: 56 CPU addresses
+	 * still served more than one handle in a single 6-lap run (the W36 figure was
+	 * 5). We were suppressing the symptom on the wrong side of the contract.
+	 *
+	 * With Mesa's munmap removed there is exactly ONE owner of the mapping -- us
+	 * -- so releasing it here is both correct and necessary. Necessary because
+	 * leaving it mapped leaks: the same run closed 299 BOs totalling 96.6 MiB,
+	 * accelerating with play (92 closes in the first half, 207 in the second), so
+	 * "not unmapping" costs ~2.8 MiB per 100 frames, not the ~1.6 MiB per process
+	 * measured back when Mesa was still doing the freeing for us.
+	 *
+	 * Safe here because GEM_CLOSE is the point at which Mesa has already dropped
+	 * the BO (v3d_bo_free() closes immediately after its now-removed unmap, and
+	 * v3dv_bo_unmap() nulls bo->map first), and because b->used/b->cpu are
+	 * cleared below, so gpuva_to_cpu() stops handing this address out.
+	 *
+	 * THESE TWO CHANGES SHIP TOGETHER. Re-enabling Mesa's munmap without
+	 * disabling this one gives a double munmap: the second call would free a
+	 * range the process may have since re-mmap'd for something else.
+	 *
+	 * V3D_KEEP_CLOSED_BO=1 opts out again, for A/B measurement only. */
 	if (b->cpu != NULL) {
-		static int unmap = -1;
+		static int keep = -1;
 
-		if (unmap < 0) {
-			const char *e = getenv("V3D_UNMAP_CLOSED_BO");
-			unmap = (e != NULL && *e == '1') ? 1 : 0;
-			if (unmap != 0) {
-				fprintf(stderr, "v3d-winsys: V3D_UNMAP_CLOSED_BO=1 -- recycling closed BO "
-					"addresses again (pre-fix behaviour, for A/B only)\n");
+		if (keep < 0) {
+			const char *e = getenv("V3D_KEEP_CLOSED_BO");
+			keep = (e != NULL && *e == '1') ? 1 : 0;
+			if (keep != 0) {
+				fprintf(stderr, "v3d-winsys: V3D_KEEP_CLOSED_BO=1 -- not unmapping closed "
+					"BOs; expect ~2.8 MiB leaked per 100 frames (A/B only)\n");
 			}
 		}
-		if (unmap != 0) {
+		if (keep == 0) {
 			munmap(b->cpu, b->size);
 		}
 	}
