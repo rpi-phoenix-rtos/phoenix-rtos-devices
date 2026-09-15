@@ -5,10 +5,9 @@
  *      no disk cache) never exercises at runtime: the gallium `draw` module,
  *      SPIR-V, ASTC decode, disk cache, gallium trace, sw tgsi_exec. Stubbed to
  *      NULL/no-op (linkage is by name; generic signatures resolve the refs).
- *  (2) small libc gaps Phoenix lacks: posix_memalign,
- *      pthread_mutex_timedlock (lets c11 threads_posix.c link). Anything
- *      libphoenix later implements MUST be dropped from here, or the duplicate
- *      definition breaks the link.
+ *  (2) small libc gaps Phoenix lacks: posix_memalign. Anything libphoenix later
+ *      implements MUST be dropped from here, or the duplicate definition breaks
+ *      the link -- strtok_r and pthread_mutex_timedlock both went that way.
  * Compiled WITHOUT the compat shim. Warnings off.
  *
  * Copyright 2026 Phoenix Systems  %LICENSE%
@@ -143,11 +142,14 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
  * .gpu-libs archives kept linking. If another libc gap closes upstream, delete
  * the stub here in the same way. */
 
-/* c11 threads_posix.c uses pthread_mutex_timedlock (absent on Phoenix); a plain
- * blocking lock is a correct-enough fallback for Mesa's timed waits. */
-struct __phx_mtx;
-int pthread_mutex_lock(void *);
-int pthread_mutex_timedlock(void *m, const void *abstime) { (void)abstime; return pthread_mutex_lock(m); }
+/* pthread_mutex_timedlock was here as a Phoenix libc gap, as a plain blocking
+ * lock that ignored the deadline. libphoenix implements it for real now
+ * (pthread/pthread.c), and it lands in libm.a too, so keeping this copy failed
+ * the link with `multiple definition of pthread_mutex_timedlock` the moment the
+ * 2026-09-16 upstream merge brought it in -- taking out Xphoenix-glamor-daemon
+ * and gl-x11-window-daemon, i.e. the whole GPU-accelerated X desktop. Removing
+ * it also restores real timed-wait semantics for Mesa's c11 threads_posix.c.
+ * Same story as strtok_r above: when a libc gap closes upstream, delete the stub. */
 
 /* util_get_process_name: u_process.c needs glibc program_invocation_short_name
  * (absent on Phoenix). Return a fixed name — only used for debug/cache naming. */
