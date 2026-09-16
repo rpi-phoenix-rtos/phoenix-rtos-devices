@@ -497,11 +497,29 @@ int main(int argc, char **argv)
 		for (c = 0; c < total; c += 256u) {
 			for (i = 0; i < 256u; i++, phase++)
 				tone[i] = ((phase / half) & 1u) ? (int16_t)8000 : (int16_t)-8000;
-			audio_write(tone, sizeof(tone));
+			/* ⚠ STOP AT THE FIRST STALLED WRITE. This loop runs BEFORE audio_thread()
+			 * and therefore before ANY message is served, so every second spent here is a
+			 * second in which open("/dev/audio0") blocks on a node that already advertises
+			 * itself as ready. audio_write() gives up on a stuck DMA after ~10 s and
+			 * returns short; 35 chunks x 10 s is ~350 s of a device that exists and
+			 * answers nothing. That is not hypothetical — it stalled a Quake II startup
+			 * past a 300 s capture window (KNOWN-ISSUES q2-sdl-openaudio-hang, 2 in 136
+			 * runs): the "ready" line was printed, this self-test line never was, and
+			 * SDL_OpenAudio never returned. One timeout is all the evidence the self-test
+			 * needs, so bail out and let the message loop start. */
+			if (audio_write(tone, sizeof(tone)) != (ssize_t)sizeof(tone)) {
+				printf("rpi4-audio: self-test ABORTED after %u samples — the write path "
+					"stalled (DMA not draining); /dev/audio0 is still served, but audio "
+					"may be silent. STA=0x%08x\n", fed, ad.pwm[PWM_STA]);
+				fed = 0;
+				break;
+			}
 			fed += 256u;
 		}
-		printf("rpi4-audio: self-test fed %u samples (~0.2s 440Hz tone), underruns=%u, path=%s, STA=0x%08x\n",
-			fed, ad.underruns, ad.dma_active ? "DMA" : "PIO", ad.pwm[PWM_STA]);
+		if (fed != 0u) {
+			printf("rpi4-audio: self-test fed %u samples (~0.2s 440Hz tone), underruns=%u, path=%s, STA=0x%08x\n",
+				fed, ad.underruns, ad.dma_active ? "DMA" : "PIO", ad.pwm[PWM_STA]);
+		}
 	}
 
 	audio_thread((void *)(uintptr_t)port);
