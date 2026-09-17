@@ -518,11 +518,22 @@ int main(int argc, char **argv)
 				 *            ring, i.e. the read cursor is not advancing
 				 * Healthy reference: STA=0x102 at "ready", 0x700 after a good self-test. */
 				if (ad.dma_active != 0) {
+					/* ⊕ 2026-09-18: this fired twice and the two registers above already
+					 * named the side — DMA_CS=0x21 is ACTIVE|DREQ_STOPPED (the channel is
+					 * alive, waiting for a DREQ that never comes) while PWM STA=0x100 has
+					 * neither FULL1 nor EMPT1 and claims STA1, i.e. the FIFO holds data the
+					 * PWM is not clocking out. That points at the PWM CLOCK, so print it:
+					 * CM_PWMCTL's BUSY bit says whether the clock generator is actually
+					 * running, and DIV says at what rate. Healthy: CTL has ENAB|BUSY|SRC_OSC,
+					 * DIV = PWM_CLK_DIVI << 12. A stopped or unconfigured clock explains
+					 * every other register in one stroke. */
 					printf("rpi4-audio: self-test ABORTED after %u samples — the write path "
 						"stalled (DMA not draining); /dev/audio0 is still served, but audio "
-						"may be silent. STA=0x%08x DMA_CS=0x%08x ring w=%u r=%u\n",
+						"may be silent. STA=0x%08x DMA_CS=0x%08x ring w=%u r=%u "
+						"CM_PWMCTL=0x%08x CM_PWMDIV=0x%08x PWM_CTL=0x%08x PWM_DMAC=0x%08x\n",
 						fed, ad.pwm[PWM_STA], ad.dma[DMA_CS], ad.write_idx,
-						audio_ringReadIdx());
+						audio_ringReadIdx(), ad.cprman[CM_PWMCTL], ad.cprman[CM_PWMDIV],
+						ad.pwm[PWM_CTL], ad.pwm[PWM_DMAC]);
 				}
 				else {
 					printf("rpi4-audio: self-test ABORTED after %u samples — the PIO write "
