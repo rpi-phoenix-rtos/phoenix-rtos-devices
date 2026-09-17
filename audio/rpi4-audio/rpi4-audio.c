@@ -508,9 +508,27 @@ int main(int argc, char **argv)
 			 * SDL_OpenAudio never returned. One timeout is all the evidence the self-test
 			 * needs, so bail out and let the message loop start. */
 			if (audio_write(tone, sizeof(tone)) != (ssize_t)sizeof(tone)) {
-				printf("rpi4-audio: self-test ABORTED after %u samples — the write path "
-					"stalled (DMA not draining); /dev/audio0 is still served, but audio "
-					"may be silent. STA=0x%08x\n", fed, ad.pwm[PWM_STA]);
+				/* Print everything needed to decide WHICH half stalled, because this
+				 * fires at most once in ~100 boots and nobody will be watching when it
+				 * does (KNOWN-ISSUES q2-sdl-openaudio-hang):
+				 *   PWM_STA  FULL1 set  -> FIFO full, the PWM is not consuming (clock/DREQ)
+				 *            EMPT1 set  -> FIFO empty, the DMA is not feeding (ring/CB)
+				 *   DMA_CS   ACTIVE clear -> the channel stopped; ERROR set -> bus error
+				 *   ring     write==read+1 (mod RING_WORDS) -> producer blocked on a full
+				 *            ring, i.e. the read cursor is not advancing
+				 * Healthy reference: STA=0x102 at "ready", 0x700 after a good self-test. */
+				if (ad.dma_active != 0) {
+					printf("rpi4-audio: self-test ABORTED after %u samples — the write path "
+						"stalled (DMA not draining); /dev/audio0 is still served, but audio "
+						"may be silent. STA=0x%08x DMA_CS=0x%08x ring w=%u r=%u\n",
+						fed, ad.pwm[PWM_STA], ad.dma[DMA_CS], ad.write_idx,
+						audio_ringReadIdx());
+				}
+				else {
+					printf("rpi4-audio: self-test ABORTED after %u samples — the PIO write "
+						"path stalled (FIFO never drained); /dev/audio0 is still served, but "
+						"audio may be silent. STA=0x%08x\n", fed, ad.pwm[PWM_STA]);
+				}
 				fed = 0;
 				break;
 			}
