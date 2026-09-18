@@ -524,7 +524,7 @@ static void audio_thread(void *arg)
  * Allocates nothing and remaps nothing, so it is safe to call again after a failure. */
 static int audio_dmaArm(void)
 {
-	uint32_t spins, start_word;
+	uint32_t spins;
 
 	ad.pwm[PWM_DMAC] = PWM_DMAC_ENAB | (8u << 8) | (4u << 0);
 
@@ -541,10 +541,18 @@ static int audio_dmaArm(void)
 	 * 2026-09-18 — a channel parked waiting for a DREQ the PWM never raises. So measure
 	 * PROGRESS instead, and sample it on EVERY boot (not only the ~7% that stall) so the
 	 * figure is a continuous measurement rather than a once-in-fourteen-boots capture.
-	 * usleep gives a real settle delay — a bare empty spin loop can be optimized away. */
-	start_word = audio_ringWordRaw();
+	 * usleep gives a real settle delay — a bare empty spin loop can be optimized away.
+	 *
+	 * ⚠ Measure DISTANCE FROM THE RING BASE, not a delta against a pre-ACTIVE sample.
+	 * The CB pins `source_ad` at the ring base and every arm rewrites CONBLK_AD, so after
+	 * the settle this figure IS the advance. A pre-ACTIVE sample would still hold the
+	 * PREVIOUS arm's cursor until the engine fetches the CB — so on a RE-arm a delta
+	 * against it reads a parked channel as a huge advance and reports "recovered" when
+	 * nothing moved. That is a cannot-fail check, which is the class of bug this whole
+	 * function exists to remove. Safe because a healthy 20 ms is ~1 800 words against a
+	 * 16 384-word ring: the cursor cannot lap and alias back to a small number. */
 	usleep(20000);
-	ad.start_words = (audio_ringWordRaw() - start_word + RING_WORDS) % RING_WORDS;
+	ad.start_words = audio_ringWordRaw();
 
 	return (ad.start_words >= DMA_START_MIN_WORDS) ? 0 : -1;
 }
