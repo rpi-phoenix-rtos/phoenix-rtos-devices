@@ -449,11 +449,14 @@ static ssize_t audio_write(const void *buf, size_t len)
 		}
 	}
 
-	/* Make the samples we just wrote visible to the DMA engine. Same Normal-NC
-	 * reasoning as audio_dmaArm(): these are ordinary stores to uncached memory that
-	 * an external master reads from DRAM, and nothing else here orders them. Once per
-	 * write() rather than per sample — the ring holds ~0.19 s of audio ahead of the
-	 * read cursor, so that is bounded latency, not a correctness gap. */
+	/* Bound how long the samples we just wrote can sit unseen by the DMA engine. Same
+	 * Normal-NC reasoning as audio_dmaArm(): these are ordinary stores to uncached memory
+	 * that an external master reads from DRAM, and nothing else here orders them. This
+	 * cannot *guarantee* visibility the way the barrier in audio_dmaArm() does — the
+	 * engine is free-running on a self-chained CB, so there is no kick to order against
+	 * and it may still fetch a word written earlier in the loop above. It only caps the
+	 * staleness at one write() call. That is acceptable because the ring holds ~0.19 s of
+	 * audio ahead of the read cursor: bounded latency, not a correctness gap. */
 	if (ring_dirty != 0) {
 		__asm__ volatile("dsb sy" ::: "memory");
 	}
@@ -472,6 +475,10 @@ static void audio_armTrials(rpi4audio_armtrials_t *at)
 	if (n > ARMTRIALS_MAX) {
 		n = ARMTRIALS_MAX;
 	}
+	/* Report the count actually honoured, not the one asked for: a caller that requests
+	 * more than the cap otherwise reads back trials > ran and cannot tell clipping from
+	 * an early stop. `ran == 0` is the refusal signal, so nothing else needs trials. */
+	at->trials = n;
 	at->ran = 0;
 	at->parked = 0;
 	at->minWords = 0xffffffffu;
@@ -481,7 +488,6 @@ static void audio_armTrials(rpi4audio_armtrials_t *at)
 	at->firstDebug = 0;
 
 	if ((ad.ring == NULL) || (ad.dma == MAP_FAILED)) {
-		at->trials = 0;
 		return;
 	}
 
@@ -496,9 +502,9 @@ static void audio_armTrials(rpi4audio_armtrials_t *at)
 				printf("rpi4-audio: ARM-TRIAL %u PARKED — advanced %u words, STA=0x%08x "
 					"CTL=0x%08x DMAC=0x%08x RNG1=%u CM_PWMCTL=0x%08x CS=0x%08x "
 					"DEBUG=0x%08x CONBLK=0x%08x SRC=0x%08x LEN=%u\n",
-					i, ad.start_words, ad.pwm[PWM_STA], ad.pwm[PWM_CTL], ad.pwm[PWM_DMAC],
-					ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL], ad.dma[DMA_CS],
-					ad.dma[DMA_DEBUG], ad.dma[DMA_CONBLK_AD], ad.dma[DMA_SOURCE_AD],
+					i, ad.start_words, at->firstSta, ad.pwm[PWM_CTL], ad.pwm[PWM_DMAC],
+					ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL], at->firstCs,
+					at->firstDebug, ad.dma[DMA_CONBLK_AD], ad.dma[DMA_SOURCE_AD],
 					ad.dma[DMA_TXFR_LEN_R]);
 			}
 			at->parked++;
