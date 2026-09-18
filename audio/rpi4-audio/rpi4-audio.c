@@ -83,6 +83,7 @@ enum {
 #define MSEN2 (1u << 15)
 
 /* PWM_STA bits. */
+#define STA_BERR  (1u << 8)   /* bus error: a register write did not take (NOT STA1, which is bit 9) */
 #define STA_FULL1 (1u << 0)
 #define STA_EMPT1 (1u << 1)
 #define STA_WERR1 (1u << 2)
@@ -201,12 +202,54 @@ static int audio_clockInit(void)
 /* Enable PWM1 channels 1+2 in mark/space + FIFO mode at PWM_RANGE. */
 static void audio_pwmInit(void)
 {
-	ad.pwm[PWM_CTL] = 0;                 /* disable while configuring */
+	/* ⚠ PACED, and it is not cosmetic. The BCM2835 peripherals doc sets PWM_STA's
+	 * BERR bit (8) when the bus "tries to write successive cycles to the same set
+	 * of registers", and this function used to write PWM_CTL three times back to
+	 * back (0, CLRF1, enable). Measured 2026-09-18: PWM_STA reads 0x2 (EMPT1, BERR
+	 * CLEAR) at driver entry and 0x102 (EMPT1|BERR) at ready — so the driver
+	 * latched a bus error on EVERY boot, and nothing decoded bit 8 to say so.
+	 * A read-back between writes forces the previous one to retire; the short
+	 * delay gives the PWM's own ~9.6 MHz domain time to accept it.
+	 *
+	 * ⓘ What this does NOT claim: that it cures the ~7% DMA stall. That stall is
+	 * timing-sensitive (its rate moved from 3-in-44 to 0-in-85 across a relink
+	 * with no functional change), so no short run can settle it. What is
+	 * verifiable here is narrow and exact: BERR must be CLEAR on the ready line
+	 * after this change, on every boot. */
+	ad.pwm[PWM_CTL] = 0; /* disable while configuring */
+	(void)ad.pwm[PWM_CTL];
+	usleep(10);
+
 	ad.pwm[PWM_RNG1] = PWM_RANGE;
+	(void)ad.pwm[PWM_RNG1];
 	ad.pwm[PWM_RNG2] = PWM_RANGE;
-	ad.pwm[PWM_CTL] = CLRF1;             /* clear FIFO */
+	(void)ad.pwm[PWM_RNG2];
+	usleep(10);
+
+	ad.pwm[PWM_CTL] = CLRF1; /* clear FIFO */
+	(void)ad.pwm[PWM_CTL];
+	usleep(10);
+
 	/* Both channels: FIFO-fed (USEF), mark/space (MSEN), enabled (PWEN). */
 	ad.pwm[PWM_CTL] = USEF1 | MSEN1 | PWEN1 | USEF2 | MSEN2 | PWEN2;
+	(void)ad.pwm[PWM_CTL];
+	usleep(10);
+
+	/* Clear any bus error we (or the firmware) latched, so the ready line's STA
+	 * reports THIS init's outcome rather than history. BERR is write-1-to-clear. */
+	ad.pwm[PWM_STA] = STA_BERR;
+
+	/* ...and say so if the period or the enable did not take. Both are read back
+	 * above, so this costs nothing on a healthy boot and names the failure on a
+	 * bad one instead of leaving a silently dead channel. */
+	if (ad.pwm[PWM_RNG1] != PWM_RANGE) {
+		printf("rpi4-audio: PWM RNG1 did not take (reads %u, wanted %u) — audio will be "
+			"silent and the DMA will park\n", ad.pwm[PWM_RNG1], PWM_RANGE);
+	}
+	if ((ad.pwm[PWM_CTL] & (PWEN1 | USEF1)) != (PWEN1 | USEF1)) {
+		printf("rpi4-audio: PWM CTL did not take (reads 0x%08x) — channel 1 not enabled in "
+			"FIFO mode\n", ad.pwm[PWM_CTL]);
+	}
 }
 
 
