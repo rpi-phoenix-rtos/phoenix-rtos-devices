@@ -1911,7 +1911,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 						vio, fva, W.hub[MMU_VIO_ID/4]);
 					gpuva_describe("BINFAULT", fva);
 					gpuva_describe("BCLSTART", s->bcl_start);
-					gpuva_describe("BINCA", ca0 & ~0xfu);
+					gpuva_describe("BINCA", ca0);
 					/* Localise the SILENT stall (no MMU/GMP/OOM error): the CLE control regs
 					 * (ct0pc frozen = no primitive progress) + the front-end debug/STALL regs
 					 * (FDBGS per-stage STALL bits name the wedged sub-unit) + the CL window AT
@@ -1930,7 +1930,10 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 						 *      ct0ca & 3 == 0. Read the byte AT ct0ca instead.
 						 *  (2) the word window ran cp[-4..7] unclamped, i.e. it could read BELOW
 						 *      the start of the covering BO. Clamp both ends to that BO.
-						 * The printed shape is unchanged so old and new logs still compare. */
+						 * The printed shape is unchanged so old and new logs still compare.
+						 * NOTE this line and the wedge_cl_dump() below share the prefix
+						 * "BIN CL@ct0ca" and overlap in content -- grep "CL@ct0ca(" for this
+						 * word window, "CL@ct0ca ca=" for the byte dump. */
 						const struct pbo *cb = bo_find_covering(ca0);
 						int cop = wedge_op_at(ca0);
 						if ((cb != NULL) && (cop >= 0)) {
@@ -2071,7 +2074,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 					vio, fva, W.hub[MMU_VIO_ID/4]);
 				gpuva_describe("RENDERFAULT", fva);
 				gpuva_describe("RCLSTART", s->rcl_start);
-				gpuva_describe("RENDERCA", ca1 & ~0xfu);
+				gpuva_describe("RENDERCA", ca1);
 				/* Where ct1ca parked relative to the SUBMITTED extent + the byte-granular
 				 * CL window there. Same shapes as the bin queue and as the server. */
 				wedge_cl_dump("RENDER CL@ct1ca", ca1, s->rcl_start, s->rcl_end);
@@ -2083,7 +2086,6 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 			}
 		}
 		/* re-read CT1CA to see if it is advancing (slow) or wedged (stall) */
-		(void)ca1;
 		fprintf(stderr, "v3d-winsys: RENDER ct1ca recheck=0x%08x\n", c0[0x0114/4]);
 	}
 job_retry:

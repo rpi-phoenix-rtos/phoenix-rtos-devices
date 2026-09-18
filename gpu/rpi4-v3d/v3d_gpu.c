@@ -1046,7 +1046,10 @@ static void reset_reinit_core(void)
 #define WEDGE_CL_AFTER    64u   /* ... and from it onwards (the parked opcode + successors) */
 
 /* The live BO whose GPU-VA range covers gpuva, or NULL if none does. Same shape as the
- * in-process winsys helper (mesa/v3d_phoenix_winsys.c bo_find_covering). */
+ * in-process winsys helper (mesa/v3d_phoenix_winsys.c bo_find_covering) -- deliberately
+ * including the absence of a b->cpu test. Requiring a CPU view here would make ca_verdict()
+ * call a mapping-less BO "foreign", and "foreign" is precisely the answer the binner-wedge
+ * observation keys on; the CPU view is checked later, where it is actually dereferenced. */
 static const struct pbo *bo_covering(uint32_t gpuva)
 {
 	uint32_t i;
@@ -1054,7 +1057,7 @@ static const struct pbo *bo_covering(uint32_t gpuva)
 	for (i = 0; i < W.nbos; i++) {
 		const struct pbo *b = &W.bos[i];
 
-		if (b->used && (b->cpu != NULL) && (gpuva >= b->gpuva) && (gpuva < (b->gpuva + b->size))) {
+		if (b->used && (gpuva >= b->gpuva) && (gpuva < (b->gpuva + b->size))) {
 			return b;
 		}
 	}
@@ -1106,7 +1109,7 @@ static void wedge_cl_dump(const char *tag, uint32_t ca, uint32_t start, uint32_t
 	fprintf(stderr, "rpi4-v3d: %s ca=0x%08x cl=[0x%08x..0x%08x) where=%s bo=%s\n",
 		tag, ca, start, end, ca_verdict(ca, start, end), bodesc);
 
-	if (b == NULL) {
+	if ((b == NULL) || (b->cpu == NULL)) {
 		/* Never dereference an address we have not proven is mapped. */
 		fprintf(stderr, "rpi4-v3d: %s no CPU view of 0x%08x - no live BO maps it\n", tag, ca);
 		return;
