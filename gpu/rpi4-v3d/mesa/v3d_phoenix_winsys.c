@@ -1346,6 +1346,131 @@ static void gpuva_describe(const char *label, uint32_t gpuva)
 			label, gpuva, matches);
 }
 
+/* =========================================================================
+ * Post-wedge control-list observation. DIAGNOSTIC ONLY.
+ *
+ * Everything below is called exclusively from the `spins == 0` timeout branches
+ * of ioc_submit_cl(); a job that completes never enters them, so this code is
+ * unreachable on a healthy run and costs a healthy frame nothing.
+ *
+ * This file is the IN-PROCESS winsys — the path the shipping games actually
+ * take (they link it; the rpi4-v3d server is not auto-launched), so this is
+ * where docs/KNOWN-ISSUES.md "V3D-binner-wedge" gets its named observation
+ * ("at the next recurrence, read CL@ct0ca") answered. The server's twin lives
+ * in ../v3d_gpu.c (bo_covering / ca_verdict / wedge_cl_dump); the two print
+ * deliberately comparable lines.
+ *
+ *   - foreign content  => BO aliasing survived the handle-recycling / stale
+ *                         dirty-line / single-owner-mapping fixes;
+ *   - a valid draw item with FDBGS stall bits and int_qpu=0 => a genuine
+ *                         front-end starve.
+ * ========================================================================= */
+
+#define WEDGE_CL_BEFORE   32u   /* bytes of context dumped before the parked address */
+#define WEDGE_CL_AFTER    64u   /* ... and from it onwards (the parked opcode + successors) */
+/* A wedge is the rare event we are trying to capture, so the old "first 3 only" gate threw
+ * away exactly the recurrences worth having. It is not unbounded either: one boot recorded
+ * 94 CT1 render timeouts (see the fix-A comment in ioc_submit_cl), so keep a generous cap
+ * and SAY so when it starts suppressing. */
+#define WEDGE_DBG_MAX     64
+
+/* One-word verdict on where a parked CL address sits relative to the SUBMITTED extent
+ * [start, end): "inside" (mid-list), "at-end" (the whole list was fetched yet the done
+ * interrupt never fired), "before"/"after" (outside the extent but still in the CL's own
+ * BO), or "foreign" (a different live BO, or no live BO at all — i.e. the aliasing case). */
+static const char *ca_verdict(uint32_t ca, uint32_t start, uint32_t end)
+{
+	const struct pbo *bca = bo_find_covering(ca);
+	const struct pbo *bstart = bo_find_covering(start);
+
+	if (ca == end) {
+		return "at-end";
+	}
+	if ((ca >= start) && (ca < end)) {
+		return "inside";
+	}
+	if ((bca != NULL) && (bca == bstart)) {
+		return (ca < start) ? "before" : "after";
+	}
+	return "foreign";
+}
+
+/* Report where `ca` lies and hexdump the control list around it. Only ever dereferences a
+ * CPU pointer this winsys itself mmap'd for a live BO (b->cpu); anything else prints a
+ * reason and touches no memory. */
+static void wedge_cl_dump(const char *tag, uint32_t ca, uint32_t start, uint32_t end)
+{
+	const struct pbo *b = bo_find_covering(ca);
+	const uint8_t *p;
+	uint32_t lo, hi, i;
+	char bodesc[96];
+
+	if (b != NULL) {
+		(void)snprintf(bodesc, sizeof(bodesc), "handle%u@0x%08x+%u off=0x%x nmaps=%u scanout=%d",
+			b->handle, b->gpuva, b->size, (unsigned)(ca - b->gpuva), b->nmaps, b->scanout);
+	}
+	else if ((W.binovf_gpuva != 0u) && (ca >= W.binovf_gpuva) &&
+			(ca < (W.binovf_gpuva + W.binovf_bytes))) {
+		/* The binner-overflow pool is not a pbo, so bo_find_covering never reports it. */
+		(void)snprintf(bodesc, sizeof(bodesc), "none (inside the binner-overflow pool)");
+	}
+	else {
+		(void)snprintf(bodesc, sizeof(bodesc), "none");
+	}
+	fprintf(stderr, "v3d-winsys: %s ca=0x%08x cl=[0x%08x..0x%08x) where=%s bo=%s\n",
+		tag, ca, start, end, ca_verdict(ca, start, end), bodesc);
+
+	if ((b == NULL) || (b->cpu == NULL)) {
+		/* Never dereference an address we have not proven is mapped. */
+		fprintf(stderr, "v3d-winsys: %s no CPU view of 0x%08x — no live BO maps it\n", tag, ca);
+		return;
+	}
+	if (b->scanout) {
+		/* A scanout BO's visible pages are re-pointed at the framebuffer PA in the V3D MMU
+		 * while b->cpu keeps its own fresh anonymous DRAM (see ioc_create_bo), so the CPU
+		 * mapping does NOT alias what the GPU fetched. Do not guess. */
+		fprintf(stderr, "v3d-winsys: %s no CPU view of 0x%08x — scanout BO, the CPU mapping "
+			"does not alias the GPU pages\n", tag, ca);
+		return;
+	}
+
+	/* Window clamped to the BO on BOTH sides (the old cp[-4] could read below the BO start).
+	 * CL BOs are allocated uncached (Mesa sets V3D_CREATE_BO_CACHEABLE only for CPU-readback
+	 * render targets), so this reads what the GPU reads; a "foreign" hit landing in a
+	 * cacheable BO could in principle show a stale CPU-side view. */
+	lo = ((ca - b->gpuva) >= WEDGE_CL_BEFORE) ? (ca - WEDGE_CL_BEFORE) : b->gpuva;
+	hi = ca + WEDGE_CL_AFTER;
+	if (hi > (b->gpuva + b->size)) {
+		hi = b->gpuva + b->size;
+	}
+	p = (const uint8_t *)b->cpu + (lo - b->gpuva);
+	fprintf(stderr, "v3d-winsys: %s bytes 0x%08x..0x%08x ('*' marks ca):", tag, lo, hi);
+	for (i = lo; i < hi; i++) {
+		fprintf(stderr, "%s%02x", (i == ca) ? " *" : " ", p[i - lo]);
+	}
+	fprintf(stderr, "\n");
+
+	/* The parked opcode on its own line, read AT ca — CLE packets are byte-granular, so a
+	 * word-aligned read is the wrong byte whenever ca is unaligned. CLE opcode 0 = HALT, so
+	 * a wedge sitting on a zero page / a HALT byte is a different story from one parked
+	 * mid-draw. No opcode table here on purpose — decode the bytes above by hand. */
+	fprintf(stderr, "v3d-winsys: %s opcode at ca = 0x%02x (0x00 = CLE HALT)\n",
+		tag, ((const uint8_t *)b->cpu)[ca - b->gpuva]);
+}
+
+/* The CL byte at `ca`, or -1 if no live non-scanout BO with a CPU mapping covers it.
+ * Byte-exact: the callers used to mask ca down to a word/16-byte boundary and read THAT
+ * byte, which is only the parked opcode when ca happens to be aligned. */
+static int wedge_op_at(uint32_t ca)
+{
+	const struct pbo *b = bo_find_covering(ca);
+
+	if ((b == NULL) || (b->cpu == NULL) || b->scanout) {
+		return -1;
+	}
+	return (int)((const uint8_t *)b->cpu)[ca - b->gpuva];
+}
+
 /* GFXH-1897 (Broadcom erratum, see linux v3d_gem.c v3d_clean_caches): a new L2TCACTL
  * flush must not be issued while a previous L2T flush is still in progress, or the new
  * flush malfunctions — the consumer then reads a stale/transient view. Our submit issues
@@ -1769,9 +1894,14 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 			/* Instrument-validation probe (same as the render path): which BO backs bcl_start and
 			 * ct0ca, at what offset / ambiguous? + full BCL head dump — head-zero vs wrong-BO. */
 			{
+				/* DIAGNOSTIC ONLY - the timeout branch, so none of this is reachable on a
+				 * healthy run. The gate used to be `bdbg++ < 3`, i.e. a FOURTH wedge in a
+				 * process printed nothing - and a recurrence is exactly what we are trying
+				 * to capture. Generous cap plus an explicit suppression notice instead. */
 				static int bdbg = 0;
-				if (bdbg++ < 3) {
+				if (bdbg < WEDGE_DBG_MAX) {
 					uint32_t ca0 = c0[0x0110/4];
+					bdbg++;
 					/* The REAL fault: VIO_ADDR is VA>>8 → bytes = <<8. Map it to the owning BO
 					 * (texture? CL? tile-alloc? or NO BO = unmapped VA / stale PTE). */
 					uint32_t vio = W.hub[MMU_VIO_ADDR/4];
@@ -1794,13 +1924,32 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 					fprintf(stderr, "v3d-winsys: BIN FDBG o=0x%08x b=0x%08x r=0x%08x s=0x%08x\n",
 						c0[0x0f04/4], c0[0x0f08/4], c0[0x0f0c/4], c0[0x0f10/4]);
 					{
-						uint32_t *cp = (uint32_t *)gpuva_to_cpu(ca0 & ~3u);
-						if (cp) {
+						/* Two defects fixed here, both diagnostic-only:
+						 *  (1) op= was read at `ca0 & ~3`, but CLE packets are BYTE-granular, so
+						 *      every historical op= in a wedge log is only trustworthy when
+						 *      ct0ca & 3 == 0. Read the byte AT ct0ca instead.
+						 *  (2) the word window ran cp[-4..7] unclamped, i.e. it could read BELOW
+						 *      the start of the covering BO. Clamp both ends to that BO.
+						 * The printed shape is unchanged so old and new logs still compare. */
+						const struct pbo *cb = bo_find_covering(ca0);
+						int cop = wedge_op_at(ca0);
+						if ((cb != NULL) && (cop >= 0)) {
+							uint32_t wbase = ca0 & ~3u;
+							uint32_t wlo = ((wbase - cb->gpuva) >= 16u) ? (wbase - 16u) : cb->gpuva;
+							uint32_t whi = wbase + 32u;
+							const uint32_t *wp;
+							if (whi > (cb->gpuva + cb->size)) whi = cb->gpuva + cb->size;
+							wp = (const uint32_t *)(const void *)((const char *)cb->cpu + (wlo - cb->gpuva));
 							fprintf(stderr, "v3d-winsys: BIN CL@ct0ca(0x%08x) op=0x%02x:",
-								ca0, (*cp) & 0xffu);
-							for (int i = -4; i < 8; i++) fprintf(stderr, " %08x", cp[i]);
+								ca0, (unsigned)cop);
+							for (uint32_t w = wlo; w < whi; w += 4u) fprintf(stderr, " %08x", wp[(w - wlo) / 4u]);
 							fprintf(stderr, "\n");
 						}
+						/* Where ct0ca parked relative to the SUBMITTED extent (inside/at-end/before/
+						 * after/foreign) + the byte-granular CL window. "foreign" is the answer the
+						 * KNOWN-ISSUES observation is after: it means BO aliasing. Prints a refusal
+						 * reason rather than dereferencing an address it has not proven is mapped. */
+						wedge_cl_dump("BIN CL@ct0ca", ca0, s->bcl_start, s->bcl_end);
 					}
 					uint32_t bw = (s->bcl_end - s->bcl_start + 3u) / 4u;
 					if (bw > 40u) bw = 40u;
@@ -1809,6 +1958,11 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 					if (bs) { for (uint32_t i = 0; i < bw; i++) fprintf(stderr, " %08x", bs[i]); }
 					else { fprintf(stderr, " (no BO)"); }
 					fprintf(stderr, "\n");
+				}
+				else if (bdbg == WEDGE_DBG_MAX) {
+					bdbg++;
+					fprintf(stderr, "v3d-winsys: BIN wedge dump SUPPRESSED after %d dumps "
+						"(further bin wedges print the TIMEOUT + PTB lines only)\n", WEDGE_DBG_MAX);
 				}
 			}
 		}
@@ -1891,8 +2045,11 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 		/* V3D error-debug registers (FDBGO/FDBGS/ERRSTAT) localize the wedged render
 		 * pipeline stage; + decode the CL opcode byte CT1 is parked on. */
 		{
-			uint32_t *cp = (uint32_t *)gpuva_to_cpu(ca1 & ~0xfu);
-			unsigned op = cp ? (cp[0] & 0xffu) : 0xffffffffu;
+			/* The opcode byte was read at `ca1 & ~0xf` - CLE packets are BYTE-granular,
+			 * so every historical wedge_op= is only trustworthy when ct1ca & 0xf == 0.
+			 * Read the byte AT ct1ca; the 0xffffffff sentinel still means "no CPU view". */
+			int opb = wedge_op_at(ca1);
+			unsigned op = (opb >= 0) ? (unsigned)opb : 0xffffffffu;
 			const char *opn = (op==21)?"BRANCH_TO_IMPLICIT":(op==18)?"RETURN_FROM_SUBLIST":
 				(op==124)?"TILE_COORDINATES":(op==23)?"SUPERTILE_COORDS":(op==0)?"HALT/zero":"?";
 			fprintf(stderr, "v3d-winsys: RENDER DBG fdbgo=0x%08x fdbgs=0x%08x errstat=0x%08x "
@@ -1902,8 +2059,11 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 		/* The REAL fault (VIO_ADDR = VA>>8) + which BO owns it — the definitive signal for
 		 * the intermittent q3dm7 wedge (texture VA-recycle vs render-CL/tile-alloc vs unmapped). */
 		{
+			/* DIAGNOSTIC ONLY - the timeout branch. The gate was `rdbg++ < 3`, so a 4th
+			 * render wedge in a process printed nothing; generous cap + a notice. */
 			static int rdbg = 0;
-			if (rdbg++ < 3) {
+			if (rdbg < WEDGE_DBG_MAX) {
+				rdbg++;
 				uint32_t vio = W.hub[MMU_VIO_ADDR/4];
 				uint32_t fva = vio << 8;
 				fprintf(stderr, "v3d-winsys: RENDER MMU-VIO vio_addr=0x%08x fault_va=0x%08x "
@@ -1912,6 +2072,14 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 				gpuva_describe("RENDERFAULT", fva);
 				gpuva_describe("RCLSTART", s->rcl_start);
 				gpuva_describe("RENDERCA", ca1 & ~0xfu);
+				/* Where ct1ca parked relative to the SUBMITTED extent + the byte-granular
+				 * CL window there. Same shapes as the bin queue and as the server. */
+				wedge_cl_dump("RENDER CL@ct1ca", ca1, s->rcl_start, s->rcl_end);
+			}
+			else if (rdbg == WEDGE_DBG_MAX) {
+				rdbg++;
+				fprintf(stderr, "v3d-winsys: RENDER wedge dump SUPPRESSED after %d dumps "
+					"(further render wedges print the TIMEOUT + DBG lines only)\n", WEDGE_DBG_MAX);
 			}
 		}
 		/* re-read CT1CA to see if it is advancing (slow) or wedged (stall) */
