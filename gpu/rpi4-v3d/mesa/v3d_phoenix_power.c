@@ -106,12 +106,20 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 			return MBOX_FAIL;
 		}
 	}
+	/* The message buffer is Normal-NC and the mailbox registers are Device; aarch64 does not
+	 * order the two, so drain our stores before handing VideoCore the address — otherwise it
+	 * can read a message we have not finished writing. Same barrier, same reason, as
+	 * rpi4-vcmbox (the serialized /dev/vcmbox path this one is the fallback for). */
+	__asm__ volatile("dsb sy" ::: "memory");
 	mbox[VC_MBOX_WRITE / 4] = request;
 	for (spins = MBOX_SPINS; spins != 0u; spins--) {
 		if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u &&
 		    mbox[VC_MBOX_READ / 4] == request)
 			break;
 	}
+	/* And the read direction: the reply was written to DRAM by VideoCore, and only an MMIO
+	 * read told us it is there. Order that against reading the message body. */
+	__asm__ volatile("dsb sy" ::: "memory");
 	if (spins != 0u && msg[1] == VC_MBOX_RESP_OK)
 		result = msg[5 + nw - 1];
 
