@@ -113,8 +113,10 @@ enum {
  * (div & CM_DIV_FRAC_MASK) ? CM_FRAC : 0`). Ours is an exact integer divide
  * (DIVI=2, DIVF=0), so it must be CLEAR — and the firmware leaves it SET
  * (entry CM_PWMCTL=0x200, measured 2026-09-18), so a read-modify-write that does
- * not mask it would run a fractional divider with nothing fractional to do. */
-#define CM_CTL_FRAC (1u << 9)
+ * not mask it would run a fractional divider with nothing fractional to do.
+ * Mask the whole MASH field [10:9], not just the bit this firmware happened to
+ * leave set -- a firmware that leaves 0x400 would otherwise reintroduce it. */
+#define CM_CTL_MASH (3u << 9)
 #define CM_SRC_MASK 0xfu
 #define CM_SRC_OSC  1u            /* BCM2711 crystal oscillator (54 MHz) */
 
@@ -178,8 +180,9 @@ enum {
  * so across the 20 ms arm settle a healthy channel walks SOURCE_AD ~900-1800 words
  * (one FIFO word per channel per range period) while the stall signature — ACTIVE,
  * DREQ_STOPPED, FIFO fed, PWM not transmitting — moves at most the FIFO depth (16).
- * The threshold sits far below either healthy estimate and far above the FIFO, so it
- * cannot fire on a merely slow boot. */
+ * Measured on this hardware: 1784-2352 words across 16 healthy boots (10-boot bench
+ * + 6-app gate). The threshold sits ~28x below the slowest of those and 4x above the
+ * FIFO, so it cannot fire on a merely slow boot. */
 #define DMA_START_MIN_WORDS  64u
 #define DMA_ARM_TRIES        3u
 
@@ -256,7 +259,7 @@ static int audio_clockInit(void)
 	}
 
 	/* Source while disabled, then the divider, then enable — three separate writes. */
-	ctl = (ad.cprman[CM_PWMCTL] & ~(CM_PASSWD | CM_CTL_ENAB | CM_CTL_FRAC | CM_SRC_MASK))
+	ctl = (ad.cprman[CM_PWMCTL] & ~(CM_PASSWD | CM_CTL_ENAB | CM_CTL_MASH | CM_SRC_MASK))
 		| CM_SRC_OSC;
 	ad.cprman[CM_PWMCTL] = CM_PASSWD | ctl;
 	ad.cprman[CM_PWMDIV] = CM_PASSWD | (PWM_CLK_DIVI << 12);
