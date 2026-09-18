@@ -1566,6 +1566,22 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 				break; /* dequeue caught up to the producer */
 			}
 
+			/* ⚠ The cycle bit is the controller's publish flag for the WHOLE TRB, so every
+			 * other field of it may only be read AFTER that flag has been observed set. The
+			 * controller is a non-coherent external master writing this ring straight to DRAM
+			 * and nothing else here orders the two loads, so without a barrier the CPU (or
+			 * the compiler — xhci_trb_t is a plain struct, not volatile) may read parameter,
+			 * status or type from the PREVIOUS owner of this slot while the cycle bit says
+			 * the new event is ready. Linux has exactly this barrier in the same place:
+			 * drivers/usb/host/xhci-ring.c, "Barrier between reading the TRB_CYCLE (valid)
+			 * flag before, and any speculative reads of the event's flags/data below"
+			 * (its rmb() is dsb(ld) on arm64 — external/linux/arch/arm64/include/asm/
+			 * barrier.h). dsb, not dmb, for the same reason the rest of this port uses dsb
+			 * against non-coherent masters.
+			 * Added 2026-09-18 after a port-wide audit; it covers the IN-data read too, since
+			 * that memcpy is ordered behind this same completion. */
+			__asm__ volatile("dsb ld" ::: "memory");
+
 			matched = xhci_eventMatch(xhci, cur, wantType, wantParam, wantSlot, wantEp);
 			if ((matched == 0) && (xhci_eventStashable(cur) != 0)) {
 				if (xhci->eventStashCount < XHCI_EVENT_STASH_MAX) {
