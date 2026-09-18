@@ -177,7 +177,7 @@ enum {
 #define RING_BYTES      (RING_WORDS * 4u)
 
 /* A started channel is one that makes PROGRESS. The ring plays free-running silence,
- * so across the 20 ms arm settle a healthy channel walks SOURCE_AD ~900-1800 words
+ * so across the 20 ms arm settle a healthy channel walks SOURCE_AD 1784-2352 words
  * (one FIFO word per channel per range period) while the stall signature — ACTIVE,
  * DREQ_STOPPED, FIFO fed, PWM not transmitting — moves at most the FIFO depth (16).
  * Measured on this hardware: 1784-2352 words across 16 healthy boots (10-boot bench
