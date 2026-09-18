@@ -185,6 +185,10 @@ enum {
  * FIFO, so it cannot fire on a merely slow boot. */
 #define DMA_START_MIN_WORDS  64u
 #define DMA_ARM_TRIES        3u
+/* Upper bound on RPI4AUDIO_ARMTRIALS. Each cycle costs the 20 ms arm settle, so this
+ * is ~100 s of a blocked message loop -- long enough to sample a ~7% event hundreds
+ * of times over, short enough that a typo cannot wedge the device for an hour. */
+#define ARMTRIALS_MAX        5000u
 
 /* DMA control block (32 bytes, 256-bit aligned) — the legacy-DMA descriptor. */
 typedef struct {
@@ -446,13 +450,84 @@ static ssize_t audio_write(const void *buf, size_t len)
 }
 
 
+/* Repeat the arm sequence and count how many cycles come up parked. Same code the
+ * boot path runs, on the instance that actually fails -- see the struct comment in
+ * rpi4-audio.h for why this cannot be done from userspace. */
+static void audio_armTrials(rpi4audio_armtrials_t *at)
+{
+	uint32_t i, n = at->trials;
+
+	if (n > ARMTRIALS_MAX) {
+		n = ARMTRIALS_MAX;
+	}
+	at->ran = 0;
+	at->parked = 0;
+	at->minWords = 0xffffffffu;
+	at->maxWords = 0;
+	at->firstSta = 0;
+	at->firstCs = 0;
+	at->firstDebug = 0;
+
+	if ((ad.ring == NULL) || (ad.dma == MAP_FAILED)) {
+		at->trials = 0;
+		return;
+	}
+
+	for (i = 0; i < n; i++) {
+		ad.dma[DMA_CS] = 0;
+		audio_pwmInit();
+		if (audio_dmaArm() != 0) {
+			if (at->parked == 0) {
+				at->firstSta = ad.pwm[PWM_STA];
+				at->firstCs = ad.dma[DMA_CS];
+				at->firstDebug = ad.dma[DMA_DEBUG];
+				printf("rpi4-audio: ARM-TRIAL %u PARKED — advanced %u words, STA=0x%08x "
+					"CTL=0x%08x DMAC=0x%08x RNG1=%u CM_PWMCTL=0x%08x CS=0x%08x "
+					"DEBUG=0x%08x CONBLK=0x%08x SRC=0x%08x LEN=%u\n",
+					i, ad.start_words, ad.pwm[PWM_STA], ad.pwm[PWM_CTL], ad.pwm[PWM_DMAC],
+					ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL], ad.dma[DMA_CS],
+					ad.dma[DMA_DEBUG], ad.dma[DMA_CONBLK_AD], ad.dma[DMA_SOURCE_AD],
+					ad.dma[DMA_TXFR_LEN_R]);
+			}
+			at->parked++;
+		}
+		if (ad.start_words < at->minWords) {
+			at->minWords = ad.start_words;
+		}
+		if (ad.start_words > at->maxWords) {
+			at->maxWords = ad.start_words;
+		}
+		at->ran++;
+	}
+
+	/* Leave the engine streaming for whoever opens the device next. */
+	if (at->ran != 0) {
+		ad.dma_active = (audio_dmaArm() == 0) ? 1 : ad.dma_active;
+	}
+	printf("rpi4-audio: arm-trials: %u run, %u parked, advance %u..%u words\n",
+		at->ran, at->parked, (at->ran != 0) ? at->minWords : 0u, at->maxWords);
+}
+
+
 static void audio_devctl(msg_t *msg)
 {
 	unsigned long req;
 	id_t id;
 	rpi4audio_state_t st;
+	rpi4audio_armtrials_t at;
+	const void *in;
 
-	(void)ioctl_unpack(msg, &req, &id);
+	in = ioctl_unpack(msg, &req, &id);
+	if (req == RPI4AUDIO_ARMTRIALS) {
+		if (in == NULL) {
+			ioctl_setResponse(msg, req, -EINVAL, NULL);
+			return;
+		}
+		at = *(const rpi4audio_armtrials_t *)in;
+		audio_armTrials(&at);
+		ioctl_setResponse(msg, req, EOK, &at);
+		return;
+	}
 	if (req == RPI4AUDIO_GETSTATE) {
 		st.rate = AUDIO_RATE;
 		st.range = PWM_RANGE;
