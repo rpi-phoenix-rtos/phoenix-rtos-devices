@@ -500,9 +500,21 @@ static void audio_armTrials(rpi4audio_armtrials_t *at)
 		at->ran++;
 	}
 
-	/* Leave the engine streaming for whoever opens the device next. */
+	/* Leave the engine streaming for whoever opens the device next — and if the final
+	 * arm will not stream, fall through to the SAME degraded state the boot path uses.
+	 * Without this a trial run could leave the device neither streaming nor null-sinking,
+	 * i.e. back to the ~10 s blocking write this whole change exists to remove. */
 	if (at->ran != 0) {
-		ad.dma_active = (audio_dmaArm() == 0) ? 1 : ad.dma_active;
+		if (audio_dmaArm() == 0) {
+			ad.dma_active = 1;
+			ad.null_sink = 0;
+		}
+		else {
+			ad.dma_active = 0;
+			ad.null_sink = 1;
+			printf("rpi4-audio: arm-trials left the engine parked — /dev/audio0 degrades to a "
+				"paced null sink\n");
+		}
 	}
 	printf("rpi4-audio: arm-trials: %u run, %u parked, advance %u..%u words\n",
 		at->ran, at->parked, (at->ran != 0) ? at->minWords : 0u, at->maxWords);
