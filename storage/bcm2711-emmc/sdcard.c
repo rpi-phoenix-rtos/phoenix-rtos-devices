@@ -1673,6 +1673,14 @@ static int _sdcard_transferBlocks(sdcard_hostData_t *host, sdio_dir_t dir, uint3
 	}
 
 	if (bounce && (dir == sdio_read)) {
+		/* The transfer was declared complete by MMIO status reads; the payload it refers to
+		 * was written to DRAM by the SDHCI DMA engine, a non-coherent external master. Nothing
+		 * else here orders "completion observed" before "payload read", so take the same
+		 * barrier the submit side takes. Load-load only — the staging buffer is uncached, so
+		 * there is no stale-cache-line hazard, just a reordering one. This is the read
+		 * direction of the class audited port-wide on 2026-09-18; genet guards the identical
+		 * spot with `dmb ld` after its producer-index read. */
+		sdio_dataBarrier();
 		memcpy(data, host->dmaBuffer, len);
 	}
 
