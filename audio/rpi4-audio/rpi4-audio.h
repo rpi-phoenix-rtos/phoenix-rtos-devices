@@ -40,7 +40,7 @@ typedef struct {
  * ⚠ It blocks the message loop for ~20 ms per trial and resets the streaming engine
  * on every one, so /dev/audio0 plays nothing while it runs. Diagnostic only. */
 typedef struct {
-	uint32_t trials;      /* in:  arm cycles to run (capped by the driver) */
+	uint32_t trials;      /* in:  arm cycles to run; out: the count after the driver's cap */
 	uint32_t ran;         /* out: cycles actually run */
 	uint32_t parked;      /* out: cycles that did not stream */
 	uint32_t minWords;    /* out: smallest advance seen, in ring words */
