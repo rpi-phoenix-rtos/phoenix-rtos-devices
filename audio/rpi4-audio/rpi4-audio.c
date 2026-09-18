@@ -100,7 +100,12 @@ enum {
  * sets it on EVERY clock enable (drivers/clk/bcm/clk-bcm2835.c, bcm2835_clock_on:
  * `ctl | CM_ENABLE | CM_GATE`), which is the only known-good driver for this block,
  * so this one follows it. Our captures read CM_PWMCTL=0x91 -- bit 6 clear -- i.e. we
- * were the only driver in the world not setting it. */
+ * were the only driver in the world not setting it.
+ * ⓘ Measured 2026-09-18 after writing it: the bit does NOT read back. CM_PWMCTL is
+ * 0x91 at the ready line on 6/6 gate boots with CM_CTL_GATE in the enable write, so
+ * on the BCM2711 PWM clock this is either write-only or not implemented. The write
+ * is kept because it matches the known-good driver and costs nothing; do not quote
+ * it as "we now set CM_GATE" -- the hardware does not agree. */
 #define CM_CTL_GATE (1u << 6)
 #define CM_CTL_BUSY (1u << 7)
 /* Bit 9 enables the MASH fractional divider. Linux clears it whenever the
