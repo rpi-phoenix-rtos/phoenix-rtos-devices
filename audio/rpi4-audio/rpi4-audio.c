@@ -526,14 +526,27 @@ int main(int argc, char **argv)
 					 * CM_PWMCTL's BUSY bit says whether the clock generator is actually
 					 * running, and DIV says at what rate. Healthy: CTL has ENAB|BUSY|SRC_OSC,
 					 * DIV = PWM_CLK_DIVI << 12. A stopped or unconfigured clock explains
-					 * every other register in one stroke. */
+					 * every other register in one stroke.
+					 *
+					 * ↩ 2026-09-18, third capture: that hypothesis is DEAD. CM_PWMCTL reads
+					 * 0x91 (ENAB|BUSY|SRC_OSC) at the abort -- the generator IS running -- and
+					 * CM_PWMDIV, PWM_CTL and PWM_DMAC all read back exactly what we
+					 * programmed, with the ring FULL (w=15 r=16) and the FIFO non-empty. So
+					 * everything configured is configured correctly and the PWM still will not
+					 * drain. The one value no print has shown yet is the PERIOD: RNG1=0 would
+					 * leave the channel enabled, clocked and fed while consuming nothing, which
+					 * explains every other register at once. So print RNG1/DAT1 -- plus STA
+					 * re-read 2 ms later, which separates a FIFO that is merely SLOW from one
+					 * that is frozen. */
 					printf("rpi4-audio: self-test ABORTED after %u samples — the write path "
 						"stalled (DMA not draining); /dev/audio0 is still served, but audio "
 						"may be silent. STA=0x%08x DMA_CS=0x%08x ring w=%u r=%u "
-						"CM_PWMCTL=0x%08x CM_PWMDIV=0x%08x PWM_CTL=0x%08x PWM_DMAC=0x%08x\n",
+						"CM_PWMCTL=0x%08x CM_PWMDIV=0x%08x PWM_CTL=0x%08x PWM_DMAC=0x%08x "
+						"RNG1=%u DAT1=%u STA+2ms=0x%08x\n",
 						fed, ad.pwm[PWM_STA], ad.dma[DMA_CS], ad.write_idx,
 						audio_ringReadIdx(), ad.cprman[CM_PWMCTL], ad.cprman[CM_PWMDIV],
-						ad.pwm[PWM_CTL], ad.pwm[PWM_DMAC]);
+						ad.pwm[PWM_CTL], ad.pwm[PWM_DMAC], ad.pwm[PWM_RNG1],
+						ad.pwm[PWM_DAT1], (usleep(2000), ad.pwm[PWM_STA]));
 				}
 				else {
 					printf("rpi4-audio: self-test ABORTED after %u samples — the PIO write "
