@@ -103,6 +103,13 @@ enum {
  * were the only driver in the world not setting it. */
 #define CM_CTL_GATE (1u << 6)
 #define CM_CTL_BUSY (1u << 7)
+/* Bit 9 enables the MASH fractional divider. Linux clears it whenever the
+ * fractional part of the divider is zero (clk-bcm2835.c: `ctl &= ~CM_FRAC; ctl |=
+ * (div & CM_DIV_FRAC_MASK) ? CM_FRAC : 0`). Ours is an exact integer divide
+ * (DIVI=2, DIVF=0), so it must be CLEAR — and the firmware leaves it SET
+ * (entry CM_PWMCTL=0x200, measured 2026-09-18), so a read-modify-write that does
+ * not mask it would run a fractional divider with nothing fractional to do. */
+#define CM_CTL_FRAC (1u << 9)
 #define CM_SRC_MASK 0xfu
 #define CM_SRC_OSC  1u            /* BCM2711 crystal oscillator (54 MHz) */
 
@@ -244,7 +251,8 @@ static int audio_clockInit(void)
 	}
 
 	/* Source while disabled, then the divider, then enable — three separate writes. */
-	ctl = (ad.cprman[CM_PWMCTL] & ~(CM_PASSWD | CM_CTL_ENAB | CM_SRC_MASK)) | CM_SRC_OSC;
+	ctl = (ad.cprman[CM_PWMCTL] & ~(CM_PASSWD | CM_CTL_ENAB | CM_CTL_FRAC | CM_SRC_MASK))
+		| CM_SRC_OSC;
 	ad.cprman[CM_PWMCTL] = CM_PASSWD | ctl;
 	ad.cprman[CM_PWMDIV] = CM_PASSWD | (PWM_CLK_DIVI << 12);
 	ad.cprman[CM_PWMCTL] = CM_PASSWD | ctl | CM_CTL_ENAB | CM_CTL_GATE;
