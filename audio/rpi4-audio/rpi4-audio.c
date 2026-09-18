@@ -123,8 +123,18 @@ enum {
 #define DMA_CS          (0x00u / 4u)
 #define DMA_CONBLK_AD   (0x04u / 4u)
 #define DMA_SOURCE_AD   (0x0cu / 4u)   /* live source address (the ring read cursor) */
+#define DMA_DEST_AD     (0x10u / 4u)   /* live destination address (the PWM FIFO) */
 #define DMA_TXFR_LEN_R  (0x14u / 4u)   /* live remaining length (read-only copy) */
+#define DMA_NEXTCONBK   (0x1cu / 4u)   /* next control block the engine will load */
 #define DMA_DEBUG       (0x20u / 4u)
+/* DMA_DEBUG bits (BCM2835 legacy DMA; the three error bits are write-1-to-clear).
+ * Layout taken from the BCM2835 peripherals doc and cross-checked against Linux
+ * drivers/dma/bcm2835-dma.c in external/ -- this file has already paid once for a
+ * bit decoded from memory (PWM_STA's BERR/STA1 swap), so it is not repeated here. */
+#define DMA_DBG_LAST_NOT_SET  (1u << 0)
+#define DMA_DBG_FIFO_ERR      (1u << 1)
+#define DMA_DBG_READ_ERR      (1u << 2)
+#define DMA_DBG_ERRORS        (DMA_DBG_LAST_NOT_SET | DMA_DBG_FIFO_ERR | DMA_DBG_READ_ERR)
 #define DMA_CS_ACTIVE   (1u << 0)
 #define DMA_CS_END      (1u << 1)
 #define DMA_CS_ERROR    (1u << 8)
@@ -166,6 +176,7 @@ static struct {
 	uint32_t write_idx;            /* next ring word audio_write() will fill */
 	int dma_active;                /* streaming DMA running -> ring path; else PIO */
 	uint32_t underruns;
+	uint32_t start_words;          /* ring words the DMA consumed during the start settle */
 } ad;
 
 
@@ -266,6 +277,18 @@ static int audio_fifoPush(uint32_t duty)
 	}
 	ad.pwm[PWM_FIF1] = duty;
 	return 0;
+}
+
+
+/* The DMA's live read cursor as a RAW ring word index -- no clamping. Used for the
+ * start-progress measurement, which must not confuse "cursor outside the ring" with
+ * "cursor at word 0"; audio_ringReadIdx() below clamps to 0 and would read a parked
+ * channel and a healthy one alike. */
+static uint32_t audio_ringWordRaw(void)
+{
+	uint32_t src = ad.dma[DMA_SOURCE_AD] & 0x3fffffffu;
+	uint32_t base = (uint32_t)ad.ring_pa & 0x3fffffffu;
+	return ((src - base) / 4u) % RING_WORDS;
 }
 
 
@@ -399,7 +422,7 @@ static void audio_thread(void *arg)
  * failure leaves it 0 so audio_write() falls back to the PIO FIFO push. */
 static void audio_dmaStart(void)
 {
-	uint32_t i, spins;
+	uint32_t i, spins, start_word;
 	dma_cb_t *cb;
 	uintptr_t cb_pa;
 
@@ -460,12 +483,25 @@ static void audio_dmaStart(void)
 	ad.dma[DMA_CS] = DMA_CS_ACTIVE;
 
 	/* Let it run a moment, then confirm it stays ACTIVE with no error. usleep gives a
-	 * real settle delay — a bare empty spin loop can be optimized away (zero settle). */
+	 * real settle delay — a bare empty spin loop can be optimized away (zero settle).
+	 *
+	 * ⚠ ACTIVE with no ERROR is NOT a started channel: DMA_CS=0x21 is
+	 * ACTIVE|DREQ_STOPPED, which is exactly the signature of the stall captured three
+	 * times on 2026-09-18 — a channel parked waiting for a DREQ the PWM never raises.
+	 * So measure PROGRESS instead: the ring is pre-filled with silence and plays
+	 * free-running, so a healthy channel walks SOURCE_AD ~900-1800 words in 20 ms
+	 * while the parked one moves at most the FIFO depth. Sampled on every boot (not
+	 * only the ~7% that stall) so the figure is a continuous measurement. */
+	start_word = audio_ringWordRaw();
 	usleep(20000);
+	ad.start_words = (audio_ringWordRaw() - start_word + RING_WORDS) % RING_WORDS;
 
 	if (((ad.dma[DMA_CS] & DMA_CS_ACTIVE) != 0) && ((ad.dma[DMA_CS] & DMA_CS_ERROR) == 0)) {
 		ad.dma_active = 1;
 	}
+	printf("rpi4-audio: dma start CS=0x%08x DEBUG=0x%08x advanced %u ring words in 20ms "
+		"(healthy ~900-1800; <= FIFO depth means the PWM never started)\n",
+		ad.dma[DMA_CS], ad.dma[DMA_DEBUG], ad.start_words);
 }
 
 
@@ -599,11 +635,15 @@ int main(int argc, char **argv)
 						"stalled (DMA not draining); /dev/audio0 is still served, but audio "
 						"may be silent. STA=0x%08x DMA_CS=0x%08x ring w=%u r=%u "
 						"CM_PWMCTL=0x%08x CM_PWMDIV=0x%08x PWM_CTL=0x%08x PWM_DMAC=0x%08x "
-						"RNG1=%u DAT1=%u STA+2ms=0x%08x\n",
+						"RNG1=%u DAT1=%u STA+2ms=0x%08x DEBUG=0x%08x CONBLK=0x%08x "
+						"SRC=0x%08x DEST=0x%08x LEN=%u NEXT=0x%08x start_words=%u\n",
 						fed, ad.pwm[PWM_STA], ad.dma[DMA_CS], ad.write_idx,
 						audio_ringReadIdx(), ad.cprman[CM_PWMCTL], ad.cprman[CM_PWMDIV],
 						ad.pwm[PWM_CTL], ad.pwm[PWM_DMAC], ad.pwm[PWM_RNG1],
-						ad.pwm[PWM_DAT1], (usleep(2000), ad.pwm[PWM_STA]));
+						ad.pwm[PWM_DAT1], (usleep(2000), ad.pwm[PWM_STA]),
+						ad.dma[DMA_DEBUG], ad.dma[DMA_CONBLK_AD], ad.dma[DMA_SOURCE_AD],
+						ad.dma[DMA_DEST_AD], ad.dma[DMA_TXFR_LEN_R], ad.dma[DMA_NEXTCONBK],
+						ad.start_words);
 				}
 				else {
 					printf("rpi4-audio: self-test ABORTED after %u samples — the PIO write "
