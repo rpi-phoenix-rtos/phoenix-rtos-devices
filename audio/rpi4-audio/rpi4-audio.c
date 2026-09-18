@@ -96,7 +96,14 @@ enum {
 #define CM_PASSWD   0x5a000000u
 #define CM_CTL_ENAB (1u << 4)
 #define CM_CTL_KILL (1u << 5)
+/* Bit 6 is not in the public BCM2835 peripherals doc. Linux names it CM_GATE and
+ * sets it on EVERY clock enable (drivers/clk/bcm/clk-bcm2835.c, bcm2835_clock_on:
+ * `ctl | CM_ENABLE | CM_GATE`), which is the only known-good driver for this block,
+ * so this one follows it. Our captures read CM_PWMCTL=0x91 -- bit 6 clear -- i.e. we
+ * were the only driver in the world not setting it. */
+#define CM_CTL_GATE (1u << 6)
 #define CM_CTL_BUSY (1u << 7)
+#define CM_SRC_MASK 0xfu
 #define CM_SRC_OSC  1u            /* BCM2711 crystal oscillator (54 MHz) */
 
 /* GPIO GPFSEL4 covers pins 40..49; GPIO40 = bits[2:0], GPIO41 = bits[5:3]. */
@@ -203,19 +210,44 @@ static void audio_gpioAlt0(void)
 }
 
 
-/* Bring up the CPRMAN PWM clock at DIVI from the oscillator. Returns 0 if the
- * clock reports BUSY (running) within the spin bound. */
+/* Bring up the CPRMAN PWM clock at DIVI from the oscillator. Returns 0 if the clock
+ * reports BUSY (running) within the spin bound.
+ *
+ * ⚠ The ORDER here is Linux's, not the obvious one, and the difference is a race.
+ * clk-bcm2835.c stops the generator, then writes CTL (source, still DISABLED), then
+ * DIV, and only afterwards sets ENAB in a SEPARATE read-modify-write — with the
+ * comment "we have to pause clock generation while updating the control and div regs"
+ * (bcm2835_clock_set_rate / bcm2835_clock_on). This driver used to change the SOURCE
+ * MUX and the ENABLE in ONE write, and write DIV before CTL: the generator's source
+ * and its enable then change on the same bus cycle, and what comes out depends on
+ * where that lands relative to the clock-domain crossing.
+ *
+ * ⓘ That is a candidate for the ~7% "enabled, clocked, FIFO fed, never transmits"
+ * stall (2026-09-18 captures) — all registers read back correct on a boot that fails,
+ * which is what a start-up race looks like — but it is NOT claimed as its cure. It is
+ * landed because conforming to the only known-good driver for this block is right
+ * either way, and because the rate of that stall is not settleable by short runs. */
 static int audio_clockInit(void)
 {
-	uint32_t spin;
+	uint32_t spin, ctl;
 
-	/* Stop the clock: clear ENAB (keep KILL low), wait for !BUSY. */
-	ad.cprman[CM_PWMCTL] = CM_PASSWD | (ad.cprman[CM_PWMCTL] & ~CM_CTL_ENAB);
+	/* Stop the generator before touching SRC or DIV (keep KILL low), wait for !BUSY. */
+	ctl = ad.cprman[CM_PWMCTL] & ~(CM_PASSWD | CM_CTL_ENAB);
+	ad.cprman[CM_PWMCTL] = CM_PASSWD | ctl;
 	for (spin = SPIN_MAX; spin && (ad.cprman[CM_PWMCTL] & CM_CTL_BUSY); spin--) {
 	}
+	if ((ad.cprman[CM_PWMCTL] & CM_CTL_BUSY) != 0) {
+		/* Reprogramming a generator that never stopped is the one case Linux's comment
+		 * warns about, so say so rather than doing it silently. */
+		printf("rpi4-audio: PWM clock still BUSY after disable (CM_PWMCTL=0x%08x) — "
+			"reprogramming a running generator\n", ad.cprman[CM_PWMCTL]);
+	}
 
+	/* Source while disabled, then the divider, then enable — three separate writes. */
+	ctl = (ad.cprman[CM_PWMCTL] & ~(CM_PASSWD | CM_CTL_ENAB | CM_SRC_MASK)) | CM_SRC_OSC;
+	ad.cprman[CM_PWMCTL] = CM_PASSWD | ctl;
 	ad.cprman[CM_PWMDIV] = CM_PASSWD | (PWM_CLK_DIVI << 12);
-	ad.cprman[CM_PWMCTL] = CM_PASSWD | CM_CTL_ENAB | CM_SRC_OSC;
+	ad.cprman[CM_PWMCTL] = CM_PASSWD | ctl | CM_CTL_ENAB | CM_CTL_GATE;
 
 	for (spin = SPIN_MAX; spin && !(ad.cprman[CM_PWMCTL] & CM_CTL_BUSY); spin--) {
 	}
@@ -634,8 +666,10 @@ int main(int argc, char **argv)
 	 * or was already set by the firmware/bootloader: 21 000 write trials on the
 	 * unused PWM0 instance raised BERR exactly 0 times, so our write PATTERN is
 	 * not what sets it. */
-	printf("rpi4-audio: entry PWM_STA=0x%08x PWM_CTL=0x%08x RNG1=%u (before any write of ours)\n",
-		ad.pwm[PWM_STA], ad.pwm[PWM_CTL], ad.pwm[PWM_RNG1]);
+	printf("rpi4-audio: entry PWM_STA=0x%08x PWM_CTL=0x%08x RNG1=%u CM_PWMCTL=0x%08x "
+		"CM_PWMDIV=0x%08x (before any write of ours)\n",
+		ad.pwm[PWM_STA], ad.pwm[PWM_CTL], ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL],
+		ad.cprman[CM_PWMDIV]);
 
 	/* P1 bring-up: GPIO ALT0, PWM clock, PWM engine. */
 	audio_gpioAlt0();
