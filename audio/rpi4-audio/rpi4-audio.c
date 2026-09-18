@@ -386,6 +386,7 @@ static ssize_t audio_write(const void *buf, size_t len)
 	const int16_t *s = buf;
 	size_t n = len / 2;   /* int16 samples */
 	size_t i;
+	int ring_dirty = 0;
 
 	/* Degraded mode: the engine would not stream and the driver said so at init. Accept
 	 * the data and drop it, but PACE the acceptance at the real playback rate — a sink
@@ -440,12 +441,23 @@ static ssize_t audio_write(const void *buf, size_t len)
 			}
 			ad.ring[ad.write_idx] = duty;
 			ad.write_idx = (ad.write_idx + 1u) % RING_WORDS;
+			ring_dirty = 1;
 		}
 		else if (audio_fifoPush(duty) != 0) {
 			ad.underruns++;
 			break;
 		}
 	}
+
+	/* Make the samples we just wrote visible to the DMA engine. Same Normal-NC
+	 * reasoning as audio_dmaArm(): these are ordinary stores to uncached memory that
+	 * an external master reads from DRAM, and nothing else here orders them. Once per
+	 * write() rather than per sample — the ring holds ~0.19 s of audio ahead of the
+	 * read cursor, so that is bounded latency, not a correctness gap. */
+	if (ring_dirty != 0) {
+		__asm__ volatile("dsb sy" ::: "memory");
+	}
+
 	return (ssize_t)(i * 2);
 }
 
@@ -612,6 +624,29 @@ static void audio_thread(void *arg)
 static int audio_dmaArm(void)
 {
 	uint32_t spins;
+
+	/* ⚠ Drain our stores into the uncached control block and ring to DRAM BEFORE the
+	 * first MMIO poke below. The CB and ring are Normal-NC (MAP_UNCACHED), the DMA
+	 * registers are Device, and aarch64 does not order the two against each other:
+	 * without this the engine can fetch the control block before our writes have
+	 * landed and follow whatever DRAM held — and MAP_CONTIGUOUS hands back memory
+	 * that is NOT zeroed (the same fact that fed the V3D binner-overflow-pool bug).
+	 * A garbage PERMAP alone would park the channel waiting for a DREQ that never
+	 * fires, which is the captured stall signature exactly.
+	 *
+	 * The window is once per boot — the CB is written in audio_dmaStart() and a
+	 * re-arm rewrites nothing — which matches what the probes measured: ~14 000 arms
+	 * of the same already-drained CB never parked.
+	 *
+	 * dsb, not dmb: completion is the requirement, because the DMA engine is a
+	 * non-coherent external master reading this straight from DRAM. Same reasoning
+	 * and same instruction as the V3D driver's submit path (gpu/rpi4-v3d/v3d_gpu.c,
+	 * "Drain CPU stores into uncached GPU BOs to DRAM BEFORE the first GPU MMIO poke").
+	 *
+	 * ⓘ NOT claimed as the cure for the stall: syscalls between the CB write and the
+	 * arm may already drain it incidentally on most boots. It is landed because
+	 * relying on an incidental barrier is a latent defect either way. */
+	__asm__ volatile("dsb sy" ::: "memory");
 
 	ad.pwm[PWM_DMAC] = PWM_DMAC_ENAB | (8u << 8) | (4u << 0);
 
