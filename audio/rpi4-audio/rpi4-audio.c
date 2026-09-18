@@ -155,6 +155,15 @@ enum {
 #define RING_WORDS      16384u
 #define RING_BYTES      (RING_WORDS * 4u)
 
+/* A started channel is one that makes PROGRESS. The ring plays free-running silence,
+ * so across the 20 ms arm settle a healthy channel walks SOURCE_AD ~900-1800 words
+ * (one FIFO word per channel per range period) while the stall signature — ACTIVE,
+ * DREQ_STOPPED, FIFO fed, PWM not transmitting — moves at most the FIFO depth (16).
+ * The threshold sits far below either healthy estimate and far above the FIFO, so it
+ * cannot fire on a merely slow boot. */
+#define DMA_START_MIN_WORDS  64u
+#define DMA_ARM_TRIES        3u
+
 /* DMA control block (32 bytes, 256-bit aligned) — the legacy-DMA descriptor. */
 typedef struct {
 	uint32_t ti;
@@ -177,6 +186,10 @@ static struct {
 	int dma_active;                /* streaming DMA running -> ring path; else PIO */
 	uint32_t underruns;
 	uint32_t start_words;          /* ring words the DMA consumed during the start settle */
+	uintptr_t cb_pa;               /* control-block physical base (re-arm needs it) */
+	int null_sink;                 /* engine will not stream -> accept+drop at playback rate */
+	uint32_t stalls;               /* write paths that timed out on a non-draining engine */
+	uint32_t recoveries;           /* successful re-arms */
 } ad;
 
 
@@ -313,11 +326,25 @@ static uint32_t audio_ringReadIdx(void)
  * Either way we return the bytes *actually consumed* (len on success, a short count
  * only if the engine is genuinely stuck), so a userspace feeder (the Quakespasm
  * SNDDMA backend) advances its play cursor by exactly what was queued. */
+static int audio_dmaArm(void);
+
+
 static ssize_t audio_write(const void *buf, size_t len)
 {
 	const int16_t *s = buf;
 	size_t n = len / 2;   /* int16 samples */
 	size_t i;
+
+	/* Degraded mode: the engine would not stream and the driver said so at init. Accept
+	 * the data and drop it, but PACE the acceptance at the real playback rate — a sink
+	 * that returns instantly turns the caller's audio thread into a spin loop that
+	 * starves the render threads, which on this port means a game that runs worse with
+	 * broken audio than with none. Silent audio is survivable; a blocked open() is the
+	 * defect this replaces (KNOWN-ISSUES q2-sdl-openaudio-hang). */
+	if (ad.null_sink != 0) {
+		usleep((unsigned int)(((uint64_t)n * 500000u) / AUDIO_RATE));
+		return (ssize_t)len;
+	}
 
 	for (i = 0; i < n; i++) {
 		uint32_t duty = (uint32_t)(((int32_t)s[i] + 32768) * (int32_t)PWM_RANGE / 65536);
@@ -332,6 +359,30 @@ static ssize_t audio_write(const void *buf, size_t len)
 				usleep(500);
 				if (++waits > 20000u) {   /* ~10 s with no drain -> DMA stuck */
 					ad.underruns++;
+					ad.stalls++;
+					/* Mid-stream stall. Never observed (all three 2026-09-18 captures were
+					 * at 0 samples, i.e. at init), so this does exactly what the init path
+					 * does and no more: one re-arm, then degrade. */
+					printf("rpi4-audio: write STALLED ~10s with no drain — CS=0x%08x "
+						"DEBUG=0x%08x STA=0x%08x CTL=0x%08x RNG1=%u CM_PWMCTL=0x%08x; "
+						"re-arming\n",
+						ad.dma[DMA_CS], ad.dma[DMA_DEBUG], ad.pwm[PWM_STA],
+						ad.pwm[PWM_CTL], ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL]);
+					ad.dma[DMA_CS] = 0;
+					audio_pwmInit();
+					if (audio_dmaArm() == 0) {
+						ad.recoveries++;
+						printf("rpi4-audio: engine RECOVERED after the stall (advanced %u "
+							"words in 20ms) — the parked channel is re-armable\n",
+							ad.start_words);
+					}
+					else {
+						ad.dma_active = 0;
+						ad.null_sink = 1;
+						printf("rpi4-audio: engine did NOT recover (advanced %u words) — "
+							"/dev/audio0 degrades to a paced null sink; a PWM re-init does "
+							"not reach whatever state this is\n", ad.start_words);
+					}
 					return (ssize_t)(i * 2);
 				}
 			}
@@ -420,9 +471,40 @@ static void audio_thread(void *arg)
  * is pre-filled with mid-scale (silence). audio_write() then fills it ahead of the
  * read cursor. On success sets ad.dma_active so the write path uses the ring; on any
  * failure leaves it 0 so audio_write() falls back to the PIO FIFO push. */
+/* Arm — or RE-arm — the streaming DMA on the already-allocated ring and control block,
+ * and answer whether the channel is actually STREAMING rather than merely ACTIVE.
+ * Allocates nothing and remaps nothing, so it is safe to call again after a failure. */
+static int audio_dmaArm(void)
+{
+	uint32_t spins, start_word;
+
+	ad.pwm[PWM_DMAC] = PWM_DMAC_ENAB | (8u << 8) | (4u << 0);
+
+	ad.dma[DMA_CS] = DMA_CS_RESET;
+	for (spins = 10000u; spins && (ad.dma[DMA_CS] & DMA_CS_RESET); spins--) {
+	}
+	ad.dma[DMA_DEBUG] = DMA_DBG_ERRORS;   /* W1C anything the engine had latched */
+	ad.dma[DMA_CONBLK_AD] = DRAM_BUS(ad.cb_pa);
+	ad.write_idx = 0;
+	ad.dma[DMA_CS] = DMA_CS_ACTIVE;
+
+	/* ⚠ ACTIVE with no ERROR is NOT a started channel: DMA_CS=0x21 is
+	 * ACTIVE|DREQ_STOPPED, exactly the signature of the stall captured three times on
+	 * 2026-09-18 — a channel parked waiting for a DREQ the PWM never raises. So measure
+	 * PROGRESS instead, and sample it on EVERY boot (not only the ~7% that stall) so the
+	 * figure is a continuous measurement rather than a once-in-fourteen-boots capture.
+	 * usleep gives a real settle delay — a bare empty spin loop can be optimized away. */
+	start_word = audio_ringWordRaw();
+	usleep(20000);
+	ad.start_words = (audio_ringWordRaw() - start_word + RING_WORDS) % RING_WORDS;
+
+	return (ad.start_words >= DMA_START_MIN_WORDS) ? 0 : -1;
+}
+
+
 static void audio_dmaStart(void)
 {
-	uint32_t i, spins, start_word;
+	uint32_t i, attempt;
 	dma_cb_t *cb;
 	uintptr_t cb_pa;
 
@@ -450,6 +532,7 @@ static void audio_dmaStart(void)
 	ad.ring_pa = (uintptr_t)va2pa((void *)ad.ring);
 
 	cb_pa = (uintptr_t)va2pa(cb);
+	ad.cb_pa = cb_pa;
 
 	/* The 0xC0000000 legacy DMA alias only reaches the low 1 GB. If either buffer
 	 * landed at/above 1 GB (possible on a 2/4/8 GB Pi 4), DRAM_BUS() would truncate
@@ -474,34 +557,45 @@ static void audio_dmaStart(void)
 	cb->nextconbk = DRAM_BUS(cb_pa);   /* self-chain -> loop the ring forever */
 	cb->pad[0] = cb->pad[1] = 0;
 
-	ad.pwm[PWM_DMAC] = PWM_DMAC_ENAB | (8u << 8) | (4u << 0);
-
-	ad.dma[DMA_CS] = DMA_CS_RESET;
-	for (spins = 10000u; spins && (ad.dma[DMA_CS] & DMA_CS_RESET); spins--) {
+	/* Arm, and if the channel parks instead of streaming, re-arm the PWM side and try
+	 * again. Whether a re-arm un-sticks it is itself the measurement the capture record
+	 * asked for: a channel that starts on attempt 2 was in a state a paced CTL/CLRF1
+	 * re-init can reach, which is a different defect from one that never starts. */
+	for (attempt = 1u; attempt <= DMA_ARM_TRIES; attempt++) {
+		if (audio_dmaArm() == 0) {
+			ad.dma_active = 1;
+			break;
+		}
+		printf("rpi4-audio: DMA NOT STREAMING on arm %u/%u — advanced %u ring words in 20ms "
+			"(want >= %u). CS=0x%08x DEBUG=0x%08x CONBLK=0x%08x SRC=0x%08x DEST=0x%08x "
+			"LEN=%u STA=0x%08x CTL=0x%08x DMAC=0x%08x RNG1=%u CM_PWMCTL=0x%08x; re-arming "
+			"the PWM\n",
+			attempt, DMA_ARM_TRIES, ad.start_words, DMA_START_MIN_WORDS,
+			ad.dma[DMA_CS], ad.dma[DMA_DEBUG], ad.dma[DMA_CONBLK_AD], ad.dma[DMA_SOURCE_AD],
+			ad.dma[DMA_DEST_AD], ad.dma[DMA_TXFR_LEN_R], ad.pwm[PWM_STA], ad.pwm[PWM_CTL],
+			ad.pwm[PWM_DMAC], ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL]);
+		ad.dma[DMA_CS] = 0;
+		audio_pwmInit();
 	}
-	ad.dma[DMA_CONBLK_AD] = DRAM_BUS(cb_pa);
-	ad.dma[DMA_CS] = DMA_CS_ACTIVE;
 
-	/* Let it run a moment, then confirm it stays ACTIVE with no error. usleep gives a
-	 * real settle delay — a bare empty spin loop can be optimized away (zero settle).
-	 *
-	 * ⚠ ACTIVE with no ERROR is NOT a started channel: DMA_CS=0x21 is
-	 * ACTIVE|DREQ_STOPPED, which is exactly the signature of the stall captured three
-	 * times on 2026-09-18 — a channel parked waiting for a DREQ the PWM never raises.
-	 * So measure PROGRESS instead: the ring is pre-filled with silence and plays
-	 * free-running, so a healthy channel walks SOURCE_AD ~900-1800 words in 20 ms
-	 * while the parked one moves at most the FIFO depth. Sampled on every boot (not
-	 * only the ~7% that stall) so the figure is a continuous measurement. */
-	start_word = audio_ringWordRaw();
-	usleep(20000);
-	ad.start_words = (audio_ringWordRaw() - start_word + RING_WORDS) % RING_WORDS;
-
-	if (((ad.dma[DMA_CS] & DMA_CS_ACTIVE) != 0) && ((ad.dma[DMA_CS] & DMA_CS_ERROR) == 0)) {
-		ad.dma_active = 1;
+	if (ad.dma_active == 0) {
+		/* Three arms and it still will not stream. Do NOT fall back to PIO: that path
+		 * spins on STA.FULL1, and a FIFO nothing drains is exactly what is wrong here, so
+		 * PIO would trade a 10 s block for a slower one. Degrade to a paced null sink —
+		 * the app opens /dev/audio0, runs at full speed and is silent. */
+		ad.null_sink = 1;
+		printf("rpi4-audio: engine would not stream in %u arms — /dev/audio0 degrades to a "
+			"PACED NULL SINK (writes accepted at the playback rate and dropped). Audio is "
+			"silent this boot; nothing blocks\n", DMA_ARM_TRIES);
 	}
-	printf("rpi4-audio: dma start CS=0x%08x DEBUG=0x%08x advanced %u ring words in 20ms "
-		"(healthy ~900-1800; <= FIFO depth means the PWM never started)\n",
-		ad.dma[DMA_CS], ad.dma[DMA_DEBUG], ad.start_words);
+	else {
+		if (attempt > 1u) {
+			ad.recoveries++;
+		}
+		printf("rpi4-audio: dma streaming on arm %u — advanced %u ring words in 20ms, "
+			"CS=0x%08x DEBUG=0x%08x\n",
+			attempt, ad.start_words, ad.dma[DMA_CS], ad.dma[DMA_DEBUG]);
+	}
 }
 
 
