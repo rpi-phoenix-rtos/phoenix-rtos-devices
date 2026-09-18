@@ -2369,9 +2369,24 @@ static int ioc_submit_tfu(struct drm_v3d_submit_tfu *t)
 #endif /* VKQ_CPU_TILE */
 
 	/* --- prologue: make the source coherent + translations fresh ---
-	 * Flush the MMU TLB so the just-created source/dest BOs are translated by their new PTEs,
-	 * then invalidate the slice caches + flush L2T so the TFU reads the source staging buffer
-	 * from RAM rather than a stale cached view (mirror the ioc_submit_cl pre-bin sequence). */
+	 * Drain CPU stores into the uncached source BO *and* the page tables to DRAM BEFORE the
+	 * first GPU MMIO poke below (aarch64 Normal-NC vs Device ordering); MUST be dsb
+	 * (completion), not dmb — the TFU is a non-coherent external master reading both straight
+	 * from DRAM. Identical reasoning and instruction to the CL path's barrier above.
+	 *
+	 * ⚠ This was MISSING until 2026-09-18, and the CL path's own comment made it look covered:
+	 * it says "the TFU CPU-tile path already drains for the same reason (see the barrier in the
+	 * TFU submit)" — but that barrier lives inside `#ifdef VKQ_CPU_TILE`, which is OFF in
+	 * shipping builds and returns before the kick. So every shipping GL mipmap/blit
+	 * (v3d_blit.c) and every Vulkan image copy (v3dv_queue.c) kicked the TFU with nothing
+	 * ordering the source texels or the fresh PTEs against the register writes. A slip here
+	 * shows as a garbage or zeroed texture level, or a TFU fault — not as a binner wedge.
+	 *
+	 * Then flush the MMU TLB so the just-created source/dest BOs are translated by their new
+	 * PTEs, and invalidate the slice caches + flush L2T so the TFU reads the source staging
+	 * buffer from RAM rather than a stale cached view (mirrors the ioc_submit_cl pre-bin
+	 * sequence). */
+	__asm__ volatile("dsb sy" ::: "memory");
 	mmu_flush_tlb(h);
 	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;
 	l2t_flush_wait(c0);                        /* prior L2T flush must be idle (GFXH-1897) */

@@ -1308,6 +1308,10 @@ static int ioc_submit_tfu(struct drm_v3d_submit_tfu *t)
 
 	/* --- prologue: make the source coherent + translations fresh (mirror the CL pre-bin
 	 * sequence): flush MMU TLB, invalidate slice caches, flush L2T + WAIT. --- */
+	/* Same Normal-NC vs Device ordering as the CL path at ioc_submit_cl(): drain CPU stores
+	 * into the uncached source BO and the page tables before the first GPU MMIO poke. This
+	 * path had no barrier until 2026-09-18. dsb, not dmb: the TFU reads DRAM directly. */
+	__asm__ volatile("dsb sy" ::: "memory");
 	mmu_flush_tlb(h);
 	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;
 	l2t_flush_wait(c0);                        /* prior L2T flush must be idle (GFXH-1897) */
