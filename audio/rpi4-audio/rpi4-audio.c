@@ -454,6 +454,16 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* What the block looks like BEFORE we touch it. The ready line below reports
+	 * STA=0x102 on every boot, and bit 8 of PWM_STA is BERR (a bus error latched
+	 * when a register write does not take) -- bit 9 is STA1, which is the mistake
+	 * to avoid here. Printing the entry value settles whether that BERR is OURS
+	 * or was already set by the firmware/bootloader: 21 000 write trials on the
+	 * unused PWM0 instance raised BERR exactly 0 times, so our write PATTERN is
+	 * not what sets it. */
+	printf("rpi4-audio: entry PWM_STA=0x%08x PWM_CTL=0x%08x RNG1=%u (before any write of ours)\n",
+		ad.pwm[PWM_STA], ad.pwm[PWM_CTL], ad.pwm[PWM_RNG1]);
+
 	/* P1 bring-up: GPIO ALT0, PWM clock, PWM engine. */
 	audio_gpioAlt0();
 	clkok = audio_clockInit();
@@ -470,9 +480,13 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
-	printf("rpi4-audio: PWM1 jack @ 0x%08x, clk %s (CM_PWMCTL=0x%08x, ~%u Hz), PWM_CTL=0x%08x STA=0x%08x; /dev/audio0 ready\n",
+	/* RNG1 is on this line deliberately: a channel whose PERIOD never took is
+	 * enabled, clocked and fed while consuming nothing, which is the one
+	 * explanation still standing for the stall captured 3x on 2026-09-18. Printing
+	 * it here samples it on EVERY boot instead of only on the ~7% that stall. */
+	printf("rpi4-audio: PWM1 jack @ 0x%08x, clk %s (CM_PWMCTL=0x%08x, ~%u Hz), PWM_CTL=0x%08x STA=0x%08x RNG1=%u (want %u); /dev/audio0 ready\n",
 		PWM1_BASE, clkok == 0 ? "BUSY" : "FAILED", ad.cprman[CM_PWMCTL], AUDIO_RATE,
-		ad.pwm[PWM_CTL], ad.pwm[PWM_STA]);
+		ad.pwm[PWM_CTL], ad.pwm[PWM_STA], ad.pwm[PWM_RNG1], PWM_RANGE);
 
 	/* Start the free-running streaming DMA (preferred write path). Falls back to PIO
 	 * inside audio_write() if the DMA didn't come up. */
