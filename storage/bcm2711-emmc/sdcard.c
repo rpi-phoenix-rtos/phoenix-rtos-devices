@@ -74,7 +74,7 @@
  * the capability register advertises ADMA2, which it does here (caps bit 19). No
  * in-tree driver programs SDHCI SDMA on a BCM2711, so SDMA is the less-tested path
  * of the two despite being the simpler one. */
-#define SDCARD_DMA_ADMA2 1
+#define SDCARD_DMA_ADMA2 0
 
 /* ADMA2 32-bit descriptor (SD Host Controller spec; matches Linux's
  * struct sdhci_adma2_32_desc). Eight bytes: attribute, length, 32-bit address. */
@@ -935,22 +935,19 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 				uint32_t dst = 0;
 				long dspin;
 
-				/* Try the Transfer-Complete interrupt first: it SLEEPS, where the
-				 * present-state loop below burns tens of thousands of MMIO reads per
-				 * transfer (measured dspin 14 765-123 376 for a 128 KiB write), which
-				 * is a large part of why SDMA writes benchmarked SLOWER than PIO.
-				 *
-				 * The comment that TC "is unreliable for DMA on this controller"
-				 * predates the Auto-CMD12 -> CMD23 change (Auto-CMD12's trailing R1b
-				 * STOP is what suppressed it) and was never re-measured after it; the
-				 * dspin probe shows intr=0x22, i.e. bit 1 TC latched, on a DMA write.
-				 * But it is not latched on EVERY sample, so this is best-effort: on a
-				 * timeout we fall through to the present-state poll, which is the
-				 * behaviour that has always worked. Correctness cannot regress. */
-				if (_sdio_cmdExecutionWait(host, SDHOST_INTR_TRANSFER_DONE, 1000 * 1000) == 0) {
-					dst = *(host->base + SDHOST_REG_INTR_STATUS);
-				}
-
+				/* ⛔ DO NOT wait on Transfer-Complete here. Tried 2026-09-19 to replace
+				 * this present-state loop (which burns tens of thousands of MMIO reads
+				 * per transfer); it is REVERTED because it broke the first DMA read
+				 * after card init. Bisect: the `busaddr` and `dmarate` boots reported
+				 * `2 partition(s)`, the very next build -- identical but for that wait
+				 * -- reported `0 partition(s)`, and ~70% of boots then failed to find
+				 * the MBR across every data-path configuration, which takes the SD boot
+				 * lane down with it. _sdio_cmdExecutionWait rewrites INTR_SIGNAL_ENABLE
+				 * and sleeps on the ISR's condvar; doing that inside the DMA completion
+				 * path evidently disturbs the first transfer.
+				 * It also bought nothing measurable: 430 s vs 431 s on a benchmark that
+				 * was itself invalid (harness idle-waits). Not worth revisiting without
+				 * a much better reason than CPU spin. */
 				for (dspin = 0; dspin < 2000000; dspin++) {
 					dst = *(host->base + SDHOST_REG_INTR_STATUS);
 					if ((dst & SDHOST_ERROR_REASONS) != 0u) {
