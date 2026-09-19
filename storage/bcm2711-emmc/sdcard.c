@@ -51,12 +51,22 @@
 #define SDCARD_ENABLE_DDR50 1 /* UHS-I DDR50 1.8V (HW-validated ~1.6x read on netboot + SD-boot; HS50 fallback) */
 
 /* Write data path. 0 = PIO (the trusted default), 1 = SDMA.
- * ⛔ TESTED AND REVERTED 2026-09-19 — SDMA writes corrupt the data. Keep 0 until
+ * ⛔ REVERTED AGAIN 2026-09-19 (second time, different reason). DMA writes are
+ * now DATA-CORRECT -- the emmc2bus bus-address fix settled that, verified over
+ * several rounds on both SDMA and ADMA2. But with writes enabled the driver's
+ * PARTITION SCAN reports `0 partition(s)`, and an SD boot then dies with
+ * `root device /dev/mmcblk0p2 not found`. Same card content scans as 2 partitions
+ * with writes=PIO and 0 with writes=ADMA2, and the restored b95e983a card boots
+ * fine, so the regression is in this build, not the medium. The mechanism is NOT
+ * understood: the scan is a READ, and reads are identical in both configurations
+ * (`useDma` is unconditional for dir == sdio_read). Do not re-enable until that is
+ * explained -- the SD lane boots from this path.
+ * ⛔ Earlier note, superseded: SDMA writes corrupt the data. Keep 0 until
  * someone finishes the SDMA write bring-up; see _sdcard_transferBlocks for what the
  * measurement actually showed. This is the ONE place to flip it, and the
  * "data paths:" line printed at init reports what it resolved to, so a correctness
  * run can never be ambiguous about which path it exercised. */
-#define SDCARD_DMA_WRITES 1
+#define SDCARD_DMA_WRITES 0
 
 /* Data-transfer engine: 0 = SDMA (single contiguous buffer, 512 KiB boundary
  * hazard), 1 = ADMA2 32-bit (scatter-gather descriptor list). ADMA2 is what Linux
