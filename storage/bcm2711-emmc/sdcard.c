@@ -56,7 +56,7 @@
  * measurement actually showed. This is the ONE place to flip it, and the
  * "data paths:" line printed at init reports what it resolved to, so a correctness
  * run can never be ambiguous about which path it exercised. */
-#define SDCARD_DMA_WRITES 1
+#define SDCARD_DMA_WRITES 0
 
 /* CPU-physical -> emmc2bus BUS address (bcm2711.dtsi dma-ranges: bus 0xC0000000+X
  * covers CPU-phys X over the low 1 GiB). Mirrors rpi4-audio's DRAM_BUS() and the
