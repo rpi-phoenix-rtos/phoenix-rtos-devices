@@ -50,6 +50,14 @@
 #define SDCARD_ENABLE_DMA 1   /* SDMA read data path (HW-validated; reads only — writes use PIO, see the write path) */
 #define SDCARD_ENABLE_DDR50 1 /* UHS-I DDR50 1.8V (HW-validated ~1.6x read on netboot + SD-boot; HS50 fallback) */
 
+/* Write data path. 0 = PIO (the trusted default), 1 = SDMA.
+ * ⛔ TESTED AND REVERTED 2026-09-19 — SDMA writes corrupt the data. Keep 0 until
+ * someone finishes the SDMA write bring-up; see _sdcard_transferBlocks for what the
+ * measurement actually showed. This is the ONE place to flip it, and the
+ * "data paths:" line printed at init reports what it resolved to, so a correctness
+ * run can never be ambiguous about which path it exercised. */
+#define SDCARD_DMA_WRITES 0
+
 
 /* #154: bound on the CMD13 SEND_STATUS busy-poll that detects write completion
  * (mirrors Linux MMC_BLK_TIMEOUT_MS). The card normally returns to TRAN in well
@@ -1334,6 +1342,14 @@ static int sdcard_wideAndFast(sdcard_hostData_t *host)
 			*(host->base + SDHOST_REG_AUTOCMD12_ERROR_STATUS) = hc2;
 			sdio_dataBarrier();
 			printf("sdcard: UHS-I DDR50 @ 50 MHz DDR (1.8V)\n");
+			/* Say which data path each direction actually took. Without this the
+			 * write path is unobservable from a log, and a correctness test cannot
+			 * tell "DMA writes are broken" from "the build under test still has
+			 * them gated off" -- which is exactly the ambiguity this line was
+			 * added to remove (2026-09-19). */
+			printf("sdcard: data paths: reads=%s writes=%s\n",
+				host->useDma ? "SDMA" : "PIO",
+				(host->useDma && (SDCARD_DMA_WRITES != 0)) ? "SDMA" : "PIO");
 			usleep(10);
 			if (sdio_cmdSendEx(host, SDIO_ACMD13_SD_STATUS, 0, NULL, false, NULL) < 0) {
 				LOG_ERROR("DDR50 verify failed");
@@ -1619,13 +1635,28 @@ static int _sdcard_transferBlocks(sdcard_hostData_t *host, sdio_dir_t dir, uint3
 	 *    buffer when 4-byte aligned (Linux sg_miter style, no staging copy), else
 	 *    via the staging buffer.
 	 * len is bounded by SDCARD_MAX_TRANSFER upstream (fits the staging buffer). */
-	/* DMA READS ONLY. DMA reads are validated correct (0 silent-corrupt vs the PIO
-	 * oracle, clean large-read) and DDR50-fast. DMA *writes* show intermittent
-	 * first-block silent corruption that survived both a poll-idle completion and a
-	 * `dsb` drain barrier — a write-DMA quirk on this controller — so writes stay on
-	 * the trusted PIO path (100% correct; ~13 MB/s at the DDR50 clock). Reads are the
-	 * headline win; correct DMA writes are a separate investigation. */
-	bool useDma = host->useDma && (dir == sdio_read);
+	/* DMA reads are validated correct (0 silent-corrupt vs the PIO oracle) and
+	 * DDR50-fast. DMA *writes* were disabled here for intermittent first-block silent
+	 * corruption (firstBadBlk=0, ~1-2/10), recorded as "a write-DMA quirk on this
+	 * controller".
+	 *
+	 * ⛔ TESTED 2026-09-19 — the store-ordering explanation is REFUTED, and the
+	 * recorded symptom is wrong. The submit barrier was `dmb sy` (ordering) where a
+	 * non-coherent external master reading Normal-NC DRAM needs `dsb` (completion);
+	 * that was a genuine defect and is fixed (sdio_submitBarrier), the identical
+	 * hazard having been measured on this SoC at 146/5000 on the DMA control-block
+	 * path. It is NOT what breaks SDMA writes: with `writes=SDMA` confirmed in the
+	 * init log and the `dsb` in place, an 8 MiB write to a scratch offset read back
+	 * corrupt on every attempt.
+	 * ⚠ And the corruption is NOT "first block, ~1-2/10" as recorded below. It is
+	 * whole-transfer and every time: head and tail MiB both wrong, and a THIRD
+	 * distinct checksum each run for identical input. So writes land, but the data is
+	 * wrong throughout -- which looks less like a subtle race than like the SDMA
+	 * write path never having been finished.
+	 * ⏭ Next, if anyone resumes this: single-block vs multi-block. A 512 B write that
+	 * is correct while a 128 KiB one is not would localise it to the multi-block or
+	 * boundary handling; both wrong points at the basic write setup. */
+	bool useDma = host->useDma && ((dir == sdio_read) || (SDCARD_DMA_WRITES != 0));
 	void *xferBuf;
 	bool bounce;
 	if (useDma) {
