@@ -58,6 +58,34 @@
  * run can never be ambiguous about which path it exercised. */
 #define SDCARD_DMA_WRITES 0
 
+/* Data-transfer engine: 0 = SDMA (single contiguous buffer, 512 KiB boundary
+ * hazard), 1 = ADMA2 32-bit (scatter-gather descriptor list). ADMA2 is what Linux
+ * actually runs on this silicon -- `sdhci_config_dma` ORs SDHCI_CTRL_ADMA32 whenever
+ * the capability register advertises ADMA2, which it does here (caps bit 19). No
+ * in-tree driver programs SDHCI SDMA on a BCM2711, so SDMA is the less-tested path
+ * of the two despite being the simpler one. */
+#define SDCARD_DMA_ADMA2 1
+
+/* ADMA2 32-bit descriptor (SD Host Controller spec; matches Linux's
+ * struct sdhci_adma2_32_desc). Eight bytes: attribute, length, 32-bit address. */
+typedef struct {
+	uint16_t attr;
+	uint16_t len;
+	uint32_t addr;
+} __attribute__((packed, aligned(4))) sdcard_adma2Desc_t;
+
+#define ADMA2_ATTR_VALID 0x0001u /* descriptor is valid */
+#define ADMA2_ATTR_END   0x0002u /* last descriptor of the list */
+#define ADMA2_ATTR_INT   0x0004u /* raise the DMA interrupt when consumed */
+#define ADMA2_ATTR_TRAN  0x0020u /* Act = 10b: transfer the data this entry names */
+
+/* One descriptor per chunk. 32 KiB, deliberately not 64 KiB: the length field is
+ * 16-bit and the spec encodes 65536 as a written 0, which Linux notes some
+ * controllers do not implement (sdhci.c "not support 'zero means 65536'"). Staying
+ * under 64 KiB keeps every length explicit. 128 KiB max transfer / 32 KiB = 4. */
+#define ADMA2_CHUNK_MAX  (32u * 1024u)
+#define ADMA2_MAX_DESCS  ((SDCARD_MAX_TRANSFER / ADMA2_CHUNK_MAX) + 2u)
+
 /* CPU-physical -> emmc2bus BUS address (bcm2711.dtsi dma-ranges: bus 0xC0000000+X
  * covers CPU-phys X over the low 1 GiB). Mirrors rpi4-audio's DRAM_BUS() and the
  * kernel's dtb_armToBus(). */
@@ -135,6 +163,10 @@ typedef struct {
 	 * BCM2711 emmc2bus dma-ranges window): enables the SDMA data path instead of the
 	 * CPU PIO FIFO loop. Set in sdhost_allocDMA. */
 	bool useDma;
+	/* ADMA2 descriptor list: CPU view and the DMA-reachable physical base. NULL when
+	 * the allocation failed or ADMA2 is compiled out, in which case SDMA is used. */
+	sdcard_adma2Desc_t *admaDesc;
+	addr_t admaDescPhys;
 
 	bool sdioInitialized;
 	bool isCDPinSupported;
@@ -229,6 +261,78 @@ static int sdhost_allocDMA(sdcard_hostData_t *host)
 #else
 	host->useDma = false;
 #endif
+
+	/* ADMA2 descriptor list. Uncached like the staging buffer -- the engine fetches
+	 * these from DRAM, so a cacheable list would need maintenance on every transfer.
+	 * One page is far more than ADMA2_MAX_DESCS * 8 bytes. It must satisfy the same
+	 * < 1 GiB reach as the data, and the controller requires the table to be
+	 * 4-byte aligned (Linux stipulates 8; a page start is both).
+	 *
+	 * On any failure we simply leave admaDesc NULL and fall back to SDMA, so ADMA2
+	 * can never turn a working transfer into a failed one at init. */
+	host->admaDesc = NULL;
+	host->admaDescPhys = 0;
+	if ((SDCARD_DMA_ADMA2 != 0) && host->useDma) {
+		void *d = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS, -1, 0);
+		if (d != MAP_FAILED) {
+			addr_t dphys = va2pa(d);
+			if (dphys < 0x40000000ul) {
+				host->admaDesc = (sdcard_adma2Desc_t *)d;
+				host->admaDescPhys = dphys;
+			}
+			else {
+				(void)munmap(d, _PAGE_SIZE);
+			}
+		}
+	}
+	return 0;
+}
+
+
+/* Build the ADMA2 descriptor list covering [phys, phys+len) and point the
+ * controller at it. Returns 0 if ADMA2 is armed, -1 to tell the caller to use SDMA.
+ *
+ * Every address handed to the engine is a BUS address (SDCARD_DRAM_BUS) -- the
+ * descriptor table's own base and each chunk inside it. Getting that wrong on the
+ * data address is precisely the defect that made SDMA writes corrupt, and ADMA2
+ * offers two more places to repeat it. */
+static int _sdio_admaArm(sdcard_hostData_t *host, addr_t phys, size_t len)
+{
+	unsigned int n = 0;
+	size_t off = 0;
+
+	if ((host->admaDesc == NULL) || (len == 0u)) {
+		return -1;
+	}
+
+	while (off < len) {
+		size_t chunk = len - off;
+		if (chunk > ADMA2_CHUNK_MAX) {
+			chunk = ADMA2_CHUNK_MAX;
+		}
+		if (n >= (ADMA2_MAX_DESCS - 1u)) {
+			return -1; /* would not fit: fall back rather than truncate the data */
+		}
+		host->admaDesc[n].attr = (uint16_t)(ADMA2_ATTR_VALID | ADMA2_ATTR_TRAN);
+		host->admaDesc[n].len = (uint16_t)chunk;
+		host->admaDesc[n].addr = SDCARD_DRAM_BUS(phys + off);
+		off += chunk;
+		n++;
+	}
+
+	/* Mark the last entry End so the engine stops there instead of running on into
+	 * whatever the page happens to contain. */
+	host->admaDesc[n - 1u].attr |= (uint16_t)ADMA2_ATTR_END;
+
+	/* Select ADMA2-32 in HOST_CONTROL (the DMA-select field is otherwise 00b =
+	 * SDMA), then point the engine at the list. */
+	uint32_t hc = *(host->base + SDHOST_REG_HOST_CONTROL);
+	hc &= ~(uint32_t)(0b11UL << 3);
+	hc |= (uint32_t)HOST_CONTROL_DMA_SELECT_ADMA32;
+	*(host->base + SDHOST_REG_HOST_CONTROL) = hc;
+	*(host->base + SDHOST_REG_ADMA_ADDR_1) = SDCARD_DRAM_BUS(host->admaDescPhys);
+
 	return 0;
 }
 
@@ -638,6 +742,21 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 					break;
 			}
 
+			/* ADMA2 when it is armed, SDMA otherwise. _sdio_admaArm programs
+			 * HOST_CONTROL's DMA-select and ADMA_ADDR_1 itself; if it declines
+			 * (no descriptor page, or the list would not fit) we fall through to
+			 * the SDMA path below, which is always valid. */
+			bool usedAdma = false;
+			if (_sdio_admaArm(host, host->dmaBufferPhys,
+					(size_t)blockCount * (size_t)blockLength) == 0) {
+				usedAdma = true;
+			}
+			else {
+				uint32_t hc = *(host->base + SDHOST_REG_HOST_CONTROL);
+				hc &= ~(uint32_t)(0b11UL << 3); /* back to SDMA (00b) */
+				*(host->base + SDHOST_REG_HOST_CONTROL) = hc;
+			}
+
 			/* BUS address, not CPU-physical. bcm2711.dtsi declares
 			 * `dma-ranges = <0x0 0xc0000000  0x0 0x00000000  0x40000000>` for the
 			 * emmc2bus: bus 0xC0000000+X maps CPU-phys X over the low 1 GiB. Linux
@@ -646,7 +765,9 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 			 * kernel has dtb_armToBus(). This driver was the only one handing the
 			 * engine a raw CPU-phys address. The buffer is guaranteed < 1 GiB by
 			 * sdhost_allocDMA, so the OR equals the documented addition. */
-			*(host->base + SDHOST_REG_SDMA_ADDRESS) = SDCARD_DRAM_BUS(host->dmaBufferPhys);
+			if (!usedAdma) {
+				*(host->base + SDHOST_REG_SDMA_ADDRESS) = SDCARD_DRAM_BUS(host->dmaBufferPhys);
+			}
 			sdio_dataBarrier();
 			/* SDMA boundary = 512K (the max): our staging buffer is at most
 			 * SDCARD_MAX_TRANSFER (128K), so the transfer never crosses a boundary
@@ -853,6 +974,20 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 					sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
 					sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
 					return -EIO;
+				}
+				/* ADMA2 reports descriptor-list faults (bad length, invalid entry,
+				 * a fetch error) in its own register, NOT in INTR_STATUS's generic
+				 * error bits -- so a malformed list can otherwise look like a clean
+				 * transfer. Cheap to read, and it names the failure. */
+				if (host->admaDesc != NULL) {
+					uint32_t aerr = *(host->base + SDHOST_REG_ADMA_ERROR_STATUS);
+					if ((aerr & 0x7u) != 0u) {
+						LOG_ERROR("ADMA2 error 0x%08x on cmd %d", (unsigned)aerr, cmd);
+						mutexUnlock(host->eventLock);
+						sdhost_reset(host, CLOCK_CONTROL_RESET_CMD);
+						sdhost_reset(host, CLOCK_CONTROL_RESET_DAT);
+						return -EIO;
+					}
 				}
 				/* Clear any (possibly-latched) Transfer-Complete so it cannot go stale
 				 * and prematurely satisfy a later command's wait. */
@@ -1398,9 +1533,12 @@ static int sdcard_wideAndFast(sdcard_hostData_t *host)
 			 * tell "DMA writes are broken" from "the build under test still has
 			 * them gated off" -- which is exactly the ambiguity this line was
 			 * added to remove (2026-09-19). */
-			printf("sdcard: data paths: reads=%s writes=%s\n",
-				host->useDma ? "SDMA" : "PIO",
-				(host->useDma && (SDCARD_DMA_WRITES != 0)) ? "SDMA" : "PIO");
+			{
+				const char *engine = (host->admaDesc != NULL) ? "ADMA2" : "SDMA";
+				printf("sdcard: data paths: reads=%s writes=%s\n",
+					host->useDma ? engine : "PIO",
+					(host->useDma && (SDCARD_DMA_WRITES != 0)) ? engine : "PIO");
+			}
 			usleep(10);
 			if (sdio_cmdSendEx(host, SDIO_ACMD13_SD_STATUS, 0, NULL, false, NULL) < 0) {
 				LOG_ERROR("DDR50 verify failed");
