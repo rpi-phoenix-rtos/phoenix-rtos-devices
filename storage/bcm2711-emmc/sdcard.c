@@ -803,6 +803,23 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 				uint32_t dmaActive = PRES_STATE_DAT_BUSY | PRES_STATE_DAT_LINE_ACTIVE;
 				uint32_t dst = 0;
 				long dspin;
+
+				/* Try the Transfer-Complete interrupt first: it SLEEPS, where the
+				 * present-state loop below burns tens of thousands of MMIO reads per
+				 * transfer (measured dspin 14 765-123 376 for a 128 KiB write), which
+				 * is a large part of why SDMA writes benchmarked SLOWER than PIO.
+				 *
+				 * The comment that TC "is unreliable for DMA on this controller"
+				 * predates the Auto-CMD12 -> CMD23 change (Auto-CMD12's trailing R1b
+				 * STOP is what suppressed it) and was never re-measured after it; the
+				 * dspin probe shows intr=0x22, i.e. bit 1 TC latched, on a DMA write.
+				 * But it is not latched on EVERY sample, so this is best-effort: on a
+				 * timeout we fall through to the present-state poll, which is the
+				 * behaviour that has always worked. Correctness cannot regress. */
+				if (_sdio_cmdExecutionWait(host, SDHOST_INTR_TRANSFER_DONE, 1000 * 1000) == 0) {
+					dst = *(host->base + SDHOST_REG_INTR_STATUS);
+				}
+
 				for (dspin = 0; dspin < 2000000; dspin++) {
 					dst = *(host->base + SDHOST_REG_INTR_STATUS);
 					if ((dst & SDHOST_ERROR_REASONS) != 0u) {
