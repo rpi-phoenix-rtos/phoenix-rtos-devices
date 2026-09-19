@@ -66,7 +66,7 @@
  * measurement actually showed. This is the ONE place to flip it, and the
  * "data paths:" line printed at init reports what it resolved to, so a correctness
  * run can never be ambiguous about which path it exercised. */
-#define SDCARD_DMA_WRITES 0
+#define SDCARD_DMA_WRITES 1
 
 /* Data-transfer engine: 0 = SDMA (single contiguous buffer, 512 KiB boundary
  * hazard), 1 = ADMA2 32-bit (scatter-gather descriptor list). ADMA2 is what Linux

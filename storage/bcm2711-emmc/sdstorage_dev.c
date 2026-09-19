@@ -525,9 +525,24 @@ static int sdstorage_addPartition(storage_t *parent, sdcard_partition_t part)
 static int sdstorage_checkMBR(unsigned int slot, sdcard_partition_t parts[4])
 {
 	mbr_t *mbr = &sdcard_common.mbr_temp;
-	if (sdcard_transferBlocks(slot, sdio_read, 0, mbr, SDCARD_BLOCKLEN) < 0) {
+	int mbrRet = sdcard_transferBlocks(slot, sdio_read, 0, mbr, SDCARD_BLOCKLEN);
+	if (mbrRet < 0) {
 		LOG_ERROR("mbr read failed");
 		return -EIO;
+	}
+
+	/* DIAGNOSTIC 2026-09-19: with SDCARD_DMA_WRITES on, this read comes back
+	 * either failing or not-an-MBR, and the SD lane then cannot find p2 -- even
+	 * though the read path is supposed to be byte-identical between the two
+	 * builds. Dump what actually landed so the failure can be classified:
+	 * all-zero = the transfer never wrote the buffer; plausible-but-wrong = we
+	 * read the wrong sector; correct-here-but-0-partitions = the parse is at
+	 * fault, not the transfer. */
+	{
+		const unsigned char *b8 = (const unsigned char *)mbr;
+		printf("sdcard: MBR probe ret=%d first8=%02x%02x%02x%02x%02x%02x%02x%02x sig=%02x%02x\n",
+			mbrRet, b8[0], b8[1], b8[2], b8[3], b8[4], b8[5], b8[6], b8[7],
+			b8[510], b8[511]);
 	}
 
 	if (mbr_deserialize(mbr) < 0) {
