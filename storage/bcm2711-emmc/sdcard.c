@@ -653,7 +653,10 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 	}
 
 	*(host->base + SDHOST_REG_CMD_ARGUMENT) = arg;
-	sdio_dataBarrier();
+	/* COMPLETION, not just ordering: the next store starts the engine, and for a
+	 * write the staging buffer it will read was filled by a memcpy into uncached
+	 * memory. `dmb` would only order the accesses, not wait for them to land. */
+	sdio_submitBarrier();
 	mutexLock(host->eventLock);
 	/* This register write starts command execution and must be done last */
 	*(host->base + SDHOST_REG_CMD) = cmdFrame.raw;
