@@ -74,7 +74,7 @@
  * the capability register advertises ADMA2, which it does here (caps bit 19). No
  * in-tree driver programs SDHCI SDMA on a BCM2711, so SDMA is the less-tested path
  * of the two despite being the simpler one. */
-#define SDCARD_DMA_ADMA2 0
+#define SDCARD_DMA_ADMA2 1
 
 /* ADMA2 32-bit descriptor (SD Host Controller spec; matches Linux's
  * struct sdhci_adma2_32_desc). Eight bytes: attribute, length, 32-bit address. */
