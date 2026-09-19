@@ -30,12 +30,19 @@ typedef struct {
 
 /* Repeat the driver's own DMA arm sequence `trials` times and report how many came
  * up PARKED (enabled, clocked, FIFO fed, not transmitting). This exists because the
- * stall behind KNOWN-ISSUES q2-sdl-openaudio-hang fires on ~7% of BOOTS, i.e. about
- * seven samples per hundred boots at 2.5 minutes each, while the userspace probes
- * that sample the same shape thousands of times per boot (tools/pwm-write-probe,
- * tools/pwm-dma-probe) necessarily run on PWM0 / DREQ 5 / channel 6 -- never on the
- * instance that actually fails. This is the only way to sample PWM1 / DREQ 1 /
- * channel 5 at that rate.
+ * stall behind KNOWN-ISSUES q2-sdl-openaudio-hang fires on roughly 1 BOOT IN 41-70
+ * by two independent censuses -- so sampling it by rebooting costs hours -- while the
+ * userspace probes that sample the same shape thousands of times per boot
+ * (tools/pwm-write-probe, tools/pwm-dma-probe) necessarily run on PWM0 / DREQ 5 /
+ * channel 6, never on the instance that actually fails. This is the only way to
+ * sample PWM1 / DREQ 1 / channel 5 at that rate.
+ *
+ * ⓘ It answered its question: ~14 000 arms, including 4 000 on the real channel,
+ * produced 0 failures, so the defect is per-BOOT, not per-arm. Retained because it
+ * is still the only in-process sampler if the stall recurs -- but see TD-23: it is a
+ * permanent ABI in a published header, and it cannot observe a STALE control-block
+ * fetch, because a re-arm re-reads the same control block and stale bytes are then
+ * the right bytes.
  *
  * ⚠ It blocks the message loop for ~20 ms per trial and resets the streaming engine
  * on every one, so /dev/audio0 plays nothing while it runs. Diagnostic only. */
