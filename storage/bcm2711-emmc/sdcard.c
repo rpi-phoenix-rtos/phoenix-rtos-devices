@@ -56,7 +56,12 @@
  * measurement actually showed. This is the ONE place to flip it, and the
  * "data paths:" line printed at init reports what it resolved to, so a correctness
  * run can never be ambiguous about which path it exercised. */
-#define SDCARD_DMA_WRITES 0
+#define SDCARD_DMA_WRITES 1
+
+/* CPU-physical -> emmc2bus BUS address (bcm2711.dtsi dma-ranges: bus 0xC0000000+X
+ * covers CPU-phys X over the low 1 GiB). Mirrors rpi4-audio's DRAM_BUS() and the
+ * kernel's dtb_armToBus(). */
+#define SDCARD_DRAM_BUS(pa) (0xc0000000u | ((uint32_t)(pa) & 0x3fffffffu))
 
 
 /* #154: bound on the CMD13 SEND_STATUS busy-poll that detects write completion
@@ -547,7 +552,14 @@ static int _sdio_pollBusyCmd(sdcard_hostData_t *host, uint8_t cmd)
  * uncached staging buffer (used only by the small register-read path). */
 static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uint32_t *res, uint16_t blockCount, bool isLongResponse, void *dataBuf, bool useDma)
 {
-	sdhost_command_reg_t cmdFrame;
+	/* Zero it. The bitfield union leaves reserved1 (bit 3), reserved2 (15:6) and
+	 * reserved4 (31:30) unwritten, and autoCmd12Enable unwritten for single-block
+	 * commands. Bit 3 is Auto-CMD23, which is FORBIDDEN with SDMA on this controller
+	 * because ARGUMENT2 and DMA_ADDRESS are the same register (0x00) -- Linux gates it
+	 * off for SDMA-in-v3 for exactly that reason. Linux builds its transfer mode from
+	 * `u16 mode = 0`; _sdio_rawSendStatus and _sdio_setBlockCount here already zero
+	 * theirs. This one did not, so those bits were whatever the stack held. */
+	sdhost_command_reg_t cmdFrame = { .raw = 0 };
 
 	if (cmd >= MAX_SD_COMMANDS) {
 		return -EINVAL;
@@ -626,7 +638,15 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 					break;
 			}
 
-			*(host->base + SDHOST_REG_SDMA_ADDRESS) = host->dmaBufferPhys;
+			/* BUS address, not CPU-physical. bcm2711.dtsi declares
+			 * `dma-ranges = <0x0 0xc0000000  0x0 0x00000000  0x40000000>` for the
+			 * emmc2bus: bus 0xC0000000+X maps CPU-phys X over the low 1 GiB. Linux
+			 * applies that translation (dma-direct -> sdhci_sdma_address), and every
+			 * other DMA master in this tree does too -- rpi4-audio has DRAM_BUS(), the
+			 * kernel has dtb_armToBus(). This driver was the only one handing the
+			 * engine a raw CPU-phys address. The buffer is guaranteed < 1 GiB by
+			 * sdhost_allocDMA, so the OR equals the documented addition. */
+			*(host->base + SDHOST_REG_SDMA_ADDRESS) = SDCARD_DRAM_BUS(host->dmaBufferPhys);
 			sdio_dataBarrier();
 			/* SDMA boundary = 512K (the max): our staging buffer is at most
 			 * SDCARD_MAX_TRANSFER (128K), so the transfer never crosses a boundary
@@ -790,6 +810,20 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 					}
 					if ((*(host->base + SDHOST_REG_PRES_STATE) & dmaActive) == 0u) {
 						break;
+					}
+				}
+				/* H2 probe: a 128 KiB DDR50 transfer cannot complete in ~no spins. If
+				 * this reports dspin close to 0 the DAT-idle poll is not really
+				 * waiting, and the CMD13 that follows a write reconfigures the
+				 * controller (TRANSFER_BLOCK=0, transfer mode 0) underneath a live
+				 * SDMA transfer. Reads never do this -- they wait on Transfer-Complete. */
+				if (!pioRead) {
+					static int dmaWrSpinReports = 0;
+					if (dmaWrSpinReports < 3) {
+						dmaWrSpinReports++;
+						printf("sdcard: DMAWR blocks=%u dspin=%ld pres=0x%08x intr=0x%08x\n",
+							(unsigned)blockCount, dspin,
+							(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)dst);
 					}
 				}
 				if (((dst & SDHOST_ERROR_REASONS) != 0u) || ((*(host->base + SDHOST_REG_PRES_STATE) & dmaActive) != 0u)) {
