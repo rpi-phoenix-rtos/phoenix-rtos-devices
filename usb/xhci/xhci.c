@@ -834,7 +834,7 @@ static void xhci_roothubStatusThread(void *arg)
  * one of the two port sets. That is not an assumption -- it is what the bench
  * showed when the SS link was first left up: the stick vanished from the USB 2
  * hub the moment it trained at SuperSpeed. */
-#define XHCI_SUPERSPEED_ENUM_READY 0
+#define XHCI_SUPERSPEED_ENUM_READY 1
 
 
 /* Is this root port owned by the USB 3.x Supported Protocol entry? */
