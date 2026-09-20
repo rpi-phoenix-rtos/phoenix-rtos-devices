@@ -717,6 +717,16 @@ static void xhci_roothubStatusThread(void *arg)
 				continue;
 			}
 
+			/* Bulk completions belong to the submitting thread, which awaits
+			 * them inline (xhci_submitNormal). Polling them here too means both
+			 * consumers race for one event: whoever loses blocks until its own
+			 * timeout, which turned every transfer into a multi-second stall
+			 * and was SLOWER than the 1 ms poll this was meant to replace.
+			 * One owner per endpoint type. */
+			if (priv->endpointType != XHCI_EP_CTX_TYPE_INTERRUPT_IN) {
+				continue;
+			}
+
 			sleepUs = 1000u;
 			/* Single non-blocking poll of the shared event ring (locked,
 			 * stash-aware) for this interrupt endpoint's completion. The
@@ -2710,12 +2720,13 @@ static int xhci_submitNormal(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
 		(priv->endpointType == XHCI_EP_CTX_TYPE_BULK_OUT)) {
 		xhci_trb_t ev;
 
+		int ret;
+
 		if (xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, priv->pendingTrbPhys,
 				priv->slotId, priv->endpointId, XHCI_BULK_TIMEOUT_MS, &ev) == EOK) {
 			uint32_t completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
 				XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
 			uint32_t residual = ev.status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
-			int ret;
 
 			if ((residual <= t->size) &&
 				((completion == XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
@@ -2725,10 +2736,15 @@ static int xhci_submitNormal(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
 			else {
 				ret = -ENODEV;
 			}
-
-			priv->pendingTransfer = NULL;
-			usb_transferFinished(t, ret);
 		}
+		else {
+			/* Nobody else will finish this one -- the roothub poller skips bulk
+			 * now -- so fail it rather than leave the caller blocked forever. */
+			ret = -ETIMEDOUT;
+		}
+
+		priv->pendingTransfer = NULL;
+		usb_transferFinished(t, ret);
 	}
 
 	return 0;
