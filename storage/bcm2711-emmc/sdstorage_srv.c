@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/threads.h>
 #include <posix/utils.h>
 #include <signal.h>
@@ -161,6 +162,31 @@ static int storage_getAttr(id_t id, int type, long long *attr)
 }
 
 
+/* stat() on a storage device. Without this the server answered mtStat with the
+ * switch's default -ENOSYS, which surfaces to userspace as
+ * `cannot fstat '/dev/mmcblk0': Function not implemented` -- and any tool that
+ * stats its input before reading it (coreutils dd, cat, cp, ...) then failed on
+ * the card while busybox, which does not stat first, worked. That looked like a
+ * broken driver and was a missing message handler. */
+static void storage_stat(struct stat *st, const oid_t *oid)
+{
+	const storage_t *strg = storage_get(GET_STORAGE_ID(oid->id));
+
+	memset(st, 0, sizeof(*st));
+	st->st_dev = oid->port;
+	st->st_ino = (ino_t)oid->id;
+	st->st_rdev = oid->port;
+	st->st_mode = S_IFBLK | 0660;
+	st->st_nlink = 1;
+	st->st_blksize = SDCARD_BLOCKLEN;
+
+	if (strg != NULL) {
+		st->st_size = (off_t)strg->size;
+		st->st_blocks = (blkcnt_t)(strg->size / 512u);
+	}
+}
+
+
 static void sdcard_msgHandler(void *arg, msg_t *msg)
 {
 	storage_t *strg;
@@ -200,6 +226,16 @@ static void sdcard_msgHandler(void *arg, msg_t *msg)
 
 		case mtMountPoint:
 			msg->o.err = storage_mountpoint(storage_get(GET_STORAGE_ID(msg->oid.id)), &omnt->oid);
+			break;
+
+		case mtStat:
+			if ((msg->o.data == NULL) || (msg->o.size < sizeof(struct stat))) {
+				msg->o.err = -EINVAL;
+			}
+			else {
+				storage_stat(msg->o.data, &msg->oid);
+				msg->o.err = EOK;
+			}
 			break;
 
 		default:
