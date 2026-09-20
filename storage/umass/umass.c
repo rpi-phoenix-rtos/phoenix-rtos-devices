@@ -591,10 +591,23 @@ static int umass_writeToDev(umass_dev_t *dev, off_t offs, const char *buf, size_
 
 static int umass_getattr(umass_dev_t *dev, int type, long long int *attr)
 {
-	if (type != atSize)
-		return -EINVAL;
+	switch (type) {
+		case atSize:
+			*attr = (long long int)dev->part.sectors * UMASS_SECTOR_SIZE;
+			break;
 
-	*attr = dev->part.sectors * UMASS_SECTOR_SIZE;
+		case atMode:
+			/* umount() asks for this FIRST, to tell a mounted device from a
+			 * mountpoint (libphoenix sys/mount.c). Answering -EINVAL made
+			 * `umount /dev/umass0` fail with EINVAL on a perfectly good mount,
+			 * and there is no other way to release one -- umount() by
+			 * mountpoint is still an unimplemented TODO there. */
+			*attr = (long long int)(S_IFBLK | 0660);
+			break;
+
+		default:
+			return -EINVAL;
+	}
 
 	return EOK;
 }

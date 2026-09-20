@@ -155,6 +155,13 @@ static int storage_getAttr(id_t id, int type, long long *attr)
 			*attr = strg->size;
 			break;
 
+		case atMode:
+			/* Same gap umass had: umount() asks for atMode first to tell a
+			 * mounted device from a mountpoint, so answering -EINVAL makes
+			 * `umount /dev/mmcblk0` fail on a healthy mount. */
+			*attr = (long long)(S_IFBLK | 0660);
+			break;
+
 		default:
 			return -EINVAL;
 	}
