@@ -7,7 +7,13 @@
 # ext2-on-USB-stick support. Was ia32-only; aarch64 (Pi 4) needs it too -- a USB
 # stick you cannot mount is not much use, and libext2 is already built for this
 # target (it backs the SD card's ext2 root).
-ifneq ($(filter ia32 aarch64,$(TARGET_FAMILY)),)
+#
+# NOTE the wildcard. TARGET_FAMILY is the first dash-separated field of TARGET
+# (Makefile.common), so for aarch64a72-generic-rpi4b it is `aarch64a72`, NOT
+# `aarch64`. A plain `filter ia32 aarch64` silently matched nothing here: the
+# port built, the driver ran, and the only symptom was `mount` returning ENOENT
+# because umass_init never registered the ext2 filesystem it was meant to.
+ifneq ($(filter ia32 aarch64%,$(TARGET_FAMILY)),)
 	UMASS_LIBS := libext2
 	UMASS_CFLAGS := -DUMASS_MOUNT_EXT2
 endif
