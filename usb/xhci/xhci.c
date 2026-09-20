@@ -174,8 +174,16 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_TRB_CONTROL_C       (1u << 0)
 #define XHCI_TRB_CONTROL_TRB_TYPE__SHIFT 10u
 #define XHCI_TRANSFER_TRB_CONTROL_ISP (1u << 2)
+#define XHCI_TRANSFER_TRB_CONTROL_CH (1u << 4)
 #define XHCI_TRANSFER_TRB_CONTROL_IOC (1u << 5)
 #define XHCI_TRANSFER_TRB_CONTROL_IDT (1u << 6)
+#define XHCI_TRANSFER_TRB_STATUS_TD_SIZE__SHIFT 17u
+/* TRB Transfer Length is a 17-bit field; keep a round cap well inside it so a
+ * single TRB can never be asked to describe more than it can express. */
+#define XHCI_TRB_MAX_TRANSFER_LEN 65536u
+/* Worst case one TRB per page, plus slack. A bulk transfer here is at most
+ * USB_BUF_SIZE-backed (the framework's own DMA allocator), so this is generous. */
+#define XHCI_MAX_TRBS_PER_TD 34u
 #define XHCI_TRANSFER_TRB_CONTROL_DIR_IN (1u << 16)
 #define XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT 16u
 #define XHCI_TRANSFER_TRB_CONTROL_TRT_NONE 0u
@@ -228,6 +236,8 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_EP_CTX_CERR__SHIFT  1u
 #define XHCI_EP_CTX_TYPE__SHIFT  3u
 #define XHCI_EP_CTX_TYPE_CONTROL 4u
+#define XHCI_EP_CTX_TYPE_BULK_OUT 2u
+#define XHCI_EP_CTX_TYPE_BULK_IN 6u
 #define XHCI_EP_CTX_TYPE_INTERRUPT_IN 7u
 #define XHCI_EP_CTX_INTERVAL__SHIFT 16u
 #define XHCI_EP_CTX_MAX_BURST__SHIFT 8u
@@ -375,7 +385,12 @@ typedef struct {
 	uint32_t ep0RingCount;
 	uint32_t ep0CycleState;   /* producer cycle state for the ep0 transfer ring */
 	uint32_t ep0Enqueue;      /* persistent ep0 producer index (xhci_ep0Push) */
-	struct xhci_pipePriv *interruptPriv; /* this slot's interrupt-IN pipe (NULL = none) */
+	/* Active non-ep0 pipes on this slot, indexed by xHCI endpoint id (DCI 2..31).
+	 * Was a single `interruptPriv`, which was enough while the only endpoints
+	 * this HCD configured were interrupt-IN and a device needed exactly one. A
+	 * mass-storage device needs bulk IN *and* bulk OUT live at the same time on
+	 * one slot, so a single slot-wide pointer cannot express it. */
+	struct xhci_pipePriv *pipes[XHCI_MAX_ENDPOINTS + 1u];
 } xhci_slot_t;
 
 
@@ -669,6 +684,7 @@ static void xhci_roothubStatusThread(void *arg)
 	uint32_t residual;
 	unsigned sleepUs;
 	unsigned s;
+	unsigned e;
 	int ret;
 
 	for (;;) {
@@ -682,13 +698,16 @@ static void xhci_roothubStatusThread(void *arg)
 			}
 		}
 
-		/* Poll every active interrupt-IN pipe once per pass. Each slot owns its
-		 * own pipe (slots[0] is the external hub's status-change ep; a device
-		 * behind a non-root hub uses its own slot). The shared event dispatcher
-		 * keys completions by (slot, endpoint), so each pipe must be awaited with
-		 * its own slotId — NOT a hardcoded slots[0]. */
+		/* Poll every active pipe on every slot once per pass — interrupt-IN and
+		 * bulk alike. Each slot owns its pipes (slots[0] is the external hub's
+		 * status-change ep; a device behind a non-root hub uses its own slot, and
+		 * a mass-storage device holds bulk IN and bulk OUT at once). The shared
+		 * event dispatcher keys completions by (slot, endpoint, TRB), so each pipe
+		 * must be awaited with its own slotId and endpointId — NOT a hardcoded
+		 * slots[0], and no longer one pipe per slot. */
 		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
-			priv = xhci->slots[s].interruptPriv;
+			for (e = 1u; e <= XHCI_MAX_ENDPOINTS; ++e) {
+			priv = xhci->slots[s].pipes[e];
 			if ((priv == NULL) || (priv->pendingTransfer == NULL)) {
 				continue;
 			}
@@ -716,6 +735,7 @@ static void xhci_roothubStatusThread(void *arg)
 
 				priv->pendingTransfer = NULL;
 				usb_transferFinished(t, ret);
+			}
 			}
 		}
 
@@ -2351,7 +2371,7 @@ static xhci_slot_t *xhci_slotForDev(xhci_t *xhci, usb_dev_t *dev)
 }
 
 
-static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
+static int xhci_initPipe(xhci_t *xhci, usb_pipe_t *pipe)
 {
 	xhci_input_ctx_t *input;
 	xhci_ep_ctx_t *epctx;
@@ -2360,6 +2380,7 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	xhci_pipePriv_t *priv;
 	xhci_slot_t *slot;
 	uint8_t endpointId;
+	uint8_t endpointType;
 	uint32_t interval;
 	int err;
 
@@ -2378,9 +2399,17 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	 * hub) has its own slot (xhci_slotForDev) with route string + TT already set
 	 * by Address Device, so its interrupt-IN endpoint is configured on that slot
 	 * the same way the hub's status endpoint is on slots[0]. */
-	if ((pipe->type != usb_transfer_interrupt) || (pipe->dir != usb_dir_in) ||
-		(pipe->dev->hub == NULL) ||
-		(pipe->dev->address == 0)) {
+	if ((pipe->dev->hub == NULL) || (pipe->dev->address == 0)) {
+		return -EINVAL;
+	}
+
+	if ((pipe->type == usb_transfer_interrupt) && (pipe->dir == usb_dir_in)) {
+		endpointType = XHCI_EP_CTX_TYPE_INTERRUPT_IN;
+	}
+	else if (pipe->type == usb_transfer_bulk) {
+		endpointType = (pipe->dir == usb_dir_in) ? XHCI_EP_CTX_TYPE_BULK_IN : XHCI_EP_CTX_TYPE_BULK_OUT;
+	}
+	else {
 		return -EINVAL;
 	}
 
@@ -2391,7 +2420,7 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 
 	/* The owning slot drives the Configure Endpoint command and the doorbell,
 	 * NOT a hardcoded slots[0]: the external hub maps to slots[0] (slotId 1),
-	 * a device behind a non-root hub to its own slot. Per-slot interruptPriv
+	 * a device behind a non-root hub to its own slot. Per-endpoint pipe
 	 * tracking lets a second interrupt pipe on a different slot coexist with
 	 * the hub's without clobbering it. */
 	slot = xhci_slotForDev(xhci, pipe->dev);
@@ -2404,7 +2433,7 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	priv->ringSize = XHCI_TRANSFER_RING_SIZE;
 	priv->slotId = slot->slotId;
 	priv->endpointId = endpointId;
-	priv->endpointType = XHCI_EP_CTX_TYPE_INTERRUPT_IN;
+	priv->endpointType = endpointType;
 	priv->ring = usb_allocAligned(priv->ringSize, XHCI_TRANSFER_RING_ALIGN);
 	if (priv->ring == NULL) {
 		free(priv);
@@ -2436,7 +2465,11 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	input->control.dropContextFlags = 1u << endpointId;
 
 	epctx = &input->device.ep[endpointId - 1u];
-	interval = xhci_convertInterval(pipe);
+	/* Interval and Max ESIT Payload describe a PERIODIC endpoint's bandwidth
+	 * reservation. A bulk endpoint is not scheduled, so both must be 0 -- a
+	 * non-zero Interval on a bulk ep is a Parameter Error from Configure
+	 * Endpoint on some controllers, and means nothing on the rest. */
+	interval = (endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) ? xhci_convertInterval(pipe) : 0u;
 	epctx->epState_mult_streams_interval = interval << XHCI_EP_CTX_INTERVAL__SHIFT;
 	epctx->cerr_type_burst_packet =
 		(3u << XHCI_EP_CTX_CERR__SHIFT) |
@@ -2444,8 +2477,15 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 		(0u << XHCI_EP_CTX_MAX_BURST__SHIFT) |
 		((uint32_t)pipe->maxPacketLen << XHCI_EP_CTX_MAX_PACKET__SHIFT);
 	epctx->trDequeuePtr = priv->ringPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS;
-	epctx->averageTrbLen_maxEsitPayload = 16u |
-		((uint32_t)pipe->maxPacketLen << XHCI_EP_CTX_MAX_ESIT_PAYLOAD__SHIFT);
+	if (endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) {
+		epctx->averageTrbLen_maxEsitPayload = 16u |
+			((uint32_t)pipe->maxPacketLen << XHCI_EP_CTX_MAX_ESIT_PAYLOAD__SHIFT);
+	}
+	else {
+		/* Average TRB Length is a scheduling hint only. The spec's own suggested
+		 * value for bulk is 3072; Max ESIT Payload stays 0 (non-periodic). */
+		epctx->averageTrbLen_maxEsitPayload = 3072u;
+	}
 
 	err = xhci_cmdConfigureEndpoint(xhci, slot, 0);
 	if (err < 0) {
@@ -2455,14 +2495,66 @@ static int xhci_initInterruptInPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	}
 
 	pipe->hcdpriv = priv;
-	slot->interruptPriv = priv;
-	fprintf(stderr, "xhci: interrupt-IN pipe ready slot=%u ep=%u maxpkt=%u\n",
+	slot->pipes[endpointId] = priv;
+	fprintf(stderr, "xhci: %s pipe ready slot=%u ep=%u maxpkt=%u\n",
+		(endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) ? "interrupt-IN" :
+			((endpointType == XHCI_EP_CTX_TYPE_BULK_IN) ? "bulk-IN" : "bulk-OUT"),
 		(unsigned)slot->slotId, (unsigned)endpointId, (unsigned)pipe->maxPacketLen);
 	return 0;
 }
 
 
-static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
+/* Split a virtually contiguous buffer into physically contiguous runs.
+ *
+ * A TRB's data pointer is a PHYSICAL address and the controller walks it
+ * linearly, so one TRB can only describe as much as is physically contiguous.
+ * The interrupt-IN path never had to care: its buffers are a few bytes. A bulk
+ * transfer is kilobytes and can straddle pages that are not adjacent in
+ * physical memory, which would silently read or write the wrong DRAM.
+ *
+ * Walks page by page, merging runs that happen to be adjacent, and caps each
+ * run at what the 17-bit TRB length field can express. Returns the number of
+ * runs, or -1 if the buffer needs more than `max`.
+ */
+static int xhci_bufferRuns(const void *buf, size_t size, uint64_t *phys, uint32_t *lens, unsigned max)
+{
+	uintptr_t va = (uintptr_t)buf;
+	size_t remaining = size;
+	unsigned n = 0u;
+
+	while (remaining > 0u) {
+		uintptr_t pageEnd = (va & ~((uintptr_t)_PAGE_SIZE - 1u)) + (uintptr_t)_PAGE_SIZE;
+		size_t chunk = (size_t)(pageEnd - va);
+		uint64_t pa;
+
+		if (chunk > remaining) {
+			chunk = remaining;
+		}
+
+		pa = (uint64_t)va2pa((void *)va);
+
+		if ((n > 0u) && ((phys[n - 1u] + (uint64_t)lens[n - 1u]) == pa) &&
+			(((uint64_t)lens[n - 1u] + (uint64_t)chunk) <= (uint64_t)XHCI_TRB_MAX_TRANSFER_LEN)) {
+			lens[n - 1u] += (uint32_t)chunk;
+		}
+		else {
+			if (n >= max) {
+				return -1;
+			}
+			phys[n] = pa;
+			lens[n] = (uint32_t)chunk;
+			n++;
+		}
+
+		va += chunk;
+		remaining -= chunk;
+	}
+
+	return (int)n;
+}
+
+
+static int xhci_submitNormal(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
 {
 	xhci_pipePriv_t *priv;
 	xhci_trb_t *ring;
@@ -2495,18 +2587,75 @@ static int xhci_submitInterruptIn(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *p
 	 * controller's dequeue cycle in step). Only one transfer is ever in flight
 	 * (pendingTransfer gates it), so producer and consumer advance in lock-step. */
 	{
-		uint32_t idx = priv->enqueue;
-		uint32_t pcs = (priv->cycleState != 0u) ? XHCI_TRB_CONTROL_C : 0u;
+		uint64_t runPhys[XHCI_MAX_TRBS_PER_TD];
+		uint32_t runLen[XHCI_MAX_TRBS_PER_TD];
+		uint32_t pcs;
+		uint32_t maxPacket;
+		size_t consumed;
+		int runs;
+		int i;
 
-		ring[idx].parameter = va2pa(t->buffer);
-		ring[idx].status = (uint32_t)t->size;
-		ring[idx].control = pcs |
-			XHCI_TRANSFER_TRB_CONTROL_IOC |
-			XHCI_TRANSFER_TRB_CONTROL_ISP |
-			(XHCI_TRB_TYPE_NORMAL << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
-		priv->pendingTrbPhys = priv->ringPhys + (uint64_t)idx * (uint64_t)XHCI_TRB_SIZE;
+		runs = xhci_bufferRuns(t->buffer, t->size, runPhys, runLen, XHCI_MAX_TRBS_PER_TD);
+		if (runs <= 0) {
+			return -EINVAL;
+		}
 
-		priv->enqueue++;
+		/* A TD must not be cut in half by the ring's trailing Link TRB. Rather
+		 * than chain across the link, wrap first when the whole TD does not fit
+		 * in the space left before it: the ring holds far more entries than a TD
+		 * needs, so the wasted tail is at most a few TRBs. */
+		if ((priv->enqueue + (uint32_t)runs) > (priv->ringCount - 1u)) {
+			pcs = (priv->cycleState != 0u) ? XHCI_TRB_CONTROL_C : 0u;
+			link = &ring[priv->ringCount - 1u];
+			link->parameter = priv->ringPhys;
+			link->status = 0u;
+			link->control = pcs |
+				XHCI_LINK_TRB_CONTROL_TC |
+				(XHCI_TRB_TYPE_LINK << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+			priv->enqueue = 0u;
+			priv->cycleState ^= 1u;
+		}
+
+		pcs = (priv->cycleState != 0u) ? XHCI_TRB_CONTROL_C : 0u;
+		maxPacket = (pipe->maxPacketLen != 0u) ? (uint32_t)pipe->maxPacketLen : 512u;
+		consumed = 0u;
+
+		for (i = 0; i < runs; ++i) {
+			uint32_t idx = priv->enqueue + (uint32_t)i;
+			int last = (i == (runs - 1));
+			uint32_t tdSize;
+			size_t rest;
+
+			consumed += (size_t)runLen[i];
+			rest = t->size - consumed;
+
+			/* TD Size is the number of packets still to come AFTER this TRB,
+			 * saturating at 31, and 0 on the last TRB of the TD (xHCI 4.11.2.4).
+			 * The controller uses it to size its own prefetch; a wrong value
+			 * shows up as a stalled or short transfer, not as an obvious error. */
+			if (last) {
+				tdSize = 0u;
+			}
+			else {
+				uint32_t pkts = (uint32_t)((rest + maxPacket - 1u) / maxPacket);
+				tdSize = (pkts > 31u) ? 31u : pkts;
+			}
+
+			ring[idx].parameter = runPhys[i];
+			ring[idx].status = runLen[i] | (tdSize << XHCI_TRANSFER_TRB_STATUS_TD_SIZE__SHIFT);
+			ring[idx].control = pcs |
+				(last ? (XHCI_TRANSFER_TRB_CONTROL_IOC | XHCI_TRANSFER_TRB_CONTROL_ISP) :
+					XHCI_TRANSFER_TRB_CONTROL_CH) |
+				(XHCI_TRB_TYPE_NORMAL << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT);
+
+			if (last) {
+				/* The transfer event points at the LAST TRB of the TD, which is
+				 * what xhci_eventAwait matches on. */
+				priv->pendingTrbPhys = priv->ringPhys + (uint64_t)idx * (uint64_t)XHCI_TRB_SIZE;
+			}
+		}
+
+		priv->enqueue += (uint32_t)runs;
 		if (priv->enqueue >= (priv->ringCount - 1u)) {
 			link = &ring[priv->ringCount - 1u];
 			link->parameter = priv->ringPhys;
@@ -3468,19 +3617,42 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 	/* Interrupt-IN endpoint on any addressed device hanging off a hub: the hub's
 	 * own status-change endpoint (slots[0]) AND a device behind a non-root hub
 	 * (the keyboard's HID endpoint, on its own slot). Per-slot interrupt pipes
-	 * (slot->interruptPriv) let both coexist; xhci_initInterruptInPipe derives
+	 * (slot->pipes[epid]) let both coexist; xhci_initPipe derives
 	 * the owning slot from pipe->dev and the roothub thread polls all slots. */
 	if ((xhci != NULL) &&
 		(pipe->dev->hub != NULL) &&
 		(pipe->dev->address != 0) &&
 		(t->type == usb_transfer_interrupt) &&
 		(t->direction == usb_dir_in)) {
-		err = xhci_initInterruptInPipe(xhci, pipe);
+		err = xhci_initPipe(xhci, pipe);
 		if (err < 0) {
 			return err;
 		}
 
-		return xhci_submitInterruptIn(xhci, t, pipe);
+		return xhci_submitNormal(xhci, t, pipe);
+	}
+
+	/* Bulk IN/OUT on any addressed device hanging off a hub -- USB mass storage
+	 * is the first consumer (its CBW/data/CSW all ride two bulk endpoints).
+	 *
+	 * This case did not exist: this dispatcher was grown one scenario at a time
+	 * and had only ever needed control and interrupt-IN, so a bulk transfer fell
+	 * through to -ENOSYS at the bottom. `usb_open()` still returned a valid pipe
+	 * for it, because the framework allocates the pipe and only the HCD knows the
+	 * endpoint was never configured -- so the failure surfaced as every
+	 * usb_transferBulk() failing on a healthy device, rather than as a refused
+	 * open. Both directions share one path; the endpoint context carries the
+	 * direction, so the TRBs do not. */
+	if ((xhci != NULL) &&
+		(pipe->dev->hub != NULL) &&
+		(pipe->dev->address != 0) &&
+		(t->type == usb_transfer_bulk)) {
+		err = xhci_initPipe(xhci, pipe);
+		if (err < 0) {
+			return err;
+		}
+
+		return xhci_submitNormal(xhci, t, pipe);
 	}
 
 	/* Addressed device BEHIND a non-root hub (the keyboard on its own slot):
@@ -3545,9 +3717,12 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 	 * by array position, not slotId, so don't index by priv->slotId here). */
 	{
 		unsigned s;
+		unsigned e;
 		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
-			if (xhci->slots[s].interruptPriv == priv) {
-				xhci->slots[s].interruptPriv = NULL;
+			for (e = 1u; e <= XHCI_MAX_ENDPOINTS; ++e) {
+				if (xhci->slots[s].pipes[e] == priv) {
+					xhci->slots[s].pipes[e] = NULL;
+				}
 			}
 		}
 	}
