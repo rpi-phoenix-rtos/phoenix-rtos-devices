@@ -1014,6 +1014,8 @@ static void _umass_devFree(umass_dev_t *dev)
 	 * forever on error, so destroying the port alone would have spun it. Hence
 	 * the explicit flag: set it, destroy the port to break the thread out of
 	 * msgRecv, then wait for it to acknowledge before touching the memory. */
+	/* idtree_remove is idempotent enough to call twice here: the unplug path
+	 * unlinks before dropping the lock, the alloc-failure paths have not. */
 	if (_umass_partUnmount(dev) < 0) {
 		/* Never observed; say so rather than free memory a live thread is
 		 * running on. Leaking one device struct beats corrupting the heap. */
@@ -1182,24 +1184,47 @@ static int umass_handleDeletion(usb_driver_t *drv, usb_deletion_t *del)
 	umass_dev_t *dev;
 	rbnode_t *node, *next;
 
-	mutexLock(umass_common.lock);
+	/* Tear each match down OUTSIDE umass_common.lock.
+	 *
+	 * _umass_devFree -> _umass_partUnmount sends a message whose completion path
+	 * runs fs->unmount() -> libext2 flush -> umass_write(), and umass_write()
+	 * takes this very lock. Holding it here would deadlock the driver against
+	 * itself on every unplug of a MOUNTED stick -- the same self-deadlock that
+	 * hung umount until it was root-caused.
+	 *
+	 * So: find one match and unlink it from the tree under the lock (which makes
+	 * it unreachable to anyone else), then drop the lock and tear it down.
+	 * Repeat until no matches remain. */
+	for (;;) {
+		umass_dev_t *victim = NULL;
 
-	node = lib_rbMinimum(umass_common.devices.root);
-	while (node != NULL) {
-		next = lib_rbNext(node);
+		mutexLock(umass_common.lock);
 
-		dev = lib_treeof(umass_dev_t, node, lib_treeof(idnode_t, linkage, node));
-		if (dev->instance.bus == del->bus && dev->instance.dev == del->dev &&
-				dev->instance.interface == del->interface) {
-			remove(dev->path);
-			fprintf(stderr, "umass: Device removed: %s\n", dev->path);
-			_umass_devFree(dev);
+		node = lib_rbMinimum(umass_common.devices.root);
+		while (node != NULL) {
+			next = lib_rbNext(node);
+
+			dev = lib_treeof(umass_dev_t, node, lib_treeof(idnode_t, linkage, node));
+			if ((dev->instance.bus == del->bus) && (dev->instance.dev == del->dev) &&
+					(dev->instance.interface == del->interface)) {
+				idtree_remove(&umass_common.devices, &dev->node);
+				victim = dev;
+				break;
+			}
+
+			node = next;
 		}
 
-		node = next;
-	}
+		mutexUnlock(umass_common.lock);
 
-	mutexUnlock(umass_common.lock);
+		if (victim == NULL) {
+			break;
+		}
+
+		remove(victim->path);
+		fprintf(stderr, "umass: Device removed: %s\n", victim->path);
+		_umass_devFree(victim);
+	}
 
 	return 0;
 }
