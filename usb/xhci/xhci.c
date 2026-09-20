@@ -117,12 +117,41 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_REG_OP_PORT_PORTSC_PP  (1u << 9)
 #define XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__SHIFT 10u
 #define XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__MASK  (0xfu << XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__SHIFT)
+#define XHCI_REG_OP_PORT_PORTSC_PIC__MASK  (0x3u << 14) /* Port Indicator Control */
 #define XHCI_REG_OP_PORT_PORTSC_CSC (1u << 17)
 #define XHCI_REG_OP_PORT_PORTSC_PEC (1u << 18)
+#define XHCI_REG_OP_PORT_PORTSC_WRC (1u << 19) /* USB3 only: Warm Port Reset Change */
 #define XHCI_REG_OP_PORT_PORTSC_OCC (1u << 20)
 #define XHCI_REG_OP_PORT_PORTSC_PRC (1u << 21)
+#define XHCI_REG_OP_PORT_PORTSC_PLC (1u << 22) /* USB3 only: Port Link State Change */
+#define XHCI_REG_OP_PORT_PORTSC_CEC (1u << 23) /* USB3 only: Port Config Error Change */
+#define XHCI_REG_OP_PORT_PORTSC_WAKE__MASK (0x7u << 25) /* WCE / WDE / WOE */
+#define XHCI_REG_OP_PORT_PORTSC_DR  (1u << 30) /* Device Removable (read-only) */
+#define XHCI_REG_OP_PORT_PORTSC_WPR (1u << 31) /* USB3 only: Warm Port Reset */
+/* Change bits worth waking the hub driver for. Deliberately NOT the full RW1C
+ * set: PLC fires on every U0<->U1/U2 link-power transition of an idle
+ * SuperSpeed port, which would turn the roothub poll into a busy loop. */
 #define XHCI_REG_OP_PORT_PORTSC_RW1C (XHCI_REG_OP_PORT_PORTSC_CSC | XHCI_REG_OP_PORT_PORTSC_PEC | \
 	XHCI_REG_OP_PORT_PORTSC_OCC | XHCI_REG_OP_PORT_PORTSC_PRC)
+/* Bits that survive a read-modify-write of PORTSC.
+ *
+ * PORTSC CANNOT be read-modify-written naively. Bit 1 (PED) is RW1CS --
+ * writing a 1 DISABLES the port -- and bits 17..23 are RW1C change bits that a
+ * write-back silently acknowledges. Feeding a port's own state back to it
+ * therefore turns the port off and eats its pending events. That is not
+ * theoretical: SetPortFeature(PORT_POWER) used to do exactly `portsc | PP`, and
+ * since a live SuperSpeed port reads PED=1, powering the ports at start-up
+ * DISABLED the already-trained USB 3 link on root port 2 (measured:
+ * 0x00281203 ccs=1 ped=1 speed=4 -> 0x00000280 ccs=0) and dropped the stick to
+ * its USB 2 personality behind the VL805's internal hub.
+ *
+ * Keep only the read-only status (CCS, OCA, Port Speed, DR) and the
+ * read-write-save controls (PLS, PP, PIC, WCE/WDE/WOE); zero PED, PR, WPR and
+ * every change bit. Mirrors Linux's xhci_port_state_to_neutral(). */
+#define XHCI_REG_OP_PORT_PORTSC_RO (XHCI_REG_OP_PORT_PORTSC_CCS | XHCI_REG_OP_PORT_PORTSC_OCA | \
+	XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__MASK | XHCI_REG_OP_PORT_PORTSC_DR)
+#define XHCI_REG_OP_PORT_PORTSC_RWS (XHCI_REG_OP_PORT_PORTSC_PLS__MASK | XHCI_REG_OP_PORT_PORTSC_PP | \
+	XHCI_REG_OP_PORT_PORTSC_PIC__MASK | XHCI_REG_OP_PORT_PORTSC_WAKE__MASK)
 #define XHCI_REG_RT_IR_ERSTSZ__MASK 0xffffu
 #define XHCI_REG_RT_IR_ERSTBA_LO__MASK 0xffffffc0u
 #define XHCI_REG_RT_IR_ERDP_LO_EHB (1u << 3)
@@ -420,6 +449,10 @@ typedef struct {
 	uint32_t nintrs;
 	uint32_t nslots;
 	uint32_t nports;
+	/* Root-port range owned by the USB 3.x Supported Protocol entry (0 = none
+	 * found). Learned in xhci_probeProtocols. */
+	unsigned ssPortLo;
+	unsigned ssPortHi;
 	/* Per-port (bit = port number) "connect announced" latch. A device
 	 * already attached before this controller's bring-up shows CCS=1 with
 	 * no fresh CSC change bit, so the change-bit-driven hub poll never
@@ -576,6 +609,14 @@ static inline void xhci_dbWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
 	 * Mirrors Linux xhci_ring_*_doorbell(), which wmb() before the DB write. */
 	__asm__ volatile("dsb sy" ::: "memory");
 	*reg = val;
+}
+
+
+/* Strip a PORTSC value down to the bits that are safe to write back. Always use
+ * this as the base of a read-modify-write -- see XHCI_REG_OP_PORT_PORTSC_RO. */
+static inline uint32_t xhci_portStateNeutral(uint32_t portsc)
+{
+	return portsc & (XHCI_REG_OP_PORT_PORTSC_RO | XHCI_REG_OP_PORT_PORTSC_RWS);
 }
 
 
@@ -765,19 +806,42 @@ static void xhci_roothubStatusThread(void *arg)
 }
 
 
-/* Walk the xHCI Extended Capabilities and report the Supported Protocol entries
- * plus every root port's current state.
+/* ONE switch for the whole SuperSpeed path.
  *
- * Why this exists: this driver has no concept of SuperSpeed. It defines port
- * speeds FULL/LOW/HIGH only, and never reads the Supported Protocol capability
- * -- the thing that says WHICH root ports are USB 2.x and which are USB 3.x. So
- * it drives every port as if it were USB 2, and a USB 3 stick in a blue Pi port
- * enumerates behind the VL805's internal USB 2.0 hub at High Speed
- * (bulk maxpkt 512 instead of 1024), capping it near 30 MB/s.
+ * 0 = SuperSpeed root ports are recognised but kept OFF, and hidden from the hub
+ * driver; every device reaches us through the VL805's internal USB 2.0 hub,
+ * which is the configuration this bench has been proven on.
+ * 1 = SuperSpeed root ports are left trained and enumerated as USB 3 devices.
  *
- * Print the facts before changing any of that: which port ranges each protocol
- * owns, and what each port has actually linked up as. Read-only. */
-static void xhci_dumpProtocols(xhci_t *xhci)
+ * Why an explicit switch rather than just "do the right thing": the two halves
+ * are not independently shippable. Measured on hardware (see
+ * docs/misc/2026-09-20-usb3-superspeed-gap.md), USB 2 enumeration on this board
+ * has only ever worked BECAUSE the driver was accidentally tearing the
+ * SuperSpeed link down at every boot -- a device operating at SuperSpeed
+ * correctly stops presenting its USB 2 personality, so the moment the SS link
+ * survives, the USB 2 hub goes empty. Leaving the link up without being able to
+ * enumerate it loses every device on the board: hub, stick, keyboard, mouse.
+ * Half of USB 3 support is worse than none. */
+#define XHCI_SUPERSPEED_ENUM_READY 0
+
+
+/* Is this root port owned by the USB 3.x Supported Protocol entry? */
+static int xhci_portIsSuperSpeed(const xhci_t *xhci, unsigned port)
+{
+	return ((xhci->ssPortLo != 0u) && (port >= xhci->ssPortLo) && (port <= xhci->ssPortHi)) ? 1 : 0;
+}
+
+
+/* Walk the xHCI Extended Capabilities, record which root ports the USB 3.x
+ * protocol owns, and report both that and every root port's current state.
+ *
+ * Why this exists: this driver used to have no concept of SuperSpeed. It
+ * defined port speeds FULL/LOW/HIGH only and never read the Supported Protocol
+ * capability -- the thing that says WHICH root ports are USB 2.x and which are
+ * USB 3.x. So it drove every port as if it were USB 2, and a USB 3 stick in a
+ * blue Pi port enumerated behind the VL805's internal USB 2.0 hub at High Speed
+ * (bulk maxpkt 512 instead of 1024), capping it near 30 MB/s. */
+static void xhci_probeProtocols(xhci_t *xhci)
 {
 	uint32_t off = (xhci->hccparams1 >> XHCI_REG_CAP_HCCPARAMS1_XECP__SHIFT) & 0xffffu;
 	unsigned guard = 0u;
@@ -807,6 +871,14 @@ static void xhci_dumpProtocols(xhci_t *xhci)
 				(char)((name >> 16) & 0xffu), (char)((name >> 24) & 0xffu),
 				(unsigned)((dw0 >> 24) & 0xffu), (unsigned)((dw0 >> 16) & 0xffu),
 				portOff, portOff + portCnt - 1u);
+
+			/* Major revision >= 3 is USB 3.x. On the Pi 4's VL805 this is
+			 * ports 2..5; port 1 is the USB 2.0 protocol's single port, which
+			 * fans out through the controller's internal USB 2.0 hub. */
+			if ((((dw0 >> 24) & 0xffu) >= 3u) && (portCnt > 0u)) {
+				xhci->ssPortLo = portOff;
+				xhci->ssPortHi = portOff + portCnt - 1u;
+			}
 		}
 
 		if (next == 0u) {
@@ -1058,7 +1130,7 @@ static int xhci_validateRuntime(xhci_t *xhci)
 	xhci->ac64 = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_AC64) != 0u) ? 1u : 0u;
 	xhci->contextSize = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_CSZ) != 0u) ? 64u : 32u;
 	xhci->maxPsaSize = (xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__MASK) >> XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__SHIFT;
-	xhci_dumpProtocols(xhci);
+	xhci_probeProtocols(xhci);
 
 	xhci->crcrLo = xhci_opRead32(xhci, XHCI_REG_OP_CRCR);
 	xhci->crcrHi = xhci_opRead32(xhci, XHCI_REG_OP_CRCR_HI);
@@ -3419,6 +3491,14 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 
 	memset(status, 0, sizeof(*status));
 
+	if ((XHCI_SUPERSPEED_ENUM_READY == 0) && (xhci_portIsSuperSpeed(xhci, (unsigned)port) != 0)) {
+		/* Report "nothing here" rather than a device we cannot yet drive.
+		 * Without this the hub driver enumerated the SuperSpeed port with USB 2
+		 * semantics; on hardware that produced a bogus duplicate of the device
+		 * on port 1 and lost the real one. */
+		return 0;
+	}
+
 	portsc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
 
 	if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) {
@@ -3465,12 +3545,6 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 		status->wPortChange |= USB_PORT_STAT_C_ENABLE;
 	}
 
-	/* TEMPORARY (SuperSpeed bring-up): why is root port 2 -- USB 3.0, CCS=1,
-	 * PED=1, speed 4, U0 -- never enumerated? Trace what the hub driver is
-	 * actually told about each port. Remove once SS enumeration works. */
-	fprintf(stderr, "xhci: GetPortStatus(%d) portsc=0x%08x -> stat=0x%04x chg=0x%04x speed=%u\n",
-		port, portsc, (unsigned)status->wPortStatus, (unsigned)status->wPortChange, speed);
-
 	if ((portsc & XHCI_REG_OP_PORT_PORTSC_OCC) != 0u) {
 		status->wPortChange |= USB_PORT_STAT_C_OVERCURRENT;
 	}
@@ -3494,14 +3568,11 @@ static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 		return -1;
 	}
 
-	/* TEMPORARY (SuperSpeed bring-up) -- see GetPortStatus. */
-	fprintf(stderr, "xhci: SetPortFeature(%d, %u)\n", port, (unsigned)wValue);
-
 	portsc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
 
 	switch (wValue) {
 		case USB_PORT_FEAT_RESET:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc | XHCI_REG_OP_PORT_PORTSC_PR) & ~XHCI_REG_OP_PORT_PORTSC_PED);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PR);
 			err = xhci_portWaitBits(xhci, port, XHCI_REG_OP_PORT_PORTSC_PR, 0u, XHCI_PORT_RESET_TIMEOUT_MS);
 			if (err < 0) {
 				return err;
@@ -3514,7 +3585,22 @@ static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 			break;
 
 		case USB_PORT_FEAT_POWER:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc | XHCI_REG_OP_PORT_PORTSC_PP);
+			if ((XHCI_SUPERSPEED_ENUM_READY == 0) && (xhci_portIsSuperSpeed(xhci, (unsigned)port) != 0)) {
+				/* Keep the SuperSpeed side switched OFF on purpose while the
+				 * enumeration path behind XHCI_SUPERSPEED_ENUM_READY is not in
+				 * use. PED is RW1CS, so writing it back is what disables the
+				 * port -- the very bug xhci_portStateNeutral() exists to
+				 * prevent, done deliberately here and nowhere else. A USB 3
+				 * device then falls back to its USB 2 personality behind the
+				 * VL805's internal hub, which is how every device on this board
+				 * currently reaches us. Remove this branch, not just the gate,
+				 * when SuperSpeed enumeration is turned on. */
+				xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC,
+					xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PP | XHCI_REG_OP_PORT_PORTSC_PED);
+			}
+			else {
+				xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PP);
+			}
 			usleep(XHCI_PORT_POWER_GOOD_DELAY_US);
 			break;
 
@@ -3549,27 +3635,37 @@ static int xhci_clearPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 			 * getPortStatus stop synthesizing C_CONNECTION for a device
 			 * that was already attached before bring-up. */
 			xhci->portConnAnnounced |= (1u << (unsigned)port);
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_CSC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_CSC);
 			break;
 
 		case USB_PORT_FEAT_C_ENABLE:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_PEC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PEC);
 			break;
 
 		case USB_PORT_FEAT_C_OVER_CURRENT:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_OCC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_OCC);
 			break;
 
 		case USB_PORT_FEAT_C_RESET:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_PRC);
+			/* Ack the warm-reset change with the hot-reset one. A USB 3 port
+			 * sets WRC, not PRC, when it comes out of a warm reset -- and the
+			 * VL805 already has WRC latched from the controller reset at
+			 * bring-up (root port 2 reads 0x00281203). Nothing else ever clears
+			 * it, and a change bit nobody acks keeps the port "changed"
+			 * forever. Harmless on a USB 2 port, where WRC is reserved-zero. */
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC,
+				xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PRC | XHCI_REG_OP_PORT_PORTSC_WRC);
 			break;
 
 		case USB_PORT_FEAT_ENABLE:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C));
+			/* Clearing PORT_ENABLE means DISABLE the port, and PED is RW1CS:
+			 * you disable it by writing a 1. Masking PED out of the write-back
+			 * (what the neutral base does) would make this a no-op. */
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PED);
 			break;
 
 		case USB_PORT_FEAT_POWER:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc & ~(XHCI_REG_OP_PORT_PORTSC_PP | XHCI_REG_OP_PORT_PORTSC_RW1C));
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) & ~XHCI_REG_OP_PORT_PORTSC_PP);
 			break;
 
 		case USB_PORT_FEAT_INDICATOR:
@@ -3930,6 +4026,12 @@ static uint32_t xhci_getHubStatus(usb_dev_t *hub)
 
 	for (i = 0; i < hub->nports; ++i) {
 		uint32_t bit = 1u << (i + 1);
+
+		if ((XHCI_SUPERSPEED_ENUM_READY == 0) && (xhci_portIsSuperSpeed(xhci, (unsigned)(i + 1)) != 0)) {
+			/* Hidden from the hub driver -- see xhci_getPortStatus. */
+			continue;
+		}
+
 		portsc = xhci_portRead32(xhci, i + 1, XHCI_REG_OP_PORT_PORTSC);
 		if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) == 0u) {
 			/* Disconnected: drop the latch so a future re-attach
