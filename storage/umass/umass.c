@@ -41,6 +41,8 @@
 #include <usb.h>
 #include <usbdriver.h>
 
+#include <cache.h>
+
 #include "../pc-ata/mbr.h"
 #include "umass.h"
 #include "scsi.h"
@@ -68,6 +70,13 @@
 /* Largest single SCSI READ(10)/WRITE(10) this driver issues. Anything bigger is
  * split across commands by umass_{read,write}ToDev. */
 #define UMASS_MAX_IO (64u * 1024u)
+/* Block-cache geometry. The line is the unit a miss fetches, so it is sized to
+ * the largest single SCSI command: one miss = one command. The raw block-size
+ * sweep measured 4 KiB -> 8.1 MB/s against 64 KiB -> 28.2, i.e. a ~0.39 ms fixed
+ * cost per command, which is what a cache exists to amortise. 32 lines is 2 MiB
+ * per partition. */
+#define UMASS_CACHE_LINE UMASS_MAX_IO
+#define UMASS_CACHE_LINES 32u
 
 #define UMASS_WRITE 0
 #define UMASS_READ  0x80
@@ -114,6 +123,11 @@ static ssize_t umass_write(id_t id, off_t offs, const char *buf, size_t len);
 typedef struct umass_dev umass_dev_t;
 static int _umass_partUnmount(umass_dev_t *dev);
 
+/* libcache calls back with this to say which partition a miss belongs to. */
+struct cache_devCtx_s {
+	umass_dev_t *dev;
+};
+
 static void umass_fsthr(void *arg);
 static void umass_poolthr(void *arg);
 static void umass_msgthr(void *arg);
@@ -147,6 +161,14 @@ typedef struct _umass_part_t {
 	void *fdata;    /* Mounted filesystem data */
 
 	oid_t mnt; /* Mountpoint this partition is spliced onto (for mtMountPoint) */
+
+	/* Block cache. Without one, every filesystem block became its own SCSI
+	 * command: ext2 with 1 KiB blocks read a 17 MiB file at 2.9 MB/s while the
+	 * raw device did 29.3, because throughput here is set by bytes-per-command
+	 * against a ~0.39 ms fixed cost, not by the bus. bcm2711-emmc has run
+	 * libcache with 128 KiB sectors for exactly this reason. */
+	cachectx_t *cache;
+	cache_devCtx_t cacheCtx;
 
 	/* Teardown handshake with umass_fsthr. The thread runs on fsstack below,
 	 * i.e. INSIDE this struct, so the struct must not be freed until it has
@@ -659,6 +681,42 @@ static umass_dev_t *_umass_devFind(id_t id)
 }
 
 
+/* libcache miss/flush callbacks. These are the ONLY things that talk to the
+ * device once a cache exists; everything above goes through cache_read/write. */
+static ssize_t umass_cacheReadCb(uint64_t offs, void *buf, size_t len, cache_devCtx_t *ctx)
+{
+	return (ssize_t)umass_readFromDev(ctx->dev, (off_t)offs, (char *)buf, len);
+}
+
+
+static ssize_t umass_cacheWriteCb(uint64_t offs, const void *buf, size_t len, cache_devCtx_t *ctx)
+{
+	return (ssize_t)umass_writeToDev(ctx->dev, (off_t)offs, (const char *)buf, len);
+}
+
+
+/* Set up the partition's block cache. A miss then fetches UMASS_CACHE_LINE bytes
+ * in one SCSI command instead of one command per filesystem block, which is the
+ * whole point -- see the comment on umass_dev_t::cache. Failing to allocate is
+ * NOT fatal: the device still works, just slowly, and saying so is better than
+ * refusing to enumerate a usable stick. */
+static void _umass_cacheInit(umass_dev_t *dev)
+{
+	cache_ops_t ops;
+	size_t sizeBytes = (size_t)dev->part.sectors * UMASS_SECTOR_SIZE;
+
+	dev->part.cacheCtx.dev = dev;
+	ops.readCb = umass_cacheReadCb;
+	ops.writeCb = umass_cacheWriteCb;
+	ops.ctx = &dev->part.cacheCtx;
+
+	dev->part.cache = cache_init(sizeBytes, UMASS_CACHE_LINE, UMASS_CACHE_LINES, &ops);
+	if (dev->part.cache == NULL) {
+		fprintf(stderr, "umass: %s: no block cache (out of memory); expect slow reads\n", dev->path);
+	}
+}
+
+
 static ssize_t umass_read(id_t id, off_t offs, char *buf, size_t len)
 {
 	mutexLock(umass_common.lock);
@@ -667,6 +725,11 @@ static ssize_t umass_read(id_t id, off_t offs, char *buf, size_t len)
 	if (dev == NULL) {
 		return -ENODEV;
 	}
+
+	if (dev->part.cache != NULL) {
+		return cache_read(dev->part.cache, (uint64_t)offs, buf, len);
+	}
+
 	return umass_readFromDev(dev, offs, buf, len);
 }
 
@@ -679,6 +742,15 @@ static ssize_t umass_write(id_t id, off_t offs, const char *buf, size_t len)
 	if (dev == NULL) {
 		return -ENODEV;
 	}
+
+	if (dev->part.cache != NULL) {
+		/* WRITE_THROUGH, deliberately: this is REMOVABLE media. A write-back
+		 * cache would hold data that a yanked stick never receives, and the
+		 * measured write rate (5.4 MB/s through ext2) is not what needs
+		 * fixing here -- reads are. */
+		return cache_write(dev->part.cache, (uint64_t)offs, (void *)buf, len, LIBCACHE_WRITE_THROUGH);
+	}
+
 	return umass_writeToDev(dev, offs, buf, len);
 }
 
@@ -923,11 +995,11 @@ static void umass_msgthr(void *arg)
 				break;
 
 			case mtRead:
-				msg.o.err = umass_readFromDev(dev, msg.i.io.offs, msg.o.data, msg.o.size);
+				msg.o.err = (int)umass_read(msg.oid.id, msg.i.io.offs, msg.o.data, msg.o.size);
 				break;
 
 			case mtWrite:
-				msg.o.err = umass_writeToDev(dev, msg.i.io.offs, msg.i.data, msg.i.size);
+				msg.o.err = (int)umass_write(msg.oid.id, msg.i.io.offs, msg.i.data, msg.i.size);
 				break;
 
 			case mtGetAttr:
@@ -978,6 +1050,12 @@ static int _umass_partUnmount(umass_dev_t *dev)
 
 	if (dev->part.fs == NULL) {
 		return 0;
+	}
+
+	/* Push anything still held before the filesystem goes away. Write-through
+	 * means there should be nothing dirty, but say so rather than assume. */
+	if (dev->part.cache != NULL) {
+		(void)cache_flush(dev->part.cache, 0, (uint64_t)dev->part.sectors * UMASS_SECTOR_SIZE);
 	}
 
 	dev->part.fsthrExit = 1;
@@ -1038,6 +1116,11 @@ static void _umass_devFree(umass_dev_t *dev)
 		fprintf(stderr, "umass: fs thread for %s did not exit; leaking its state\n", dev->path);
 		idtree_remove(&umass_common.devices, &dev->node);
 		return;
+	}
+
+	if (dev->part.cache != NULL) {
+		(void)cache_deinit(dev->part.cache);
+		dev->part.cache = NULL;
 	}
 
 	idtree_remove(&umass_common.devices, &dev->node);
@@ -1202,6 +1285,7 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 			}
 
 			_umass_partSet(pdev, &mbr->pent[i], i);
+			_umass_cacheInit(pdev);
 
 			oid.port = umass_common.msgport;
 			oid.id = pdev->fileId;

@@ -14,7 +14,7 @@
 # port built, the driver ran, and the only symptom was `mount` returning ENOENT
 # because umass_init never registered the ext2 filesystem it was meant to.
 ifneq ($(filter ia32 aarch64%,$(TARGET_FAMILY)),)
-	UMASS_LIBS := libext2
+	UMASS_LIBS := libext2 libcache
 	UMASS_CFLAGS := -DUMASS_MOUNT_EXT2
 endif
 
