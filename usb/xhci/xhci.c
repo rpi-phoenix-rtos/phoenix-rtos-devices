@@ -460,6 +460,10 @@ typedef struct {
 	 * this latch records the ack (ClearPortFeature C_CONNECTION) so we stop
 	 * re-synthesizing, and is cleared on disconnect to allow re-announce. */
 	uint32_t portConnAnnounced;
+	/* Per-port (bit = port number) "reset was acknowledged without being
+	 * performed" latch, for an already-enabled SuperSpeed port. See
+	 * xhci_setPortFeature(USB_PORT_FEAT_RESET). */
+	uint32_t portResetSynth;
 	uint32_t erstMax;
 	uint32_t ist;
 	uint32_t nscratchpad;
@@ -540,6 +544,7 @@ typedef struct xhci_pipePriv {
 static uint32_t xhci_getHubStatus(usb_dev_t *hub);
 static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId);
 static int xhci_enterHaltedState(xhci_t *xhci);
+static xhci_slot_t *xhci_findSlotForDev(xhci_t *xhci, usb_dev_t *dev);
 
 
 static inline uint8_t xhci_read8(xhci_t *xhci, uintptr_t off)
@@ -821,7 +826,14 @@ static void xhci_roothubStatusThread(void *arg)
  * correctly stops presenting its USB 2 personality, so the moment the SS link
  * survives, the USB 2 hub goes empty. Leaving the link up without being able to
  * enumerate it loses every device on the board: hub, stick, keyboard, mouse.
- * Half of USB 3 support is worse than none. */
+ * Half of USB 3 support is worse than none.
+ *
+ * Note there is nothing to do to stop the same physical device being driven
+ * twice, once per personality: a device that operates at SuperSpeed stops using
+ * its USB 2 pins entirely (USB 3.2 section 10.3.1), so it is present on exactly
+ * one of the two port sets. That is not an assumption -- it is what the bench
+ * showed when the SS link was first left up: the stick vanished from the USB 2
+ * hub the moment it trained at SuperSpeed. */
 #define XHCI_SUPERSPEED_ENUM_READY 0
 
 
@@ -1625,6 +1637,9 @@ static unsigned int xhci_usbSpeedToPsi(enum usb_speed speed)
 		case usb_high_speed:
 			return XHCI_PORT_SPEED_HIGH;
 
+		case usb_super_speed:
+			return XHCI_PORT_SPEED_SUPER;
+
 		default:
 			return 0u;
 	}
@@ -1640,6 +1655,13 @@ static uint16_t xhci_ep0MaxPacket(enum usb_speed speed)
 
 		case usb_high_speed:
 			return 64u;
+
+		case usb_super_speed:
+			/* Fixed by the spec (USB 3.2 section 9.6.1): a SuperSpeed device's
+			 * ep0 is ALWAYS 512 bytes. The descriptor's bMaxPacketSize0 carries
+			 * the exponent 9, not the byte count -- read as a byte count it
+			 * gives a 9-byte ep0 and every control transfer fails. */
+			return 512u;
 
 		default:
 			return 0u;
@@ -2253,7 +2275,10 @@ static uint8_t xhci_convertInterval(const usb_pipe_t *pipe)
 	}
 
 	interval = (unsigned)pipe->interval;
-	if (pipe->dev->speed == usb_high_speed) {
+	/* SuperSpeed uses the same encoding as High Speed: bInterval is an exponent
+	 * of 125 us microframes (USB 3.2 section 9.6.6), so the Interval field is
+	 * bInterval - 1. Only low/full speed express it in whole milliseconds. */
+	if ((pipe->dev->speed == usb_high_speed) || (pipe->dev->speed == usb_super_speed)) {
 		if (interval < 1u) {
 			interval = 1u;
 		}
@@ -2316,8 +2341,13 @@ static int xhci_prepareAddressContext(xhci_t *xhci, xhci_slot_t *target, usb_dev
 		(1u << XHCI_SLOT_CTX_CONTEXT_ENTRIES__SHIFT);
 
 	if (behindHub == 0) {
-		/* Root-port device (the external hub). Root hub port = dev->port; no
-		 * route string, no TT. Behaviour identical to the pre-Step-2 path. */
+		/* Root-port device (the external hub, or a device on a SuperSpeed root
+		 * port). Root hub port = dev->port; no route string, no TT.
+		 *
+		 * A route string of 0 with Root Hub Port Number = the SS port is exactly
+		 * how a SuperSpeed device attached directly to a root port is addressed
+		 * (xHCI 1.2 section 4.5.2): the route string enumerates the downstream
+		 * ports of intermediate hubs, of which there are none. */
 		rootHubPort = (uint32_t)dev->port & 0xffu;
 		word1 = rootHubPort << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT;
 		slot->ttHubSlot_ttPort_ttt_intrTarget = 0u;
@@ -2345,12 +2375,17 @@ static int xhci_prepareAddressContext(xhci_t *xhci, xhci_slot_t *target, usb_dev
 		word1 = rootHubPort << XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT;
 
 		/* TT for a low/full-speed device behind a high-speed hub: the TT hub is
-		 * the parent hub's xHCI slot. TODO(hub-slot-map): the only non-root hub
-		 * today is the primary slot (slots[0], slotId 1); map dev->hub -> its
-		 * slot generally once a second hub can appear. TT Port = device's port
-		 * on the hub; TT Think Time = 0. */
+		 * the parent hub's xHCI slot, looked up by device rather than assumed to
+		 * be slots[0] (a second root-port device can now own that slot). TT Port
+		 * = device's port on the hub; TT Think Time = 0. */
+		xhci_slot_t *hubSlot = xhci_findSlotForDev(xhci, dev->hub);
+
+		if (hubSlot == NULL) {
+			hubSlot = &xhci->slots[0];
+		}
+
 		slot->ttHubSlot_ttPort_ttt_intrTarget =
-			((uint32_t)xhci->slots[0].slotId << XHCI_SLOT_CTX_TT_HUB_SLOT_ID__SHIFT) |
+			((uint32_t)hubSlot->slotId << XHCI_SLOT_CTX_TT_HUB_SLOT_ID__SHIFT) |
 			(((uint32_t)dev->port & 0xffu) << XHCI_SLOT_CTX_TT_PORT_NUMBER__SHIFT) |
 			(0u << XHCI_SLOT_CTX_TT_THINK_TIME__SHIFT);
 	}
@@ -2436,14 +2471,20 @@ static int xhci_cmdHubSlotFixup(xhci_t *xhci, xhci_slot_t *hubSlot, usb_dev_t *h
 }
 
 
-/* Find the slot table entry already bound to `dev`, or NULL. The primary slot
- * (slots[0]) is reserved for the root-port device (the external hub) and is
- * matched by topology in xhci_slotForDev, not by this exact-pointer lookup. */
+/* Find the slot table entry already bound to `dev`, or NULL.
+ *
+ * Includes slots[0]: the primary slot used to be matched by topology ("any
+ * root-port device"), which was fine while the controller had exactly one
+ * usable root port. It is not fine now that a SuperSpeed root port can hold a
+ * second one -- both mapped to slots[0], so the second device's GET_DESCRIPTOR
+ * ran down the FIRST device's ep0 ring and came back as a duplicate of it (on
+ * hardware: a bogus second '2109:3431 USB2.0 Hub' on root port 2). slots[0] is
+ * now bound by device pointer like every other slot, in xhci_slotForDev. */
 static xhci_slot_t *xhci_findSlotForDev(xhci_t *xhci, usb_dev_t *dev)
 {
 	unsigned i;
 
-	for (i = 1u; i < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++i) {
+	for (i = 0u; i < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++i) {
 		if ((xhci->slots[i].slotId != 0u) && (xhci->slots[i].dev == dev)) {
 			return &xhci->slots[i];
 		}
@@ -2453,11 +2494,13 @@ static xhci_slot_t *xhci_findSlotForDev(xhci_t *xhci, usb_dev_t *dev)
 }
 
 
-/* Allocate, enable and Address-Device a fresh xHCI slot for a device sitting
- * behind a non-root hub (the low-speed keyboard behind the VIA hub). Returns
- * the new slot, or NULL on failure (errno-style rc via *err). The framework's
- * subsequent SET_ADDRESS is acknowledged without re-issuing Address Device,
- * exactly as the primary (slots[0]) path does. */
+/* Allocate, enable and Address-Device a fresh xHCI slot for a device that
+ * cannot use the primary one: a device behind a non-root hub (the low-speed
+ * keyboard behind the VIA hub), or a second root-port device (the SuperSpeed
+ * port alongside the USB 2 one). Returns the new slot, or NULL on failure
+ * (errno-style rc via *err). The framework's subsequent SET_ADDRESS is
+ * acknowledged without re-issuing Address Device, exactly as the primary
+ * (slots[0]) path does. */
 static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
 {
 	xhci_slot_t *slot = NULL;
@@ -2500,10 +2543,21 @@ static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
 	/* Ensure the parent hub's slot ctx declares Hub=1/NumPorts/TTT before the
 	 * keyboard slot is addressed, so the controller can route split transactions
 	 * down to it. The framework drives the hub's class-descriptor read through
-	 * this HCD, so nports is known by the time the keyboard first appears. */
-	*err = xhci_cmdHubSlotFixup(xhci, &xhci->slots[0], dev->hub);
-	if (*err < 0) {
-		return NULL;
+	 * this HCD, so nports is known by the time the keyboard first appears.
+	 *
+	 * Only for a device BEHIND a non-root hub: a device on a root port has no
+	 * intermediate hub, and dev->hub is then the root hub, which owns no slot. */
+	if (dev->hub->hub != NULL) {
+		xhci_slot_t *hubSlot = xhci_findSlotForDev(xhci, dev->hub);
+
+		if (hubSlot == NULL) {
+			hubSlot = &xhci->slots[0];
+		}
+
+		*err = xhci_cmdHubSlotFixup(xhci, hubSlot, dev->hub);
+		if (*err < 0) {
+			return NULL;
+		}
 	}
 
 	*err = xhci_prepareAddressContext(xhci, slot, dev);
@@ -2528,23 +2582,86 @@ static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
 }
 
 
-/* Map a device to the slot that drives it. Root-port devices (the external hub:
- * dev->hub->hub == NULL) use the primary slot, slots[0]. Devices behind a
- * non-root hub use their dedicated slot (allocated lazily by
- * xhci_allocSlotForDev). Returns slots[0] as the safe default so the existing
- * single-slot path is unchanged when no per-dev slot exists yet. */
+/* Map a device to the slot that drives it, or NULL if it has none yet (the
+ * caller then allocates one with xhci_allocSlotForDev).
+ *
+ * The FIRST root-port device claims the primary slot, slots[0] -- that slot is
+ * enabled once during xhci_init, so reusing it saves an Enable Slot on the path
+ * that has always worked. Every other device, root-port or not, gets its own. */
 static xhci_slot_t *xhci_slotForDev(xhci_t *xhci, usb_dev_t *dev)
 {
 	xhci_slot_t *slot;
 
-	if ((dev->hub != NULL) && (dev->hub->hub != NULL)) {
-		slot = xhci_findSlotForDev(xhci, dev);
-		if (slot != NULL) {
-			return slot;
-		}
+	slot = xhci_findSlotForDev(xhci, dev);
+	if (slot != NULL) {
+		return slot;
 	}
 
-	return &xhci->slots[0];
+	/* A device behind a non-root hub always needs its own slot (route string +
+	 * TT), so it never claims the primary one even when that is free. */
+	if ((dev->hub != NULL) && (dev->hub->hub == NULL) && (xhci->slots[0].dev == NULL)) {
+		xhci->slots[0].dev = dev;
+		return &xhci->slots[0];
+	}
+
+	return NULL;
+}
+
+
+/* Max Burst for this pipe's endpoint, from its SuperSpeed Endpoint Companion
+ * descriptor (USB 3.2 section 9.6.7); 0 for anything that has none.
+ *
+ * This is where SuperSpeed throughput comes from. bMaxBurst is "packets per
+ * burst minus one", and the endpoint context field has the same encoding
+ * (xHCI 1.2 section 6.2.3.4), so it is copied across unchanged. A controller
+ * that leaves it at 0 moves one packet per handshake and runs a 5 Gbps link at
+ * a small fraction of its rate.
+ *
+ * The companion descriptor is not stored by the framework's configuration
+ * parser (it belongs to the endpoint before it, and usb_pipe_t has nowhere to
+ * put it), so re-walk the raw configuration blob the device returned. */
+static uint8_t xhci_pipeMaxBurst(const usb_pipe_t *pipe)
+{
+	const usb_dev_t *dev = pipe->dev;
+	const char *ptr;
+	const char *end;
+	uint8_t address;
+
+	if ((dev == NULL) || (dev->speed != usb_super_speed) || (dev->conf == NULL)) {
+		return 0u;
+	}
+
+	address = (uint8_t)(((uint32_t)pipe->num & 0xfu) | ((pipe->dir == usb_dir_in) ? 0x80u : 0x00u));
+
+	ptr = (const char *)dev->conf;
+	end = ptr + dev->conf->wTotalLength;
+	ptr += sizeof(usb_configuration_desc_t);
+
+	while ((ptr + sizeof(struct usb_desc_header)) <= end) {
+		const struct usb_desc_header *hdr = (const struct usb_desc_header *)ptr;
+
+		if ((hdr->bLength < sizeof(struct usb_desc_header)) || ((ptr + hdr->bLength) > end)) {
+			break;
+		}
+
+		if ((hdr->bDescriptorType == USB_DESC_ENDPOINT) &&
+			(hdr->bLength >= sizeof(usb_endpoint_desc_t)) &&
+			(((const usb_endpoint_desc_t *)ptr)->bEndpointAddress == address)) {
+			const char *next = ptr + hdr->bLength;
+
+			/* The companion, if present, immediately follows its endpoint. */
+			if (((next + sizeof(usb_ss_endpoint_companion_desc_t)) <= end) &&
+				(((const struct usb_desc_header *)next)->bDescriptorType == USB_DESC_ENDPOINT_SS_COMPANION)) {
+				return ((const usb_ss_endpoint_companion_desc_t *)next)->bMaxBurst & 0xfu;
+			}
+
+			return 0u;
+		}
+
+		ptr += hdr->bLength;
+	}
+
+	return 0u;
 }
 
 
@@ -2558,6 +2675,7 @@ static int xhci_initPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	xhci_slot_t *slot;
 	uint8_t endpointId;
 	uint8_t endpointType;
+	uint8_t maxBurst;
 	uint32_t interval;
 	int err;
 
@@ -2601,6 +2719,11 @@ static int xhci_initPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	 * tracking lets a second interrupt pipe on a different slot coexist with
 	 * the hub's without clobbering it. */
 	slot = xhci_slotForDev(xhci, pipe->dev);
+	if (slot == NULL) {
+		/* No slot bound yet: the device has not been addressed through
+		 * xhci_transferEnqueue, so there is nothing to configure an endpoint on. */
+		return -ENODEV;
+	}
 
 	priv = calloc(1, sizeof(*priv));
 	if (priv == NULL) {
@@ -2647,11 +2770,12 @@ static int xhci_initPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	 * non-zero Interval on a bulk ep is a Parameter Error from Configure
 	 * Endpoint on some controllers, and means nothing on the rest. */
 	interval = (endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) ? xhci_convertInterval(pipe) : 0u;
+	maxBurst = xhci_pipeMaxBurst(pipe);
 	epctx->epState_mult_streams_interval = interval << XHCI_EP_CTX_INTERVAL__SHIFT;
 	epctx->cerr_type_burst_packet =
 		(3u << XHCI_EP_CTX_CERR__SHIFT) |
 		((uint32_t)priv->endpointType << XHCI_EP_CTX_TYPE__SHIFT) |
-		(0u << XHCI_EP_CTX_MAX_BURST__SHIFT) |
+		((uint32_t)maxBurst << XHCI_EP_CTX_MAX_BURST__SHIFT) |
 		((uint32_t)pipe->maxPacketLen << XHCI_EP_CTX_MAX_PACKET__SHIFT);
 	epctx->trDequeuePtr = priv->ringPhys | XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS;
 	if (endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) {
@@ -2673,10 +2797,11 @@ static int xhci_initPipe(xhci_t *xhci, usb_pipe_t *pipe)
 
 	pipe->hcdpriv = priv;
 	slot->pipes[endpointId] = priv;
-	fprintf(stderr, "xhci: %s pipe ready slot=%u ep=%u maxpkt=%u\n",
+	fprintf(stderr, "xhci: %s pipe ready slot=%u ep=%u maxpkt=%u burst=%u\n",
 		(endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) ? "interrupt-IN" :
 			((endpointType == XHCI_EP_CTX_TYPE_BULK_IN) ? "bulk-IN" : "bulk-OUT"),
-		(unsigned)slot->slotId, (unsigned)endpointId, (unsigned)pipe->maxPacketLen);
+		(unsigned)slot->slotId, (unsigned)endpointId, (unsigned)pipe->maxPacketLen,
+		(unsigned)maxBurst + 1u);
 	return 0;
 }
 
@@ -3521,12 +3646,20 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 		status->wPortStatus |= USB_PORT_STAT_POWER;
 	}
 
+	/* The Port Speed field is a Protocol Speed ID, not a USB speed: 1 = Full,
+	 * 2 = Low, 3 = High, 4 = SuperSpeed Gen1 (xHCI 1.2 section 5.4.8, default
+	 * PSI mapping). Full Speed is the implicit case -- the hub-status word has
+	 * no bit for it. SuperSpeed has no bit either, so it is reported in the
+	 * LOW|HIGH combination the framework reserves for it (usb/hub.h). */
 	speed = (portsc & XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__MASK) >> XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__SHIFT;
-	if (speed == 2u) {
+	if (speed == XHCI_PORT_SPEED_LOW) {
 		status->wPortStatus |= USB_PORT_STAT_LOW_SPEED;
 	}
-	else if (speed == 3u) {
+	else if (speed == XHCI_PORT_SPEED_HIGH) {
 		status->wPortStatus |= USB_PORT_STAT_HIGH_SPEED;
+	}
+	else if (speed == XHCI_PORT_SPEED_SUPER) {
+		status->wPortStatus |= USB_PORT_STAT_SUPER_SPEED;
 	}
 
 	if ((portsc & XHCI_REG_OP_PORT_PORTSC_CSC) != 0u) {
@@ -3549,7 +3682,8 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 		status->wPortChange |= USB_PORT_STAT_C_OVERCURRENT;
 	}
 
-	if ((portsc & XHCI_REG_OP_PORT_PORTSC_PRC) != 0u) {
+	if (((portsc & XHCI_REG_OP_PORT_PORTSC_PRC) != 0u) ||
+		((xhci->portResetSynth & (1u << (unsigned)port)) != 0u)) {
 		status->wPortChange |= USB_PORT_STAT_C_RESET;
 	}
 
@@ -3572,6 +3706,25 @@ static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 
 	switch (wValue) {
 		case USB_PORT_FEAT_RESET:
+			if ((xhci_portIsSuperSpeed(xhci, (unsigned)port) != 0) &&
+				((portsc & XHCI_REG_OP_PORT_PORTSC_PED) != 0u) &&
+				(((portsc & XHCI_REG_OP_PORT_PORTSC_PLS__MASK) >> XHCI_REG_OP_PORT_PORTSC_PLS__SHIFT) ==
+					XHCI_REG_OP_PORT_PORTSC_PLS_U0)) {
+				/* "Reset to enable" is USB 2 semantics. A SuperSpeed port trains
+				 * itself and arrives PED=1 in U0 with the device already in
+				 * Default state, so a USB2-style reset here would knock a
+				 * working link down for nothing (xHCI 1.2 section 4.19.1.2).
+				 *
+				 * The hub driver nevertheless waits for a C_RESET change before
+				 * it will address the device (usb/hub.c hub_portReset polls for
+				 * it and gives up after 500 ms), and no change bit is set by a
+				 * reset we did not perform. So latch a synthesized one; it is
+				 * reported by xhci_getPortStatus and dropped when the hub driver
+				 * acks it with ClearPortFeature(C_RESET). */
+				xhci->portResetSynth |= (1u << (unsigned)port);
+				break;
+			}
+
 			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PR);
 			err = xhci_portWaitBits(xhci, port, XHCI_REG_OP_PORT_PORTSC_PR, 0u, XHCI_PORT_RESET_TIMEOUT_MS);
 			if (err < 0) {
@@ -3653,6 +3806,7 @@ static int xhci_clearPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 			 * bring-up (root port 2 reads 0x00281203). Nothing else ever clears
 			 * it, and a change bit nobody acks keeps the port "changed"
 			 * forever. Harmless on a USB 2 port, where WRC is reserved-zero. */
+			xhci->portResetSynth &= ~(1u << (unsigned)port);
 			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC,
 				xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PRC | XHCI_REG_OP_PORT_PORTSC_WRC);
 			break;
@@ -3732,12 +3886,10 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		return xhci_roothubReq(pipe->dev, t);
 	}
 
-	/* Route every transfer to the slot that drives this device: the external
-	 * hub on a root port -> slots[0]; a device behind a non-root hub (the
-	 * keyboard) -> its own slot. Defaults to slots[0] (the single-slot path) so
-	 * root-port behaviour is unchanged. The behind-hub slot is created lazily in
-	 * the address==0 block below; until then this returns slots[0], but the
-	 * address==0 branch overrides xhci->cur after allocation. */
+	/* Route every transfer to the slot that drives this device: the first
+	 * root-port device (the external hub) -> slots[0]; anything else -> its own
+	 * slot. NULL means "not bound yet"; the address==0 block below creates the
+	 * slot and sets xhci->cur itself. */
 	if (xhci != NULL) {
 		xhci->cur = xhci_slotForDev(xhci, pipe->dev);
 	}
@@ -3755,20 +3907,17 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		 * the first descriptor read and SET_ADDRESS is a no-op for high- and
 		 * super-speed (fixed 64/512) and is a TODO for low/full-speed devices
 		 * once those are reachable behind a hub. */
-		if ((pipe->dev->hub != NULL) && (pipe->dev->hub->hub != NULL)) {
-			/* Device behind a non-root hub (the low-speed keyboard behind the
-			 * VIA hub). It needs its OWN xHCI slot with a route string + TT;
-			 * slots[0] (the hub) cannot be reused. Allocate + address it once,
-			 * then drive its descriptor reads on that slot. ADDITIVE: the
-			 * root-port (hub/slots[0]) path below is untouched. */
-			xhci_slot_t *kbdSlot = xhci_findSlotForDev(xhci, pipe->dev);
-			if (kbdSlot == NULL) {
-				kbdSlot = xhci_allocSlotForDev(xhci, pipe->dev, &err);
-				if (kbdSlot == NULL) {
-					return err;
-				}
+		if (xhci->cur == NULL) {
+			/* No slot bound to this device and the primary one is taken. Covers
+			 * a device behind a non-root hub (the low-speed keyboard behind the
+			 * VIA hub), which needs its OWN slot with a route string + TT, and a
+			 * SECOND root-port device -- the SuperSpeed port alongside the USB 2
+			 * one. Allocate + address it once, then drive its descriptor reads
+			 * on that slot. */
+			xhci->cur = xhci_allocSlotForDev(xhci, pipe->dev, &err);
+			if (xhci->cur == NULL) {
+				return err;
 			}
-			xhci->cur = kbdSlot;
 		}
 		else if (xhci->cur->addressed == 0u) {
 			err = xhci_initEp0Ring(xhci, xhci->cur);
@@ -3831,6 +3980,13 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 		}
 
 		return -ENOSYS;
+	}
+
+	/* Every path below drives xhci->cur. An addressed device always has a slot
+	 * bound (it was addressed through the block above), but say so rather than
+	 * dereferencing NULL if that ever stops holding. */
+	if ((xhci == NULL) || (xhci->cur == NULL)) {
+		return -ENODEV;
 	}
 
 	/* Any control-IN (DEV2HOST, has data) on the addressed device's ep0 — the
@@ -4004,6 +4160,11 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 				 * so a later Enable Slot cannot inherit stale flags. */
 				xhci->slots[s].addressed = 0u;
 				xhci->slots[s].hubFixedUp = 0u;
+				/* And unbind the device: usb_devFree() is about to release that
+				 * usb_dev_t, and slots are matched by pointer. A recycled
+				 * allocation at the same address would otherwise be handed this
+				 * dead slot. */
+				xhci->slots[s].dev = NULL;
 			}
 		}
 	}
@@ -4034,9 +4195,10 @@ static uint32_t xhci_getHubStatus(usb_dev_t *hub)
 
 		portsc = xhci_portRead32(xhci, i + 1, XHCI_REG_OP_PORT_PORTSC);
 		if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) == 0u) {
-			/* Disconnected: drop the latch so a future re-attach
-			 * re-announces. */
+			/* Disconnected: drop the latches so a future re-attach
+			 * re-announces and re-resets. */
 			xhci->portConnAnnounced &= ~bit;
+			xhci->portResetSynth &= ~bit;
 		}
 		/* Report a port to the hub driver on a real RW1C change OR when a
 		 * device is attached (CCS=1) that we have not yet announced — the
