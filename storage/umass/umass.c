@@ -143,6 +143,12 @@ typedef struct _umass_part_t {
 	umass_fs_t *fs; /* Mounted filesystem */
 	void *fdata;    /* Mounted filesystem data */
 
+	/* Teardown handshake with umass_fsthr. The thread runs on fsstack below,
+	 * i.e. INSIDE this struct, so the struct must not be freed until it has
+	 * left -- see _umass_devFree. */
+	volatile int fsthrRunning;
+	volatile int fsthrExit;
+
 	/* Partition filesystem thread stack */
 	char fsstack[4 * _PAGE_SIZE] __attribute__((aligned(8)));
 } umass_part_t;
@@ -686,8 +692,11 @@ static int umass_mountFromDev(umass_dev_t *dev, const char *name, oid_t *oid)
 	}
 	oid->id = err;
 
+	dev->part.fsthrExit = 0;
+	dev->part.fsthrRunning = 1;
 	err = beginthread(umass_fsthr, 4, dev->part.fsstack, sizeof(dev->part.fsstack), &dev->part);
 	if (err < 0) {
+		dev->part.fsthrRunning = 0;
 		dev->part.fs->unmount(dev->part.fdata);
 		dev->part.fs = NULL;
 		dev->part.fdata = NULL;
@@ -749,6 +758,13 @@ static void umass_fsthr(void *arg)
 
 		ret = -1;
 		while (ret < 0) {
+			if (part->fsthrExit != 0) {
+				/* Torn down underneath us (device unplugged). The port is gone,
+				 * so msgRecv will keep failing -- leave instead of spinning. */
+				free(req);
+				part->fsthrRunning = 0;
+				endthread();
+			}
 			ret = msgRecv(req->part->port, &req->msg, &req->rid);
 		}
 
@@ -764,6 +780,7 @@ static void umass_fsthr(void *arg)
 		mutexUnlock(umass_common.rlock);
 
 		if (umount != 0) {
+			part->fsthrRunning = 0;
 			endthread();
 		}
 	}
@@ -882,6 +899,41 @@ static void umass_msgthr(void *arg)
 
 static void _umass_devFree(umass_dev_t *dev)
 {
+	/* A mounted device being freed is the hot-UNPLUG path, and it used to be a
+	 * use-after-free: umass_fsthr runs on dev->part.fsstack, which lives INSIDE
+	 * this struct, and nothing stopped it. The filesystem was never unmounted
+	 * and the partition port was never destroyed either, so any client still
+	 * holding the mount kept messaging a dead port.
+	 *
+	 * The thread only ever left on an mtUmount message and retried msgRecv
+	 * forever on error, so destroying the port alone would have spun it. Hence
+	 * the explicit flag: set it, destroy the port to break the thread out of
+	 * msgRecv, then wait for it to acknowledge before touching the memory. */
+	if (dev->part.fs != NULL) {
+		unsigned tries;
+
+		dev->part.fsthrExit = 1;
+		portDestroy(dev->part.port);
+
+		for (tries = 0u; (tries < 1000u) && (dev->part.fsthrRunning != 0); ++tries) {
+			usleep(1000);
+		}
+
+		if (dev->part.fsthrRunning != 0) {
+			/* Never observed; say so rather than free memory a live thread is
+			 * running on. Leaking one device struct beats corrupting the heap. */
+			fprintf(stderr, "umass: fs thread for %s did not exit; leaking its state\n", dev->path);
+			idtree_remove(&umass_common.devices, &dev->node);
+			return;
+		}
+
+		if (dev->part.fs->unmount != NULL) {
+			(void)dev->part.fs->unmount(dev->part.fdata);
+		}
+		dev->part.fs = NULL;
+		dev->part.fdata = NULL;
+	}
+
 	idtree_remove(&umass_common.devices, &dev->node);
 	resourceDestroy(dev->lock);
 	free(dev);
