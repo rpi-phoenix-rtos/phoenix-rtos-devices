@@ -22,9 +22,14 @@
 /* Misc definitions */
 #define MBR_MAGIC 0xaa55
 
+/* Primary partition entries in an MBR. Was hard-coded as the array bound below;
+ * named so a driver can walk the table instead of assuming entry 0. */
+#define MBR_PARTITIONS 4
+
 
 /* Partition types */
 enum {
+	PENTRY_EMPTY      = 0x00, /* Unused table entry */
 	PENTRY_LINUX      = 0x83, /* Any native Linux partition */
 	PENTRY_PROTECTIVE = 0xee  /* Protective MBR mode for GPT partition table */
 };
@@ -42,7 +47,7 @@ typedef struct {
 
 typedef struct {
 	char bca[446];    /* Bootstrap Code Area */
-	pentry_t pent[4]; /* Partition entries */
+	pentry_t pent[MBR_PARTITIONS]; /* Partition entries */
 	uint16_t magic;   /* MBR magic */
 } __attribute__((packed)) mbr_t;
 

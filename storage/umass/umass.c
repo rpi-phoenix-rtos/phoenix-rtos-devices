@@ -181,7 +181,15 @@ typedef struct umass_dev {
 	unsigned port;
 	handle_t lock;
 
-	umass_part_t part; /* TODO extend for more partitions */
+	umass_part_t part;
+
+	/* One umass_dev_t per PARTITION, but a physical stick has exactly one set of
+	 * bulk pipes and one CBW tag counter, so SCSI commands have to stay
+	 * serialised across its partitions. Every partition of a device points at
+	 * the first one, which owns the pipes and the lock; `owner == self` for that
+	 * first device. Use dev->owner for anything USB-level, dev->part for
+	 * anything partition-level. */
+	struct umass_dev *owner;
 
 	usb_driver_t *drv;
 } umass_dev_t;
@@ -259,16 +267,16 @@ static int _umass_transmit(umass_dev_t *dev, void *cmd, size_t clen, char *data,
 		return -1;
 
 	for (i = 0; ret < 0 && i < UMASS_TRANSMIT_RETRIES; i++) {
-		dataPipe = (dir == usb_dir_out) ? dev->pipeOut : dev->pipeIn;
+		dataPipe = (dir == usb_dir_out) ? dev->owner->pipeOut : dev->owner->pipeIn;
 		cbw.sig = CBW_SIG;
-		cbw.tag = dev->tag++;
+		cbw.tag = dev->owner->tag++;
 		cbw.dlen = dlen;
 		cbw.flags = (dir == usb_dir_out) ? UMASS_WRITE : UMASS_READ;
 		cbw.lun = 0;
 		cbw.clen = clen;
 		memcpy(cbw.cmd, cmd, clen);
 
-		ret = usb_transferBulk(dev->drv, dev->pipeOut, &cbw, sizeof(cbw), usb_dir_out);
+		ret = usb_transferBulk(dev->owner->drv, dev->owner->pipeOut, &cbw, sizeof(cbw), usb_dir_out);
 		if (ret != sizeof(cbw)) {
 			fprintf(stderr, "umass_transmit: usb_transferBulk OUT failed\n");
 			return -EIO;
@@ -276,7 +284,7 @@ static int _umass_transmit(umass_dev_t *dev, void *cmd, size_t clen, char *data,
 
 		/* Optional data transfer */
 		if (dlen > 0) {
-			ret = usb_transferBulk(dev->drv, dataPipe, data, dlen, dir);
+			ret = usb_transferBulk(dev->owner->drv, dataPipe, data, dlen, dir);
 			if (ret < 0) {
 				fprintf(stderr, "umass_transmit: umass_transmit data transfer failed\n");
 				return ret;
@@ -284,7 +292,7 @@ static int _umass_transmit(umass_dev_t *dev, void *cmd, size_t clen, char *data,
 			bytes = ret;
 		}
 
-		ret = usb_transferBulk(dev->drv, dev->pipeIn, &csw, sizeof(csw), usb_dir_in);
+		ret = usb_transferBulk(dev->owner->drv, dev->owner->pipeIn, &csw, sizeof(csw), usb_dir_in);
 		if (ret != sizeof(csw)) {
 			fprintf(stderr, "umass_transmit: usb_transferBulk IN transfer failed\n");
 			return -EIO;
@@ -422,7 +430,10 @@ static int _umass_scsiInit(umass_dev_t *dev)
 }
 
 
-static int _umass_check(umass_dev_t *dev)
+/* Read the MBR into the device's staging buffer and hand back a pointer to it.
+ * Used to configure partition 0 only and silently ignore the rest; the caller
+ * now walks all four entries. */
+static int _umass_readMBR(umass_dev_t *dev, mbr_t **out)
 {
 	scsi_cdb10_t readcmd = {
 		.opcode = 0x28,
@@ -431,7 +442,6 @@ static int _umass_check(umass_dev_t *dev)
 	mbr_t *mbr;
 	int ret;
 
-	/* Read MBR */
 	ret = _umass_transmit(dev, &readcmd, sizeof(readcmd), dev->buffer, UMASS_SECTOR_SIZE, usb_dir_in);
 	if (ret < 0) {
 		LOG_ERROR("reading MBR failed");
@@ -444,16 +454,22 @@ static int _umass_check(umass_dev_t *dev)
 		return -1;
 	}
 
-	/* Read only the first partition */
-	dev->part.start = mbr->pent[0].start;
-	dev->part.sectors = mbr->pent[0].sectors;
-	dev->part.fs = NULL;
-	dev->part.fdata = NULL;
-	dev->part.idx = 0;
-
-	DEBUG("part.start=0x%x, part.sectors=0x%x", dev->part.start, dev->part.sectors);
+	*out = mbr;
 
 	return 0;
+}
+
+
+/* Point a device at one MBR partition entry. */
+static void _umass_partSet(umass_dev_t *dev, const pentry_t *pent, unsigned idx)
+{
+	dev->part.start = pent->start;
+	dev->part.sectors = pent->sectors;
+	dev->part.fs = NULL;
+	dev->part.fdata = NULL;
+	dev->part.idx = idx;
+
+	DEBUG("part[%u].start=0x%x, sectors=0x%x", idx, dev->part.start, dev->part.sectors);
 }
 
 
@@ -523,9 +539,9 @@ static int umass_readFromDev(umass_dev_t *dev, off_t offs, char *buf, size_t len
 		readcmd.lba = htonl((uint32_t)((offs + (off_t)done) / UMASS_SECTOR_SIZE) + dev->part.start);
 		readcmd.length = htons((uint16_t)(chunk / UMASS_SECTOR_SIZE));
 
-		mutexLock(dev->lock);
+		mutexLock(dev->owner->lock);
 		ret = _umass_transmit(dev, &readcmd, sizeof(readcmd), buf + done, chunk, usb_dir_in);
-		mutexUnlock(dev->lock);
+		mutexUnlock(dev->owner->lock);
 
 		if (ret <= 0) {
 			fprintf(stderr, "umass: read failed at offs %jd (+%zu of %zu): %d\n",
@@ -573,9 +589,9 @@ static int umass_writeToDev(umass_dev_t *dev, off_t offs, const char *buf, size_
 		writecmd.lba = htonl((uint32_t)((offs + (off_t)done) / UMASS_SECTOR_SIZE) + dev->part.start);
 		writecmd.length = htons((uint16_t)(chunk / UMASS_SECTOR_SIZE));
 
-		mutexLock(dev->lock);
+		mutexLock(dev->owner->lock);
 		ret = _umass_transmit(dev, &writecmd, sizeof(writecmd), (char *)buf + done, chunk, usb_dir_out);
-		mutexUnlock(dev->lock);
+		mutexUnlock(dev->owner->lock);
 
 		if (ret <= 0) {
 			fprintf(stderr, "umass: write failed at offs %jd (+%zu of %zu): %d\n",
@@ -1025,7 +1041,11 @@ static void _umass_devFree(umass_dev_t *dev)
 	}
 
 	idtree_remove(&umass_common.devices, &dev->node);
-	resourceDestroy(dev->lock);
+	/* Only the owner created a lock; the other partitions of the same stick
+	 * borrow it via dev->owner. */
+	if (dev->owner == dev) {
+		resourceDestroy(dev->lock);
+	}
 	free(dev);
 }
 
@@ -1041,6 +1061,7 @@ static umass_dev_t *_umass_devAlloc(void)
 		return NULL;
 	}
 
+	dev->owner = dev; /* overridden for the 2nd+ partition of one stick */
 	rv = mutexCreate(&dev->lock);
 	if (rv < 0) {
 		free(dev);
@@ -1087,7 +1108,10 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 {
 	int err;
 	umass_dev_t *dev;
+	mbr_t *mbr;
 	oid_t oid;
+	unsigned i;
+	unsigned nparts = 0u;
 
 	mutexLock(umass_common.lock);
 
@@ -1140,28 +1164,77 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 			break;
 		}
 
-		err = _umass_check(dev);
+		err = _umass_readMBR(dev, &mbr);
 		if (err < 0) {
-			fprintf(stderr, "umass: umass_check failed\n");
+			fprintf(stderr, "umass: reading the partition table failed\n");
 			_umass_devFree(dev);
 			break;
 		}
 
-		oid.port = umass_common.msgport;
-		oid.id = dev->fileId;
-		err = create_dev(&oid, dev->path);
-		if (err != 0) {
-			fprintf(stderr, "usb: Can't create dev!\n");
+		/* One device node per NON-EMPTY partition entry. This used to take
+		 * pent[0] and silently ignore the rest, so a stick with more than one
+		 * partition only ever exposed its first -- and a stick whose first entry
+		 * was empty exposed nothing usable at all.
+		 *
+		 * The first partition found keeps the umass_dev_t that owns the pipes;
+		 * each later one gets its own node pointing back at that owner, because
+		 * a stick has exactly one set of bulk pipes and its SCSI commands must
+		 * stay serialised across partitions. */
+		for (i = 0u; i < MBR_PARTITIONS; ++i) {
+			umass_dev_t *pdev;
+
+			if ((mbr->pent[i].type == PENTRY_EMPTY) || (mbr->pent[i].sectors == 0u)) {
+				continue;
+			}
+
+			if (nparts == 0u) {
+				pdev = dev;
+			}
+			else {
+				pdev = _umass_devAlloc();
+				if (pdev == NULL) {
+					fprintf(stderr, "umass: devAlloc failed for partition %u\n", i);
+					break;
+				}
+				pdev->owner = dev;
+				pdev->drv = drv;
+				pdev->instance = *insertion;
+			}
+
+			_umass_partSet(pdev, &mbr->pent[i], i);
+
+			oid.port = umass_common.msgport;
+			oid.id = pdev->fileId;
+			if (create_dev(&oid, pdev->path) != 0) {
+				fprintf(stderr, "umass: can't create %s\n", pdev->path);
+				if (pdev != dev) {
+					_umass_devFree(pdev);
+				}
+				break;
+			}
+
+			printf("umass: %s = partition %u, type 0x%02x, %u sectors (%u MiB)\n",
+				pdev->path, i, mbr->pent[i].type, pdev->part.sectors,
+				(unsigned)((uint64_t)pdev->part.sectors * UMASS_SECTOR_SIZE / (1024u * 1024u)));
+
+			if (nparts == 0u) {
+				event->deviceCreated = true;
+				event->dev = oid;
+				strncpy(event->devPath, pdev->path, sizeof(event->devPath));
+				event->devPath[sizeof(event->devPath) - 1] = '\0';
+			}
+
+			nparts++;
+		}
+
+		if (nparts == 0u) {
+			fprintf(stderr, "umass: no usable partition in the table\n");
 			_umass_devFree(dev);
+			err = -ENOENT;
 			break;
 		}
 
-		printf("umass: New USB Mass Storage device: %s sectors: %d\n", dev->path, dev->part.sectors);
-
-		event->deviceCreated = true;
-		event->dev = oid;
-		strncpy(event->devPath, dev->path, sizeof(event->devPath));
-		event->devPath[sizeof(event->devPath) - 1] = '\0';
+		err = 0;
 	} while (0);
 
 	mutexUnlock(umass_common.lock);
