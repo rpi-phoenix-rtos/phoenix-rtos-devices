@@ -615,7 +615,8 @@ static int umass_mountFromDev(umass_dev_t *dev, const char *name, oid_t *oid)
 	err = portCreate(&dev->part.port);
 	if (err != 0) {
 		fprintf(stderr, "umass: Can't create partition port!\n");
-		return 1;
+		dev->part.fs = NULL;
+		return -EIO;
 	}
 
 	oid->port = dev->part.port;
@@ -623,6 +624,13 @@ static int umass_mountFromDev(umass_dev_t *dev, const char *name, oid_t *oid)
 
 	err = fs->mount(oid, UMASS_SECTOR_SIZE, umass_read, umass_write, &dev->part.fdata);
 	if (err < 0) {
+		/* Clearing part.fs here is the point: it is the "already mounted" flag
+		 * this function tests on entry, so leaving it set after a FAILED mount
+		 * made the device permanently unmountable -- one failed attempt and
+		 * every later mount returned -EEXIST, which reads like the device is
+		 * busy rather than like the first attempt went wrong. */
+		dev->part.fs = NULL;
+		dev->part.fdata = NULL;
 		portDestroy(dev->part.port);
 		return err;
 	}
@@ -948,7 +956,7 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 	if (err == 0 && umass_common.mount_root) {
 		err = umass_mountRoot(dev);
 		if (err < 0) {
-			fprintf(stderr, "umass: failed to mount root partition\n");
+			fprintf(stderr, "umass: failed to mount root partition: %s (%d)\n", strerror(-err), err);
 			return err;
 		}
 		umass_common.mount_root = false; /* don't try to mount root again */
@@ -997,12 +1005,15 @@ static int umass_init(usb_driver_t *drv, void *args)
 	umass_args_t *umass_args = (umass_args_t *)args;
 	int ret, i;
 
-	if (umass_args != NULL) {
-		umass_common.mount_root = umass_args->mount_root;
-	}
-	else {
-		umass_common.mount_root = true;
-	}
+	/* No args means hosted inside the usb daemon (USB_HOSTDRV_LIBS), which calls
+	 * ops.init(drv, NULL). That must NOT imply "mount the first stick somebody
+	 * plugs in as the system root": on a Pi 4 the root is already NFS or the SD
+	 * card, the attempt fails, and -- see umass_mountFromDev -- the failure used
+	 * to leave dev->part.fs set, so every later explicit mount of that device
+	 * returned -EEXIST. Root-on-USB stays opt-in via the standalone server's -r,
+	 * which is what umass_args_t already defaults to (srv.c: .mount_root = false);
+	 * the NULL-args path was contradicting the program's own default. */
+	umass_common.mount_root = (umass_args != NULL) ? umass_args->mount_root : false;
 
 	do {
 		ret = mutexCreate(&umass_common.rlock);
