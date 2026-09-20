@@ -111,6 +111,9 @@ static ssize_t umass_write(id_t id, off_t offs, const char *buf, size_t len);
 
 
 /* Thread types */
+typedef struct umass_dev umass_dev_t;
+static int _umass_partUnmount(umass_dev_t *dev);
+
 static void umass_fsthr(void *arg);
 static void umass_poolthr(void *arg);
 static void umass_msgthr(void *arg);
@@ -142,6 +145,8 @@ typedef struct _umass_part_t {
 	/* Filesystem data */
 	umass_fs_t *fs; /* Mounted filesystem */
 	void *fdata;    /* Mounted filesystem data */
+
+	oid_t mnt; /* Mountpoint this partition is spliced onto (for mtMountPoint) */
 
 	/* Teardown handshake with umass_fsthr. The thread runs on fsstack below,
 	 * i.e. INSIDE this struct, so the struct must not be freed until it has
@@ -874,6 +879,34 @@ static void umass_msgthr(void *arg)
 				imnt = (mount_i_msg_t *)msg.i.raw;
 				omnt = (mount_o_msg_t *)msg.o.raw;
 				msg.o.err = umass_mount(msg.oid.id, imnt->fstype, &omnt->oid);
+				if (msg.o.err >= 0) {
+					/* mount() tells us which directory it spliced us onto. It
+					 * was being thrown away, and umount() needs it back via
+					 * mtMountPoint -- without it there is no way to release a
+					 * mounted device at all. */
+					dev->part.mnt = imnt->mnt;
+				}
+				break;
+
+			case mtMountPoint:
+				omnt = (mount_o_msg_t *)msg.o.raw;
+				if (dev->part.fs == NULL) {
+					msg.o.err = -ENOENT;
+				}
+				else {
+					omnt->oid = dev->part.mnt;
+					msg.o.err = EOK;
+				}
+				break;
+
+			case mtUmount:
+				/* umount() sends this to the DEVICE port. umass_fsthr handles an
+				 * mtUmount arriving on the PARTITION port, which is a different
+				 * thing and not what libphoenix does -- so this fell through to
+				 * -ENOSYS and no mounted stick could ever be released. */
+				mutexLock(umass_common.lock);
+				msg.o.err = _umass_partUnmount(dev);
+				mutexUnlock(umass_common.lock);
 				break;
 
 			case mtRead:
@@ -910,6 +943,40 @@ static void umass_msgthr(void *arg)
 }
 
 
+/* Stop the filesystem thread and unmount, leaving the partition mountable again.
+ * Shared by the explicit mtUmount path and by device teardown on unplug: both
+ * have to stop a thread that runs on a stack INSIDE umass_dev_t before anything
+ * touches that memory. Returns -EBUSY if the thread would not leave. */
+static int _umass_partUnmount(umass_dev_t *dev)
+{
+	unsigned tries;
+
+	if (dev->part.fs == NULL) {
+		return 0;
+	}
+
+	dev->part.fsthrExit = 1;
+	portDestroy(dev->part.port);
+
+	for (tries = 0u; (tries < 1000u) && (dev->part.fsthrRunning != 0); ++tries) {
+		usleep(1000);
+	}
+
+	if (dev->part.fsthrRunning != 0) {
+		return -EBUSY;
+	}
+
+	if (dev->part.fs->unmount != NULL) {
+		(void)dev->part.fs->unmount(dev->part.fdata);
+	}
+
+	dev->part.fs = NULL;
+	dev->part.fdata = NULL;
+
+	return 0;
+}
+
+
 static void _umass_devFree(umass_dev_t *dev)
 {
 	/* A mounted device being freed is the hot-UNPLUG path, and it used to be a
@@ -922,29 +989,12 @@ static void _umass_devFree(umass_dev_t *dev)
 	 * forever on error, so destroying the port alone would have spun it. Hence
 	 * the explicit flag: set it, destroy the port to break the thread out of
 	 * msgRecv, then wait for it to acknowledge before touching the memory. */
-	if (dev->part.fs != NULL) {
-		unsigned tries;
-
-		dev->part.fsthrExit = 1;
-		portDestroy(dev->part.port);
-
-		for (tries = 0u; (tries < 1000u) && (dev->part.fsthrRunning != 0); ++tries) {
-			usleep(1000);
-		}
-
-		if (dev->part.fsthrRunning != 0) {
-			/* Never observed; say so rather than free memory a live thread is
-			 * running on. Leaking one device struct beats corrupting the heap. */
-			fprintf(stderr, "umass: fs thread for %s did not exit; leaking its state\n", dev->path);
-			idtree_remove(&umass_common.devices, &dev->node);
-			return;
-		}
-
-		if (dev->part.fs->unmount != NULL) {
-			(void)dev->part.fs->unmount(dev->part.fdata);
-		}
-		dev->part.fs = NULL;
-		dev->part.fdata = NULL;
+	if (_umass_partUnmount(dev) < 0) {
+		/* Never observed; say so rather than free memory a live thread is
+		 * running on. Leaking one device struct beats corrupting the heap. */
+		fprintf(stderr, "umass: fs thread for %s did not exit; leaking its state\n", dev->path);
+		idtree_remove(&umass_common.devices, &dev->node);
+		return;
 	}
 
 	idtree_remove(&umass_common.devices, &dev->node);
