@@ -65,6 +65,9 @@
 #define UMASS_INIT_RETRIES     10
 
 #define UMASS_SECTOR_SIZE 512
+/* Largest single SCSI READ(10)/WRITE(10) this driver issues. Anything bigger is
+ * split across commands by umass_{read,write}ToDev. */
+#define UMASS_MAX_IO (64u * 1024u)
 
 #define UMASS_WRITE 0
 #define UMASS_READ  0x80
@@ -474,62 +477,109 @@ static umass_fs_t *umass_findfs(uint8_t type)
 #endif
 
 
+/* One SCSI READ(10)/WRITE(10) can only move UMASS_MAX_IO bytes, so a larger
+ * request must be issued as several commands.
+ *
+ * Both of these used to `len = min(len, sizeof(dev->buffer))` and return the
+ * truncated count as if it were the whole transfer. Nothing reported an error,
+ * so the caller simply got less data than it asked for: a 512 B or 4 KiB read
+ * was exact, an 8 KiB read silently returned 4 KiB. libext2 reads more than
+ * 4 KiB while mounting, saw a short read, and failed the mount with -EIO --
+ * which pointed at the device rather than at the driver that shortened it.
+ * Measured on hardware: requested 512 -> 512, 4096 -> 4096, 8192 -> 4096,
+ * 16384 -> 4096. */
 static int umass_readFromDev(umass_dev_t *dev, off_t offs, char *buf, size_t len)
 {
-	scsi_cdb10_t readcmd = { .opcode = 0x28 };
-	int ret;
+	size_t done = 0;
 
-	if ((offs % UMASS_SECTOR_SIZE) || (len % UMASS_SECTOR_SIZE)) {
+	if (((offs % UMASS_SECTOR_SIZE) != 0) || ((len % UMASS_SECTOR_SIZE) != 0)) {
 		return -EINVAL;
 	}
 
-	if (offs + len > dev->part.sectors * UMASS_SECTOR_SIZE) {
+	if ((offs + (off_t)len) > (off_t)((off_t)dev->part.sectors * UMASS_SECTOR_SIZE)) {
 		return -EINVAL;
 	}
 
-	len = min(len, sizeof(dev->buffer));
+	while (done < len) {
+		scsi_cdb10_t readcmd = { .opcode = 0x28 };
+		size_t chunk = len - done;
+		int ret;
 
-	readcmd.lba = htonl(offs / UMASS_SECTOR_SIZE + dev->part.start);
-	readcmd.length = htons((uint16_t)(len / UMASS_SECTOR_SIZE));
+		if (chunk > UMASS_MAX_IO) {
+			chunk = UMASS_MAX_IO;
+		}
 
-	mutexLock(dev->lock);
-	ret = _umass_transmit(dev, &readcmd, sizeof(readcmd), buf, len, usb_dir_in);
-	mutexUnlock(dev->lock);
+		readcmd.lba = htonl((uint32_t)((offs + (off_t)done) / UMASS_SECTOR_SIZE) + dev->part.start);
+		readcmd.length = htons((uint16_t)(chunk / UMASS_SECTOR_SIZE));
 
-	if (ret <= 0 && len > 0) {
-		printf("read transmit failed for offs: %jd\n", (intmax_t)offs);
+		mutexLock(dev->lock);
+		ret = _umass_transmit(dev, &readcmd, sizeof(readcmd), buf + done, chunk, usb_dir_in);
+		mutexUnlock(dev->lock);
+
+		if (ret <= 0) {
+			fprintf(stderr, "umass: read failed at offs %jd (+%zu of %zu): %d\n",
+				(intmax_t)offs, done, len, ret);
+			/* Report what was actually transferred rather than claiming the
+			 * whole request: a partial result the caller can see is far better
+			 * than a short one it cannot. */
+			return (done > 0u) ? (int)done : ret;
+		}
+
+		done += (size_t)ret;
+
+		/* A short-but-successful transfer means the device ended the command
+		 * early; stop rather than spin. */
+		if ((size_t)ret < chunk) {
+			break;
+		}
 	}
 
-	return ret;
+	return (int)done;
 }
 
 
 static int umass_writeToDev(umass_dev_t *dev, off_t offs, const char *buf, size_t len)
 {
-	scsi_cdb10_t writecmd = { .opcode = 0x2a };
-	int ret;
+	size_t done = 0;
 
-	if ((offs % UMASS_SECTOR_SIZE) || (len % UMASS_SECTOR_SIZE)) {
+	if (((offs % UMASS_SECTOR_SIZE) != 0) || ((len % UMASS_SECTOR_SIZE) != 0)) {
 		return -EINVAL;
 	}
 
-	if (offs + len > dev->part.sectors * UMASS_SECTOR_SIZE) {
+	if ((offs + (off_t)len) > (off_t)((off_t)dev->part.sectors * UMASS_SECTOR_SIZE)) {
 		return -EINVAL;
 	}
 
-	len = min(len, sizeof(dev->buffer));
+	while (done < len) {
+		scsi_cdb10_t writecmd = { .opcode = 0x2a };
+		size_t chunk = len - done;
+		int ret;
 
-	writecmd.lba = htonl(offs / UMASS_SECTOR_SIZE + dev->part.start);
-	writecmd.length = htons((uint16_t)(len / UMASS_SECTOR_SIZE));
+		if (chunk > UMASS_MAX_IO) {
+			chunk = UMASS_MAX_IO;
+		}
 
-	mutexLock(dev->lock);
-	ret = _umass_transmit(dev, &writecmd, sizeof(writecmd), (char *)buf, len, usb_dir_out);
-	mutexUnlock(dev->lock);
-	if (ret < 0) {
-		fprintf(stderr, "write transmit failed for offs: %jd\n", (intmax_t)offs);
+		writecmd.lba = htonl((uint32_t)((offs + (off_t)done) / UMASS_SECTOR_SIZE) + dev->part.start);
+		writecmd.length = htons((uint16_t)(chunk / UMASS_SECTOR_SIZE));
+
+		mutexLock(dev->lock);
+		ret = _umass_transmit(dev, &writecmd, sizeof(writecmd), (char *)buf + done, chunk, usb_dir_out);
+		mutexUnlock(dev->lock);
+
+		if (ret <= 0) {
+			fprintf(stderr, "umass: write failed at offs %jd (+%zu of %zu): %d\n",
+				(intmax_t)offs, done, len, ret);
+			return (done > 0u) ? (int)done : ret;
+		}
+
+		done += (size_t)ret;
+
+		if ((size_t)ret < chunk) {
+			break;
+		}
 	}
 
-	return ret;
+	return (int)done;
 }
 
 
