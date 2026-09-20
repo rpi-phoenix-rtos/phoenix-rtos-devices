@@ -436,6 +436,10 @@ typedef struct {
 	uint32_t nintrs;
 	uint32_t nslots;
 	uint32_t nports;
+	/* Root-port range owned by the USB 3.x Supported Protocol entry (0 = none
+	 * found). Learned in xhci_dumpProtocols. */
+	unsigned ssPortLo;
+	unsigned ssPortHi;
 	/* Per-port (bit = port number) "connect announced" latch. A device
 	 * already attached before this controller's bring-up shows CCS=1 with
 	 * no fresh CSC change bit, so the change-bit-driven hub poll never
@@ -801,6 +805,31 @@ static void xhci_roothubStatusThread(void *arg)
  *
  * Print the facts before changing any of that: which port ranges each protocol
  * owns, and what each port has actually linked up as. Read-only. */
+/* Is this root port owned by the USB 3.x protocol entry? */
+static int xhci_portIsSuperSpeed(const xhci_t *xhci, unsigned port)
+{
+	return ((xhci->ssPortLo != 0u) && (port >= xhci->ssPortLo) && (port <= xhci->ssPortHi)) ? 1 : 0;
+}
+
+
+/* SuperSpeed root ports are recognised but NOT yet enumerated.
+ *
+ * With the PORTSC read-modify-write fixed, root port 2 correctly stays up at
+ * speed 4 -- and the framework then enumerates it with USB 2 semantics, which
+ * it is not: the Slot Context has no SuperSpeed speed value, ep0 on a
+ * SuperSpeed device is always 512 bytes (bMaxPacketSize0 = 9, an exponent, not
+ * a byte count), and bulk endpoints carry a SuperSpeed Endpoint Companion
+ * descriptor. The result on hardware was a bogus second '2109:3431 USB2.0 Hub'
+ * on port 2 and the SanDisk stick DISAPPEARING entirely -- a regression against
+ * a working device.
+ *
+ * So hide SS ports from the hub driver until that path is implemented. The
+ * stick keeps working over its USB 2 personality at ~29 MB/s, and the SS link
+ * stays trained and waiting rather than being torn down. Removing this gate is
+ * the LAST step of SuperSpeed support, not the first. */
+#define XHCI_SUPERSPEED_ENUM_READY 0
+
+
 static void xhci_dumpProtocols(xhci_t *xhci)
 {
 	uint32_t off = (xhci->hccparams1 >> XHCI_REG_CAP_HCCPARAMS1_XECP__SHIFT) & 0xffffu;
@@ -831,6 +860,11 @@ static void xhci_dumpProtocols(xhci_t *xhci)
 				(char)((name >> 16) & 0xffu), (char)((name >> 24) & 0xffu),
 				(unsigned)((dw0 >> 24) & 0xffu), (unsigned)((dw0 >> 16) & 0xffu),
 				portOff, portOff + portCnt - 1u);
+
+			if ((((dw0 >> 24) & 0xffu) >= 3u) && (portCnt > 0u)) {
+				xhci->ssPortLo = portOff;
+				xhci->ssPortHi = portOff + portCnt - 1u;
+			}
 		}
 
 		if (next == 0u) {
@@ -3443,6 +3477,11 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 
 	memset(status, 0, sizeof(*status));
 
+	if ((XHCI_SUPERSPEED_ENUM_READY == 0) && (xhci_portIsSuperSpeed(xhci, (unsigned)port) != 0)) {
+		/* Report "nothing here" rather than a device we cannot yet drive. */
+		return 0;
+	}
+
 	portsc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
 
 	if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) {
@@ -3954,6 +3993,11 @@ static uint32_t xhci_getHubStatus(usb_dev_t *hub)
 
 	for (i = 0; i < hub->nports; ++i) {
 		uint32_t bit = 1u << (i + 1);
+
+		if ((XHCI_SUPERSPEED_ENUM_READY == 0) && (xhci_portIsSuperSpeed(xhci, (unsigned)(i + 1)) != 0)) {
+			continue;
+		}
+
 		portsc = xhci_portRead32(xhci, i + 1, XHCI_REG_OP_PORT_PORTSC);
 		if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) == 0u) {
 			/* Disconnected: drop the latch so a future re-attach
