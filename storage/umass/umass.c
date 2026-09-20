@@ -946,7 +946,16 @@ static void umass_msgthr(void *arg)
 /* Stop the filesystem thread and unmount, leaving the partition mountable again.
  * Shared by the explicit mtUmount path and by device teardown on unplug: both
  * have to stop a thread that runs on a stack INSIDE umass_dev_t before anything
- * touches that memory. Returns -EBUSY if the thread would not leave. */
+ * touches that memory. Returns -EBUSY if the thread would not leave.
+ *
+ * ⛔ Do NOT portDestroy() to break the thread out of msgRecv. That was the first
+ * attempt and it HUNG the umount: the thread is blocked *inside* msgRecv, not at
+ * the loop test, so destroying the port under it neither woke it nor let it
+ * re-check the exit flag, and the caller never got a reply.
+ *
+ * umass_fsthr already knows how to leave: it exits on an mtUmount arriving on
+ * its OWN port. So ask it, the way it expects to be asked, and only tear the
+ * port down once it is gone. */
 static int _umass_partUnmount(umass_dev_t *dev)
 {
 	unsigned tries;
@@ -956,19 +965,37 @@ static int _umass_partUnmount(umass_dev_t *dev)
 	}
 
 	dev->part.fsthrExit = 1;
-	portDestroy(dev->part.port);
-
-	for (tries = 0u; (tries < 1000u) && (dev->part.fsthrRunning != 0); ++tries) {
-		usleep(1000);
-	}
 
 	if (dev->part.fsthrRunning != 0) {
-		return -EBUSY;
+		msg_t msg = { 0 };
+
+		msg.type = mtUmount;
+		(void)msgSend(dev->part.port, &msg);
+
+		for (tries = 0u; (tries < 1000u) && (dev->part.fsthrRunning != 0); ++tries) {
+			usleep(1000);
+		}
+
+		if (dev->part.fsthrRunning != 0) {
+			return -EBUSY;
+		}
+
+		/* ⚠ umass_poolthr has ALREADY called fs->unmount() and cleared
+		 * fs/fdata for us -- that is what it does with an mtUmount. Calling
+		 * unmount() again here would be a second free of libext2's state. All
+		 * that is left is the port. */
+		portDestroy(dev->part.port);
+
+		return 0;
 	}
 
+	/* The thread was never started (mount failed part-way), so nothing has
+	 * unmounted anything: do it here. */
 	if (dev->part.fs->unmount != NULL) {
 		(void)dev->part.fs->unmount(dev->part.fdata);
 	}
+
+	portDestroy(dev->part.port);
 
 	dev->part.fs = NULL;
 	dev->part.fdata = NULL;
