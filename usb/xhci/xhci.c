@@ -3465,6 +3465,12 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 		status->wPortChange |= USB_PORT_STAT_C_ENABLE;
 	}
 
+	/* TEMPORARY (SuperSpeed bring-up): why is root port 2 -- USB 3.0, CCS=1,
+	 * PED=1, speed 4, U0 -- never enumerated? Trace what the hub driver is
+	 * actually told about each port. Remove once SS enumeration works. */
+	fprintf(stderr, "xhci: GetPortStatus(%d) portsc=0x%08x -> stat=0x%04x chg=0x%04x speed=%u\n",
+		port, portsc, (unsigned)status->wPortStatus, (unsigned)status->wPortChange, speed);
+
 	if ((portsc & XHCI_REG_OP_PORT_PORTSC_OCC) != 0u) {
 		status->wPortChange |= USB_PORT_STAT_C_OVERCURRENT;
 	}
@@ -3487,6 +3493,9 @@ static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 	if ((port <= 0) || (port > hub->nports)) {
 		return -1;
 	}
+
+	/* TEMPORARY (SuperSpeed bring-up) -- see GetPortStatus. */
+	fprintf(stderr, "xhci: SetPortFeature(%d, %u)\n", port, (unsigned)wValue);
 
 	portsc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
 
