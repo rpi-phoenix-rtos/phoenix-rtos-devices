@@ -225,9 +225,12 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_TRB_COMPLETION_CODE_SUCCESS 1u
 #define XHCI_TRB_COMPLETION_CODE_SHORT_PACKET 13u
+#define XHCI_REG_CAP_HCCPARAMS1_XECP__SHIFT 16u
+#define XHCI_XECP_ID_SUPPORTED_PROTOCOL 2u
 #define XHCI_PORT_SPEED_FULL     1u
 #define XHCI_PORT_SPEED_LOW      2u
 #define XHCI_PORT_SPEED_HIGH     3u
+#define XHCI_PORT_SPEED_SUPER    4u
 #define XHCI_SLOT_CTX_SPEED__SHIFT 20u
 #define XHCI_SLOT_CTX_CONTEXT_ENTRIES__SHIFT 27u
 #define XHCI_SLOT_CTX_ROOT_HUB_PORT__SHIFT 16u
@@ -762,6 +765,70 @@ static void xhci_roothubStatusThread(void *arg)
 }
 
 
+/* Walk the xHCI Extended Capabilities and report the Supported Protocol entries
+ * plus every root port's current state.
+ *
+ * Why this exists: this driver has no concept of SuperSpeed. It defines port
+ * speeds FULL/LOW/HIGH only, and never reads the Supported Protocol capability
+ * -- the thing that says WHICH root ports are USB 2.x and which are USB 3.x. So
+ * it drives every port as if it were USB 2, and a USB 3 stick in a blue Pi port
+ * enumerates behind the VL805's internal USB 2.0 hub at High Speed
+ * (bulk maxpkt 512 instead of 1024), capping it near 30 MB/s.
+ *
+ * Print the facts before changing any of that: which port ranges each protocol
+ * owns, and what each port has actually linked up as. Read-only. */
+static void xhci_dumpProtocols(xhci_t *xhci)
+{
+	uint32_t off = (xhci->hccparams1 >> XHCI_REG_CAP_HCCPARAMS1_XECP__SHIFT) & 0xffffu;
+	unsigned guard = 0u;
+	unsigned port;
+
+	if (off == 0u) {
+		fprintf(stderr, "xhci: no extended capabilities\n");
+		return;
+	}
+
+	/* xECP offset is in DWORDs from the CAPABILITY base, not the operational one. */
+	off *= 4u;
+
+	while ((off != 0u) && (guard < 64u)) {
+		uint32_t dw0 = xhci_read32(xhci, off);
+		uint32_t id = dw0 & 0xffu;
+		uint32_t next = (dw0 >> 8) & 0xffu;
+
+		if (id == XHCI_XECP_ID_SUPPORTED_PROTOCOL) {
+			uint32_t name = xhci_read32(xhci, off + 4u);
+			uint32_t dw2 = xhci_read32(xhci, off + 8u);
+			unsigned portOff = dw2 & 0xffu;
+			unsigned portCnt = (dw2 >> 8) & 0xffu;
+
+			fprintf(stderr, "xhci: protocol '%c%c%c%c' %u.%u ports %u..%u\n",
+				(char)(name & 0xffu), (char)((name >> 8) & 0xffu),
+				(char)((name >> 16) & 0xffu), (char)((name >> 24) & 0xffu),
+				(unsigned)((dw0 >> 24) & 0xffu), (unsigned)((dw0 >> 16) & 0xffu),
+				portOff, portOff + portCnt - 1u);
+		}
+
+		if (next == 0u) {
+			break;
+		}
+		off += next * 4u;
+		guard++;
+	}
+
+	for (port = 1u; port <= xhci->nports; ++port) {
+		uint32_t sc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
+
+		fprintf(stderr, "xhci: port %u PORTSC=0x%08x ccs=%u ped=%u speed=%u pls=%u\n",
+			port, sc,
+			((sc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) ? 1u : 0u,
+			((sc & XHCI_REG_OP_PORT_PORTSC_PED) != 0u) ? 1u : 0u,
+			(sc & XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__MASK) >> XHCI_REG_OP_PORT_PORTSC_PORT_SPEED__SHIFT,
+			(sc & XHCI_REG_OP_PORT_PORTSC_PLS__MASK) >> XHCI_REG_OP_PORT_PORTSC_PLS__SHIFT);
+	}
+}
+
+
 static int xhci_map(hcd_t *hcd, xhci_t **xhcip)
 {
 	xhci_t *xhci;
@@ -991,6 +1058,8 @@ static int xhci_validateRuntime(xhci_t *xhci)
 	xhci->ac64 = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_AC64) != 0u) ? 1u : 0u;
 	xhci->contextSize = ((xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_CSZ) != 0u) ? 64u : 32u;
 	xhci->maxPsaSize = (xhci->hccparams1 & XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__MASK) >> XHCI_REG_CAP_HCCPARAMS1_MAX_PSA_SIZE__SHIFT;
+	xhci_dumpProtocols(xhci);
+
 	xhci->crcrLo = xhci_opRead32(xhci, XHCI_REG_OP_CRCR);
 	xhci->crcrHi = xhci_opRead32(xhci, XHCI_REG_OP_CRCR_HI);
 	xhci->dcbaapLo = xhci_opRead32(xhci, XHCI_REG_OP_DCBAAP);
