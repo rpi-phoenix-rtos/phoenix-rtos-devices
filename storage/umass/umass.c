@@ -900,16 +900,10 @@ static void umass_msgthr(void *arg)
 				break;
 
 			case mtUmount:
-				/* umount() sends this to the DEVICE port, while umass_fsthr
-				 * expects one on the PARTITION port. Bridging the two is the
-				 * open item: both ways tried so far (portDestroy, and
-				 * forwarding the message) HUNG on hardware, which is worse than
-				 * failing. Fail fast and visibly until that is understood --
-				 * releasing a mounted stick still does not work, but nothing
-				 * blocks forever. */
-				fprintf(stderr, "umass: umount of %s not supported yet "
-					"(fs thread teardown unresolved)\n", dev->path);
-				msg.o.err = -ENOTSUP;
+				/* umount() sends this to the DEVICE port; umass_fsthr expects
+				 * one on the PARTITION port. Bridge them -- WITHOUT holding
+				 * umass_common.lock, see _umass_partUnmount. */
+				msg.o.err = _umass_partUnmount(dev);
 				break;
 
 			case mtRead:
@@ -946,31 +940,65 @@ static void umass_msgthr(void *arg)
 }
 
 
-/* Best-effort teardown for the UNPLUG path. Bounded and non-hanging by
- * construction, because nothing is waiting on a reply here.
+/* Stop the filesystem thread and release the mount.
  *
- * ⛔ Two ways of actively stopping umass_fsthr were tried on hardware and BOTH
- * hung `umount` (see the weekly log for the cycles):
- *   1. portDestroy() to break it out of msgRecv -- it is blocked INSIDE
- *      msgRecv, not at the loop test, so the port vanishing neither woke it
- *      nor let it re-check the exit flag.
- *   2. msgSend(mtUmount) to its own port, the way it expects to be asked --
- *      also never returned.
- * Both are worse than failing cleanly, so neither is done here. The flag is set
- * (the thread checks it whenever msgRecv does return) and the struct is kept
- * rather than freed, which is what actually matters: umass_fsthr runs on a
- * stack INSIDE umass_dev_t, so freeing it under a live thread corrupts the heap.
- * Leaking one device struct per unplug is the safe trade until the msgSend
- * question is understood. */
+ * ⛔ MUST NOT be called with umass_common.lock held. That was the bug behind the
+ * umount hang: this sends a message whose completion path runs
+ * fs->unmount() -> libext2 flush -> umass_write(), and umass_write() takes
+ * umass_common.lock. Holding it across the synchronous round-trip deadlocks the
+ * driver against itself. Nothing else in the message loop holds it either --
+ * mtRead/mtWrite drop it before doing any work.
+ *
+ * ⛔ And do NOT portDestroy() to break umass_fsthr out of msgRecv: it is blocked
+ * INSIDE msgRecv, not at the loop test, so the port vanishing neither wakes it
+ * nor lets it re-check the exit flag. Tried on hardware; it hung.
+ *
+ * umass_fsthr already knows how to leave -- it exits on an mtUmount arriving on
+ * its OWN port, and umass_poolthr does the actual fs->unmount() and clears
+ * fs/fdata when it processes that message. So ask, wait, then take the port. */
 static int _umass_partUnmount(umass_dev_t *dev)
 {
+	unsigned tries;
+
 	if (dev->part.fs == NULL) {
 		return 0;
 	}
 
 	dev->part.fsthrExit = 1;
 
-	return (dev->part.fsthrRunning != 0) ? -EBUSY : 0;
+	if (dev->part.fsthrRunning != 0) {
+		msg_t msg = { 0 };
+
+		msg.type = mtUmount;
+		(void)msgSend(dev->part.port, &msg);
+
+		for (tries = 0u; (tries < 1000u) && (dev->part.fsthrRunning != 0); ++tries) {
+			usleep(1000);
+		}
+
+		if (dev->part.fsthrRunning != 0) {
+			return -EBUSY;
+		}
+
+		/* umass_poolthr has already unmounted and cleared fs/fdata -- that is
+		 * what it does with an mtUmount. Unmounting again here would free
+		 * libext2's state twice. Only the port is left. */
+		portDestroy(dev->part.port);
+
+		return 0;
+	}
+
+	/* Thread never started (a mount that failed part-way): nothing has
+	 * unmounted anything, so do it here. */
+	if (dev->part.fs->unmount != NULL) {
+		(void)dev->part.fs->unmount(dev->part.fdata);
+	}
+
+	portDestroy(dev->part.port);
+	dev->part.fs = NULL;
+	dev->part.fdata = NULL;
+
+	return 0;
 }
 
 
