@@ -123,22 +123,6 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_REG_OP_PORT_PORTSC_PRC (1u << 21)
 #define XHCI_REG_OP_PORT_PORTSC_RW1C (XHCI_REG_OP_PORT_PORTSC_CSC | XHCI_REG_OP_PORT_PORTSC_PEC | \
 	XHCI_REG_OP_PORT_PORTSC_OCC | XHCI_REG_OP_PORT_PORTSC_PRC)
-/* Bits that survive a read-modify-write of PORTSC.
- *
- * ⛔ PORTSC CANNOT be read-modify-written naively. Bit 1 (PED) is RW1CS --
- * writing a 1 DISABLES the port -- and bits 17..23 are RW1C change bits that a
- * write-back silently acknowledges. So feeding a port's own state back to it
- * turns the port off and eats its pending events. That is not theoretical: the
- * PORT_POWER case below did exactly `portsc | PP`, and since a live SuperSpeed
- * port reads PED=1, powering the ports at start-up DISABLED the already-trained
- * USB 3 link on root port 2 and dropped the stick down to its USB 2 personality
- * behind the VL805's internal hub, capping it at High Speed.
- *
- * Keep only the read-only status (CCS, OCA, PortSpeed, DR) and the
- * read-write-save controls (PLS, PP, PIC, WCE/WDE/WOE); zero PED, PR, WPR and
- * every change bit. Mirrors Linux's xhci_port_state_to_neutral(). */
-#define XHCI_REG_OP_PORT_PORTSC_RO  ((1u << 0) | (1u << 3) | (0xfu << 10) | (1u << 30))
-#define XHCI_REG_OP_PORT_PORTSC_RWS ((0xfu << 5) | (1u << 9) | (0x3u << 14) | (0x7u << 25))
 #define XHCI_REG_RT_IR_ERSTSZ__MASK 0xffffu
 #define XHCI_REG_RT_IR_ERSTBA_LO__MASK 0xffffffc0u
 #define XHCI_REG_RT_IR_ERDP_LO_EHB (1u << 3)
@@ -436,10 +420,6 @@ typedef struct {
 	uint32_t nintrs;
 	uint32_t nslots;
 	uint32_t nports;
-	/* Root-port range owned by the USB 3.x Supported Protocol entry (0 = none
-	 * found). Learned in xhci_dumpProtocols. */
-	unsigned ssPortLo;
-	unsigned ssPortHi;
 	/* Per-port (bit = port number) "connect announced" latch. A device
 	 * already attached before this controller's bring-up shows CCS=1 with
 	 * no fresh CSC change bit, so the change-bit-driven hub poll never
@@ -596,14 +576,6 @@ static inline void xhci_dbWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
 	 * Mirrors Linux xhci_ring_*_doorbell(), which wmb() before the DB write. */
 	__asm__ volatile("dsb sy" ::: "memory");
 	*reg = val;
-}
-
-
-/* Strip a PORTSC value down to the bits that are safe to write back. Always use
- * this as the base of a read-modify-write -- see XHCI_REG_OP_PORT_PORTSC_RO. */
-static inline uint32_t xhci_portStateNeutral(uint32_t portsc)
-{
-	return portsc & (XHCI_REG_OP_PORT_PORTSC_RO | XHCI_REG_OP_PORT_PORTSC_RWS);
 }
 
 
@@ -805,31 +777,6 @@ static void xhci_roothubStatusThread(void *arg)
  *
  * Print the facts before changing any of that: which port ranges each protocol
  * owns, and what each port has actually linked up as. Read-only. */
-/* Is this root port owned by the USB 3.x protocol entry? */
-static int xhci_portIsSuperSpeed(const xhci_t *xhci, unsigned port)
-{
-	return ((xhci->ssPortLo != 0u) && (port >= xhci->ssPortLo) && (port <= xhci->ssPortHi)) ? 1 : 0;
-}
-
-
-/* SuperSpeed root ports are recognised but NOT yet enumerated.
- *
- * With the PORTSC read-modify-write fixed, root port 2 correctly stays up at
- * speed 4 -- and the framework then enumerates it with USB 2 semantics, which
- * it is not: the Slot Context has no SuperSpeed speed value, ep0 on a
- * SuperSpeed device is always 512 bytes (bMaxPacketSize0 = 9, an exponent, not
- * a byte count), and bulk endpoints carry a SuperSpeed Endpoint Companion
- * descriptor. The result on hardware was a bogus second '2109:3431 USB2.0 Hub'
- * on port 2 and the SanDisk stick DISAPPEARING entirely -- a regression against
- * a working device.
- *
- * So hide SS ports from the hub driver until that path is implemented. The
- * stick keeps working over its USB 2 personality at ~29 MB/s, and the SS link
- * stays trained and waiting rather than being torn down. Removing this gate is
- * the LAST step of SuperSpeed support, not the first. */
-#define XHCI_SUPERSPEED_ENUM_READY 0
-
-
 static void xhci_dumpProtocols(xhci_t *xhci)
 {
 	uint32_t off = (xhci->hccparams1 >> XHCI_REG_CAP_HCCPARAMS1_XECP__SHIFT) & 0xffffu;
@@ -860,11 +807,6 @@ static void xhci_dumpProtocols(xhci_t *xhci)
 				(char)((name >> 16) & 0xffu), (char)((name >> 24) & 0xffu),
 				(unsigned)((dw0 >> 24) & 0xffu), (unsigned)((dw0 >> 16) & 0xffu),
 				portOff, portOff + portCnt - 1u);
-
-			if ((((dw0 >> 24) & 0xffu) >= 3u) && (portCnt > 0u)) {
-				xhci->ssPortLo = portOff;
-				xhci->ssPortHi = portOff + portCnt - 1u;
-			}
 		}
 
 		if (next == 0u) {
@@ -3477,11 +3419,6 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 
 	memset(status, 0, sizeof(*status));
 
-	if ((XHCI_SUPERSPEED_ENUM_READY == 0) && (xhci_portIsSuperSpeed(xhci, (unsigned)port) != 0)) {
-		/* Report "nothing here" rather than a device we cannot yet drive. */
-		return 0;
-	}
-
 	portsc = xhci_portRead32(xhci, port, XHCI_REG_OP_PORT_PORTSC);
 
 	if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) {
@@ -3564,7 +3501,7 @@ static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 
 	switch (wValue) {
 		case USB_PORT_FEAT_RESET:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PR);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc | XHCI_REG_OP_PORT_PORTSC_PR) & ~XHCI_REG_OP_PORT_PORTSC_PED);
 			err = xhci_portWaitBits(xhci, port, XHCI_REG_OP_PORT_PORTSC_PR, 0u, XHCI_PORT_RESET_TIMEOUT_MS);
 			if (err < 0) {
 				return err;
@@ -3577,7 +3514,7 @@ static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 			break;
 
 		case USB_PORT_FEAT_POWER:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PP);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc | XHCI_REG_OP_PORT_PORTSC_PP);
 			usleep(XHCI_PORT_POWER_GOOD_DELAY_US);
 			break;
 
@@ -3612,27 +3549,27 @@ static int xhci_clearPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 			 * getPortStatus stop synthesizing C_CONNECTION for a device
 			 * that was already attached before bring-up. */
 			xhci->portConnAnnounced |= (1u << (unsigned)port);
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_CSC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_CSC);
 			break;
 
 		case USB_PORT_FEAT_C_ENABLE:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PEC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_PEC);
 			break;
 
 		case USB_PORT_FEAT_C_OVER_CURRENT:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_OCC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_OCC);
 			break;
 
 		case USB_PORT_FEAT_C_RESET:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PRC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_PRC);
 			break;
 
 		case USB_PORT_FEAT_ENABLE:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc));
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C));
 			break;
 
 		case USB_PORT_FEAT_POWER:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) & ~XHCI_REG_OP_PORT_PORTSC_PP);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc & ~(XHCI_REG_OP_PORT_PORTSC_PP | XHCI_REG_OP_PORT_PORTSC_RW1C));
 			break;
 
 		case USB_PORT_FEAT_INDICATOR:
@@ -3993,11 +3930,6 @@ static uint32_t xhci_getHubStatus(usb_dev_t *hub)
 
 	for (i = 0; i < hub->nports; ++i) {
 		uint32_t bit = 1u << (i + 1);
-
-		if ((XHCI_SUPERSPEED_ENUM_READY == 0) && (xhci_portIsSuperSpeed(xhci, (unsigned)(i + 1)) != 0)) {
-			continue;
-		}
-
 		portsc = xhci_portRead32(xhci, i + 1, XHCI_REG_OP_PORT_PORTSC);
 		if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) == 0u) {
 			/* Disconnected: drop the latch so a future re-attach
