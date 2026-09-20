@@ -189,6 +189,9 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
  * caught by the class driver's own retry, not by cutting a slow transfer
  * short. */
 #define XHCI_BULK_TIMEOUT_MS 5000u
+/* Event-ring poll cadence: tight for this long, then back off to 1 ms. */
+#define XHCI_EVENT_FASTPOLL_US 4000u
+#define XHCI_EVENT_POLL_STEP_US 20u
 #define XHCI_TRANSFER_TRB_CONTROL_DIR_IN (1u << 16)
 #define XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT 16u
 #define XHCI_TRANSFER_TRB_CONTROL_TRT_NONE 0u
@@ -1569,10 +1572,23 @@ static int xhci_eventStashable(const xhci_trb_t *ev)
 static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint8_t wantSlot, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out)
 {
 	xhci_trb_t *ring = (xhci_trb_t *)xhci->eventRing;
-	unsigned t;
+	unsigned waitedUs = 0u;
+	unsigned budgetUs = timeoutMs * 1000u;
 	uint32_t i;
 
-	for (t = timeoutMs; t > 0u; --t) {
+	/* The poll granularity USED to be a flat usleep(1000), one iteration per
+	 * millisecond of timeout. That is fine for a command completion nobody is
+	 * timing, and ruinous for bulk: the controller finishes a transfer in tens of
+	 * microseconds, so a 1 ms floor meant ~1 ms per transfer and, since one SCSI
+	 * command is CBW + data + CSW, ~3 ms per command. Measured on hardware before
+	 * this change: 4 KiB reads ran at 1.3 MB/s (3.1 ms/command) against 14.7 MB/s
+	 * for 64 KiB ones -- i.e. fixed cost, not bandwidth.
+	 *
+	 * Poll tightly for the first couple of milliseconds, where nearly every
+	 * transfer lands, then fall back to the 1 ms cadence so a genuinely slow or
+	 * absent completion does not burn a core. The timeout is still expressed and
+	 * honoured in milliseconds. */
+	while (waitedUs <= budgetUs) {
 		mutexLock(xhci->eventLock);
 
 		/* The other consumer may already have pulled our event off the ring. */
@@ -1655,7 +1671,12 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 		}
 
 		mutexUnlock(xhci->eventLock);
-		usleep(1000);
+
+		{
+			unsigned stepUs = (waitedUs < XHCI_EVENT_FASTPOLL_US) ? XHCI_EVENT_POLL_STEP_US : 1000u;
+			usleep(stepUs);
+			waitedUs += stepUs;
+		}
 	}
 
 	return -ETIMEDOUT;
