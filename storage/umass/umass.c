@@ -652,12 +652,33 @@ static int umass_mountFromDev(umass_dev_t *dev, const char *name, oid_t *oid)
 static int umass_mount(id_t id, const char *name, oid_t *oid)
 {
 	umass_dev_t *dev;
+	int ret;
 
 	mutexLock(umass_common.lock);
 	dev = _umass_devFind(id);
 	mutexUnlock(umass_common.lock);
 
-	return umass_mountFromDev(dev, name, oid);
+	/* Name which check failed. Both "no such device id" and "no such filesystem"
+	 * return -ENOENT, and mount(2) surfaces either as a bare
+	 * "No such file or directory" -- indistinguishable from the path not
+	 * existing, which is where this was misread twice. */
+	if (dev == NULL) {
+		fprintf(stderr, "umass: mount: no device with id %llu\n", (unsigned long long)id);
+		return -ENOENT;
+	}
+
+	if (umass_getfs(name) == NULL) {
+		fprintf(stderr, "umass: mount: filesystem '%s' is not registered\n", name);
+		return -ENOENT;
+	}
+
+	ret = umass_mountFromDev(dev, name, oid);
+	if (ret < 0) {
+		fprintf(stderr, "umass: mount: %s on id %llu failed: %s (%d)\n",
+			name, (unsigned long long)id, strerror(-ret), ret);
+	}
+
+	return ret;
 }
 
 
