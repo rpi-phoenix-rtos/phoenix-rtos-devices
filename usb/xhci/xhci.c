@@ -184,6 +184,11 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 /* Worst case one TRB per page, plus slack. A bulk transfer here is at most
  * USB_BUF_SIZE-backed (the framework's own DMA allocator), so this is generous. */
 #define XHCI_MAX_TRBS_PER_TD 34u
+/* How long a bulk submit waits for its own completion before handing the
+ * transfer back to the roothub poller. Generous: a stalled device should be
+ * caught by the class driver's own retry, not by cutting a slow transfer
+ * short. */
+#define XHCI_BULK_TIMEOUT_MS 5000u
 #define XHCI_TRANSFER_TRB_CONTROL_DIR_IN (1u << 16)
 #define XHCI_TRANSFER_TRB_CONTROL_TRT__SHIFT 16u
 #define XHCI_TRANSFER_TRB_CONTROL_TRT_NONE 0u
@@ -2683,6 +2688,48 @@ static int xhci_submitNormal(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
 	priv->pendingTransfer = t;
 
 	xhci_dbWrite32(xhci, (uintptr_t)priv->slotId * sizeof(uint32_t), priv->endpointId);
+
+	/* Reap this transfer's completion HERE, in the submitting thread, instead of
+	 * leaving it to the roothub poller.
+	 *
+	 * That poller sleeps 1 ms whenever anything is outstanding, so every transfer
+	 * paid up to a millisecond AFTER the controller had already finished. For an
+	 * interrupt endpoint that is free -- a keyboard has nothing to say more often
+	 * than that. For bulk it is the whole performance story: one SCSI command is
+	 * three transfers (CBW, data, CSW), so a 64 KiB read cost ~3 ms of pure
+	 * waiting and the stick was capped near 1 MB/s against ~35 MB/s for the bus.
+	 *
+	 * xhci_eventAwait() is locked and stash-aware precisely so more than one
+	 * consumer can use it, so this is safe from any thread. The wait is bounded;
+	 * on timeout the transfer is simply left pending and the roothub poller
+	 * finishes it as before, so this is an accelerator, not a new owner.
+	 *
+	 * Only for bulk: leaving interrupt-IN on the poller keeps the hub and HID
+	 * paths byte-for-byte on the code that has been running for months. */
+	if ((priv->endpointType == XHCI_EP_CTX_TYPE_BULK_IN) ||
+		(priv->endpointType == XHCI_EP_CTX_TYPE_BULK_OUT)) {
+		xhci_trb_t ev;
+
+		if (xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, priv->pendingTrbPhys,
+				priv->slotId, priv->endpointId, XHCI_BULK_TIMEOUT_MS, &ev) == EOK) {
+			uint32_t completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
+				XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+			uint32_t residual = ev.status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
+			int ret;
+
+			if ((residual <= t->size) &&
+				((completion == XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
+				(completion == XHCI_TRB_COMPLETION_CODE_SHORT_PACKET))) {
+				ret = (int)(t->size - residual);
+			}
+			else {
+				ret = -ENODEV;
+			}
+
+			priv->pendingTransfer = NULL;
+			usb_transferFinished(t, ret);
+		}
+	}
 
 	return 0;
 }
