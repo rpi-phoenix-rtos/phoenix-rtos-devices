@@ -2157,10 +2157,16 @@ static int xhci_allocSlotSpace(xhci_t *xhci, xhci_slot_t *slot)
 	xhci->inputCtxSize = xhci->contextSize * (XHCI_CONTEXT_INPUT + 1u + XHCI_MAX_ENDPOINTS);
 	xhci->ep0RingSize = XHCI_TRANSFER_RING_SIZE;
 
-	slot->devCtx = usb_allocAligned(xhci->devCtxSize, XHCI_CONTEXT_ALIGN);
+	/* Reuse this slot entry's buffers if it has been through here before. A slot
+	 * table entry is released for reuse when its device goes away
+	 * (xhci_pipeDestroy), and the sizes are controller constants, so allocating
+	 * again would simply leak the previous pair. */
 	if (slot->devCtx == NULL) {
-		fprintf(stderr, "xhci: failed to allocate device context\n");
-		return -ENOMEM;
+		slot->devCtx = usb_allocAligned(xhci->devCtxSize, XHCI_CONTEXT_ALIGN);
+		if (slot->devCtx == NULL) {
+			fprintf(stderr, "xhci: failed to allocate device context\n");
+			return -ENOMEM;
+		}
 	}
 
 	/* inputCtx is a shared per-controller scratch buffer reused across slot
@@ -2174,10 +2180,12 @@ static int xhci_allocSlotSpace(xhci_t *xhci, xhci_slot_t *slot)
 		}
 	}
 
-	slot->ep0Ring = usb_allocAligned(xhci->ep0RingSize, XHCI_TRANSFER_RING_ALIGN);
 	if (slot->ep0Ring == NULL) {
-		fprintf(stderr, "xhci: failed to allocate ep0 ring\n");
-		return -ENOMEM;
+		slot->ep0Ring = usb_allocAligned(xhci->ep0RingSize, XHCI_TRANSFER_RING_ALIGN);
+		if (slot->ep0Ring == NULL) {
+			fprintf(stderr, "xhci: failed to allocate ep0 ring\n");
+			return -ENOMEM;
+		}
 	}
 
 	memset(slot->devCtx, 0, xhci->devCtxSize);
@@ -4165,6 +4173,18 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 				 * allocation at the same address would otherwise be handed this
 				 * dead slot. */
 				xhci->slots[s].dev = NULL;
+
+				if (s != 0u) {
+					/* Release the table entry itself. Non-primary slots are
+					 * enabled on demand and the hardware slot was just disabled,
+					 * so an entry that keeps its id is simply lost -- there are
+					 * only eight, and a board with a USB 2 hub, a SuperSpeed
+					 * device and two HID devices already re-enumerates enough to
+					 * run out. The buffers are kept and reused
+					 * (xhci_allocSlotSpace). The PRIMARY slot's id is allocated
+					 * once in xhci_init and is deliberately left alone. */
+					xhci->slots[s].slotId = 0u;
+				}
 			}
 		}
 	}
