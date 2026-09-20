@@ -170,6 +170,17 @@ typedef struct _umass_part_t {
 	cachectx_t *cache;
 	cache_devCtx_t cacheCtx;
 
+	/* Write-amplification counters. libcache's WRITE_THROUGH policy flushes the
+	 * WHOLE cache line on every write (cache_executePolicy -> cache_flushLine,
+	 * which always writes cache->lineSize), so a filesystem writing one 1 KiB
+	 * block into a 64 KiB line can cost far more device traffic than it asked
+	 * for. Measure the real ratio instead of assuming it: writes degrade with
+	 * size (5.4 / 3.3 / 2.8 MB/s at 4 / 16 / 64 MiB) which is the signature of
+	 * amplification, but the naive 64x would predict much worse than observed,
+	 * so libext2 must batch to some degree. Printed at unmount. */
+	uint64_t wrAsked;
+	uint64_t wrDevice;
+
 	/* Teardown handshake with umass_fsthr. The thread runs on fsstack below,
 	 * i.e. INSIDE this struct, so the struct must not be freed until it has
 	 * left -- see _umass_devFree. */
@@ -691,6 +702,7 @@ static ssize_t umass_cacheReadCb(uint64_t offs, void *buf, size_t len, cache_dev
 
 static ssize_t umass_cacheWriteCb(uint64_t offs, const void *buf, size_t len, cache_devCtx_t *ctx)
 {
+	ctx->dev->part.wrDevice += (uint64_t)len;
 	return (ssize_t)umass_writeToDev(ctx->dev, (off_t)offs, (const char *)buf, len);
 }
 
@@ -745,9 +757,8 @@ static ssize_t umass_write(id_t id, off_t offs, const char *buf, size_t len)
 
 	if (dev->part.cache != NULL) {
 		/* WRITE_THROUGH, deliberately: this is REMOVABLE media. A write-back
-		 * cache would hold data that a yanked stick never receives, and the
-		 * measured write rate (5.4 MB/s through ext2) is not what needs
-		 * fixing here -- reads are. */
+		 * cache would hold data that a yanked stick never receives. */
+		dev->part.wrAsked += (uint64_t)len;
 		return cache_write(dev->part.cache, (uint64_t)offs, (void *)buf, len, LIBCACHE_WRITE_THROUGH);
 	}
 
@@ -1056,6 +1067,13 @@ static int _umass_partUnmount(umass_dev_t *dev)
 	 * means there should be nothing dirty, but say so rather than assume. */
 	if (dev->part.cache != NULL) {
 		(void)cache_flush(dev->part.cache, 0, (uint64_t)dev->part.sectors * UMASS_SECTOR_SIZE);
+	}
+
+	if (dev->part.wrAsked != 0u) {
+		fprintf(stderr, "umass: %s write amplification: asked %llu B, device %llu B (%llu.%02llux)\n",
+			dev->path, (unsigned long long)dev->part.wrAsked, (unsigned long long)dev->part.wrDevice,
+			(unsigned long long)(dev->part.wrDevice / dev->part.wrAsked),
+			(unsigned long long)(((dev->part.wrDevice * 100u) / dev->part.wrAsked) % 100u));
 	}
 
 	dev->part.fsthrExit = 1;
