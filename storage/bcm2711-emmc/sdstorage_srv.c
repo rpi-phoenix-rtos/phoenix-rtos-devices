@@ -28,6 +28,7 @@
 #include <libjffs2.h>
 #include <libext2.h>
 
+#include "sdcard.h"
 #include "sdstorage_dev.h"
 
 #define LOG_TAG "sdstorage_srv"
