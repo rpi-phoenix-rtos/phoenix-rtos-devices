@@ -123,6 +123,22 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_REG_OP_PORT_PORTSC_PRC (1u << 21)
 #define XHCI_REG_OP_PORT_PORTSC_RW1C (XHCI_REG_OP_PORT_PORTSC_CSC | XHCI_REG_OP_PORT_PORTSC_PEC | \
 	XHCI_REG_OP_PORT_PORTSC_OCC | XHCI_REG_OP_PORT_PORTSC_PRC)
+/* Bits that survive a read-modify-write of PORTSC.
+ *
+ * ⛔ PORTSC CANNOT be read-modify-written naively. Bit 1 (PED) is RW1CS --
+ * writing a 1 DISABLES the port -- and bits 17..23 are RW1C change bits that a
+ * write-back silently acknowledges. So feeding a port's own state back to it
+ * turns the port off and eats its pending events. That is not theoretical: the
+ * PORT_POWER case below did exactly `portsc | PP`, and since a live SuperSpeed
+ * port reads PED=1, powering the ports at start-up DISABLED the already-trained
+ * USB 3 link on root port 2 and dropped the stick down to its USB 2 personality
+ * behind the VL805's internal hub, capping it at High Speed.
+ *
+ * Keep only the read-only status (CCS, OCA, PortSpeed, DR) and the
+ * read-write-save controls (PLS, PP, PIC, WCE/WDE/WOE); zero PED, PR, WPR and
+ * every change bit. Mirrors Linux's xhci_port_state_to_neutral(). */
+#define XHCI_REG_OP_PORT_PORTSC_RO  ((1u << 0) | (1u << 3) | (0xfu << 10) | (1u << 30))
+#define XHCI_REG_OP_PORT_PORTSC_RWS ((0xfu << 5) | (1u << 9) | (0x3u << 14) | (0x7u << 25))
 #define XHCI_REG_RT_IR_ERSTSZ__MASK 0xffffu
 #define XHCI_REG_RT_IR_ERSTBA_LO__MASK 0xffffffc0u
 #define XHCI_REG_RT_IR_ERDP_LO_EHB (1u << 3)
@@ -576,6 +592,14 @@ static inline void xhci_dbWrite32(xhci_t *xhci, uintptr_t off, uint32_t val)
 	 * Mirrors Linux xhci_ring_*_doorbell(), which wmb() before the DB write. */
 	__asm__ volatile("dsb sy" ::: "memory");
 	*reg = val;
+}
+
+
+/* Strip a PORTSC value down to the bits that are safe to write back. Always use
+ * this as the base of a read-modify-write -- see XHCI_REG_OP_PORT_PORTSC_RO. */
+static inline uint32_t xhci_portStateNeutral(uint32_t portsc)
+{
+	return portsc & (XHCI_REG_OP_PORT_PORTSC_RO | XHCI_REG_OP_PORT_PORTSC_RWS);
 }
 
 
@@ -3501,7 +3525,7 @@ static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 
 	switch (wValue) {
 		case USB_PORT_FEAT_RESET:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc | XHCI_REG_OP_PORT_PORTSC_PR) & ~XHCI_REG_OP_PORT_PORTSC_PED);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PR);
 			err = xhci_portWaitBits(xhci, port, XHCI_REG_OP_PORT_PORTSC_PR, 0u, XHCI_PORT_RESET_TIMEOUT_MS);
 			if (err < 0) {
 				return err;
@@ -3514,7 +3538,7 @@ static int xhci_setPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 			break;
 
 		case USB_PORT_FEAT_POWER:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc | XHCI_REG_OP_PORT_PORTSC_PP);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PP);
 			usleep(XHCI_PORT_POWER_GOOD_DELAY_US);
 			break;
 
@@ -3549,27 +3573,27 @@ static int xhci_clearPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 			 * getPortStatus stop synthesizing C_CONNECTION for a device
 			 * that was already attached before bring-up. */
 			xhci->portConnAnnounced |= (1u << (unsigned)port);
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_CSC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_CSC);
 			break;
 
 		case USB_PORT_FEAT_C_ENABLE:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_PEC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PEC);
 			break;
 
 		case USB_PORT_FEAT_C_OVER_CURRENT:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_OCC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_OCC);
 			break;
 
 		case USB_PORT_FEAT_C_RESET:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, (portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C)) | XHCI_REG_OP_PORT_PORTSC_PRC);
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_PRC);
 			break;
 
 		case USB_PORT_FEAT_ENABLE:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc & ~(XHCI_REG_OP_PORT_PORTSC_PED | XHCI_REG_OP_PORT_PORTSC_RW1C));
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc));
 			break;
 
 		case USB_PORT_FEAT_POWER:
-			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, portsc & ~(XHCI_REG_OP_PORT_PORTSC_PP | XHCI_REG_OP_PORT_PORTSC_RW1C));
+			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) & ~XHCI_REG_OP_PORT_PORTSC_PP);
 			break;
 
 		case USB_PORT_FEAT_INDICATOR:
