@@ -12,6 +12,13 @@
 # omitted: with the daemon built -DUSB_INTERNAL_ONLY they have no connect path and
 # would just fail with "unsupported usb_msg type: 0".
 DEFAULT_COMPONENTS := pl011-tty libusbxhci libusbdrv-usbkbd libusbdrv-usbmouse
+# USB mass storage (BOT/SCSI): the same in-daemon hosting as the HID drivers, so a
+# USB stick enumerates as /dev/umass0 and can be mounted while the system runs. The
+# driver itself is upstream and unchanged; it had simply never been built for this
+# target. Add it to USB_HOSTDRV_LIBS in build-core-aarch64a72-generic.sh too -- the
+# component alone builds the lib but nothing links it, and the stick then enumerates
+# with no driver bound (the exact shape of the #126 mouse bug).
+DEFAULT_COMPONENTS += libusbdrv-umass
 # BCM2711 EMMC2 SD-card block driver (rootfs storage). DEP_LIBS pulls in
 # libsdcard-bcm2711 (generic SDHCI core + bcm2711 platform layer).
 DEFAULT_COMPONENTS += bcm2711-emmc

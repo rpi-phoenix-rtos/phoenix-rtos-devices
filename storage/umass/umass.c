@@ -21,6 +21,8 @@
 #include <sys/file.h>
 #include <sys/threads.h>
 #include <posix/utils.h>
+#include <stdint.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -495,7 +497,7 @@ static int umass_readFromDev(umass_dev_t *dev, off_t offs, char *buf, size_t len
 	mutexUnlock(dev->lock);
 
 	if (ret <= 0 && len > 0) {
-		printf("read transmit failed for offs: %lld\n", offs);
+		printf("read transmit failed for offs: %jd\n", (intmax_t)offs);
 	}
 
 	return ret;
@@ -524,7 +526,7 @@ static int umass_writeToDev(umass_dev_t *dev, off_t offs, const char *buf, size_
 	ret = _umass_transmit(dev, &writecmd, sizeof(writecmd), (char *)buf, len, usb_dir_out);
 	mutexUnlock(dev->lock);
 	if (ret < 0) {
-		fprintf(stderr, "write transmit failed for offs: %lld\n", offs);
+		fprintf(stderr, "write transmit failed for offs: %jd\n", (intmax_t)offs);
 	}
 
 	return ret;
@@ -539,6 +541,25 @@ static int umass_getattr(umass_dev_t *dev, int type, long long int *attr)
 	*attr = dev->part.sectors * UMASS_SECTOR_SIZE;
 
 	return EOK;
+}
+
+
+/* stat() on the block device. Without this, mtStat fell through to the message
+ * loop's default -ENOSYS and userspace saw
+ * `cannot fstat '/dev/umass0': Function not implemented` -- so every tool that
+ * stats its input before reading it (coreutils dd, cat, cp, ...) failed on a
+ * perfectly healthy stick. Same gap, same fix as bcm2711-emmc's sdstorage_srv.c. */
+static void umass_stat(umass_dev_t *dev, struct stat *st, const oid_t *oid)
+{
+	memset(st, 0, sizeof(*st));
+	st->st_dev = oid->port;
+	st->st_ino = (ino_t)oid->id;
+	st->st_rdev = oid->port;
+	st->st_mode = S_IFBLK | 0660;
+	st->st_nlink = 1;
+	st->st_blksize = UMASS_SECTOR_SIZE;
+	st->st_size = (off_t)dev->part.sectors * UMASS_SECTOR_SIZE;
+	st->st_blocks = (blkcnt_t)dev->part.sectors;
 }
 
 
@@ -756,6 +777,16 @@ static void umass_msgthr(void *arg)
 
 			case mtGetAttr:
 				msg.o.err = umass_getattr(dev, msg.i.attr.type, &msg.o.attr.val);
+				break;
+
+			case mtStat:
+				if ((msg.o.data == NULL) || (msg.o.size < sizeof(struct stat))) {
+					msg.o.err = -EINVAL;
+				}
+				else {
+					umass_stat(dev, msg.o.data, &msg.oid);
+					msg.o.err = EOK;
+				}
 				break;
 
 			default:
