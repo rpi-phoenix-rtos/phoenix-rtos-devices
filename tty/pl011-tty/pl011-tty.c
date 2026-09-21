@@ -1082,6 +1082,10 @@ static void pl011_thr(void *arg)
 		 * to the idle gate below. Same value, one fewer lock round-trip on the
 		 * idle path -- which is the hot path when the console is quiet. */
 		int txPending = 0;
+		/* Hoisted out of the TX block below: the fbcon mirror now runs AFTER
+		 * tty->lock is released, so the batch has to outlive that block. */
+		char batch[64];
+		size_t n = 0u;
 
 		/* Everything that touches libtty state runs under tty->lock now; the
 		 * HW-side entry points are the _-prefixed ones and assume it is held.
@@ -1115,9 +1119,6 @@ static void pl011_thr(void *arg)
 		 * while TX has more data — i.e. we drain the same total
 		 * volume, just with RX servicing interleaved. */
 		{
-			char batch[64];
-			size_t n = 0u;
-
 			while ((n < sizeof(batch)) &&
 				(_libtty_txready(&uart->tty) != 0) &&
 				((pl011_read(uart, fr) & fr_txff) == 0)) {
