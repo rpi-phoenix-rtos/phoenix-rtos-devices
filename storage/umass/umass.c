@@ -602,20 +602,11 @@ static int umass_writeToDev(umass_dev_t *dev, off_t offs, const char *buf, size_
 {
 	size_t done = 0;
 
-	/* TEMPORARY (EINVAL hunt, 2026-09-21). Creating a file on the SECOND-mounted
-	 * partition fails with EINVAL while the first is still mounted -- reproduced
-	 * deterministically. Name which check rejects it; both return the same
-	 * errno, and mount(2)/open(2) surface it identically. */
 	if (((offs % UMASS_SECTOR_SIZE) != 0) || ((len % UMASS_SECTOR_SIZE) != 0)) {
-		fprintf(stderr, "umass: %s write UNALIGNED offs=%jd len=%zu\n",
-			dev->path, (intmax_t)offs, len);
 		return -EINVAL;
 	}
 
 	if ((offs + (off_t)len) > (off_t)((off_t)dev->part.sectors * UMASS_SECTOR_SIZE)) {
-		fprintf(stderr, "umass: %s write PAST END offs=%jd len=%zu sectors=%u limit=%jd\n",
-			dev->path, (intmax_t)offs, len, dev->part.sectors,
-			(intmax_t)((off_t)dev->part.sectors * UMASS_SECTOR_SIZE));
 		return -EINVAL;
 	}
 
@@ -767,17 +758,8 @@ static ssize_t umass_write(id_t id, off_t offs, const char *buf, size_t len)
 	if (dev->part.cache != NULL) {
 		/* WRITE_THROUGH, deliberately: this is REMOVABLE media. A write-back
 		 * cache would hold data that a yanked stick never receives. */
-		ssize_t cret;
-
 		dev->part.wrAsked += (uint64_t)len;
-		cret = cache_write(dev->part.cache, (uint64_t)offs, (void *)buf, len, LIBCACHE_WRITE_THROUGH);
-		if (cret < 0) {
-			/* TEMPORARY (EINVAL hunt): libcache rejects addr > srcMemSize with
-			 * -EINVAL too, so say which layer refused. */
-			fprintf(stderr, "umass: %s cache_write REFUSED offs=%jd len=%zu -> %zd\n",
-				dev->path, (intmax_t)offs, len, cret);
-		}
-		return cret;
+		return cache_write(dev->part.cache, (uint64_t)offs, (void *)buf, len, LIBCACHE_WRITE_THROUGH);
 	}
 
 	return umass_writeToDev(dev, offs, buf, len);
