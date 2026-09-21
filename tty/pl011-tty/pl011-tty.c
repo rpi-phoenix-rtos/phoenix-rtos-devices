@@ -121,6 +121,10 @@ typedef struct {
 	libtty_common_t tty;
 	int speed;
 	tcflag_t cflag;
+	/* libtty adopts this as tty->lock (libtty_init's last argument), so it is
+	 * the SAME object as libtty_lock()/libtty_unlock() take. Upstream's tty
+	 * drivers do the same; it lets the HW path hold one lock rather than two. */
+	handle_t ttyLock;
 	handle_t fbLock;
 	/* TD-15 Stage 4 phase 1c: the POINTER itself is volatile (not just
 	 * the pointed-to data). pl011_thr starts before pl011_fbcon_init
@@ -907,7 +911,12 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 		return -ENODEV;
 	}
 
+	if (mutexCreate(&uart->ttyLock) < 0) {
+		return -ENOMEM;
+	}
+
 	if (mutexCreate(&uart->fbLock) < 0) {
+		resourceDestroy(uart->ttyLock);
 		return -ENOMEM;
 	}
 
@@ -926,7 +935,7 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 	callbacks.set_cflag = set_cflag;
 	callbacks.signal_txready = signal_txready;
 
-	if (libtty_init(&uart->tty, &callbacks, _PAGE_SIZE, PL011_TTY_BAUDRATE) < 0) {
+	if (libtty_init(&uart->tty, &callbacks, _PAGE_SIZE, PL011_TTY_BAUDRATE, &uart->ttyLock) < 0) {
 		return -ENOMEM;
 	}
 
@@ -943,12 +952,16 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 
 static void pl011_ioctl(unsigned int port, msg_t *msg)
 {
-	const void *idata, *odata = NULL;
+	const void *idata;
+	void *odata = NULL;
 	oid_t oid = { .port = port };
 	unsigned long req;
 	int err;
 
-	idata = ioctl_unpack(msg, &req, &oid.id);
+	/* The out argument is now a buffer the CALLER provides, obtained with
+	 * ioctl_unpackEx, rather than a pointer libtty/we set. So results are
+	 * memcpy'd into it and ioctl_setResponse takes NULL. */
+	idata = ioctl_unpackEx(msg, &req, &oid.id, &odata);
 
 	if (req == KIOEN) {
 		libklog_enable((int)(intptr_t)idata);
@@ -959,15 +972,20 @@ static void pl011_ioctl(unsigned int port, msg_t *msg)
 		err = pl011_fbcon_setmode(&pl011_common.uart, (int)(intptr_t)idata);
 	}
 	else if (req == FBCONGETMODE) {
-		odata = (const void *)&pl011_common.uart.fbmode;
-		err = EOK;
+		if (odata == NULL) {
+			err = -EINVAL;
+		}
+		else {
+			memcpy(odata, &pl011_common.uart.fbmode, sizeof(pl011_common.uart.fbmode));
+			err = EOK;
+		}
 	}
 #endif
 	else {
-		err = libtty_ioctl(&pl011_common.uart.tty, ioctl_getSenderPid(msg), req, idata, &odata);
+		err = libtty_ioctl(&pl011_common.uart.tty, ioctl_getSenderPid(msg), req, idata, odata);
 	}
 
-	ioctl_setResponse(msg, req, err, odata);
+	ioctl_setResponse(msg, req, err, NULL);
 }
 
 
@@ -1059,9 +1077,19 @@ static void pl011_thr(void *arg)
 	for (;;) {
 		int wake_reader = 0;
 		int wake_writer = 0;
+		/* _libtty_txready() needs tty->lock and there is no unlocked variant any
+		 * more, so sample it inside the locked section and carry the answer out
+		 * to the idle gate below. Same value, one fewer lock round-trip on the
+		 * idle path -- which is the hot path when the console is quiet. */
+		int txPending = 0;
+
+		/* Everything that touches libtty state runs under tty->lock now; the
+		 * HW-side entry points are the _-prefixed ones and assume it is held.
+		 * The fbcon mirror is deliberately NOT in here -- see below. */
+		libtty_lock(&uart->tty);
 
 		while ((pl011_read(uart, fr) & fr_rxfe) == 0) {
-			libtty_putchar(&uart->tty, (unsigned char)pl011_read(uart, dr), &wake_reader);
+			_libtty_putchar(&uart->tty, (unsigned char)pl011_read(uart, dr), &wake_reader);
 		}
 
 		/* TD-12 boot-speed fix (2026-05-17, refined 2026-05-18):
@@ -1091,26 +1119,38 @@ static void pl011_thr(void *arg)
 			size_t n = 0u;
 
 			while ((n < sizeof(batch)) &&
-				(libtty_txready(&uart->tty) != 0) &&
+				(_libtty_txready(&uart->tty) != 0) &&
 				((pl011_read(uart, fr) & fr_txff) == 0)) {
-				batch[n] = (char)libtty_popchar(&uart->tty);
+				batch[n] = (char)_libtty_popchar(&uart->tty);
 				pl011_write(uart, dr, (unsigned char)batch[n]);
 				++n;
 			}
 			if (n != 0u) {
-				if (uart->fbaddr != NULL) {
-					pl011_fbcon_write(uart, batch, n);
-				}
 				wake_writer = 1;
 			}
 		}
 
 		if (wake_reader != 0) {
-			libtty_wake_reader(&uart->tty);
+			_libtty_wake_reader(&uart->tty);
 		}
 
 		if (wake_writer != 0) {
-			libtty_wake_writer(&uart->tty);
+			_libtty_wake_writer(&uart->tty);
+		}
+
+		txPending = _libtty_txready(&uart->tty);
+
+		libtty_unlock(&uart->tty);
+
+		/* fbcon mirror OUTSIDE tty->lock, on purpose. libtty's lock now covers
+		 * every reader and writer of this tty, and pl011_fbcon_write() renders
+		 * glyphs into the framebuffer -- holding the lock across that would
+		 * block anyone reading or writing the CONSOLE for the duration of a
+		 * blit. Upstream's drivers hold their lock across the whole drain, but
+		 * none of them renders anything. `batch` is a local copy, so the bytes
+		 * are already ours and need no protection. */
+		if ((n != 0u) && (uart->fbaddr != NULL)) {
+			pl011_fbcon_write(uart, batch, n);
 		}
 
 		/* TD-15 Stage 4 phase 1h: only sleep when there was nothing
@@ -1125,7 +1165,7 @@ static void pl011_thr(void *arg)
 		 * already drain to completion, so once we exit them we
 		 * really are idle. */
 		if ((wake_reader == 0) && (wake_writer == 0) &&
-			(libtty_txready(&uart->tty) == 0) &&
+			(txPending == 0) &&
 			((pl011_read(uart, fr) & fr_rxfe) != 0)) {
 			usleep(PL011_TTY_POLL_US);
 		}
@@ -1192,7 +1232,7 @@ static void pl011_kbdthr(void *arg)
 			continue;
 		}
 
-		libtty_putchar_lock(&uart->tty);
+		libtty_lock(&uart->tty);
 		for (i = 0u; i < (size_t)len; ++i) {
 			/* Accumulate per-char (B8): libtty_putchar_helper resets *wake_reader to
 			 * 0 on entry, so passing &wake_reader directly would collapse a multi-char
@@ -1200,14 +1240,15 @@ static void pl011_kbdthr(void *arg)
 			 * would lose its reader wakeup. OR each char's decision into wake_reader
 			 * (matches the reset-and-accumulate pattern the other tty drivers use). */
 			int wh = 0;
-			(void)libtty_putchar_unlocked(&uart->tty, (unsigned char)buf[i], &wh);
+			(void)_libtty_putchar(&uart->tty, (unsigned char)buf[i], &wh);
 			wake_reader |= wh;
 		}
-		libtty_putchar_unlock(&uart->tty);
 
 		if (wake_reader != 0) {
-			libtty_wake_reader(&uart->tty);
+			_libtty_wake_reader(&uart->tty);
 		}
+
+		libtty_unlock(&uart->tty);
 	}
 }
 
