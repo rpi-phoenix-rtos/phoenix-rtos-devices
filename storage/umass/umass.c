@@ -187,6 +187,12 @@ typedef struct _umass_part_t {
 	volatile int fsthrRunning;
 	volatile int fsthrExit;
 
+	/* Requests currently inside fs->handler() for THIS partition. mtUmount
+	 * waits for it to reach 0 before freeing the filesystem context; see
+	 * umass_poolthr(). Guarded by umass_common.rlock. Per-partition rather
+	 * than global so that a busy second device cannot stall this unmount. */
+	unsigned int nreqs;
+
 	/* Partition filesystem thread stack */
 	char fsstack[4 * _PAGE_SIZE] __attribute__((aligned(8)));
 } umass_part_t;
@@ -238,6 +244,7 @@ static struct {
 
 	umass_req_t *rqueue;   /* Requests FIFO queue */
 	handle_t rlock, rcond; /* Requests synchronization */
+	handle_t dcond;        /* Signalled when a partition's nreqs reaches 0 */
 
 	bool mount_root;
 
@@ -934,12 +941,47 @@ static void umass_poolthr(void *arg)
 		mutexUnlock(umass_common.rlock);
 
 		if (req->msg.type == mtUmount) {
+			/* Wait for requests already dispatched for this partition to
+			 * finish before the filesystem context is freed.
+			 *
+			 * The FIFO orders DEQUEUE, not COMPLETION. There are
+			 * UMASS_N_POOL_THREADS of us popping one shared queue, so the
+			 * other pool thread can still be inside fs->handler() -- holding
+			 * libext2's fs->lock -- when this one dequeues the mtUmount. That
+			 * handler's fdata is exactly what fs->unmount() is about to
+			 * free(), locks and all, so without this wait it keeps running on
+			 * freed memory and finally unlocks a destroyed mutex.
+			 *
+			 * No new request can arrive for this partition meanwhile:
+			 * umass_fsthr() ends its thread as soon as it has queued the
+			 * mtUmount, so nreqs is monotonically decreasing here and the wait
+			 * terminates. libstorage does the same thing in its
+			 * requestctx_stop(). */
+			mutexLock(umass_common.rlock);
+			while (req->part->nreqs != 0) {
+				condWait(umass_common.dcond, umass_common.rlock, 0);
+			}
+			mutexUnlock(umass_common.rlock);
+
 			req->part->fs->unmount(req->part->fdata);
 			req->part->fs = NULL;
 			req->part->fdata = NULL;
 		}
 		else {
+			mutexLock(umass_common.rlock);
+			req->part->nreqs++;
+			mutexUnlock(umass_common.rlock);
+
 			req->part->fs->handler(req->part->fdata, &req->msg);
+
+			mutexLock(umass_common.rlock);
+			if (--req->part->nreqs == 0) {
+				/* Broadcast, not signal: dcond is shared by every partition's
+				 * unmount waiter, and only the one whose count hit zero may
+				 * proceed. The others re-check and go back to waiting. */
+				condBroadcast(umass_common.dcond);
+			}
+			mutexUnlock(umass_common.rlock);
 		}
 
 		msgRespond(req->part->port, &req->msg, req->rid);
@@ -1172,6 +1214,9 @@ static umass_dev_t *_umass_devAlloc(void)
 	}
 
 	dev->owner = dev; /* overridden for the 2nd+ partition of one stick */
+	/* malloc, not calloc -- the unmount drain reads this before any request has
+	 * run, so it has to start at a known 0 rather than whatever was on the heap. */
+	dev->part.nreqs = 0;
 	rv = mutexCreate(&dev->lock);
 	if (rv < 0) {
 		free(dev);
@@ -1445,6 +1490,12 @@ static int umass_init(usb_driver_t *drv, void *args)
 		ret = condCreate(&umass_common.rcond);
 		if (ret < 0) {
 			fprintf(stderr, "umass: failed to create server requests condition variable\n");
+			break;
+		}
+
+		ret = condCreate(&umass_common.dcond);
+		if (ret < 0) {
+			fprintf(stderr, "umass: failed to create unmount drain condition variable\n");
 			break;
 		}
 
