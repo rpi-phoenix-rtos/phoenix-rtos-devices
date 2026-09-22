@@ -64,37 +64,36 @@ static ssize_t storage_read(id_t id, off_t offs, void *buff, size_t len)
 	else if (offs >= (off_t)strg->size) {
 		res = 0;
 	}
-	else if (len == 0) {
-		res = 0;
-	}
-	else if ((strg->dev->mtd != NULL) &&
-		(strg->dev->mtd->ops != NULL) &&
-		(strg->dev->mtd->ops->read != NULL) &&
-		IS_MTD_DEVICE_ID(id)) {
-		size_t retlen;
-
-		if (len > (size_t)((off_t)strg->size - offs)) {
-			len = (size_t)((off_t)strg->size - offs);
-		}
-
-		res = strg->dev->mtd->ops->read(strg, strg->start + offs, buff, len, &retlen);
-
-		if (retlen > 0) {
-			res = retlen;
-		}
-	}
-	else if ((strg->dev->blk != NULL) &&
-		(strg->dev->blk->ops != NULL) &&
-		(strg->dev->blk->ops->read != NULL) &&
-		IS_BLOCK_DEVICE_ID(id)) {
-		if (len > (size_t)((off_t)strg->size - offs)) {
-			len = (size_t)((off_t)strg->size - offs);
-		}
-
-		res = strg->dev->blk->ops->read(strg, strg->start + offs, buff, len);
-	}
 	else {
-		res = -EINVAL;
+		/* Clamp once, for every backend. */
+		if (len > (size_t)((off_t)strg->size - offs)) {
+			len = (size_t)((off_t)strg->size - offs);
+		}
+
+		if (len == 0) {
+			res = 0;
+		}
+		else if ((strg->dev->mtd != NULL) &&
+			(strg->dev->mtd->ops != NULL) &&
+			(strg->dev->mtd->ops->read != NULL) &&
+			IS_MTD_DEVICE_ID(id)) {
+			size_t retlen;
+
+			res = strg->dev->mtd->ops->read(strg, strg->start + offs, buff, len, &retlen);
+
+			if (retlen > 0) {
+				res = retlen;
+			}
+		}
+		else if ((strg->dev->blk != NULL) &&
+			(strg->dev->blk->ops != NULL) &&
+			(strg->dev->blk->ops->read != NULL) &&
+			IS_BLOCK_DEVICE_ID(id)) {
+			res = strg->dev->blk->ops->read(strg, strg->start + offs, buff, len);
+		}
+		else {
+			res = -EINVAL;
+		}
 	}
 
 	return res;
