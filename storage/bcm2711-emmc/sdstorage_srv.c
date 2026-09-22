@@ -45,9 +45,24 @@ static ssize_t storage_read(id_t id, off_t offs, void *buff, size_t len)
 
 	if ((strg == NULL) ||
 		(strg->dev == NULL) ||
-		((offs + len) > strg->size) ||
-		(buff == NULL)) {
+		(buff == NULL) ||
+		(offs < 0)) {
 		res = -EINVAL;
+	}
+	/* At or past the end is EOF, and a read that would CROSS the end returns
+	 * the bytes that are actually there.
+	 *
+	 * Both used to be -EINVAL, which makes reading a device to EOF fail:
+	 * `dd if=/dev/mmcblk0p2 of=img` with no count aborts after the last whole
+	 * block, prints no summary, and leaves a file short of the partition. It
+	 * reads exactly like a truncated device -- it cost two wasted Pi cycles
+	 * and very nearly a bogus defect report before the arithmetic showed the
+	 * refused read simply overran the end by 286 KiB.
+	 *
+	 * The same pattern is in zynq7000-sdcard and zynq-flash; left alone there
+	 * deliberately, since neither is exercised on this hardware. */
+	else if (offs >= (off_t)strg->size) {
+		res = 0;
 	}
 	else if (len == 0) {
 		res = 0;
@@ -57,6 +72,11 @@ static ssize_t storage_read(id_t id, off_t offs, void *buff, size_t len)
 		(strg->dev->mtd->ops->read != NULL) &&
 		IS_MTD_DEVICE_ID(id)) {
 		size_t retlen;
+
+		if (len > (size_t)((off_t)strg->size - offs)) {
+			len = (size_t)((off_t)strg->size - offs);
+		}
+
 		res = strg->dev->mtd->ops->read(strg, strg->start + offs, buff, len, &retlen);
 
 		if (retlen > 0) {
@@ -67,6 +87,10 @@ static ssize_t storage_read(id_t id, off_t offs, void *buff, size_t len)
 		(strg->dev->blk->ops != NULL) &&
 		(strg->dev->blk->ops->read != NULL) &&
 		IS_BLOCK_DEVICE_ID(id)) {
+		if (len > (size_t)((off_t)strg->size - offs)) {
+			len = (size_t)((off_t)strg->size - offs);
+		}
+
 		res = strg->dev->blk->ops->read(strg, strg->start + offs, buff, len);
 	}
 	else {
