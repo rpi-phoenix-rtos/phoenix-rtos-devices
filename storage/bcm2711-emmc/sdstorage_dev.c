@@ -519,33 +519,41 @@ static int sdstorage_addPartition(storage_t *parent, sdcard_partition_t part)
 }
 
 
+/* A sector-0 read that succeeds but does not parse is the one SD failure that is
+ * otherwise silent: the lane simply cannot find p2, with no error anywhere. The
+ * first eight bytes plus the signature classify it in one line -- all-zero means
+ * the transfer never wrote the buffer, plausible-but-wrong means the wrong sector
+ * was read, and a well-formed MBR here means the parse is at fault rather than
+ * the transfer. Printed ONLY on that failure; a healthy boot says nothing extra.
+ * (This is what made the 2026-09-19 stale-buffer failure legible.) */
+static void sdstorage_reportBadMBR(const unsigned char raw[10], int mbrRet)
+{
+	printf("sdcard: sector 0 is not a usable MBR (ret=%d first8=%02x%02x%02x%02x%02x%02x%02x%02x sig=%02x%02x)\n",
+		mbrRet, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+		raw[8], raw[9]);
+}
+
+
 /* Returns number of valid MBR partitions or < 0 if an error occurred while reading.
  * If MBR is malformed it does not count as an error and 0 is returned.
  */
 static int sdstorage_checkMBR(unsigned int slot, sdcard_partition_t parts[4])
 {
 	mbr_t *mbr = &sdcard_common.mbr_temp;
+	unsigned char raw[10];
 	int mbrRet = sdcard_transferBlocks(slot, sdio_read, 0, mbr, SDCARD_BLOCKLEN);
 	if (mbrRet < 0) {
 		LOG_ERROR("mbr read failed");
 		return -EIO;
 	}
 
-	/* DIAGNOSTIC 2026-09-19: with SDCARD_DMA_WRITES on, this read comes back
-	 * either failing or not-an-MBR, and the SD lane then cannot find p2 -- even
-	 * though the read path is supposed to be byte-identical between the two
-	 * builds. Dump what actually landed so the failure can be classified:
-	 * all-zero = the transfer never wrote the buffer; plausible-but-wrong = we
-	 * read the wrong sector; correct-here-but-0-partitions = the parse is at
-	 * fault, not the transfer. */
-	{
-		const unsigned char *b8 = (const unsigned char *)mbr;
-		printf("sdcard: MBR probe ret=%d first8=%02x%02x%02x%02x%02x%02x%02x%02x sig=%02x%02x\n",
-			mbrRet, b8[0], b8[1], b8[2], b8[3], b8[4], b8[5], b8[6], b8[7],
-			b8[510], b8[511]);
-	}
+	/* Snapshot the identifying bytes BEFORE mbr_deserialize(), which byte-swaps
+	 * in place -- a report taken afterwards would not be what the device sent. */
+	memcpy(raw, (const unsigned char *)mbr, 8);
+	memcpy(raw + 8, (const unsigned char *)mbr + 510, 2);
 
 	if (mbr_deserialize(mbr) < 0) {
+		sdstorage_reportBadMBR(raw, mbrRet);
 		return 0;
 	}
 
@@ -556,6 +564,10 @@ static int sdstorage_checkMBR(unsigned int slot, sdcard_partition_t parts[4])
 			parts[partNum].sizeBl = mbr->pent[i].sectors;
 			partNum++;
 		}
+	}
+
+	if (partNum == 0) {
+		sdstorage_reportBadMBR(raw, mbrRet);
 	}
 
 	return partNum;
