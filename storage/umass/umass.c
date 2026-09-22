@@ -143,6 +143,7 @@ static void umass_msgthr(void *arg);
 /* Filesystem callbacks types */
 typedef int (*fs_handler_t)(void *, msg_t *);
 typedef int (*fs_unmount_t)(void *);
+typedef int (*fs_busy_t)(void *);
 typedef int (*fs_mount_t)(oid_t *, unsigned int, typeof(umass_read) *, typeof(umass_write) *, void **);
 
 
@@ -152,6 +153,7 @@ typedef struct {
 	uint8_t type;       /* Compatible partition type */
 	fs_handler_t handler; /* Message handler callback */
 	fs_unmount_t unmount; /* Unmount callback */
+	fs_busy_t busy;       /* Open-object count; NULL means "cannot tell" */
 	fs_mount_t mount;     /* Mount callback */
 } umass_fs_t;
 
@@ -269,7 +271,7 @@ static const usb_device_id_t filters[] = {
 
 
 #ifdef UMASS_MOUNT_EXT2
-static int umass_registerfs(const char *name, uint8_t type, fs_mount_t mount, fs_unmount_t unmount, fs_handler_t handler)
+static int umass_registerfs(const char *name, uint8_t type, fs_mount_t mount, fs_unmount_t unmount, fs_busy_t busy, fs_handler_t handler)
 {
 	umass_fs_t *fs = malloc(sizeof(umass_fs_t));
 	if (fs == NULL) {
@@ -281,6 +283,7 @@ static int umass_registerfs(const char *name, uint8_t type, fs_mount_t mount, fs
 	fs->type = type;
 	fs->mount = mount;
 	fs->unmount = unmount;
+	fs->busy = busy;
 	fs->handler = handler;
 	lib_rbInsert(&umass_common.fss, &fs->node);
 
@@ -1131,6 +1134,29 @@ static int _umass_partUnmount(umass_dev_t *dev)
 		return 0;
 	}
 
+	/* Refuse to unmount a filesystem that is still in use, which is what Linux
+	 * does and what callers expect.
+	 *
+	 * This is the fix for the measured defect: a 200 MiB write unmounted 2 s in
+	 * lost everything past the first few MiB while umount returned 0. Draining
+	 * requests already in flight is NOT enough on its own, because the writer
+	 * holds the file open and keeps sending more -- between two of its writes
+	 * the in-flight count is legitimately zero. The open COUNT is the stable
+	 * signal; libext2 derives it from ext2_open()'s reference, which it holds
+	 * until ext2_close().
+	 *
+	 * Checked here, first, on the device message thread: nothing has been torn
+	 * down yet, so returning now leaves the mount exactly as it was. */
+	if (dev->part.fs->busy != NULL) {
+		int busy = dev->part.fs->busy(dev->part.fdata);
+
+		if (busy > 0) {
+			fprintf(stderr, "umass: %s is busy (%d object(s) still open) -- not unmounting\n",
+				dev->path, busy);
+			return -EBUSY;
+		}
+	}
+
 	/* Push anything still held before the filesystem goes away. Write-through
 	 * means there should be nothing dirty, but say so rather than assume. */
 	if (dev->part.cache != NULL) {
@@ -1538,7 +1564,8 @@ static int umass_init(usb_driver_t *drv, void *args)
 
 #ifdef UMASS_MOUNT_EXT2
 		/* Register filesystems */
-		ret = umass_registerfs(LIBEXT2_NAME, LIBEXT2_TYPE, LIBEXT2_MOUNT, LIBEXT2_UNMOUNT, LIBEXT2_HANDLER);
+		ret = umass_registerfs(LIBEXT2_NAME, LIBEXT2_TYPE, LIBEXT2_MOUNT, LIBEXT2_UNMOUNT, LIBEXT2_BUSY,
+			LIBEXT2_HANDLER);
 		if (ret < 0) {
 			fprintf(stderr, "umass: failed to register ext2 filesystem\n");
 			break;
