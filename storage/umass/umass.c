@@ -938,6 +938,19 @@ static void umass_poolthr(void *arg)
 		req = umass_common.rqueue;
 		LIST_REMOVE(&umass_common.rqueue, req);
 
+		/* Count this request in BEFORE releasing rlock, not after.
+		 *
+		 * Incrementing once outside the lock leaves a window between the pop
+		 * and the increment in which the other pool thread can dequeue an
+		 * mtUmount, see nreqs == 0, and free the context -- so the drain below
+		 * would be satisfied while this request is already on its way into
+		 * libext2. Doing it here makes "left the queue" and "is counted" the
+		 * same event, both under rlock, which is the same lock the drain
+		 * waits on. */
+		if (req->msg.type != mtUmount) {
+			req->part->nreqs++;
+		}
+
 		mutexUnlock(umass_common.rlock);
 
 		if (req->msg.type == mtUmount) {
@@ -968,10 +981,7 @@ static void umass_poolthr(void *arg)
 			req->part->fdata = NULL;
 		}
 		else {
-			mutexLock(umass_common.rlock);
-			req->part->nreqs++;
-			mutexUnlock(umass_common.rlock);
-
+			/* nreqs was incremented at dequeue, above. */
 			req->part->fs->handler(req->part->fdata, &req->msg);
 
 			mutexLock(umass_common.rlock);
