@@ -51,6 +51,13 @@
 #define UMASS_N_MSG_THREADS 2
 #endif
 
+/* How long _umass_partUnmount waits for an in-flight unmount to complete before
+ * giving up with -EBUSY. It covers draining requests already accepted, so it is
+ * sized for a large write finishing, not for a round trip. */
+#ifndef UMASS_UMOUNT_WAIT_MS
+#define UMASS_UMOUNT_WAIT_MS 120000u
+#endif
+
 #ifndef UMASS_N_POOL_THREADS
 #define UMASS_N_POOL_THREADS 2
 #endif
@@ -1145,11 +1152,27 @@ static int _umass_partUnmount(umass_dev_t *dev)
 		msg.type = mtUmount;
 		(void)msgSend(dev->part.port, &msg);
 
-		for (tries = 0u; (tries < 1000u) && (dev->part.fsthrRunning != 0); ++tries) {
+		/* Wait for the unmount to have actually HAPPENED, not merely to have
+		 * been queued.
+		 *
+		 * fsthrRunning is cleared by umass_fsthr as soon as it has pushed the
+		 * mtUmount onto the pool queue, so on its own it is satisfied within a
+		 * millisecond -- and portDestroy() below then tore the partition port
+		 * down underneath requests that were still in flight. A 200 MiB write
+		 * racing a umount lost everything past the first few MiB and the writer
+		 * got -EINVAL, while umount returned 0. Measured: umountrace-A/B.
+		 *
+		 * umass_poolthr clears part->fs once it has drained the in-flight
+		 * requests (see its mtUmount branch) and completed fs->unmount(), so
+		 * that is the completion signal. The bound is generous because the
+		 * drain legitimately waits for whatever I/O was already accepted. */
+		for (tries = 0u; (tries < UMASS_UMOUNT_WAIT_MS) &&
+			((dev->part.fsthrRunning != 0) || (dev->part.fs != NULL));
+			++tries) {
 			usleep(1000);
 		}
 
-		if (dev->part.fsthrRunning != 0) {
+		if ((dev->part.fsthrRunning != 0) || (dev->part.fs != NULL)) {
 			return -EBUSY;
 		}
 
