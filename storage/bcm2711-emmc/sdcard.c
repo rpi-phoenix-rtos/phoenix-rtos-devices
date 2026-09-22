@@ -957,20 +957,6 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 						break;
 					}
 				}
-				/* H2 probe: a 128 KiB DDR50 transfer cannot complete in ~no spins. If
-				 * this reports dspin close to 0 the DAT-idle poll is not really
-				 * waiting, and the CMD13 that follows a write reconfigures the
-				 * controller (TRANSFER_BLOCK=0, transfer mode 0) underneath a live
-				 * SDMA transfer. Reads never do this -- they wait on Transfer-Complete. */
-				if (!pioRead) {
-					static int dmaWrSpinReports = 0;
-					if (dmaWrSpinReports < 3) {
-						dmaWrSpinReports++;
-						printf("sdcard: DMAWR blocks=%u dspin=%ld pres=0x%08x intr=0x%08x\n",
-							(unsigned)blockCount, dspin,
-							(unsigned)*(host->base + SDHOST_REG_PRES_STATE), (unsigned)dst);
-					}
-				}
 				if (((dst & SDHOST_ERROR_REASONS) != 0u) || ((*(host->base + SDHOST_REG_PRES_STATE) & dmaActive) != 0u)) {
 #ifdef SDCARD_DIAG_CLOCKSWEEP
 					printf("SDDIAG: dma-complete-fail cmd=%u dir=%s pres=0x%08x intr=0x%08x\n", (unsigned)cmd,
