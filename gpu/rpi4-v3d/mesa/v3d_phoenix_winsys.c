@@ -267,6 +267,7 @@ struct pbo {            /* Phoenix BO */
 	uint32_t size;
 	int      used;      /* slot in use (freed by GEM_CLOSE -> reusable) */
 	int      scanout;   /* this BO aliases the scanout surface (clear W.scanout_claimed on close) */
+	int      cacheable; /* created with V3D_CREATE_BO_CACHEABLE, so b->cpu is NOT MAP_UNCACHED */
 	uint32_t nmaps;     /* times MMAP_BO handed this BO's pointer to Mesa (see the corrupt-list report) */
 };
 
@@ -1027,7 +1028,7 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 		cpu = mmap(NULL, pages*_PAGE_SIZE, PROT_READ|PROT_WRITE, mapflags, -1, 0);
 		if (cpu==MAP_FAILED) {
 			fprintf(stderr, "v3d-winsys: BO mmap FAILED (%u pages, %u KiB, flags 0x%x)\n",
-				pages, pages*_PAGE_SIZE/1024u, c->flags);
+				pages, (unsigned)(pages*_PAGE_SIZE/1024u), c->flags);
 			va_free(gpuva, pages); return -ENOMEM;
 		}
 		/* Zero freshly-allocated BO memory. Phoenix mmap(MAP_CONTIGUOUS) returns NON-zeroed
@@ -1074,6 +1075,7 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 	b->scanout = (W.scanout_pa != 0 && (pa == W.scanout_pa ||
 		(W.scanout_pa2 != 0 && pa == W.scanout_pa2) ||
 		(W.scanout_pa3 != 0 && pa == W.scanout_pa3)));   /* this BO aliases a scanout buffer */
+	b->cacheable = ((c->flags & 0x1u) != 0u);
 	c->handle = b->handle;
 	c->offset = gpuva;          /* V3D address-space offset (nonzero) */
 	if (bo_trace_on() != 0) {
@@ -1083,11 +1085,177 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 	return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * CLOSED-BO QUARANTINE  (C1 instrument; V3D_BO_QUARANTINE=1, or =selftest)
+ *
+ * WHAT IT IS FOR. C1 is a single stray u32 that appears in memory the allocator
+ * has handed out -- historically noticed only when it lands on a malloc heap
+ * header. The standing hypothesis is that the landing zone is a page this file
+ * just returned: GEM_CLOSE -> munmap -> the kernel recycles the page -> malloc
+ * hands it out -> a LATE write from the GPU side arrives on it. Evidence for
+ * that shape: V3D_KEEP_CLOSED_BO=1 (never recycle) showed 0 fires in 8 runs
+ * where the default showed fires.
+ *
+ * Testing that by fire RATE costs ~14 runs per arm. This instrument answers it
+ * in one run instead, by watching the hypothesised dartboard directly: hold each
+ * closed BO's pages for a while instead of releasing them immediately, fill them
+ * with a known pattern, and scan them before they finally go back. Anything that
+ * writes a closed BO is then reported with its handle, its offset, its value and
+ * how long after the close it arrived -- none of which the rate measurement can
+ * give.
+ *
+ * WHY THE SCAN IS TRUSTWORTHY HERE. Default BOs are MAP_UNCACHED (see
+ * ioc_create_bo), so both the fill and the scan go straight to DRAM; there is no
+ * CPU cache line of ours to hide a foreign write behind. The two BO kinds that
+ * would NOT be trustworthy are skipped at the call site: a cacheable BO (our own
+ * dirty lines would mask it) and a scanout BO (its CPU pages are decoupled
+ * scratch -- the GPU writes the framebuffer PA, not this mapping).
+ *
+ * The silence of an instrument that has never been seen to fire means nothing,
+ * so V3D_BO_QUARANTINE=selftest plants the exact C1 word in a quarantined BO and
+ * the normal scan has to find it.
+ * ------------------------------------------------------------------------- */
+#define QT_SLOTS        64u
+#define QT_MAX_BYTES    (12u * 1024u * 1024u)
+#define QT_PATTERN      0xa5a5a5a5u     /* not 0, not 0x80000001, not a plausible pointer */
+#define QT_MAX_REPORTS  12u
+
+static struct {
+	void    *cpu;
+	uint32_t size;
+	uint32_t handle;
+	uint32_t seq;
+} qt_slot[QT_SLOTS];
+
+static uint32_t qt_head, qt_count, qt_seq, qt_bytes, qt_reports, qt_released;
+
+static int qt_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("V3D_BO_QUARANTINE");
+		on = ((e != NULL) && (*e != '\0') && (*e != '0')) ? 1 : 0;
+		if (on != 0) {
+			fprintf(stderr, "v3d-qt: closed-BO quarantine ON (%u slots, %u MiB cap, "
+				"pattern 0x%08x)\n", QT_SLOTS, QT_MAX_BYTES / (1024u * 1024u), QT_PATTERN);
+		}
+	}
+	return on;
+}
+
+
+/* Scan one held BO for any word that is no longer the pattern, then release it. */
+static void qt_release(uint32_t idx)
+{
+	volatile uint32_t *p = (volatile uint32_t *)qt_slot[idx].cpu;
+	uint32_t words = qt_slot[idx].size / sizeof(uint32_t);
+	uint32_t i, hits = 0u;
+
+	for (i = 0u; i < words; i++) {
+		if (p[i] == QT_PATTERN) {
+			continue;
+		}
+		hits++;
+		if (qt_reports < QT_MAX_REPORTS) {
+			uint32_t off = i * (uint32_t)sizeof(uint32_t);
+			uint32_t lo = (i >= 4u) ? (i - 4u) : 0u;
+			uint32_t hi = ((i + 5u) < words) ? (i + 5u) : words;
+			uint32_t k;
+
+			qt_reports++;
+			fprintf(stderr, "v3d-qt: STRAY WRITE into CLOSED BO handle=%u size=%u "
+				"off=0x%x (page %u, +0x%x) value=0x%08x closes-since=%u\n",
+				qt_slot[idx].handle, qt_slot[idx].size, off,
+				(unsigned)(off / _PAGE_SIZE), (unsigned)(off & (_PAGE_SIZE - 1u)),
+				p[i], qt_seq - qt_slot[idx].seq);
+			/* The discriminator: an isolated store, or a run of foreign words? */
+			for (k = lo; k < hi; k++) {
+				fprintf(stderr, "v3d-qt:    w[%+d] = 0x%08x%s\n", (int)(k - i), p[k],
+					(p[k] == QT_PATTERN) ? "" : "  <-- not pattern");
+			}
+		}
+	}
+	if (hits != 0u) {
+		fprintf(stderr, "v3d-qt: handle=%u total %u stray word(s)\n", qt_slot[idx].handle, hits);
+	}
+
+	qt_released++;
+	qt_bytes -= qt_slot[idx].size;
+	munmap(qt_slot[idx].cpu, qt_slot[idx].size);
+	qt_slot[idx].cpu = NULL;
+
+	/* A run in which the instrument never ran must not read like a clean run. */
+	if ((qt_released % 64u) == 0u) {
+		fprintf(stderr, "v3d-qt: released %u closed BOs, %u held, %u stray report(s)\n",
+			qt_released, qt_count - 1u, qt_reports);
+	}
+}
+
+
+static void qt_retire_oldest(void)
+{
+	qt_release((qt_head + QT_SLOTS - qt_count) % QT_SLOTS);
+	qt_count--;
+}
+
+
+/* Take ownership of a just-closed BO's mapping. Returns 1 if the quarantine now
+ * owns it (the caller must NOT munmap), 0 if the caller should release it itself. */
+static int qt_push(struct pbo *b)
+{
+	volatile uint32_t *p;
+	uint32_t words, i;
+
+	if (qt_on() == 0) {
+		return 0;
+	}
+	if ((b->cpu == NULL) || (b->size == 0u)) {
+		return 0;
+	}
+
+	/* Make room. A BO larger than the whole cap is simply not held. */
+	while ((qt_count >= QT_SLOTS) || ((qt_bytes + b->size) > QT_MAX_BYTES)) {
+		if (qt_count == 0u) {
+			return 0;
+		}
+		qt_retire_oldest();
+	}
+
+	p = (volatile uint32_t *)b->cpu;
+	words = b->size / sizeof(uint32_t);
+	for (i = 0u; i < words; i++) {
+		p[i] = QT_PATTERN;
+	}
+
+	qt_seq++;
+	if (qt_seq == 8u) {
+		const char *e = getenv("V3D_BO_QUARANTINE");
+		if ((e != NULL) && (strcmp(e, "selftest") == 0) && (words > 2u)) {
+			p[1] = 0x80000001u;   /* the exact C1 word, at the offset it is seen at */
+			fprintf(stderr, "v3d-qt: selftest -- planted 0x80000001 at +4 of handle=%u; "
+				"its release must report it\n", b->handle);
+		}
+	}
+
+	qt_slot[qt_head].cpu = b->cpu;
+	qt_slot[qt_head].size = b->size;
+	qt_slot[qt_head].handle = b->handle;
+	qt_slot[qt_head].seq = qt_seq;
+	qt_head = (qt_head + 1u) % QT_SLOTS;
+	qt_count++;
+	qt_bytes += b->size;
+	return 1;
+}
+
+
 /* DRM core GEM_CLOSE: free the BO so its slot + GPU VA are reclaimed. */
 static int ioc_close_bo(struct drm_gem_close *gc)
 {
 	struct pbo *b = bo_find(gc->handle);
+	int was_scanout;
 	if (b == NULL) return 0;   /* already gone / never ours */
+	was_scanout = b->scanout;  /* captured: the claim-release below clears it */
 	/* If the scanout-backed RT is being freed, release the single-claim so the NEXT full-screen
 	 * RT can re-acquire scanout backing. Without this, a freed+realloc'd RT silently fell back to
 	 * plain DRAM while the present path still expected render-to-scanout -> a frozen screen. */
@@ -1203,7 +1371,12 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 			}
 		}
 		if (keep == 0) {
-			munmap(b->cpu, b->size);
+			/* V3D_BO_QUARANTINE holds the pages a while and scans them before they
+			 * go back, instead of releasing them straight into the kernel's free
+			 * pool. The two kinds it cannot answer for are released as usual. */
+			if ((was_scanout != 0) || (b->cacheable != 0) || (qt_push(b) == 0)) {
+				munmap(b->cpu, b->size);
+			}
 		}
 	}
 	b->used = 0;
@@ -1642,7 +1815,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 
 	/* ENTRY-TIME RCL SANITY CHECK (2026-09-03). Decoding the wedged jobs showed that
 	 * only about HALF of them have a control list at all: over
-	 * artifacts/rpi4b-uart/*.log, 65 recorded RCLBYTES dumps split 29 opening with
+	 * the .log files under artifacts/rpi4b-uart, 65 recorded RCLBYTES dumps split 29 opening with
 	 * 0x79 (TILE_RENDERING_MODE_CFG) and 36 opening with RGBA pixel data or zeros,
 	 * parked at offset 0. That leaves one question that decides where
 	 * the bug is, and it cannot be answered from the wedge dump alone:
@@ -2195,7 +2368,7 @@ job_retry:
 		 * to perform the copy on the CPU rather than re-submit it.
 		 *
 		 * SECOND, SEPARATE DEFECT, also on record: only about HALF the drops have
-		 * a decodable list at all. Counted over artifacts/rpi4b-uart/*.log:
+		 * a decodable list at all. Counted over the .log files under artifacts/rpi4b-uart:
 		 * 65 RCLBYTES dumps, 29 beginning with 0x79 (TILE_RENDERING_MODE_CFG, a
 		 * valid RCL) and 36 beginning with RGBA pixel data or zeros (0x74 x15,
 		 * 0x2a x13, 0xff x3, 0x90 x3, 0x00 x2 -- none a defined CLE opcode), all
@@ -2210,6 +2383,51 @@ job_retry:
 	/* L2T flush so RT stores reach RAM before CPU readback (scout finding). */
 	l2t_flush_wait(c0);                       /* GFXH-1897: render flush must complete first */
 	c0[CTL_L2TCACTL/4]=L2TCACTL_L2TFLS|(2u<<1); /* FLM_CLEAN */
+
+	/* DRM_V3D_SUBMIT_CL_FLUSH_CACHE. Mesa sets this on a job whose shaders wrote
+	 * through the TMU -- `job->tmu_dirty_rcl && screen->has_cache_flush`, v3d_job.c:694
+	 * -- and Linux answers it by queueing a CACHE_CLEAN job that runs v3d_clean_caches()
+	 * before the job is reported complete (v3d_submit.c:998 -> v3d_gem.c:202).
+	 *
+	 * We advertise SUPPORTS_CACHE_FLUSH=1 in ioc_get_param -- which is also what makes
+	 * Mesa expose shader images and SSBOs in the first place (v3d_screen.c:173,178,305)
+	 * -- and then never honoured the flag. The clean just above is a bare FLM_CLEAN that
+	 * is issued and NOT awaited, and nothing anywhere on this path drains the TMU write
+	 * combiner. The combiner holds PARTIAL cache-line writes that never reach RAM on
+	 * their own; this file says so itself in the TFU epilogue, which is the only place
+	 * the drain exists. A u32 parked there can arrive in DRAM arbitrarily later -- after
+	 * GEM_CLOSE has munmap'd the page and the kernel has recycled it into somebody
+	 * else's allocation. That is exactly the shape of C1.
+	 *
+	 * Env-gated while it is being measured against the closed-BO quarantine; see
+	 * docs/KNOWN-ISSUES.md (C1). The counter is here because the whole hypothesis
+	 * depends on this workload actually producing flagged jobs -- if the count stays
+	 * zero, there is no writer and the idea is dead, and that must be visible in the
+	 * log rather than inferred from silence. */
+	if ((s->flags & DRM_V3D_SUBMIT_CL_FLUSH_CACHE) != 0u) {
+		static int clean = -1;
+		static uint32_t flagged;
+
+		if (clean < 0) {
+			const char *e = getenv("V3D_CL_CACHE_CLEAN");
+			clean = ((e != NULL) && (*e == '1')) ? 1 : 0;
+		}
+		flagged++;
+		if ((flagged == 1u) || ((flagged % 512u) == 0u)) {
+			fprintf(stderr, "v3d-winsys: CL FLUSH_CACHE job #%u -- %s\n", flagged,
+				(clean != 0) ? "cleaning (TMUWCF + L2T clean, both awaited)"
+				             : "NOT cleaning (legacy behaviour, A/B baseline)");
+		}
+		if (clean != 0) {
+			uint32_t ccspins;
+
+			l2t_flush_wait(c0);                              /* GFXH-1897: prior flush idle */
+			c0[CTL_L2TCACTL/4] = L2TCACTL_TMUWCF;            /* drain the TMU write combiner... */
+			for (ccspins = 1000000u; ccspins && (c0[CTL_L2TCACTL/4] & L2TCACTL_TMUWCF); ccspins--) {}
+			c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS | L2TCACTL_FLM_CLEAN;  /* ...then write back... */
+			l2t_flush_wait(c0);                              /* ...and wait for the clean */
+		}
+	}
 	return 0;
 }
 
