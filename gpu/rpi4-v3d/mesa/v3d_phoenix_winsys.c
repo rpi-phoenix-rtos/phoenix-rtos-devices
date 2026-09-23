@@ -1128,14 +1128,21 @@ static struct {
 } qt_slot[QT_SLOTS];
 
 static uint32_t qt_head, qt_count, qt_seq, qt_bytes, qt_reports, qt_released;
+static uint32_t qt_plant_handle;   /* the selftest BO, so its hit is not counted as a finding */
+static uint32_t qt_plant_seen;     /* and so a scan that never found it is loud */
 
+/* TEMPORARY DEFAULT-ON, for the C1 hunt only. psh implements no `export`, so an
+ * env-gated arm cannot be selected on the target at all -- the only way to run an
+ * arm is to compile it as the default, exactly as the V3D_KEEP_CLOSED_BO A/B was
+ * run. V3D_BO_QUARANTINE=0 still turns it off. Revert to default-off (`== '1'`)
+ * when C1 closes; docs/KNOWN-ISSUES.md (C1) tracks it. */
 static int qt_on(void)
 {
 	static int on = -1;
 
 	if (on < 0) {
 		const char *e = getenv("V3D_BO_QUARANTINE");
-		on = ((e != NULL) && (*e != '\0') && (*e != '0')) ? 1 : 0;
+		on = ((e != NULL) && (*e == '0')) ? 0 : 1;
 		if (on != 0) {
 			fprintf(stderr, "v3d-qt: closed-BO quarantine ON (%u slots, %u MiB cap, "
 				"pattern 0x%08x)\n", QT_SLOTS, QT_MAX_BYTES / (1024u * 1024u), QT_PATTERN);
@@ -1154,6 +1161,15 @@ static void qt_scan(uint32_t idx)
 
 	for (i = 0u; i < words; i++) {
 		if (p[i] == QT_PATTERN) {
+			continue;
+		}
+		/* The selftest word is ours; count and label it separately so it can never
+		 * be read as a finding, and so its ABSENCE is loud. */
+		if ((qt_slot[idx].handle == qt_plant_handle) && (i == 1u) && (p[i] == 0x80000001u)) {
+			fprintf(stderr, "v3d-qt: SELFTEST PLANT found at +4 of handle=%u -- "
+				"the scan works on this run\n", qt_slot[idx].handle);
+			qt_plant_seen = 1u;
+			p[i] = QT_PATTERN;
 			continue;
 		}
 		hits++;
@@ -1221,8 +1237,9 @@ static void qt_drain(void)
 		qt_scan((qt_head + QT_SLOTS - qt_count + i) % QT_SLOTS);
 	}
 	fprintf(stderr, "v3d-qt: EXIT -- %u BOs released, %u scanned at exit, "
-		"%u quarantined in total, %u stray report(s)\n",
-		qt_released, n, qt_seq, qt_reports);
+		"%u quarantined in total, %u stray report(s), selftest %s\n",
+		qt_released, n, qt_seq, qt_reports,
+		(qt_plant_seen != 0u) ? "FOUND" : "NOT FOUND -- scan is not trustworthy this run");
 }
 
 
@@ -1256,13 +1273,19 @@ static int qt_push(struct pbo *b)
 
 	qt_seq++;
 	if (qt_seq == 1u) {
-		/* Plant on the FIRST quarantined BO, not a later one: a short run may not
-		 * close enough BOs to reach any other index, and the point of the selftest
-		 * is that it is always there to be found. qt_drain() guarantees it is
-		 * scanned even if the ring never cycles. */
-		const char *e = getenv("V3D_BO_QUARANTINE");
-		if ((e != NULL) && (strcmp(e, "selftest") == 0) && (words > 2u)) {
+		/* Plant on the FIRST quarantined BO, and plant on EVERY run rather than
+		 * behind a separate mode. An instrument that has never been seen to fire is
+		 * no evidence when it stays quiet, and this one's entire value is that its
+		 * silence is meaningful -- so each run carries its own proof that the scan
+		 * works, instead of that proof living in a build from hours earlier.
+		 *
+		 * The plant is identified by handle so the report says so explicitly and a
+		 * reader never has to subtract it by hand. First BO, not a later one: a
+		 * short run may close fewer BOs than the ring holds. qt_drain() guarantees
+		 * it is scanned even if the ring never cycles. */
+		if (words > 2u) {
 			p[1] = 0x80000001u;   /* the exact C1 word, at the offset it is seen at */
+			qt_plant_handle = b->handle;
 			fprintf(stderr, "v3d-qt: selftest -- planted 0x80000001 at +4 of handle=%u; "
 				"the scan must report it\n", b->handle);
 		}
