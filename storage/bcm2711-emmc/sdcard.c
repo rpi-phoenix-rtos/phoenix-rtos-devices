@@ -342,6 +342,14 @@ static int _sdio_admaArm(sdcard_hostData_t *host, addr_t phys, size_t len)
 	hc |= (uint32_t)HOST_CONTROL_DMA_SELECT_ADMA32;
 	*(host->base + SDHOST_REG_HOST_CONTROL) = hc;
 	*(host->base + SDHOST_REG_ADMA_ADDR_1) = SDCARD_DRAM_BUS(host->admaDescPhys);
+	/* C7 CANDIDATE FIX 2026-09-23: the upper half of the ADMA system address was
+	 * never written, so the engine saw whatever 0x5C happened to hold. The SD
+	 * transfers themselves work, so on this controller it evidently reads as 0 for
+	 * the fetch -- but leaving a 64-bit address register half-initialised is wrong
+	 * regardless, and C7 (arming ADMA2 stops the WiFi chip's firmware loading) is
+	 * exactly the shape of a stray bus access. Descriptors are always < 1 GiB here,
+	 * so the correct upper half is 0. */
+	*(host->base + SDHOST_REG_ADMA_ADDR_2) = 0u;
 
 	return 0;
 }
