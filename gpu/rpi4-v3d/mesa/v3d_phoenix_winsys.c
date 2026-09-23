@@ -1145,8 +1145,8 @@ static int qt_on(void)
 }
 
 
-/* Scan one held BO for any word that is no longer the pattern, then release it. */
-static void qt_release(uint32_t idx)
+/* Scan one held BO for any word that is no longer the pattern. Does not release it. */
+static void qt_scan(uint32_t idx)
 {
 	volatile uint32_t *p = (volatile uint32_t *)qt_slot[idx].cpu;
 	uint32_t words = qt_slot[idx].size / sizeof(uint32_t);
@@ -1179,15 +1179,23 @@ static void qt_release(uint32_t idx)
 	if (hits != 0u) {
 		fprintf(stderr, "v3d-qt: handle=%u total %u stray word(s)\n", qt_slot[idx].handle, hits);
 	}
+}
 
+
+/* Scan, then hand the pages back to the kernel. */
+static void qt_release(uint32_t idx)
+{
+	qt_scan(idx);
 	qt_released++;
 	qt_bytes -= qt_slot[idx].size;
 	munmap(qt_slot[idx].cpu, qt_slot[idx].size);
 	qt_slot[idx].cpu = NULL;
 
-	/* A run in which the instrument never ran must not read like a clean run. */
-	if ((qt_released % 64u) == 0u) {
-		fprintf(stderr, "v3d-qt: released %u closed BOs, %u held, %u stray report(s)\n",
+	/* Report from the FIRST release as well as periodically: a run in which the
+	 * quarantine never engaged would otherwise print nothing at all, and read
+	 * exactly like a run in which it engaged and found nothing. */
+	if ((qt_released == 1u) || ((qt_released % 64u) == 0u)) {
+		fprintf(stderr, "v3d-qt: released %u closed BOs, %u still held, %u stray report(s)\n",
 			qt_released, qt_count - 1u, qt_reports);
 	}
 }
@@ -1197,6 +1205,24 @@ static void qt_retire_oldest(void)
 {
 	qt_release((qt_head + QT_SLOTS - qt_count) % QT_SLOTS);
 	qt_count--;
+}
+
+
+/* Scan everything still held. Without this the BOs in the ring at exit -- up to
+ * QT_SLOTS of them, including the selftest plant if the run closed fewer BOs than
+ * the ring holds -- would never be looked at, and a short run would report nothing
+ * while appearing to have run. */
+static void qt_drain(void)
+{
+	uint32_t n = qt_count;
+	uint32_t i;
+
+	for (i = 0u; i < n; i++) {
+		qt_scan((qt_head + QT_SLOTS - qt_count + i) % QT_SLOTS);
+	}
+	fprintf(stderr, "v3d-qt: EXIT -- %u BOs released, %u scanned at exit, "
+		"%u quarantined in total, %u stray report(s)\n",
+		qt_released, n, qt_seq, qt_reports);
 }
 
 
@@ -1229,13 +1255,18 @@ static int qt_push(struct pbo *b)
 	}
 
 	qt_seq++;
-	if (qt_seq == 8u) {
+	if (qt_seq == 1u) {
+		/* Plant on the FIRST quarantined BO, not a later one: a short run may not
+		 * close enough BOs to reach any other index, and the point of the selftest
+		 * is that it is always there to be found. qt_drain() guarantees it is
+		 * scanned even if the ring never cycles. */
 		const char *e = getenv("V3D_BO_QUARANTINE");
 		if ((e != NULL) && (strcmp(e, "selftest") == 0) && (words > 2u)) {
 			p[1] = 0x80000001u;   /* the exact C1 word, at the offset it is seen at */
 			fprintf(stderr, "v3d-qt: selftest -- planted 0x80000001 at +4 of handle=%u; "
-				"its release must report it\n", b->handle);
+				"the scan must report it\n", b->handle);
 		}
+		(void)atexit(qt_drain);
 	}
 
 	qt_slot[qt_head].cpu = b->cpu;
