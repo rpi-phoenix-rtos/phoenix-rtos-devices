@@ -128,7 +128,24 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	 * cannot produce that signature and the candidate is dead. Either answer
 	 * settles it, which beats waiting for a rare natural occurrence. */
 	if (mboxForceLeak != 0) {
+		uint32_t dspins;
+
+		/* Release the page FIRST -- that ordering is the whole defect: it goes back
+		 * to the kernel while VideoCore still holds its PA and may not even have
+		 * read it yet. */
 		munmap(msg_page, _PAGE_SIZE);
+
+		/* Only then reconcile one FIFO entry. Without this the FIFO fills and every
+		 * later call burns its whole MBOX_SPINS budget on the pre-doorbell FULL
+		 * check -- measured: 256 iterations did not finish inside a 37 s window.
+		 * Consuming an entry after the page is already gone costs the experiment
+		 * nothing. */
+		for (dspins = 200000u; dspins != 0u; dspins--) {
+			if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u) {
+				(void)mbox[VC_MBOX_READ / 4];
+				break;
+			}
+		}
 		munmap(mbox_page, _PAGE_SIZE);
 		return MBOX_FAIL;
 	}
@@ -200,8 +217,8 @@ static void mboxLeakTest(void)
 	if (n == 0u) {
 		return;
 	}
-	if (n > 4096u) {
-		n = 4096u;
+	if (n > 1024u) {
+		n = 1024u;
 	}
 
 	fprintf(stderr, "v3d-power: C1 POSITIVE CONTROL -- leaking %lu mailbox pages on "
@@ -212,36 +229,7 @@ static void mboxLeakTest(void)
 	}
 	mboxForceLeak = 0;
 
-	/* Drain the read FIFO. n requests were posted and none of their replies was
-	 * consumed, so without this the FIFO stays full of our responses and the next
-	 * mailbox user -- the vcmbox server, or the real power sequence -- would consume
-	 * a non-matching entry and fail. The memory writes under test have already
-	 * happened by then, so draining costs the experiment nothing. Bounded, because a
-	 * wedged VideoCore must not hang bring-up. */
-	{
-		addr_t pa_base = (addr_t)RPI_MAILBOX_BASE & ~(addr_t)(_PAGE_SIZE - 1);
-		addr_t pa_offs = (addr_t)RPI_MAILBOX_BASE & (addr_t)(_PAGE_SIZE - 1);
-		void *page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
-			MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, pa_base);
-
-		if (page != MAP_FAILED) {
-			volatile uint32_t *mb = (volatile uint32_t *)((volatile uint8_t *)page + pa_offs);
-			unsigned long drained = 0u;
-			uint32_t spins;
-
-			for (spins = MBOX_SPINS; (spins != 0u) && (drained < n); spins--) {
-				if ((mb[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u) {
-					(void)mb[VC_MBOX_READ / 4];
-					drained++;
-				}
-			}
-			munmap(page, _PAGE_SIZE);
-			fprintf(stderr, "v3d-power: C1 POSITIVE CONTROL -- %lu pages leaked, "
-				"%lu of %lu replies drained from the FIFO\n", n, drained, n);
-			return;
-		}
-	}
-	fprintf(stderr, "v3d-power: C1 POSITIVE CONTROL -- %lu pages leaked (FIFO NOT drained)\n", n);
+	fprintf(stderr, "v3d-power: C1 POSITIVE CONTROL -- %lu pages leaked\n", n);
 }
 
 
