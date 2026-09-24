@@ -1025,6 +1025,113 @@ static void va_free(uint32_t gpuva, uint32_t pages)
 	/* else: VA leaks (bounded); the next-bump path still serves new allocs. */
 }
 
+/* ---------------------------------------------------------------------------
+ * BO PAGE POOL (V3D_BO_POOL=1)
+ *
+ * WHY. The one statistically supported fact about issue C1 is that keeping a
+ * closed BO's pages out of the kernel's free pool suppresses the corruption:
+ * `V3D_KEEP_CLOSED_BO=1` gives 0 fires in 12 runs against 7 in 19 with it unset,
+ * Fisher one-tailed p = 0.019, all 31 runs in one byte-identical binary with the
+ * arm chosen by `export`. What lands on those pages after they are recycled is
+ * still unidentified -- but the lever is real and measured.
+ *
+ * KEEP_CLOSED_BO itself is not shippable: it never releases anything, and a
+ * six-lap run closes ~299 BOs totalling ~96 MiB. This gets the same "pages never
+ * go back to the kernel" property with bounded memory, by RECYCLING them inside
+ * the driver instead: a closed BO's mapping goes on a size-keyed free list and
+ * the next create of that exact size reuses it. Steady state costs the high-water
+ * mark of simultaneously-free BO bytes, not the sum of all closes.
+ *
+ * Two side benefits: it removes an mmap/munmap pair from the per-BO path, and it
+ * makes CPU-address recycling explicit and bounded rather than incidental -- today
+ * munmap+mmap already hands the same address to a later BO (56 addresses served
+ * more than one handle in a single measured run).
+ *
+ * ⚠ This is a MITIGATION, not a fix: the writer is still unidentified, so this
+ * removes the symptom by keeping the pages ours. Documented as such in
+ * docs/KNOWN-ISSUES.md (C1).
+ * ------------------------------------------------------------------------- */
+#define BOPOOL_MAX_ENT   256u
+#define BOPOOL_MAX_BYTES (24u * 1024u * 1024u)
+
+static struct {
+	void    *cpu;
+	uint32_t size;
+} boPool[BOPOOL_MAX_ENT];
+
+static uint32_t boPoolN, boPoolBytes, boPoolHiBytes, boPoolHits, boPoolMiss, boPoolSpill;
+
+
+static int boPool_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("V3D_BO_POOL");
+		on = ((e != NULL) && (*e == '1')) ? 1 : 0;
+		if (on != 0) {
+			fprintf(stderr, "v3d-pool: BO page pool ON (<=%u entries, <=%u MiB) -- closed BOs are "
+				"recycled in-driver instead of returned to the kernel (C1 mitigation)\n",
+				BOPOOL_MAX_ENT, BOPOOL_MAX_BYTES / (1024u * 1024u));
+		}
+	}
+	return on;
+}
+
+
+/* An exact-size mapping from the pool, or NULL. Exact size only: a partial reuse
+ * would leave the tail mapped but unaccounted, which is how VA bookkeeping bugs
+ * start. */
+static void *boPool_take(uint32_t size)
+{
+	uint32_t i;
+
+	if (boPool_on() == 0) {
+		return NULL;
+	}
+	for (i = boPoolN; i > 0u; i--) {
+		if (boPool[i - 1u].size == size) {
+			void *cpu = boPool[i - 1u].cpu;
+
+			boPool[i - 1u] = boPool[boPoolN - 1u];
+			boPoolN--;
+			boPoolBytes -= size;
+			boPoolHits++;
+			return cpu;
+		}
+	}
+	boPoolMiss++;
+	return NULL;
+}
+
+
+/* Returns 1 if the pool took ownership (caller must NOT munmap), 0 otherwise. */
+static int boPool_give(void *cpu, uint32_t size)
+{
+	if ((boPool_on() == 0) || (cpu == NULL) || (size == 0u)) {
+		return 0;
+	}
+	if ((boPoolN >= BOPOOL_MAX_ENT) || ((boPoolBytes + size) > BOPOOL_MAX_BYTES)) {
+		/* Over the cap: release it normally. Bounded by construction -- the whole
+		 * point is that memory cannot grow without limit. */
+		boPoolSpill++;
+		return 0;
+	}
+	boPool[boPoolN].cpu = cpu;
+	boPool[boPoolN].size = size;
+	boPoolN++;
+	boPoolBytes += size;
+	if (boPoolBytes > boPoolHiBytes) {
+		boPoolHiBytes = boPoolBytes;
+	}
+	if (((boPoolHits + boPoolMiss) % 512u) == 0u) {
+		fprintf(stderr, "v3d-pool: %u held (%u KiB, peak %u KiB), %u hits / %u misses, %u spilled\n",
+			boPoolN, boPoolBytes / 1024u, boPoolHiBytes / 1024u, boPoolHits, boPoolMiss, boPoolSpill);
+	}
+	return 1;
+}
+
+
 static int ioc_create_bo(struct drm_v3d_create_bo *c)
 {
 	/* A zero-byte BO request (e.g. vkQuake's empty lightstyles buffer) would compute 0 pages
@@ -1123,11 +1230,27 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 		int mapflags = MAP_CONTIGUOUS | MAP_ANONYMOUS;
 		if ((c->flags & 0x1u) == 0u)
 			mapflags |= MAP_UNCACHED;
-		cpu = mmap(NULL, pages*_PAGE_SIZE, PROT_READ|PROT_WRITE, mapflags, -1, 0);
-		if (cpu==MAP_FAILED) {
-			fprintf(stderr, "v3d-winsys: BO mmap FAILED (%u pages, %u KiB, flags 0x%x)\n",
-				pages, (unsigned)(pages*_PAGE_SIZE/1024u), c->flags);
-			va_free(gpuva, pages); return -ENOMEM;
+		/* Only the default uncached kind is pooled: a cacheable BO has different
+		 * mapping attributes and must not be handed out as an uncached one. */
+		/* A pooled mapping is reused as-is; the zeroing and per-page PT setup below
+		 * are shared with the fresh path, so a pooled BO is indistinguishable from a
+		 * freshly mmap'd one.
+		 *
+		 * One implicit dependency changes here and is worth naming: the kernel
+		 * clean+invalidates a page when it CREATES an uncached mapping
+		 * (_pmap_cacheOpAfterChange), which is what protects an uncached BO from a
+		 * previous cacheable owner's dirty lines (#67). A pooled page never gets a
+		 * new mapping, so that guarantee is not re-applied -- and does not need to be:
+		 * the page never left this uncached mapping, so no cacheable owner can have
+		 * touched it in between. */
+		cpu = ((c->flags & 0x1u) == 0u) ? boPool_take(pages*_PAGE_SIZE) : NULL;
+		if (cpu == NULL) {
+			cpu = mmap(NULL, pages*_PAGE_SIZE, PROT_READ|PROT_WRITE, mapflags, -1, 0);
+			if (cpu==MAP_FAILED) {
+				fprintf(stderr, "v3d-winsys: BO mmap FAILED (%u pages, %u KiB, flags 0x%x)\n",
+					pages, (unsigned)(pages*_PAGE_SIZE/1024u), c->flags);
+				va_free(gpuva, pages); return -ENOMEM;
+			}
 		}
 		/* Zero freshly-allocated BO memory. Phoenix mmap(MAP_CONTIGUOUS) returns NON-zeroed
 		 * DRAM (kernel zeroes only the vm_object struct, not pages — unlike Linux __GFP_ZERO
@@ -1554,7 +1677,11 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 			 * go back, instead of releasing them straight into the kernel's free
 			 * pool. The two kinds it cannot answer for are released as usual. */
 			if ((was_scanout != 0) || (b->cacheable != 0) || (qt_push(b) == 0)) {
-				munmap(b->cpu, b->size);
+				/* Recycle in-driver rather than returning the page to the kernel;
+				 * falls through to munmap when the pool is off or over its cap. */
+				if (boPool_give(b->cpu, b->size) == 0) {
+					munmap(b->cpu, b->size);
+				}
 			}
 #else
 			(void)was_scanout;
