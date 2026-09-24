@@ -1059,7 +1059,7 @@ static struct {
 	uint32_t size;
 } boPool[BOPOOL_MAX_ENT];
 
-static uint32_t boPoolN, boPoolBytes, boPoolHiBytes, boPoolHits, boPoolMiss, boPoolSpill;
+static uint32_t boPoolN, boPoolBytes, boPoolHiBytes, boPoolHits, boPoolMiss, boPoolSpill, boPoolGives;
 
 
 static int boPool_on(void)
@@ -1124,9 +1124,16 @@ static int boPool_give(void *cpu, uint32_t size)
 	if (boPoolBytes > boPoolHiBytes) {
 		boPoolHiBytes = boPoolBytes;
 	}
-	if (((boPoolHits + boPoolMiss) % 512u) == 0u) {
-		fprintf(stderr, "v3d-pool: %u held (%u KiB, peak %u KiB), %u hits / %u misses, %u spilled\n",
-			boPoolN, boPoolBytes / 1024u, boPoolHiBytes / 1024u, boPoolHits, boPoolMiss, boPoolSpill);
+	/* Deterministic cadence: the first give and every 128th after it. An earlier
+	 * version keyed this on (hits + misses) % 512 sampled inside give(), which can
+	 * simply never align -- the pool then looks idle whether or not it is working,
+	 * and a silent instrument cannot be asserted. */
+	boPoolGives++;
+	if ((boPoolGives == 1u) || ((boPoolGives % 128u) == 0u)) {
+		fprintf(stderr, "v3d-pool: %u held (%u KiB, peak %u KiB), %u hits / %u misses, %u spilled, "
+			"%u given\n",
+			boPoolN, boPoolBytes / 1024u, boPoolHiBytes / 1024u, boPoolHits, boPoolMiss,
+			boPoolSpill, boPoolGives);
 	}
 	return 1;
 }
