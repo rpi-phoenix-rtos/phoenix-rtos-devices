@@ -117,29 +117,32 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	 * order the two, so drain our stores before handing VideoCore the address — otherwise it
 	 * can read a message we have not finished writing. Same barrier, same reason, as
 	 * rpi4-vcmbox (the serialized /dev/vcmbox path this one is the fallback for). */
-	__asm__ volatile("dsb sy" ::: "memory");
-	mbox[VC_MBOX_WRITE / 4] = request;
-
 	/* POSITIVE CONTROL for C1 (V3D_MBOX_LEAKTEST, off unless set). Reproduces the
-	 * defect deliberately: ring the doorbell, then hand the page straight back to
-	 * the kernel without waiting for the reply. If the mailbox mechanism really is
-	 * what corrupts memory at page+4, forcing it must make C1 fire far more often
-	 * than its ~1-in-3 baseline; if forcing it produces nothing, the mechanism
-	 * cannot produce that signature and the candidate is dead. Either answer
-	 * settles it, which beats waiting for a rare natural occurrence. */
+	 * defect deliberately, and does so with NO dependence on firmware latency: the
+	 * page is returned to the kernel BEFORE the doorbell is rung, so VideoCore is
+	 * guaranteed to read (and reply into) a page the kernel has already reclaimed.
+	 *
+	 * The first version of this control released the page immediately *after* the
+	 * doorbell instead, and measured 2 fires / 4 against 0 / 3 (p ~ 0.29) -- too
+	 * weak to conclude from, and for a knowable reason: GET_FIRMWARE_REVISION is
+	 * answered quickly, so the firmware had usually already written before the page
+	 * was freed, leaving a window of microseconds rather than the timeout-scale
+	 * window the real defect opens. Ordering the release first removes that
+	 * confound entirely.
+	 *
+	 * So: if this still does not raise C1 above the ~1-in-3 baseline, the mechanism
+	 * cannot produce the signature and the candidate is dead. */
 	if (mboxForceLeak != 0) {
 		uint32_t dspins;
 
-		/* Release the page FIRST -- that ordering is the whole defect: it goes back
-		 * to the kernel while VideoCore still holds its PA and may not even have
-		 * read it yet. */
 		munmap(msg_page, _PAGE_SIZE);
+		__asm__ volatile("dsb sy" ::: "memory");
+		mbox[VC_MBOX_WRITE / 4] = request;
 
-		/* Only then reconcile one FIFO entry. Without this the FIFO fills and every
-		 * later call burns its whole MBOX_SPINS budget on the pre-doorbell FULL
-		 * check -- measured: 256 iterations did not finish inside a 37 s window.
-		 * Consuming an entry after the page is already gone costs the experiment
-		 * nothing. */
+		/* Reconcile one FIFO entry, or the FIFO fills and every later call burns its
+		 * whole MBOX_SPINS budget on the pre-doorbell FULL check -- measured: 256
+		 * iterations did not finish inside a 37 s window. The page is already gone by
+		 * here, so this costs the experiment nothing. */
 		for (dspins = 200000u; dspins != 0u; dspins--) {
 			if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u) {
 				(void)mbox[VC_MBOX_READ / 4];
@@ -149,6 +152,9 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 		munmap(mbox_page, _PAGE_SIZE);
 		return MBOX_FAIL;
 	}
+
+	__asm__ volatile("dsb sy" ::: "memory");
+	mbox[VC_MBOX_WRITE / 4] = request;
 
 	for (spins = MBOX_SPINS; spins != 0u; spins--) {
 		if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u &&
