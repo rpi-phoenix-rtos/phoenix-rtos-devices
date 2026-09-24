@@ -182,8 +182,17 @@ static uint32_t diag_mboxPower(uint32_t tag, uint32_t device_id, uint32_t state)
 		/* else: a response for a different request — drain and keep waiting */
 	}
 	if (deadline == 0u) {
-		munmap(msg_page, _PAGE_SIZE);
-		munmap(mbox_page, _PAGE_SIZE);
+		/* The doorbell already handed the firmware this page's PHYSICAL address, and
+		 * it writes its reply into msg[1] -- offset +4 -- whenever it gets round to
+		 * it, whether or not we are still waiting. Returning the page to the kernel
+		 * here would let that late reply land at +4 of whatever owns the page next,
+		 * in any address space, since a physical write goes through no MMU. That is
+		 * issue C1. Leak it on purpose instead, and say so. */
+		fprintf(stderr, "rpi4-wifi: mailbox tag 0x%08x timed out AFTER the doorbell; "
+			"leaking its message page on purpose -- the firmware still owns PA 0x%08x "
+			"and would write the reply into it (see C1)\n",
+			tag, (unsigned)msg_pa);
+		munmap(mbox_page, _PAGE_SIZE);   /* MMIO window: returns no RAM, always safe */
 		return 0xFFFFFFFFu;
 	}
 

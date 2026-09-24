@@ -123,7 +123,34 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	if (spins != 0u && msg[1] == VC_MBOX_RESP_OK)
 		result = msg[5 + nw - 1];
 
-	munmap(msg_page, _PAGE_SIZE);
+	/* The doorbell handed VideoCore this page's PHYSICAL address, and it writes its
+	 * reply into msg[1] -- offset +4 of the page -- whenever it gets round to it. It
+	 * neither knows nor cares that we stopped waiting.
+	 *
+	 * So the page may only go back to the kernel once our own response has surfaced
+	 * in the FIFO. Unmapping it on the timeout path returns it to the free pool while
+	 * the firmware still owns it, and because a physical write goes through no MMU,
+	 * the late reply then lands at +4 of whatever owns that page next -- in THIS
+	 * process (this winsys is linked into the application, so the page typically goes
+	 * straight back to our own malloc) or in the kernel.
+	 *
+	 * That is issue C1: 154 of 154 observations are a 64-bit word whose HIGH half
+	 * became 0x8000_0001 -- the response code -- with its low half intact, seen in a
+	 * malloc heap header, in a Mesa hash_table's mem_ctx, and in a kernel zone link.
+	 *
+	 * Leaking one page per timed-out call is the cheap side of the trade: these are
+	 * rare clock/power queries, and the alternative is silent corruption anywhere in
+	 * the system. Loud, because an unreported leak becomes permanent. The MMIO window
+	 * maps device registers rather than RAM, so dropping it is always safe. */
+	if (spins != 0u) {
+		munmap(msg_page, _PAGE_SIZE);
+	}
+	else {
+		fprintf(stderr, "v3d-power: mailbox tag 0x%08x timed out AFTER the doorbell; "
+			"leaking its message page on purpose -- VideoCore still owns PA 0x%08x and "
+			"would write the reply into it (see C1)\n",
+			tag, (unsigned)msg_pa);
+	}
 	munmap(mbox_page, _PAGE_SIZE);
 	return result;
 }
