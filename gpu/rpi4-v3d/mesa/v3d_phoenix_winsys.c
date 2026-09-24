@@ -1141,18 +1141,26 @@ static uint32_t qt_head, qt_count, qt_seq, qt_bytes, qt_reports, qt_released;
 static uint32_t qt_plant_handle;   /* the selftest BO, so its hit is not counted as a finding */
 static uint32_t qt_plant_seen;     /* and so a scan that never found it is loud */
 
-/* TEMPORARY DEFAULT-ON, for the C1 hunt only. psh implements no `export`, so an
- * env-gated arm cannot be selected on the target at all -- the only way to run an
- * arm is to compile it as the default, exactly as the V3D_KEEP_CLOSED_BO A/B was
- * run. V3D_BO_QUARANTINE=0 still turns it off. Revert to default-off (`== '1'`)
- * when C1 closes; docs/KNOWN-ISSUES.md (C1) tracks it. */
+/* Back to DEFAULT-OFF after its first five runs, and the reason is worth keeping.
+ *
+ * The quarantine answered its own question: across 5 runs it held and fully
+ * scanned ~1000 closed BOs and found NOTHING written to them, with the scan proven
+ * on every run by the planted word. But those same 5 runs produced 0 heap fires
+ * against a 4/10 baseline -- i.e. holding the pages SUPPRESSES C1 exactly as
+ * V3D_KEEP_CLOSED_BO=1 did (pooled: retention 0/13, default 4/10, Fisher p ~ 0.024).
+ *
+ * So the instrument cannot see the event it was built to catch: whatever it is
+ * needs the pages to go back to the kernel, and turning the quarantine on stops
+ * that from happening. Leaving it on would spend Pi time measuring silence. The
+ * question moves to attributing a FIRED page, which needs a firing run, which
+ * needs this off. V3D_BO_QUARANTINE=1 re-enables it. */
 static int qt_on(void)
 {
 	static int on = -1;
 
 	if (on < 0) {
 		const char *e = getenv("V3D_BO_QUARANTINE");
-		on = ((e != NULL) && (*e == '0')) ? 0 : 1;
+		on = ((e != NULL) && (*e == '1')) ? 1 : 0;
 		if (on != 0) {
 			fprintf(stderr, "v3d-qt: closed-BO quarantine ON (%u slots, %u MiB cap, "
 				"pattern 0x%08x)\n", QT_SLOTS, QT_MAX_BYTES / (1024u * 1024u), QT_PATTERN);
