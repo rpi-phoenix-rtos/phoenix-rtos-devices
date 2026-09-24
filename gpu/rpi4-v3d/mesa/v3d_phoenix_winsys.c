@@ -340,13 +340,23 @@ volatile unsigned v3d_phoenix_render_timeouts = 0;
  * fix: it is how that class of bug is recognised, and how V3D_KEEP_CLOSED_BO=1
  * A/B runs are read. It is also how the 56 recycled CPU addresses that disproved
  * the W36 premise were counted. */
+/* TEMPORARY DEFAULT-ON for the C1 hunt, alongside the quarantine, and for the same
+ * reason: psh has no `export`, so the only way to select this on the target is to
+ * compile it as the default. V3D_BO_TRACE=0 turns it off.
+ *
+ * What it buys: the allocator's page+4 report prints `p4page`, and the winsys is
+ * in-process with malloc, so a CLOSE line carrying `cpu=` and `size=` lets the
+ * fired page be tested for having EVER been a BO. That is the question that
+ * separates the two live readings of C1 — a write aimed at a closed BO's pages,
+ * versus a write into ordinary malloc memory that merely correlates with BO
+ * recycling. Revert to default-off (`== '1'`) when C1 closes. */
 static int bo_trace_on(void)
 {
 	static int on = -1;
 
 	if (on < 0) {
 		const char *e = getenv("V3D_BO_TRACE");
-		on = (e != NULL && *e == '1') ? 1 : 0;
+		on = ((e != NULL) && (*e == '0')) ? 0 : 1;
 	}
 	return on;
 }
