@@ -16,6 +16,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv/strtoul for the C1 positive control */
 #include <unistd.h>
 #include <sys/mman.h>
 #include "libvcmbox.h"   /* serialized /dev/vcmbox client (single-FIFO arbitration) */
@@ -41,6 +42,7 @@
 #define VC_PROP_GET_CLOCK_RATE      0x00030002u   /* configured rate (Hz), w0=clock id */
 #define VC_PROP_GET_CLOCK_MEASURED  0x00030047u   /* actual measured rate (Hz) — reveals an unlocked/unsettled PLL */
 #define VC_PROP_GET_CLOCK_STATE     0x00030001u   /* bit0 on, bit1 not-exists */
+#define VC_PROP_GET_FIRMWARE_REV    0x00000001u   /* benign read-only query, used by the C1 positive control */
 #define VC_PROP_GET_TEMPERATURE     0x00030006u   /* SoC temp (milli-degC), w0=temp id 0 */
 #define VC_PROP_GET_THROTTLED       0x00030046u   /* throttle/undervolt bitmask */
 #define VC_PROP_GET_VOLTAGE         0x00030003u   /* w0=voltage id; id 1 = core */
@@ -57,6 +59,11 @@
 #define ASB_ACK                 (1u << 1)
 #define PM_PASSWORD             0x5a000000u
 #define ASB_ACK_SPINS           100000u
+
+/* Set only while the C1 positive control runs; see the V3D_MBOX_LEAKTEST block
+ * inside mboxProp() and mboxLeakTest() below. Never set in normal operation. */
+static int mboxForceLeak;
+
 
 static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 {
@@ -112,6 +119,20 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	 * rpi4-vcmbox (the serialized /dev/vcmbox path this one is the fallback for). */
 	__asm__ volatile("dsb sy" ::: "memory");
 	mbox[VC_MBOX_WRITE / 4] = request;
+
+	/* POSITIVE CONTROL for C1 (V3D_MBOX_LEAKTEST, off unless set). Reproduces the
+	 * defect deliberately: ring the doorbell, then hand the page straight back to
+	 * the kernel without waiting for the reply. If the mailbox mechanism really is
+	 * what corrupts memory at page+4, forcing it must make C1 fire far more often
+	 * than its ~1-in-3 baseline; if forcing it produces nothing, the mechanism
+	 * cannot produce that signature and the candidate is dead. Either answer
+	 * settles it, which beats waiting for a rare natural occurrence. */
+	if (mboxForceLeak != 0) {
+		munmap(msg_page, _PAGE_SIZE);
+		munmap(mbox_page, _PAGE_SIZE);
+		return MBOX_FAIL;
+	}
+
 	for (spins = MBOX_SPINS; spins != 0u; spins--) {
 		if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u &&
 		    mbox[VC_MBOX_READ / 4] == request)
@@ -154,6 +175,75 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	munmap(mbox_page, _PAGE_SIZE);
 	return result;
 }
+
+/* C1 positive control. `export V3D_MBOX_LEAKTEST=<n>` before the workload makes
+ * power-on issue n benign GET_FIRMWARE_REVISION queries that ring the doorbell and
+ * then release their page immediately -- the defect, on purpose, n times.
+ *
+ * A benign read-only tag is used rather than forcing the real clock/power calls to
+ * time out: those are retried until confirmed, so failing them would hang bring-up
+ * instead of testing anything. This leaves the actual power sequence untouched.
+ *
+ * Grade the run by the allocator's page+4 reports: a large rise over the ~1-in-3
+ * baseline confirms the mechanism can produce the C1 signature; nothing at all,
+ * across a few runs, refutes it. */
+static void mboxLeakTest(void)
+{
+	const char *e = getenv("V3D_MBOX_LEAKTEST");
+	unsigned long n;
+	unsigned long i;
+
+	if (e == NULL) {
+		return;
+	}
+	n = strtoul(e, NULL, 0);
+	if (n == 0u) {
+		return;
+	}
+	if (n > 4096u) {
+		n = 4096u;
+	}
+
+	fprintf(stderr, "v3d-power: C1 POSITIVE CONTROL -- leaking %lu mailbox pages on "
+		"purpose (doorbell rung, page released unwaited)\n", n);
+	mboxForceLeak = 1;
+	for (i = 0u; i < n; i++) {
+		(void)mboxProp(VC_PROP_GET_FIRMWARE_REV, 1, 0u, 0u);
+	}
+	mboxForceLeak = 0;
+
+	/* Drain the read FIFO. n requests were posted and none of their replies was
+	 * consumed, so without this the FIFO stays full of our responses and the next
+	 * mailbox user -- the vcmbox server, or the real power sequence -- would consume
+	 * a non-matching entry and fail. The memory writes under test have already
+	 * happened by then, so draining costs the experiment nothing. Bounded, because a
+	 * wedged VideoCore must not hang bring-up. */
+	{
+		addr_t pa_base = (addr_t)RPI_MAILBOX_BASE & ~(addr_t)(_PAGE_SIZE - 1);
+		addr_t pa_offs = (addr_t)RPI_MAILBOX_BASE & (addr_t)(_PAGE_SIZE - 1);
+		void *page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+			MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, pa_base);
+
+		if (page != MAP_FAILED) {
+			volatile uint32_t *mb = (volatile uint32_t *)((volatile uint8_t *)page + pa_offs);
+			unsigned long drained = 0u;
+			uint32_t spins;
+
+			for (spins = MBOX_SPINS; (spins != 0u) && (drained < n); spins--) {
+				if ((mb[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) == 0u) {
+					(void)mb[VC_MBOX_READ / 4];
+					drained++;
+				}
+			}
+			munmap(page, _PAGE_SIZE);
+			fprintf(stderr, "v3d-power: C1 POSITIVE CONTROL -- %lu pages leaked, "
+				"%lu of %lu replies drained from the FIFO\n", n, drained, n);
+			return;
+		}
+	}
+	fprintf(stderr, "v3d-power: C1 POSITIVE CONTROL -- %lu pages leaked (FIFO NOT drained)\n", n);
+}
+
 
 static int asbEnable(volatile uint32_t *asb, uint32_t reg)
 {
@@ -339,6 +429,9 @@ int v3d_phoenix_powerOn(void)
 	usleep(2000);
 	munmap(asb_page, _PAGE_SIZE);
 	munmap(pm_page, _PAGE_SIZE);
+	/* Off unless V3D_MBOX_LEAKTEST is exported; runs last so the leaked pages are
+	 * recycled while the application allocates and renders. */
+	mboxLeakTest();
 	/* An unconfirmed clock is fatal, not cosmetic: the caller's next act is a V3D MMIO
 	 * read, which never returns if the block is unclocked. Fail loudly instead. */
 	return (rcM == 0 && rcS == 0 && rcClk == 0) ? 0 : -1;
