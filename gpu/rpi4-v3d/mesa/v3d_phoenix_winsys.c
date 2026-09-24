@@ -1685,7 +1685,13 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 			}
 #else
 			(void)was_scanout;
-			munmap(b->cpu, b->size);
+			/* Recycle in-driver rather than returning the page to the kernel;
+			 * falls through to munmap when the pool is off or over its cap.
+			 * Cacheable BOs are rejected inside boPool_give's caller check below,
+			 * so only the default uncached kind is ever pooled. */
+			if ((b->cacheable != 0) || (boPool_give(b->cpu, b->size) == 0)) {
+				munmap(b->cpu, b->size);
+			}
 #endif
 		}
 	}
