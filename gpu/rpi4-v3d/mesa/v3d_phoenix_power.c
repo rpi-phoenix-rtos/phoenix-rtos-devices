@@ -60,9 +60,15 @@
 #define PM_PASSWORD             0x5a000000u
 #define ASB_ACK_SPINS           100000u
 
+#ifdef V3D_C1_HUNT
 /* Set only while the C1 positive control runs; see the V3D_MBOX_LEAKTEST block
- * inside mboxProp() and mboxLeakTest() below. Never set in normal operation. */
+ * inside mboxProp() and mboxLeakTest() below. Never set in normal operation.
+ *
+ * The control deliberately corrupts memory, so it is compiled out unless the hunt
+ * build asks for it -- an env variable alone is too easy to set by accident on a
+ * shipped image. */
 static int mboxForceLeak;
+#endif
 
 
 static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
@@ -113,10 +119,7 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 			return MBOX_FAIL;
 		}
 	}
-	/* The message buffer is Normal-NC and the mailbox registers are Device; aarch64 does not
-	 * order the two, so drain our stores before handing VideoCore the address — otherwise it
-	 * can read a message we have not finished writing. Same barrier, same reason, as
-	 * rpi4-vcmbox (the serialized /dev/vcmbox path this one is the fallback for). */
+#ifdef V3D_C1_HUNT
 	/* POSITIVE CONTROL for C1 (V3D_MBOX_LEAKTEST, off unless set). Reproduces the
 	 * defect deliberately, and does so with NO dependence on firmware latency: the
 	 * page is returned to the kernel BEFORE the doorbell is rung, so VideoCore is
@@ -152,7 +155,12 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 		munmap(mbox_page, _PAGE_SIZE);
 		return MBOX_FAIL;
 	}
+#endif /* V3D_C1_HUNT */
 
+	/* The message buffer is Normal-NC and the mailbox registers are Device; aarch64 does not
+	 * order the two, so drain our stores before handing VideoCore the address — otherwise it
+	 * can read a message we have not finished writing. Same barrier, same reason, as
+	 * rpi4-vcmbox (the serialized /dev/vcmbox path this one is the fallback for). */
 	__asm__ volatile("dsb sy" ::: "memory");
 	mbox[VC_MBOX_WRITE / 4] = request;
 
@@ -199,6 +207,7 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	return result;
 }
 
+#ifdef V3D_C1_HUNT
 /* C1 positive control. `export V3D_MBOX_LEAKTEST=<n>` before the workload makes
  * power-on issue n benign GET_FIRMWARE_REVISION queries that ring the doorbell and
  * then release their page immediately -- the defect, on purpose, n times.
@@ -237,6 +246,7 @@ static void mboxLeakTest(void)
 
 	fprintf(stderr, "v3d-power: C1 POSITIVE CONTROL -- %lu pages leaked\n", n);
 }
+#endif /* V3D_C1_HUNT */
 
 
 static int asbEnable(volatile uint32_t *asb, uint32_t reg)
@@ -423,9 +433,11 @@ int v3d_phoenix_powerOn(void)
 	usleep(2000);
 	munmap(asb_page, _PAGE_SIZE);
 	munmap(pm_page, _PAGE_SIZE);
+#ifdef V3D_C1_HUNT
 	/* Off unless V3D_MBOX_LEAKTEST is exported; runs last so the leaked pages are
 	 * recycled while the application allocates and renders. */
 	mboxLeakTest();
+#endif
 	/* An unconfirmed clock is fatal, not cosmetic: the caller's next act is a V3D MMIO
 	 * read, which never returns if the block is unclocked. Fail loudly instead. */
 	return (rcM == 0 && rcS == 0 && rcClk == 0) ? 0 : -1;
