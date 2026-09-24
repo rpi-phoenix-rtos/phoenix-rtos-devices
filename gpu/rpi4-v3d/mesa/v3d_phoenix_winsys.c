@@ -340,23 +340,19 @@ volatile unsigned v3d_phoenix_render_timeouts = 0;
  * fix: it is how that class of bug is recognised, and how V3D_KEEP_CLOSED_BO=1
  * A/B runs are read. It is also how the 56 recycled CPU addresses that disproved
  * the W36 premise were counted. */
-/* TEMPORARY DEFAULT-ON for the C1 hunt, alongside the quarantine, and for the same
- * reason: psh has no `export`, so the only way to select this on the target is to
- * compile it as the default. V3D_BO_TRACE=0 turns it off.
- *
- * What it buys: the allocator's page+4 report prints `p4page`, and the winsys is
- * in-process with malloc, so a CLOSE line carrying `cpu=` and `size=` lets the
- * fired page be tested for having EVER been a BO. That is the question that
- * separates the two live readings of C1 — a write aimed at a closed BO's pages,
- * versus a write into ordinary malloc memory that merely correlates with BO
- * recycling. Revert to default-off (`== '1'`) when C1 closes. */
+/* Back to default-off. It was briefly default-on so a fired page could be matched
+ * against BO ranges offline, and that cost ~1470 UART lines a run -- during which
+ * the event did not fire once in 7 runs, against a 4-in-10 baseline. Rather than
+ * spend more runs deciding whether the trace suppresses the bug or that was
+ * chance, the attribution moved to c1_seen[] above, which answers the same
+ * question from a table, in-process, with no output at all. */
 static int bo_trace_on(void)
 {
 	static int on = -1;
 
 	if (on < 0) {
 		const char *e = getenv("V3D_BO_TRACE");
-		on = ((e != NULL) && (*e == '0')) ? 0 : 1;
+		on = ((e != NULL) && (*e == '1')) ? 1 : 0;
 	}
 	return on;
 }
@@ -394,6 +390,94 @@ static void bo_hist_record(const struct pbo *b)
 	e->cpu = b->cpu;
 	bo_hist_next++;
 }
+
+/* ---------------------------------------------------------------------------
+ * C1 PAGE ATTRIBUTION -- always on, silent, and passive.
+ *
+ * The allocator's page+4 report knows WHICH page was corrupted but not what that
+ * page used to be. This winsys runs in the same process as malloc, so malloc can
+ * simply ask it, and answering out of a table costs two stores per BO and not one
+ * byte of output.
+ *
+ * That property is the whole point. Every instrument tried before this one either
+ * wrote to the UART (V3D_BO_TRACE, ~1470 lines a run) or withheld pages from the
+ * kernel (V3D_KEEP_CLOSED_BO, the closed-BO quarantine), and every one of them
+ * SUPPRESSED the event rather than catching it: 0 fires in 8, 5 and 7 runs
+ * respectively against a 4-in-10 baseline. Whatever C1 is, it is fragile to
+ * perturbation, so an instrument that perturbs nothing is the only kind that can
+ * still see it.
+ *
+ * bo_hist above is not usable for this -- it holds 16 entries, a fraction of the
+ * ~300 closes in a run -- so this keeps its own full-run table.
+ *
+ * malloc declares v3d_c1_lookup_page() weak, so a binary without this driver
+ * still links and simply reports the page as unattributable.
+ * ------------------------------------------------------------------------- */
+#define C1_SEEN_MAX MAX_BOS
+
+static struct {
+	void    *cpu;
+	uint32_t size;
+	uint32_t handle;
+	uint32_t closed;    /* 0 = still open, else the ordinal of its close */
+} c1_seen[C1_SEEN_MAX];
+
+static uint32_t c1_seen_n, c1_close_ord;
+
+
+static void c1_seen_create(const struct pbo *b)
+{
+	if ((c1_seen_n >= C1_SEEN_MAX) || (b->cpu == NULL)) {
+		return;
+	}
+	c1_seen[c1_seen_n].cpu = b->cpu;
+	c1_seen[c1_seen_n].size = b->size;
+	c1_seen[c1_seen_n].handle = b->handle;
+	c1_seen[c1_seen_n].closed = 0u;
+	c1_seen_n++;
+}
+
+
+static void c1_seen_close(const struct pbo *b)
+{
+	uint32_t i;
+
+	c1_close_ord++;
+	for (i = c1_seen_n; i > 0u; i--) {
+		if (c1_seen[i - 1u].handle == b->handle) {
+			c1_seen[i - 1u].closed = c1_close_ord;
+			return;
+		}
+	}
+}
+
+
+/* Was this page ever a BO? Returns the NUMBER of BOs whose CPU range covered it
+ * -- more than one means the address was recycled between BOs, which is itself a
+ * result -- and fills in the most recent of them. */
+int v3d_c1_lookup_page(unsigned long page, unsigned int *handle, unsigned long *off,
+	int *closed, unsigned int *total)
+{
+	uint32_t i, matches = 0u;
+
+	for (i = c1_seen_n; i > 0u; i--) {
+		unsigned long lo = (unsigned long)c1_seen[i - 1u].cpu;
+
+		if ((page >= lo) && (page < (lo + c1_seen[i - 1u].size))) {
+			if (matches == 0u) {
+				if (handle != NULL) *handle = c1_seen[i - 1u].handle;
+				if (off != NULL) *off = page - lo;
+				if (closed != NULL) *closed = (int)c1_seen[i - 1u].closed;
+			}
+			matches++;
+		}
+	}
+	if (total != NULL) {
+		*total = c1_seen_n;
+	}
+	return (int)matches;
+}
+
 
 /* Report any recently-closed BO that overlapped this one's GPU VA or CPU address.
  * Overlap, not equality: a smaller BO reusing part of a bigger one's range is the
@@ -1086,6 +1170,7 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 		(W.scanout_pa2 != 0 && pa == W.scanout_pa2) ||
 		(W.scanout_pa3 != 0 && pa == W.scanout_pa3)));   /* this BO aliases a scanout buffer */
 	b->cacheable = ((c->flags & 0x1u) != 0u);
+	c1_seen_create(b);
 	c->handle = b->handle;
 	c->offset = gpuva;          /* V3D address-space offset (nonzero) */
 	if (bo_trace_on() != 0) {
@@ -1345,6 +1430,7 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 			b->handle, b->gpuva, b->size, b->cpu);
 	}
 	bo_hist_record(b);
+	c1_seen_close(b);
 
 	/* Invalidate this BO's page-table entries BEFORE the VA and the memory go back.
 	 *
