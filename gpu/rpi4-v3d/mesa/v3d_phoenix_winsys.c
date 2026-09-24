@@ -391,6 +391,7 @@ static void bo_hist_record(const struct pbo *b)
 	bo_hist_next++;
 }
 
+#ifdef V3D_C1_HUNT
 /* ---------------------------------------------------------------------------
  * C1 PAGE ATTRIBUTION -- always on, silent, and passive.
  *
@@ -477,6 +478,9 @@ int v3d_c1_lookup_page(unsigned long page, unsigned int *handle, unsigned long *
 	}
 	return (int)matches;
 }
+
+
+#endif /* V3D_C1_HUNT */
 
 
 /* Report any recently-closed BO that overlapped this one's GPU VA or CPU address.
@@ -1170,7 +1174,9 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 		(W.scanout_pa2 != 0 && pa == W.scanout_pa2) ||
 		(W.scanout_pa3 != 0 && pa == W.scanout_pa3)));   /* this BO aliases a scanout buffer */
 	b->cacheable = ((c->flags & 0x1u) != 0u);
+#ifdef V3D_C1_HUNT
 	c1_seen_create(b);
+#endif
 	c->handle = b->handle;
 	c->offset = gpuva;          /* V3D address-space offset (nonzero) */
 	if (bo_trace_on() != 0) {
@@ -1180,6 +1186,15 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 	return 0;
 }
 
+/* The C1 hunt instruments below are compiled OUT by default, and that is a
+ * measured requirement rather than tidiness. C1 is sensitive to binary layout:
+ * four separate builds carrying one instrument each produced 0 fires in 24 runs
+ * where the uninstrumented binary fires about 1 run in 3, and merely adding
+ * c1_seen[]'s 96 KB of BSS is enough to shift every address after it. So master
+ * must build the layout that still reproduces the bug; -DV3D_C1_HUNT turns the
+ * instruments on, and doing so is itself a new layout that has to be re-baselined.
+ * See docs/KNOWN-ISSUES.md (C1). */
+#ifdef V3D_C1_HUNT
 /* ---------------------------------------------------------------------------
  * CLOSED-BO QUARANTINE  (C1 instrument; V3D_BO_QUARANTINE=1, or =selftest)
  *
@@ -1406,6 +1421,9 @@ static int qt_push(struct pbo *b)
 }
 
 
+#endif /* V3D_C1_HUNT */
+
+
 /* DRM core GEM_CLOSE: free the BO so its slot + GPU VA are reclaimed. */
 static int ioc_close_bo(struct drm_gem_close *gc)
 {
@@ -1430,7 +1448,9 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 			b->handle, b->gpuva, b->size, b->cpu);
 	}
 	bo_hist_record(b);
+#ifdef V3D_C1_HUNT
 	c1_seen_close(b);
+#endif
 
 	/* Invalidate this BO's page-table entries BEFORE the VA and the memory go back.
 	 *
@@ -1529,12 +1549,17 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 			}
 		}
 		if (keep == 0) {
+#ifdef V3D_C1_HUNT
 			/* V3D_BO_QUARANTINE holds the pages a while and scans them before they
 			 * go back, instead of releasing them straight into the kernel's free
 			 * pool. The two kinds it cannot answer for are released as usual. */
 			if ((was_scanout != 0) || (b->cacheable != 0) || (qt_push(b) == 0)) {
 				munmap(b->cpu, b->size);
 			}
+#else
+			(void)was_scanout;
+			munmap(b->cpu, b->size);
+#endif
 		}
 	}
 	b->used = 0;
