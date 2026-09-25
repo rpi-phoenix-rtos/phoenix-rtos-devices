@@ -232,6 +232,31 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	 * the system. Loud, because an unreported leak becomes permanent. The MMIO window
 	 * maps device registers rather than RAM, so dropping it is always safe. */
 	if (spins != 0u) {
+		/* TODO(C1-hunt): log the RELEASE too, bounded and paired with the
+		 * allocation line above.
+		 *
+		 * Without this the offline coincidence test in c1-report.sh cannot mean
+		 * anything. It compares these request-buffer PAs against the physical
+		 * pages of live malloc heaps, and this driver mmaps and munmaps a FRESH
+		 * page per call -- 19 distinct pages in 24 logged calls on a single STK
+		 * run -- so those frames return to the pool and are reused by malloc
+		 * constantly. Benign reuse would therefore dominate any raw PA match.
+		 *
+		 * A release logged HERE means the response had already surfaced, so the
+		 * firmware was finished with the page and a later match on it is
+		 * harmless. An allocation with NO matching release is the interesting
+		 * case, and it is the shape of the one route still untested: a process
+		 * exiting with a property call in flight, where the kernel reclaims the
+		 * page with no munmap and no counter to observe it. */
+		{
+			static unsigned c1_rel_logged;
+
+			if (c1_rel_logged < 24u) {
+				c1_rel_logged++;
+				fprintf(stderr, "v3d-pwr: C1-hunt: mbox req buf RELEASED pa=0x%08x\n",
+					(unsigned)((uint32_t)msg_pa & ~0xfffu));
+			}
+		}
 		munmap(msg_page, _PAGE_SIZE);
 	}
 	else {
@@ -318,6 +343,16 @@ static int asbStop(volatile uint32_t *asb, uint32_t reg)
  * lottery each trial (v3d_phoenix_powerOn alone only re-deasserts; it does not hold the
  * core in reset, so it cannot re-create the cold first-frame condition). Returns 0 on
  * success. */
+
+/* Defined at the bottom of this file but called from v3d_phoenix_reset() just below.
+ * Without this declaration the call is an implicit one, which gcc-16 rejects under
+ * -Werror -- a latent break that syntax-check.sh surfaces and that would bite the first
+ * time this file is compiled in a configuration that enables that diagnostic. The
+ * winsys declares the same prototype (v3d_phoenix_winsys.c:325); this keeps the
+ * definition's own translation unit honest too. */
+int v3d_phoenix_powerOn(void);
+
+
 int v3d_phoenix_reset(void)
 {
 	volatile uint32_t *pm, *asb;
