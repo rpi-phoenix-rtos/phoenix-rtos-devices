@@ -105,7 +105,20 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	msg[5 + nw] = 0;
 
 	msg_pa = (uintptr_t)va2pa(msg);
-	if (msg_pa == (uintptr_t)-1) {
+	/* The request handed to VideoCore is a 32-bit address, so reject a message
+	 * page that va2pa could not resolve (-1) OR that landed above 4 GiB. The cast
+	 * to uint32_t below would silently truncate such a PA and point the firmware
+	 * at the WRONG physical page, which it would then write its response word into
+	 * -- at offset +4 of that page, in whatever address space now owns it -- while
+	 * the transaction still "matches" and reports success. rpi4-vcmbox guards its
+	 * bounce buffer for exactly this reason; this in-process fallback did not, and
+	 * it is linked into every GPU application.
+	 *
+	 * Latent on the 4 GB Pi 4B this is validated on (the highest PA observed
+	 * anywhere in the log archive is ~0x451f0000 and vcmbox's equivalent guard has
+	 * never fired), so this is NOT a fix for C1. It is a real hole on a 2/8 GB
+	 * board, where MAP_CONTIGUOUS can return a PA above 4 GiB -- see P1. */
+	if ((msg_pa == (uintptr_t)-1) || ((uint64_t)msg_pa > 0xffffffffULL)) {
 		munmap(msg_page, _PAGE_SIZE);
 		munmap(mbox_page, _PAGE_SIZE);
 		return MBOX_FAIL;

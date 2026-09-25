@@ -298,7 +298,12 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	msg[5 + nw] = 0;
 
 	msg_pa = (uintptr_t)va2pa(msg);
-	if (msg_pa == (uintptr_t)-1) {
+	/* Reject a PA above 4 GiB as well as an unresolvable one: the cast below
+	 * truncates to 32 bits, which would aim the firmware at the wrong physical
+	 * page and have it write the response word at +4 of whatever owns that page,
+	 * while still reporting success. Same guard as rpi4-vcmbox and rpi4-wifi.
+	 * Latent on the 4 GB board this is validated on; a real hole on 2/8 GB (P1). */
+	if ((msg_pa == (uintptr_t)-1) || ((uint64_t)msg_pa > 0xffffffffULL)) {
 		munmap(msg_page, _PAGE_SIZE);
 		munmap(mbox_page, _PAGE_SIZE);
 		return MBOX_FAIL;
