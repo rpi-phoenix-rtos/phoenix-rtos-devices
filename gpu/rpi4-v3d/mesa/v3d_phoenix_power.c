@@ -125,6 +125,30 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	}
 	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
 
+	/* TODO(C1-hunt): log this buffer's PHYSICAL page, bounded.
+	 *
+	 * This is the decisive comparison for C1. The corrupting write is a 32-bit
+	 * 0x80000000/0x80000001 at page+4 -- and msg is an mmap'd PAGE whose msg[1],
+	 * at exactly page+4, is where the firmware writes precisely those two
+	 * response codes. If the writer is a stale mailbox response, then a poisoned
+	 * page that later breaks should carry the SAME physical address as one of
+	 * these request buffers, which malloc now prints as p4pa.
+	 *
+	 * This path is the one that matters: rpi4-vcmbox serialises property calls
+	 * through a single PERSISTENT bounce buffer (it logs buf_pa once and never
+	 * frees it, so it cannot leave a recycled page), whereas this in-process
+	 * path -- reached from v3d_phoenix_powerOn(), which the winsys calls
+	 * directly -- mmaps and munmaps a fresh page per call. */
+	{
+		static unsigned c1_pa_logged;
+
+		if (c1_pa_logged < 24u) {
+			c1_pa_logged++;
+			fprintf(stderr, "v3d-pwr: C1-hunt: mbox req buf pa=0x%08x tag=0x%08x\n",
+				(unsigned)((uint32_t)msg_pa & ~0xfffu), (unsigned)tag);
+		}
+	}
+
 	for (spins = MBOX_SPINS; (mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u; spins--) {
 		if (spins == 0u) {
 			munmap(msg_page, _PAGE_SIZE);
