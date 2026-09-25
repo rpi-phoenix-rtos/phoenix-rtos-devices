@@ -140,9 +140,15 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 	 * path -- reached from v3d_phoenix_powerOn(), which the winsys calls
 	 * directly -- mmaps and munmaps a fresh page per call. */
 	{
+		/* 256, not 24. The first bound was consumed entirely by STARTUP calls,
+		 * which is the wrong window: the route still untested is a process
+		 * EXITING with a property call in flight, so the logging has to survive
+		 * until shutdown to say anything about it. Measured on run c1coin: 24
+		 * allocations, 24 releases, 20 distinct pages, none unreleased -- a clean
+		 * result that could only ever have described boot. */
 		static unsigned c1_pa_logged;
 
-		if (c1_pa_logged < 24u) {
+		if (c1_pa_logged < 256u) {
 			c1_pa_logged++;
 			fprintf(stderr, "v3d-pwr: C1-hunt: mbox req buf pa=0x%08x tag=0x%08x\n",
 				(unsigned)((uint32_t)msg_pa & ~0xfffu), (unsigned)tag);
@@ -251,7 +257,7 @@ static uint32_t mboxProp(uint32_t tag, int nw, uint32_t w0, uint32_t w1)
 		{
 			static unsigned c1_rel_logged;
 
-			if (c1_rel_logged < 24u) {
+			if (c1_rel_logged < 256u) {
 				c1_rel_logged++;
 				fprintf(stderr, "v3d-pwr: C1-hunt: mbox req buf RELEASED pa=0x%08x\n",
 					(unsigned)((uint32_t)msg_pa & ~0xfffu));
