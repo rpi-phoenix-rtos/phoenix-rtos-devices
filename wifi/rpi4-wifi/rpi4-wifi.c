@@ -2412,6 +2412,48 @@ static uint16_t g_glom_lens[WIFI_GLOM_MAX_SUBS];
 static uint32_t g_glom_nlens = 0, g_glom_idx = 0, g_glom_slotbase = 0;
 
 
+/* Association state after the join. The join loop reads its own events; after
+ * it returns, event frames (SDPCM channel 1) reach only the data path below, which
+ * used to drop them -- so a deauthentication, or the AP simply going away, left
+ * `status` reporting a join that no longer existed. These record the loss. */
+static int wifi_isJoined(void);
+static uint32_t g_link_losses = 0u;
+static uint32_t g_link_loss_event = 0u; /* WLC_E_* type of the most recent loss */
+
+
+/* Look at one channel-1 frame (SDPCM header at f[0]) from the data path and note a
+ * lost association: WLC_E_LINK with the link bit clear, or a deauth/disassoc in
+ * either direction. Same event_msg offsets as the join loop. */
+static void wifi_noteEvent(const uint8_t *f, uint32_t len)
+{
+	uint32_t sdoff, ehdr, etype;
+	uint16_t flags;
+
+	sdoff = f[7];
+	if ((sdoff + 4u) > len) {
+		return;
+	}
+	ehdr = sdoff + 4u + 4u * (uint32_t)f[sdoff + 3u];
+	if (((ehdr + 48u) > len) || (diag_be16(f + ehdr + 12u) != 0x886Cu)) {
+		return; /* not an ETH_P_LINK_CTL event */
+	}
+	flags = diag_be16(f + ehdr + 26u);
+	etype = diag_be32(f + ehdr + 28u);
+
+	/* 5/6 = WLC_E_DEAUTH(_IND), 11/12 = WLC_E_DISASSOC(_IND), 16 = WLC_E_LINK */
+	if ((etype == 5u) || (etype == 6u) || (etype == 11u) || (etype == 12u) ||
+		((etype == 16u) && ((flags & 0x01u) == 0u))) {
+		if (wifi_isJoined()) {
+			g_link_losses++;
+			g_link_loss_event = etype;
+			printf("wifi: association LOST (event %u)\n", (unsigned)etype);
+		}
+		g_join_link_up = 0;
+		g_join_psksup_status = -101; /* no longer keyed: wifi_isJoined() reads 0 */
+	}
+}
+
+
 /* Next channel-2 subframe of the superframe in hand. 0 with *elen set, or 1 when
  * it is exhausted. Consumes every subframe it walks past, data or not. */
 static int diag_glomNext(uint8_t *eth, uint32_t cap, uint32_t *elen)
@@ -2442,6 +2484,9 @@ static int diag_glomNext(uint8_t *eth, uint32_t cap, uint32_t *elen)
 		schan = (uint8_t)(q[5] & 0x0fu);
 		sdoff = q[7];
 		if (schan != 2u) {
+			if (schan == 1u) {
+				wifi_noteEvent(q, (uint32_t)slen);
+			}
 			continue; /* control/event subframe */
 		}
 		if ((sdoff < 12u) || ((sdoff + 4u) > (uint32_t)slen)) {
@@ -2571,6 +2616,9 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 		return 1;
 	}
 	if (chan != 2u) {
+		if (chan == 1u) {
+			wifi_noteEvent(g_glomf, (uint32_t)flen);
+		}
 		return 1;
 	}
 	/* eth offset = SDPCM data_offset + BDC(4) + BDC.doff words (<<2), exactly
@@ -4330,9 +4378,8 @@ static int wifi_joinwpa(const char *ssid, const char *psk, char *out, int cap)
 }
 
 
-/* The last join succeeded and no `leave` has been issued since. The firmware's
- * own link events after a join are not tracked (the data path drops channel-1
- * frames), so this is what the daemon was told, not a live link probe. */
+/* The last join succeeded, and neither a `leave` nor a lost association (see
+ * wifi_noteEvent) has happened since. */
 static int wifi_isJoined(void)
 {
 	return (g_join_setssid_status == 0) && (g_join_psksup_status == 6);
@@ -4370,8 +4417,8 @@ static int wifi_status(char *out, int cap)
 	if (g_sdhci == NULL) {
 		return snprintf(out, (size_t)cap, "STATUS controller=down\n");
 	}
-	n = snprintf(out, (size_t)cap, "STATUS joined=%d ssid=%s\n",
-		wifi_isJoined(), wifi_isJoined() ? g_join_ssid : "-");
+	n = snprintf(out, (size_t)cap, "STATUS joined=%d ssid=%s losses=%u\n",
+		wifi_isJoined(), wifi_isJoined() ? g_join_ssid : "-", (unsigned)g_link_losses);
 	if ((n > 0) && (n < cap) && g_txmac_valid) {
 		int m = snprintf(out + n, (size_t)(cap - n), "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
 			g_txmac[0], g_txmac[1], g_txmac[2], g_txmac[3], g_txmac[4], g_txmac[5]);
