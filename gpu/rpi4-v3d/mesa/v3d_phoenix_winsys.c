@@ -1700,7 +1700,11 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 		 * are MAP_CONTIGUOUS, so the first entry's frame plus the page count
 		 * describes the whole BO. */
 		if ((npages > 0u) && ((W.pt[first] & PTE_V) != 0u)) {
-			c1_closed_record(W.pt[first] & ~(PTE_W | PTE_V), npages);
+			/* Mask the PFN FIELD explicitly rather than clearing the two flags we
+			 * happen to have named. A PTE is written as (pa >> PAGE_SHIFT) | PTE_W |
+			 * PTE_V, so the frame lives in the low 28 bits; ~(PTE_W|PTE_V) would also
+			 * carry bits 30-31 through if anything ever set them. */
+			c1_closed_record(W.pt[first] & 0x0fffffffu, npages);
 		}
 
 		for (i = 0; i < npages; i++) {
