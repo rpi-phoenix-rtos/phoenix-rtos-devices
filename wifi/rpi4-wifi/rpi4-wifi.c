@@ -2946,6 +2946,13 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 	}
 	printf("wifi: JOIN-DONE attempts=%d setssid=%d psksup=%d link=%d\n",
 		g_join_attempts, g_join_setssid_status, g_join_psksup_status, g_join_link_up);
+	/* The setup commands' own return codes and the event count: a join that fails
+	 * with no SET_SSID event at all (setssid=-100, ~2 runs in 5) is otherwise
+	 * undiagnosable -- this says whether the firmware refused a command or simply
+	 * never answered. */
+	printf("wifi: JOIN-RC events=%d em=%d glom=%d infra=%d up=%d wsec=%d wpa=%d sup=%d pmk=%d ssid=%d\n",
+		g_join_evt_total, g_join_em_rc, g_join_rxglom_rc, g_join_infra_rc, g_join_up_rc,
+		g_join_wsec_rc, g_join_wpaauth_rc, g_join_sup_rc, g_join_pmk_rc, g_join_ssid_rc);
 	fflush(stdout);
 
 	/* Only an associated + 4-way-keyed STA can carry data frames, so skip the
