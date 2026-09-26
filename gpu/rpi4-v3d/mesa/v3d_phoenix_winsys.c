@@ -564,6 +564,29 @@ static unsigned long c1_bo_creates, c1_bo_reuses;
  * that to a run. */
 static unsigned long c1_va_allocs, c1_va_reuses;
 
+/* ★★ THE THIRD THING V3D_KEEP_CLOSED_BO=1 STOPS, and the only one the C1 story
+ * actually needs.
+ *
+ * Closing a BO does NOT normally return its pages to the kernel. The default path
+ * offers them to the in-driver boPool (256 entries / 24 MiB) and only munmap()s
+ * when the pool declines -- it is off, it is over its cap, or the BO is cacheable
+ * and never eligible. So there are two completely different fates for a closed
+ * BO's memory, and they are not the same threat at all:
+ *
+ *   pooled  -- the page never leaves this driver. A stale GPU PTE or a late DMA
+ *              write lands in driver memory.
+ *   munmap  -- the page goes back to the KERNEL's free pool, from where it can be
+ *              handed to malloc. That is the only route by which a BO page can
+ *              end up under a heap header, which is the C1 signature.
+ *
+ * So C1 requires the munmap path specifically, and nothing has ever counted it.
+ * `mun`/`munkb` are the bytes that actually reached the kernel; `pool` is what
+ * was absorbed in-driver. If the first munmap lands at the ~76 s where the fire
+ * window opens, that is the onset, and V3D_KEEP_CLOSED_BO=1 suppressing C1 is
+ * explained exactly: with keep=1 nothing is ever unmapped, so no BO page ever
+ * reaches the kernel at all. */
+static unsigned long c1_bo_munmaps, c1_bo_munmapkb, c1_bo_pooled;
+
 /* Heap-growth counters from libphoenix's allocator. WEAK, mirroring how malloc
  * declares v3d_c1_lookup_pa() below: neither side may fail to link because the
  * other is absent. ⚠ A weak symbol that resolves to NULL prints zeros, which is
@@ -1049,17 +1072,19 @@ void v3d_phoenix_flip(int buf)
 					}
 					if (have != 0) {
 						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
-							"bore=%lu vaa=%lu var=%lu heaps=%lu heapkb=%lu\n",
+							"bore=%lu vaa=%lu var=%lu mun=%lu munkb=%lu pool=%lu heaps=%lu heapkb=%lu\n",
 							(unsigned long)((now - v3d_flip_first_us) / 1000u),
 							v3d_flip_total, c1_bo_creates, c1_bo_reuses,
-							c1_va_allocs, c1_va_reuses, hn, hb / 1024u);
+							c1_va_allocs, c1_va_reuses, c1_bo_munmaps, c1_bo_munmapkb,
+							c1_bo_pooled, hn, hb / 1024u);
 					}
 					else {
 						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
-							"bore=%lu vaa=%lu var=%lu heaps=? heapkb=?\n",
+							"bore=%lu vaa=%lu var=%lu mun=%lu munkb=%lu pool=%lu heaps=? heapkb=?\n",
 							(unsigned long)((now - v3d_flip_first_us) / 1000u),
 							v3d_flip_total, c1_bo_creates, c1_bo_reuses,
-							c1_va_allocs, c1_va_reuses);
+							c1_va_allocs, c1_va_reuses, c1_bo_munmaps, c1_bo_munmapkb,
+							c1_bo_pooled);
 					}
 				}
 				v3d_flip_window = 0;
@@ -1891,7 +1916,12 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 				/* Recycle in-driver rather than returning the page to the kernel;
 				 * falls through to munmap when the pool is off or over its cap. */
 				if (boPool_give(b->cpu, b->size) == 0) {
+					c1_bo_munmaps++;
+					c1_bo_munmapkb += b->size / 1024u;
 					munmap(b->cpu, b->size);
+				}
+				else {
+					c1_bo_pooled++;
 				}
 			}
 #else
@@ -1901,7 +1931,12 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 			 * Cacheable BOs are rejected inside boPool_give's caller check below,
 			 * so only the default uncached kind is ever pooled. */
 			if ((b->cacheable != 0) || (boPool_give(b->cpu, b->size) == 0)) {
+				c1_bo_munmaps++;
+				c1_bo_munmapkb += b->size / 1024u;
 				munmap(b->cpu, b->size);
+			}
+			else {
+				c1_bo_pooled++;
 			}
 #endif
 		}
