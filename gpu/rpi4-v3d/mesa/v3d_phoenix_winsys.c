@@ -562,15 +562,19 @@ static unsigned long c1_bo_creates, c1_bo_reuses;
  * page table to 2 GiB because a run that never reclaims VA needs it -- so an
  * exhausted window would kill STK and read as "suppressed". Counting cannot do
  * that to a run. */
-static unsigned long c1_va_allocs, c1_va_reuses;
+static unsigned long c1_va_reuses;
 
 /* ★★ THE THIRD THING V3D_KEEP_CLOSED_BO=1 STOPS, and the only one the C1 story
  * actually needs.
  *
- * Closing a BO does NOT normally return its pages to the kernel. The default path
- * offers them to the in-driver boPool (256 entries / 24 MiB) and only munmap()s
- * when the pool declines -- it is off, it is over its cap, or the BO is cacheable
- * and never eligible. So there are two completely different fates for a closed
+ * ⚠ READ boPool_on() FIRST: the in-driver pool is OPT-IN and OFF by default
+ * (V3D_BO_POOL=1), so in the shipped build boPool_give() declines immediately
+ * and EVERY close munmap()s -- the pages go back to the kernel from the very
+ * first close, not after a pool fills. An earlier version of this comment had
+ * it the other way round and a mechanism was built on it.
+ *
+ * The distinction is still worth counting, because the pool is the shipped C1
+ * MITIGATION and an A/B with it on needs these numbers on both sides. So there are two completely different fates for a closed
  * BO's memory, and they are not the same threat at all:
  *
  *   pooled  -- the page never leaves this driver. A stale GPU PTE or a late DMA
@@ -579,13 +583,23 @@ static unsigned long c1_va_allocs, c1_va_reuses;
  *              handed to malloc. That is the only route by which a BO page can
  *              end up under a heap header, which is the C1 signature.
  *
- * So C1 requires the munmap path specifically, and nothing has ever counted it.
- * `mun`/`munkb` are the bytes that actually reached the kernel; `pool` is what
- * was absorbed in-driver. If the first munmap lands at the ~76 s where the fire
- * window opens, that is the onset, and V3D_KEEP_CLOSED_BO=1 suppressing C1 is
- * explained exactly: with keep=1 nothing is ever unmapped, so no BO page ever
- * reaches the kernel at all. */
-static unsigned long c1_bo_munmaps, c1_bo_munmapkb, c1_bo_pooled;
+ * So C1 requires the munmap path specifically. `munc` counts CACHEABLE closes,
+ * which unmap unconditionally from the first one, and `munp` the ones the pool
+ * declined -- kept apart because lumping them makes the onset question
+ * unanswerable: one cacheable BO during asset load puts the first munmap at t~0
+ * no matter when anything else happens. `pool` is what was absorbed in-driver,
+ * and with the pool OFF by default it should read 0; a non-zero there means
+ * someone set V3D_BO_POOL and the trial is not the default configuration.
+ *
+ * ⚠ None of these establish that a BO page ever reaches MALLOC -- they are all
+ * the driver's half. The allocator's half is malloc_c1HeapBoHits() below. */
+static unsigned long c1_bo_munmap_cache, c1_bo_munmap_pool, c1_bo_munmapkb, c1_bo_pooled;
+
+/* Heaps that landed on a page this driver had closed, out of heaps checked. WEAK,
+ * so a binary without this allocator prints `?`. This is the only counter in the
+ * set that is about the route C1 actually needs: a closed BO page arriving under a
+ * malloc heap header. */
+extern void malloc_c1HeapBoHits(unsigned long *hits, unsigned long *probes) __attribute__((weak));
 
 /* Heap-growth counters from libphoenix's allocator. WEAK, mirroring how malloc
  * declares v3d_c1_lookup_pa() below: neither side may fail to link because the
@@ -1064,26 +1078,31 @@ void v3d_phoenix_flip(int buf)
 				 * Printing 0 there would be indistinguishable from "nothing allocated",
 				 * which is exactly the silent-zero failure this project keeps hitting. */
 				{
-					unsigned long hn = 0u, hb = 0u;
+					unsigned long hn = 0u, hb = 0u, bh = 0u, bp = 0u;
 					int have = (malloc_c1Pacing != NULL) ? 1 : 0;
 
 					if (have != 0) {
 						malloc_c1Pacing(&hn, &hb);
 					}
+					if (malloc_c1HeapBoHits != NULL) {
+						malloc_c1HeapBoHits(&bh, &bp);
+					}
 					if (have != 0) {
 						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
-							"bore=%lu vaa=%lu var=%lu mun=%lu munkb=%lu pool=%lu heaps=%lu heapkb=%lu\n",
+							"bore=%lu var=%lu munc=%lu munp=%lu munkb=%lu pool=%lu "
+							"hbo=%lu hbop=%lu heaps=%lu heapkb=%lu\n",
 							(unsigned long)((now - v3d_flip_first_us) / 1000u),
-							v3d_flip_total, c1_bo_creates, c1_bo_reuses,
-							c1_va_allocs, c1_va_reuses, c1_bo_munmaps, c1_bo_munmapkb,
-							c1_bo_pooled, hn, hb / 1024u);
+							v3d_flip_total, c1_bo_creates, c1_bo_reuses, c1_va_reuses,
+							c1_bo_munmap_cache, c1_bo_munmap_pool, c1_bo_munmapkb,
+							c1_bo_pooled, bh, bp, hn, hb / 1024u);
 					}
 					else {
 						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
-							"bore=%lu vaa=%lu var=%lu mun=%lu munkb=%lu pool=%lu heaps=? heapkb=?\n",
+							"bore=%lu var=%lu munc=%lu munp=%lu munkb=%lu pool=%lu "
+							"hbo=? hbop=? heaps=? heapkb=?\n",
 							(unsigned long)((now - v3d_flip_first_us) / 1000u),
-							v3d_flip_total, c1_bo_creates, c1_bo_reuses,
-							c1_va_allocs, c1_va_reuses, c1_bo_munmaps, c1_bo_munmapkb,
+							v3d_flip_total, c1_bo_creates, c1_bo_reuses, c1_va_reuses,
+							c1_bo_munmap_cache, c1_bo_munmap_pool, c1_bo_munmapkb,
 							c1_bo_pooled);
 					}
 				}
@@ -1193,7 +1212,6 @@ static struct pbo *bo_find(uint32_t handle)
  * high-water mark. Returns 0 on exhaustion. */
 static uint32_t va_alloc(uint32_t pages)
 {
-	c1_va_allocs++;
 #if !V3D_VA_NO_RECYCLE
 	for (uint32_t i = 0; i < W.nholes; i++) {
 		if (W.holes[i].pages >= pages) {
@@ -1916,7 +1934,12 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 				/* Recycle in-driver rather than returning the page to the kernel;
 				 * falls through to munmap when the pool is off or over its cap. */
 				if (boPool_give(b->cpu, b->size) == 0) {
-					c1_bo_munmaps++;
+					if (b->cacheable != 0) {
+						c1_bo_munmap_cache++;
+					}
+					else {
+						c1_bo_munmap_pool++;
+					}
 					c1_bo_munmapkb += b->size / 1024u;
 					munmap(b->cpu, b->size);
 				}
@@ -1931,7 +1954,15 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 			 * Cacheable BOs are rejected inside boPool_give's caller check below,
 			 * so only the default uncached kind is ever pooled. */
 			if ((b->cacheable != 0) || (boPool_give(b->cpu, b->size) == 0)) {
-				c1_bo_munmaps++;
+				/* Cacheable BOs never enter the pool, so they unmap from the FIRST
+				 * close; keeping them apart is what makes the onset of the
+				 * pool-declined ones readable at all. */
+				if (b->cacheable != 0) {
+					c1_bo_munmap_cache++;
+				}
+				else {
+					c1_bo_munmap_pool++;
+				}
 				c1_bo_munmapkb += b->size / 1024u;
 				munmap(b->cpu, b->size);
 			}
