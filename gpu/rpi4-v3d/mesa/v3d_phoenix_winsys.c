@@ -522,6 +522,32 @@ static struct {
 
 static uint32_t c1_closed_next, c1_closed_ord;
 
+/* ------------------------------------------------------------------------- *
+ * C1 PACING: is the event paced by TIME or by WORK?
+ *
+ * The 33 archived C1 fires say it is paced by time -- ~90 s after the first
+ * rendered frame -- and the evidence is a natural experiment rather than an
+ * assumption. STK's race start is bimodal (70-74 s vs 80-84 s) on one binary,
+ * which splits the archive in two, and between those halves the frame count at
+ * the fire differs by 1.9x while the elapsed time agrees to 3%.
+ *
+ * That was inferred from a frame counter that happens to be logged. These
+ * counters make it DIRECT: printed next to flipstat, they put every fire on the
+ * BO-creation, BO-recycle and heap-growth axes as well, and the axis that stays
+ * invariant across runs is the anchor. It matters because "paced by time" and
+ * "paced by heap growth" are indistinguishable from anything logged today --
+ * STK streams assets over NFS at a rate the network sets, not the frame loop --
+ * and they imply completely different suspects.
+ * ------------------------------------------------------------------------- */
+static unsigned long c1_bo_creates, c1_bo_reuses;
+
+/* Heap-growth counters from libphoenix's allocator. WEAK, mirroring how malloc
+ * declares v3d_c1_lookup_pa() below: neither side may fail to link because the
+ * other is absent. ⚠ A weak symbol that resolves to NULL prints zeros, which is
+ * indistinguishable from "nothing allocated" -- so the flipstat line prints
+ * `heaps=?` rather than `heaps=0` when the symbol is missing. */
+extern void malloc_c1Pacing(unsigned long *heaps, unsigned long *bytes) __attribute__((weak));
+
 
 static void c1_closed_record(uint32_t pfn, uint32_t npages)
 {
@@ -918,6 +944,10 @@ extern void v3d_phoenix_fb_flip(unsigned yoff);
 static unsigned long v3d_flip_total;
 static unsigned long v3d_flip_window;
 static uint64_t v3d_flip_t0_us;
+/* Set once, at the first flip. v3d_flip_t0_us restarts every reporting window,
+ * so it cannot answer "how long since rendering began" -- which is the axis the
+ * C1 fires are pinned to. */
+static uint64_t v3d_flip_first_us;
 static int v3d_flipstat = -1;      /* -1 = not yet read from the environment */
 static unsigned v3d_flipstat_ms = 5000u;
 
@@ -952,6 +982,7 @@ void v3d_phoenix_flip(int buf)
 				}
 			}
 			v3d_flip_t0_us = v3d_flip_now_us();
+			v3d_flip_first_us = v3d_flip_t0_us;
 		}
 
 		v3d_flip_total++;
@@ -972,6 +1003,40 @@ void v3d_phoenix_flip(int buf)
 				fprintf(stderr, "v3d-winsys: flipstat %lu frames in %lu ms = %lu.%02lu fps (total %lu)\n",
 					v3d_flip_window, (unsigned long)(dt / 1000u),
 					cfps / 100u, cfps % 100u, v3d_flip_total);
+
+				/* The C1 pacing line. Deliberately a SEPARATE line with its own tag
+				 * rather than extra fields on the one above: this UART corrupts ~1.3%
+				 * of lines, and a corrupted pacing field must not cost the frame count
+				 * that every existing grader reads. It also leaves those graders'
+				 * patterns untouched.
+				 *
+				 * `t=` is measured from the FIRST frame, not from the window start,
+				 * because that is the axis the archive says C1 is pinned to -- it is
+				 * the number a fire has to be placed on.
+				 *
+				 * ⚠ heaps/bytes print `?` when the weak allocator symbol is absent.
+				 * Printing 0 there would be indistinguishable from "nothing allocated",
+				 * which is exactly the silent-zero failure this project keeps hitting. */
+				{
+					unsigned long hn = 0u, hb = 0u;
+					int have = (malloc_c1Pacing != NULL) ? 1 : 0;
+
+					if (have != 0) {
+						malloc_c1Pacing(&hn, &hb);
+					}
+					if (have != 0) {
+						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
+							"bore=%lu heaps=%lu heapkb=%lu\n",
+							(unsigned long)((now - v3d_flip_first_us) / 1000u),
+							v3d_flip_total, c1_bo_creates, c1_bo_reuses, hn, hb / 1024u);
+					}
+					else {
+						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
+							"bore=%lu heaps=? heapkb=?\n",
+							(unsigned long)((now - v3d_flip_first_us) / 1000u),
+							v3d_flip_total, c1_bo_creates, c1_bo_reuses);
+					}
+				}
 				v3d_flip_window = 0;
 				v3d_flip_t0_us = now;
 			}
@@ -1388,6 +1453,22 @@ static int ioc_create_bo(struct drm_v3d_create_bo *c)
 		(W.scanout_pa2 != 0 && pa == W.scanout_pa2) ||
 		(W.scanout_pa3 != 0 && pa == W.scanout_pa3)));   /* this BO aliases a scanout buffer */
 	b->cacheable = ((c->flags & 0x1u) != 0u);
+
+	/* ★ PACING COUNTERS. c1_bo_creates is every BO; c1_bo_reuses is the subset whose
+	 * first physical frame was already recorded as CLOSED -- i.e. a frame the kernel
+	 * handed back out. That second number is the one the recycling hypothesis is
+	 * about, and until now nothing counted it: c1_closed[] could only be queried
+	 * after the fact, from a fire.
+	 *
+	 * Unconditional, like the malloc-side pair. The lookup is a 512-entry scan per
+	 * BO creation and a run creates a few hundred, so the whole instrument costs
+	 * well under a millisecond across a trial -- against a bench where one trial is
+	 * 14 minutes. */
+	c1_bo_creates++;
+	if (v3d_c1_lookup_pa((unsigned long)pa, NULL, NULL, NULL) > 0) {
+		c1_bo_reuses++;
+	}
+
 #ifdef V3D_C1_HUNT
 	c1_seen_create(b);
 #endif
