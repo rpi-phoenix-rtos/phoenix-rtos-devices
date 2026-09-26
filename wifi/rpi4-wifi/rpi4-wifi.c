@@ -1660,6 +1660,7 @@ static int diag_bcdcCmd(volatile uint8_t *sdhci, uint32_t sdio_core, int is_set,
 #define WLC_UP_CMD 2u
 #define BRCMF_C_SET_INFRA 20u
 #define WLC_SET_SSID_CMD 26u       /* BRCMF_C_SET_SSID: brcmf_ssid_le (broadcast WPA2 join) */
+#define WLC_DISASSOC_CMD 52u       /* BRCMF_C_DISASSOC: no payload, as brcmf_link_down() */
 #define WLC_SET_WSEC_PMK_CMD 268u  /* BRCMF_C_SET_WSEC_PMK: brcmf_wsec_pmk_le (passphrase) */
 #define BRCMF_C_GET_PKTCNTS 137u   /* brcmf_pktcnt_le { rx_good, rx_bad, tx_good, tx_bad, rx_ocast } */
 #define SET_VAR_CMD 263u
@@ -4329,6 +4330,59 @@ static int wifi_joinwpa(const char *ssid, const char *psk, char *out, int cap)
 }
 
 
+/* The last join succeeded and no `leave` has been issued since. The firmware's
+ * own link events after a join are not tracked (the data path drops channel-1
+ * frames), so this is what the daemon was told, not a live link probe. */
+static int wifi_isJoined(void)
+{
+	return (g_join_setssid_status == 0) && (g_join_psksup_status == 6);
+}
+
+
+/* `leave`: disassociate, the way brcmf_link_down() does, and forget the join so
+ * `status` and the next `joinwpa` start clean. An lwip netif sends this before
+ * joining a different network -- WLC_SET_SSID on top of a live association is
+ * untested territory. */
+static int wifi_leave(char *out, int cap)
+{
+	int rc;
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	}
+	rc = diag_bcdcCmd(g_sdhci, g_sdio_core, 1, WLC_DISASSOC_CMD, NULL, 0u,
+		NULL, 0u, NULL, 211u, g_data_seq++);
+	g_join_setssid_status = -100;
+	g_join_psksup_status = -100;
+	g_join_link_up = 0;
+	g_join_ssid[0] = '\0';
+	g_join_psk[0] = '\0';
+
+	return snprintf(out, (size_t)cap, "LEAVE %s rc=%d\n", (rc == 0) ? "ok" : "fail", rc);
+}
+
+
+/* `status`: one line a client can parse, plus the MAC line when it is known. */
+static int wifi_status(char *out, int cap)
+{
+	int n;
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "STATUS controller=down\n");
+	}
+	n = snprintf(out, (size_t)cap, "STATUS joined=%d ssid=%s\n",
+		wifi_isJoined(), wifi_isJoined() ? g_join_ssid : "-");
+	if ((n > 0) && (n < cap) && g_txmac_valid) {
+		int m = snprintf(out + n, (size_t)(cap - n), "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+			g_txmac[0], g_txmac[1], g_txmac[2], g_txmac[3], g_txmac[4], g_txmac[5]);
+		if ((m > 0) && (m < cap - n)) {
+			n += m;
+		}
+	}
+	return n;
+}
+
+
 /* Where the per-frame time actually goes. RX measured ~10 ms/frame end to end,
  * which is far more than the poll interval explains, so the read path is timed
  * here and split into HIT (a frame came back) vs MISS (empty FIFO): the two have
@@ -4681,6 +4735,12 @@ static void wifi_thread(void *arg)
 					char ssid[33], psk[64];
 					wifi_parseSsidPsk(msg.i.data, msg.i.size, 8, ssid, sizeof(ssid), psk, sizeof(psk));
 					g_resp_len = wifi_joinwpa(ssid, psk, g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 5 && memcmp(msg.i.data, "leave", 5) == 0) {
+					g_resp_len = wifi_leave(g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 6 && memcmp(msg.i.data, "status", 6) == 0) {
+					g_resp_len = wifi_status(g_resp, (int)sizeof(g_resp));
 				}
 				else if (msg.i.size >= 5 && memcmp(msg.i.data, "stats", 5) == 0) {
 					g_resp_len = wifi_stats(g_resp, (int)sizeof(g_resp));

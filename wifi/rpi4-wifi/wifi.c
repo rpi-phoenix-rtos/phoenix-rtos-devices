@@ -1,13 +1,18 @@
 /*
- * Phoenix-RTOS — wifi: WiFi control client for /dev/wifi.
+ * Phoenix-RTOS — wifi: WiFi control client.
  *
- * `wifi scan` asks the rpi4-wifi driver to scan the air and prints the
- * discovered access points — the acceptance test that the /dev/wifi driver
- * drives the BCM43455 radio. It writes the literal "scan" to /dev/wifi (which
- * triggers an active escan in the driver) and then reads back the AP list text.
+ * Everyday use goes through the lwip `wl` netif, whose join thread keeps the
+ * association in line with /etc/wifi.conf:
  *
- * First cut: a standalone /bin tool. It will become a psh applet
- * (phoenix-rtos-utils/psh/wifi) once the driver is boot-integrated.
+ *   wifi scan                   list access points (asks the rpi4-wifi daemon)
+ *   wifi connect <ssid> <psk>   write /etc/wifi.conf, wait for the DHCP lease
+ *   wifi disconnect             remove /etc/wifi.conf; the netif leaves
+ *   wifi status                 wanted network, daemon state, netif address
+ *
+ * The remaining commands talk to the daemon directly and bypass lwip. They are
+ * bring-up diagnostics: `netup` and `join` run their own association (and
+ * `netup` its own DHCP client) inside the daemon, which fights the netif if it
+ * is active.
  *
  * Copyright 2026 Phoenix Systems
  * SPDX-License-Identifier: BSD-3-Clause
@@ -15,17 +20,23 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
-#define WIFI_DEV "/dev/wifi"
-#define WIFI_CONF "/etc/wifi.conf"
+#define WIFI_DEV       "/dev/wifi"
+#define WIFI_CONF      "/etc/wifi.conf"
+#define WIFI_CONF_TMP  "/etc/wifi.conf.new"
+#define WIFI_WAIT_SECS 120 /* join (20-40 s) + DHCP, plus a failed first attempt */
 
-/* Read the `ssid=` value from /etc/wifi.conf into out (INI-lite: key=value per
- * line, '#' comments, surrounding whitespace trimmed). Returns 0 on success, -1
- * if the file or key is absent. Forward-compatible: unknown keys (e.g. a future
- * psk=) are ignored, so a config can carry psk= before the driver supports it. */
-static int conf_get_ssid(char *out, int outsz)
+/* Read the `<key>=` value from /etc/wifi.conf into out (INI-lite: key=value per
+ * line, '#' comments, surrounding whitespace trimmed) -- the same tolerance as
+ * the netif's parser. Returns 0 on success, -1 if the file or key is absent. */
+static int conf_get(const char *key, char *out, int outsz)
 {
 	FILE *f = fopen(WIFI_CONF, "r");
 	char line[160];
@@ -51,7 +62,7 @@ static int conf_get_ssid(char *out, int outsz)
 		for (e = eq - 1; e >= p && (*e == ' ' || *e == '\t'); e--) {
 			*e = '\0';
 		}
-		if (strcmp(p, "ssid") != 0) {
+		if (strcmp(p, key) != 0) {
 			continue;
 		}
 		v = eq + 1;
@@ -71,6 +82,205 @@ static int conf_get_ssid(char *out, int outsz)
 	fclose(f);
 	return got;
 }
+
+
+/* IPv4 address of the WiFi netif (the lwip `wl` interface), or 0 if it has
+ * none yet. The netif's number depends on registration order, so match the
+ * name prefix. */
+static uint32_t wl_addr(char *name, size_t namesz)
+{
+	struct ifaddrs *list, *ifa;
+	uint32_t addr = 0;
+
+	if (getifaddrs(&list) != 0) {
+		return 0;
+	}
+	for (ifa = list; ifa != NULL; ifa = ifa->ifa_next) {
+		if ((ifa->ifa_name == NULL) || (strncmp(ifa->ifa_name, "wl", 2) != 0) ||
+				(ifa->ifa_addr == NULL) || (ifa->ifa_addr->sa_family != AF_INET)) {
+			continue;
+		}
+		addr = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
+		if (name != NULL) {
+			(void)snprintf(name, namesz, "%s", ifa->ifa_name);
+		}
+		if (addr != 0) {
+			break;
+		}
+	}
+	freeifaddrs(list);
+	return addr;
+}
+
+
+static void print_addr(const char *label, uint32_t addr, const char *ifname)
+{
+	char buf[INET_ADDRSTRLEN];
+	struct in_addr in = { .s_addr = addr };
+
+	printf("%s%s (%s)\n", label,
+		(inet_ntop(AF_INET, &in, buf, sizeof(buf)) != NULL) ? buf : "?", ifname);
+}
+
+
+/* Replace /etc/wifi.conf in one step: write a new file beside it, then rename
+ * over the old one, so the netif (which re-reads it every few seconds) never
+ * sees half a file. */
+static int conf_write(const char *ssid, const char *psk)
+{
+	FILE *f = fopen(WIFI_CONF_TMP, "w");
+
+	if (f == NULL) {
+		printf("wifi: cannot create %s: %s\n", WIFI_CONF_TMP, strerror(errno));
+		return -1;
+	}
+	fprintf(f, "# Written by `wifi connect`. The WiFi netif re-reads this file;\n"
+		"# `wifi disconnect` removes it.\n"
+		"ssid=%s\npsk=%s\n", ssid, psk);
+	if (fclose(f) != 0) {
+		printf("wifi: cannot write %s: %s\n", WIFI_CONF_TMP, strerror(errno));
+		(void)unlink(WIFI_CONF_TMP);
+		return -1;
+	}
+	if (rename(WIFI_CONF_TMP, WIFI_CONF) != 0) {
+		printf("wifi: cannot replace %s: %s\n", WIFI_CONF, strerror(errno));
+		(void)unlink(WIFI_CONF_TMP);
+		return -1;
+	}
+	return 0;
+}
+
+
+/* A WPA2 passphrase is 8..63 printable characters; 64 characters is a raw hex
+ * key. Anything else the firmware would reject 30 s later, so say so now. */
+static int creds_valid(const char *ssid, const char *psk)
+{
+	size_t sl = strlen(ssid), pl = strlen(psk);
+
+	if ((sl == 0) || (sl > 32)) {
+		printf("wifi: ssid must be 1-32 characters\n");
+		return 0;
+	}
+	if ((pl < 8) || (pl > 64)) {
+		printf("wifi: WPA2 passphrase must be 8-63 characters (or 64 hex digits)\n");
+		return 0;
+	}
+	if ((strchr(ssid, '\n') != NULL) || (strchr(psk, '\n') != NULL)) {
+		printf("wifi: ssid/passphrase may not contain a newline\n");
+		return 0;
+	}
+	return 1;
+}
+
+
+static int do_connect(const char *ssid, const char *psk)
+{
+	char ifname[16] = "wl", old_ssid[40], old_psk[72];
+	uint32_t addr;
+	int t, same;
+
+	if (!creds_valid(ssid, psk)) {
+		return 2;
+	}
+	same = (conf_get("ssid", old_ssid, (int)sizeof(old_ssid)) == 0) &&
+		(conf_get("psk", old_psk, (int)sizeof(old_psk)) == 0) &&
+		(strcmp(old_ssid, ssid) == 0) && (strcmp(old_psk, psk) == 0);
+	addr = wl_addr(ifname, sizeof(ifname));
+	if (same && (addr != 0)) {
+		print_addr("wifi: already connected, address ", addr, ifname);
+		return 0;
+	}
+
+	if (conf_write(ssid, psk) != 0) {
+		return 1;
+	}
+	printf("wifi: connecting to \"%s\" (join 20-40 s, then DHCP)...\n", ssid);
+
+	/* A lease from the PREVIOUS network stays on the netif until its join
+	 * thread notices the new file (within a few seconds), so wait for that one
+	 * to go before accepting an address as the new lease. */
+	for (t = 0; (t < 15) && (addr != 0); ++t) {
+		sleep(1);
+		addr = wl_addr(ifname, sizeof(ifname));
+	}
+	if (addr != 0) {
+		print_addr("wifi: the netif did not leave its network, still ", addr, ifname);
+		printf("      (a network named in the boot config overrides %s)\n", WIFI_CONF);
+		return 1;
+	}
+	for (; t < WIFI_WAIT_SECS; ++t) {
+		addr = wl_addr(ifname, sizeof(ifname));
+		if (addr != 0) {
+			print_addr("wifi: connected, address ", addr, ifname);
+			return 0;
+		}
+		sleep(1);
+	}
+	printf("wifi: no address after %d s -- the netif keeps trying in the background.\n"
+		"      Check the passphrase and the AP; `wifi status` shows the state and the\n"
+		"      lwip log has the join result (lwip: wifi43455: ...).\n", WIFI_WAIT_SECS);
+	return 1;
+}
+
+
+static int do_disconnect(void)
+{
+	char ifname[16] = "wl";
+	int t;
+
+	if ((unlink(WIFI_CONF) != 0) && (errno != ENOENT)) {
+		printf("wifi: cannot remove %s: %s\n", WIFI_CONF, strerror(errno));
+		return 1;
+	}
+	for (t = 0; t < 15; ++t) {
+		if (wl_addr(ifname, sizeof(ifname)) == 0) {
+			printf("wifi: disconnected\n");
+			return 0;
+		}
+		sleep(1);
+	}
+	printf("wifi: %s removed, but the netif still has an address after 15 s\n", WIFI_CONF);
+	return 1;
+}
+
+
+static int cmd_run(int fd, const char *cmd, int cmdlen);
+
+
+static int do_status(void)
+{
+	char ssid[40], ifname[16] = "wl";
+	uint32_t addr;
+	int fd;
+
+	if (conf_get("ssid", ssid, (int)sizeof(ssid)) == 0) {
+		printf("wanted:  \"%s\" (%s)\n", ssid, WIFI_CONF);
+	}
+	else {
+		printf("wanted:  none (no %s; the boot config may still name a network)\n", WIFI_CONF);
+	}
+
+	fd = open(WIFI_DEV, O_RDWR);
+	if (fd < 0) {
+		printf("daemon:  not running (%s absent -- start rpi4-wifi)\n", WIFI_DEV);
+	}
+	else {
+		printf("daemon:  ");
+		fflush(stdout);
+		(void)cmd_run(fd, "status", 6);
+		close(fd);
+	}
+
+	addr = wl_addr(ifname, sizeof(ifname));
+	if (addr != 0) {
+		print_addr("address: ", addr, ifname);
+	}
+	else {
+		printf("address: none\n");
+	}
+	return 0;
+}
+
 
 /* Write a command to /dev/wifi (which runs it synchronously) then read back +
  * print the text result. */
@@ -188,25 +398,22 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
-	if (argc >= 2 && strcmp(argv[1], "up") == 0) {
-		char ssid[40];
-		int n;
-		if (conf_get_ssid(ssid, (int)sizeof(ssid)) != 0) {
-			printf("wifi: no ssid in %s (add a line: ssid=<name>)\n", WIFI_CONF);
-			return 2;
-		}
-		n = snprintf(cmd, sizeof(cmd), "join %s", ssid);
-		if (n < 0 || n >= (int)sizeof(cmd)) {
-			printf("wifi: ssid too long\n");
-			return 2;
-		}
-		printf("wifi: bringing up \"%s\" from %s (open-network control path)...\n", ssid, WIFI_CONF);
+	if (argc >= 4 && strcmp(argv[1], "connect") == 0) {
+		return do_connect(argv[2], argv[3]);
+	}
+	if (argc >= 2 && strcmp(argv[1], "disconnect") == 0) {
+		return do_disconnect();
+	}
+	if (argc >= 2 && strcmp(argv[1], "status") == 0) {
+		return do_status();
+	}
+	if (argc >= 2 && strcmp(argv[1], "leave") == 0) {
 		fd = open(WIFI_DEV, O_RDWR);
 		if (fd < 0) {
 			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
 			return 1;
 		}
-		rc = cmd_run(fd, cmd, n);
+		rc = cmd_run(fd, "leave", 5);
 		close(fd);
 		return rc;
 	}
@@ -229,9 +436,13 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
-	printf("usage: wifi scan | wifi join <ssid> | wifi netup <ssid> <psk> |\n"
-	       "       wifi joinwpa <ssid> <psk> | wifi mac | wifi stats | wifi mtu | wifi up\n");
-	printf("  netup: WPA2-PSK join + DHCP lease (reports the bound IP)\n");
-	printf("  up: join the ssid configured in %s\n", WIFI_CONF);
+	printf("usage: wifi scan | wifi connect <ssid> <psk> | wifi disconnect | wifi status\n"
+	       "  connect:    save the network to %s and wait for the DHCP lease;\n"
+	       "              the WiFi netif (wl) joins it and rejoins after a reboot\n"
+	       "  disconnect: forget the network; the netif releases its lease and leaves\n"
+	       "diagnostics (talk to the daemon directly, bypassing the netif -- do not use\n"
+	       "while it is connected):\n"
+	       "  wifi mac | wifi stats | wifi joinwpa <ssid> <psk> | wifi leave |\n"
+	       "  wifi netup <ssid> <psk> | wifi join <ssid> | wifi mtu\n", WIFI_CONF);
 	return 2;
 }
