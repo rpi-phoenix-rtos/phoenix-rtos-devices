@@ -478,8 +478,7 @@ int main(int argc, char *argv[])
 	if (ret < 0) {
 		/* Non-fatal: keep the daemon up so /dev/mmcblk0[pN] stay served even when
 		 * the root mount fails -- the system can still boot on dummyfs-root and the
-		 * block device remains usable for recovery/inspection (and, during #120
-		 * bring-up, for a live diag-udp SD-read probe). */
+		 * block device remains usable for recovery/inspection. */
 		LOG_ERROR("failed to mount rootfs, err: %d (continuing; /dev/mmcblk0* stay available)", ret);
 	}
 

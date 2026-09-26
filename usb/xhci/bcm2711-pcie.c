@@ -1013,8 +1013,8 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 			 * page uses Device-nGnRnE (strongly ordered,
 			 * MAIR_IDX_S_ORDERED) rather than Device-nGnRE: nGnRnE is
 			 * the strongest, correct ordering for PCIe device
-			 * registers and matches the known-good lwip-port 'X'
-			 * mapping of the same BAR. */
+			 * registers and matches the known-good mapping of the
+			 * same BAR by the since-removed lwip-port 'X' diagnostic. */
 			volatile uint8_t *xhci_mmio = mmap(NULL,
 				bcm2711_pcie_getXhciMmioSize(),
 				PROT_READ | PROT_WRITE,

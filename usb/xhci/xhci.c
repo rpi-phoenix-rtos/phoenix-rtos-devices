@@ -1391,8 +1391,8 @@ static int xhci_programCommandSpace(xhci_t *xhci)
 	config &= ~XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK;
 	config |= xhci->nslots & XHCI_REG_OP_CONFIG_MAX_SLOTS_EN__MASK;
 
-	/* 2026-05-28: match the 'X' diag rig's register-write order
-	 * exactly (port/diag-udp.c):
+	/* 2026-05-28: match the register-write order of the known-good 'X'
+	 * bring-up rig (a since-removed lwip-port diagnostic) exactly:
 	 *   1) CONFIG.MaxSlotsEn  — set BEFORE pointers, not after
 	 *   2) DCBAAP_LO          — LO first (LO commits the 64-bit write)
 	 *   3) DCBAAP_HI
@@ -3359,8 +3359,8 @@ static int xhci_programEventRing(xhci_t *xhci)
 	 * internal event-ring enqueue/dequeue (xHCI 1.2 §4.9.4 / §5.5.2.3).
 	 * Within each 64-bit register pair, write LO then HI. (For the
 	 * low-memory rings the HI halves are 0, so the half-order is inert,
-	 * but LO-then-HI matches the known-good lwip-port bring-up
-	 * sequence.) */
+	 * but LO-then-HI matches the known-good bring-up sequence of the
+	 * since-removed lwip-port diagnostic.) */
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERSTSZ, XHCI_ERST_ENTRY_COUNT & XHCI_REG_RT_IR_ERSTSZ__MASK);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_LO, erdpLo);
 	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_ERDP_HI, erdpHi);
