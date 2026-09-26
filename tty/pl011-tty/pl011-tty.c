@@ -629,50 +629,6 @@ static void pl011_note(pl011_t *uart, const char *s)
 }
 
 
-static int pl011_createTty0(pl011_t *uart)
-{
-	static const char name[] = "tty0";
-	oid_t odev;
-	msg_t msg = { 0 };
-	int err;
-	unsigned int i;
-
-	err = -ENODEV;
-	/* /dev/tty0 is optional here, so keep the retry budget small: each
-	 * devfs lookup IPC can itself stretch from ~1 ms to tens of seconds
-	 * on Pi 4, so fewer retries beats a long stall when the node is
-	 * absent. */
-	for (i = 0; i < 5; ++i) {
-		err = lookup("devfs", NULL, &odev);
-		if (err >= 0) {
-			break;
-		}
-
-		usleep(100000);
-	}
-
-	if (err < 0) {
-		pl011_note(uart, "pl011-tty: tty0 lookup failed\r\n");
-		return err;
-	}
-
-	msg.type = mtCreate;
-	msg.oid = odev;
-	msg.i.create.dev = uart->oid;
-	msg.i.create.type = otDev;
-	msg.i.create.mode = 0666;
-	msg.i.data = name;
-	msg.i.size = sizeof(name);
-
-	if (msgSend(odev.port, &msg) != EOK) {
-		pl011_note(uart, "pl011-tty: tty0 send failed\r\n");
-		return -ENOMEM;
-	}
-
-	return msg.o.err;
-}
-
-
 static uint32_t pl011_lcrh(tcflag_t cflag)
 {
 	uint32_t val = lcrh_fen;
@@ -1268,30 +1224,20 @@ int main(void)
 		return EXIT_FAILURE;
 	}
 
-	/* TODO(TD-14-tty0-nonfatal): pl011_createTty0() depends on a fast
-	 * lookup("devfs") that is intermittently slow on real Pi 4 (TD-04-
-	 * class IPC fragility). It runs the same lookup as create_dev()
-	 * below — but lacks the latter's fallback, so it can hang for tens
-	 * of seconds and block the entire pl011-tty bring-up. Treat its
-	 * failure as non-fatal: skip /dev/tty0 if it doesn't register
-	 * cleanly and proceed to register /dev/console (whose libphoenix
-	 * helper has its own portRegister fallback). /dev/tty0 is not
-	 * strictly required for psh's shell prompt to come up. Restore
-	 * the fatal path once the underlying IPC slowness is rooted out. */
-	if (pl011_createTty0(&pl011_common.uart) < 0) {
-		fprintf(stderr, "pl011-tty: tty0 register failed (non-fatal, continuing)\n");
+	/* /dev/tty0 is the node X, SDL and vkQuake open for the console VT;
+	 * /dev/console is what psh and syspage programs use. Both through
+	 * create_dev(), whose own devfs retry + portRegister fallback covers a
+	 * devfs that is not up yet -- the same registration upstream's UART
+	 * drivers do, and fatal on failure for the same reason. */
+	if (create_dev(&pl011_common.uart.oid, "/dev/tty0") < 0) {
+		fprintf(stderr, "pl011-tty: failed to register /dev/tty0\n");
+		return EXIT_FAILURE;
 	}
 
 	if (create_dev(&pl011_common.uart.oid, _PATH_CONSOLE) < 0) {
 		fprintf(stderr, "pl011-tty: failed to register %s\n", _PATH_CONSOLE);
 		return EXIT_FAILURE;
 	}
-
-	/* TODO(TD-14-console-alias): keep the direct kernel namespace alias
-	 * until Pi 4 bind/devfs lookup latency is fixed. create_dev() registers
-	 * the node in devfs; this alias preserves the fast /dev/console path used
-	 * by early shell startup and mirrors create_dev()'s fallback behavior. */
-	(void)portRegister(port, _PATH_CONSOLE, &pl011_common.uart.oid);
 
 	/* TD-14/#127: initialize the HDMI fbcon (which sets uart->fbaddr) BEFORE
 	 * registering the klog callback and BEFORE starting pl011_thr, so every
