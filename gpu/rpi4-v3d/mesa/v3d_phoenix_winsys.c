@@ -982,6 +982,290 @@ int v3d_phoenix_scanout_init(uint32_t pa, uint32_t w, uint32_t h, uint32_t pitch
  * screenshot capture can read exactly the region HDMI shows. */
 extern void v3d_phoenix_fb_flip(unsigned yoff);
 
+/* SUBMIT-PATH PROFILE (experiment E2, docs/gpu-new-lane/E2-stk-submit-breakdown.md).
+ *
+ * Question: SuperTuxKart spends ~88% of its frame inside the V3D ioctls. How much of
+ * that is the GPU actually executing (the bin and render spins), how much is our
+ * cache/TLB maintenance around each job, and how much of the frame is the CPU
+ * building the next job while the GPU sits idle? That split decides how much an
+ * asynchronous submit (new-lane M1) could win.
+ *
+ * COMPILED OUT BY DEFAULT. Every hook below is wrapped in V3D_SP(), which expands to
+ * nothing unless the file is built with -DV3D_PHX_SUBMIT_PROFILE, so the shipped
+ * winsys (every game, the X server, vkQuake's copy of this file) is byte-identical
+ * to a build without this block. The profiled build is a separate, cloned binary
+ * (tools/gpu-lane/stkprof/); never replace a shipped binary with it -- the C1 hunt
+ * is layout-sensitive.
+ *
+ * Clock: the ARM generic timer (cntvct_el0, EL0-readable on this port), one `isb;
+ * mrs` per stamp. Every submit is split at fixed points (see the SP_* phases), and
+ * every ioctl is timed as a whole, so the phases of a submit must add up to its
+ * ioctl time -- that identity, and the ratio of the counter window to the
+ * clock_gettime window flipstat already measures, are the instrument's own checks.
+ *
+ * Output: three lines per flipstat window (default 5 s), each carrying t= and fr= so
+ * a UART-corrupted line costs only itself. All times are microseconds, raw sums over
+ * the window, so per-frame figures are sum / fr. `cpu` is COMPUTED, not measured:
+ * window wall time minus all ioctl, lock, flip and instrument-print time -- i.e. what
+ * the application and Mesa spent on the CPU between our entry points. */
+#ifdef V3D_PHX_SUBMIT_PROFILE
+#define V3D_SP(x) x
+
+enum {
+	SP_CL_PRE,      /* entry -> TLB flush: entry RCL check, dsb, SLCACTL invalidate */
+	SP_CL_TLB,      /* mmu_flush_tlb(): MMUC flush + TLB clear, both spin-waited */
+	SP_CL_L2T,      /* pre-bin L2T flush: wait-old + issue + wait-new */
+	SP_CL_FIXA,     /* "fix-A": the second waited L2T flush before the CT0 kick */
+	SP_CL_BIN,      /* CT0 kick -> FLDONE seen (binner spin, OUTOMEM servicing) */
+	SP_CL_HANDOFF,  /* FLDONE -> CT1 kick: waited L2T flush, SLCACTL, bincrc */
+	SP_CL_RENDER,   /* CT1 kick -> FRDONE seen (render spin) */
+	SP_CL_POST,     /* FRDONE -> return: wedge handling, post clean, FLUSH_CACHE */
+	SP_TFU_PRE,     /* dsb + TLB flush + SLCACTL + waited L2T flush */
+	SP_TFU_SPIN,    /* TFU kick -> TFUC/TFUF (or BUSY fallback) */
+	SP_TFU_DIAG,    /* the gated readback probe (only n<=12 or every 1024th) */
+	SP_TFU_POST,    /* TMUWCF drain + waited L2T clean + SLCACTL */
+	SP_CSD_PRE,     /* dsb + SLCACTL + TLB + waited L2T + wait for CSD not-current */
+	SP_CSD_SPIN,    /* CFG0 kick -> CSDDONE */
+	SP_CSD_POST,    /* TMUWCF drain + waited L2T clean */
+	SP_NPHASE
+};
+
+enum {
+	SPK_CL, SPK_TFU, SPK_CSD, SPK_CREATE, SPK_CLOSE, SPK_MMAP, SPK_UNLOCKED, SPK_OTHER,
+	SPK_N
+};
+
+/* One window's worth of sums, in counter ticks. */
+struct sp_acc {
+	uint64_t phase[SP_NPHASE];
+	uint64_t ioc[SPK_N];
+	uint32_t iocn[SPK_N];
+	uint64_t lock;          /* waiting for v3d_submit_lock */
+	uint64_t flip;          /* v3d_phoenix_fb_flip(): the mailbox pan */
+	uint64_t rep;           /* flipstat/pace/subprof printing (the instrument itself) */
+	uint64_t gap;           /* GPU-job exit -> next GPU-job entry, summed */
+	uint64_t gapmax;
+	uint32_t gapn;
+	uint32_t oom;           /* OUTOMEM overflow hand-outs */
+	uint32_t wedge;         /* bin/render wedges (a wedge adds ~0.8 s: exclude the window) */
+	uint32_t l2tto, tlbto;  /* silent spin-cap exits in l2t_flush_wait / mmu_flush_tlb */
+	uint64_t fmax, fmin;    /* flip-to-flip frame period extremes */
+	uint64_t gpumax;        /* largest per-frame GPU-spin total */
+	uint32_t frames;
+};
+
+static struct sp_acc sp_win;
+static uint64_t sp_hz;              /* cntfrq_el0 */
+static uint64_t sp_last;            /* phase cursor inside one submit */
+static uint64_t sp_gpu_exit;        /* end of the last GPU job ioctl (0 = none yet) */
+static uint64_t sp_win_t0;          /* window start (0 = not started) */
+static uint64_t sp_flip_prev;       /* previous flip, for the frame period */
+static uint64_t sp_flip_done;       /* end of the last mailbox pan */
+static uint64_t sp_frame_gpu;       /* GPU spins inside the current frame */
+static unsigned long sp_frame_idx;
+static long sp_pf_from = -1, sp_pf_count;   /* V3D_SUBPROF_FRAMES[_FROM] */
+static int sp_banner;
+
+static inline uint64_t sp_now(void)
+{
+	uint64_t v;
+
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v) : : "memory");
+	return v;
+}
+
+static unsigned long sp_us(uint64_t ticks)
+{
+	return (unsigned long)((ticks * 1000000ull) / sp_hz);
+}
+
+static void sp_init_once(void)
+{
+	uint64_t f;
+	const char *e;
+
+	if (sp_banner != 0) {
+		return;
+	}
+	sp_banner = 1;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+	sp_hz = (f != 0u) ? f : 54000000u;
+	e = getenv("V3D_SUBPROF_FRAMES");
+	sp_pf_count = (e != NULL) ? atol(e) : 0;
+	e = getenv("V3D_SUBPROF_FRAMES_FROM");
+	sp_pf_from = (e != NULL) ? atol(e) : 0;
+	fprintf(stderr, "v3d-winsys: SUBMIT PROFILE build (V3D_PHX_SUBMIT_PROFILE) cntfrq=%lu%s "
+		"perframe=%ld from=%ld\n", (unsigned long)f, (f != 0u) ? "" : " (0! assuming 54 MHz)",
+		sp_pf_count, sp_pf_from);
+}
+
+/* Start the phase cursor of one submit. */
+static inline void sp_begin(void)
+{
+	sp_last = sp_now();
+}
+
+/* Credit the time since the previous mark to phase p. */
+static inline void sp_mark(int p)
+{
+	uint64_t now = sp_now();
+
+	sp_win.phase[p] += now - sp_last;
+	if ((p == SP_CL_BIN) || (p == SP_CL_RENDER) || (p == SP_TFU_SPIN) || (p == SP_CSD_SPIN)) {
+		sp_frame_gpu += now - sp_last;
+	}
+	sp_last = now;
+}
+
+static int sp_kind(unsigned long request)
+{
+	unsigned cmd = _IOC_NR(request) - DRM_COMMAND_BASE;
+
+	if (_IOC_NR(request) == _IOC_NR(DRM_IOCTL_GEM_CLOSE)) {
+		return SPK_CLOSE;
+	}
+	switch (cmd) {
+	case DRM_V3D_SUBMIT_CL:  return SPK_CL;
+	case DRM_V3D_SUBMIT_TFU: return SPK_TFU;
+	case DRM_V3D_SUBMIT_CSD: return SPK_CSD;
+	case DRM_V3D_CREATE_BO:  return SPK_CREATE;
+	case DRM_V3D_MMAP_BO:    return SPK_MMAP;
+	case DRM_V3D_GET_PARAM:
+	case DRM_V3D_WAIT_BO:    return SPK_UNLOCKED;
+	default:                 return SPK_OTHER;
+	}
+}
+
+/* One whole ioctl: t0 = before the lock, t1 = lock held, t2 = handler returned. */
+static void sp_ioctl(unsigned long request, uint64_t t0, uint64_t t1, uint64_t t2)
+{
+	int k = sp_kind(request);
+
+	sp_win.lock += t1 - t0;
+	sp_win.ioc[k] += t2 - t1;
+	sp_win.iocn[k]++;
+	if ((k == SPK_CL) || (k == SPK_TFU) || (k == SPK_CSD)) {
+		if (sp_gpu_exit != 0u) {
+			uint64_t g = t0 - sp_gpu_exit;
+
+			sp_win.gap += g;
+			sp_win.gapn++;
+			if (g > sp_win.gapmax) {
+				sp_win.gapmax = g;
+			}
+		}
+		sp_gpu_exit = t2;
+	}
+}
+
+/* A flip closes a frame. t0/t1 bracket the mailbox pan. */
+static void sp_flip(uint64_t t0, uint64_t t1)
+{
+	sp_init_once();
+	sp_win.flip += t1 - t0;
+	sp_flip_done = t1;      /* re-stamped at the end, after any per-frame print */
+	if (sp_win_t0 == 0u) {
+		/* First flip: open the first window here, so load-time work before the first
+		 * presented frame never lands in a window. */
+		sp_win_t0 = t0;
+		sp_flip_prev = t0;
+		memset(&sp_win, 0, sizeof(sp_win));
+		sp_frame_gpu = 0;
+		return;
+	}
+	{
+		uint64_t per = t0 - sp_flip_prev;
+
+		if ((sp_win.frames == 0u) || (per > sp_win.fmax)) {
+			sp_win.fmax = per;
+		}
+		if ((sp_win.frames == 0u) || (per < sp_win.fmin)) {
+			sp_win.fmin = per;
+		}
+		if (sp_frame_gpu > sp_win.gpumax) {
+			sp_win.gpumax = sp_frame_gpu;
+		}
+		sp_win.frames++;
+		sp_frame_idx++;
+		/* Optional per-frame line (V3D_SUBPROF_FRAMES=N [V3D_SUBPROF_FRAMES_FROM=S]).
+		 * Each line is ~1 ms of UART time, which lands in `rep`, not in `cpu`. */
+		if ((sp_pf_count > 0) && ((long)sp_frame_idx >= sp_pf_from) &&
+				((long)sp_frame_idx < sp_pf_from + sp_pf_count)) {
+			uint64_t p0 = sp_now();
+
+			fprintf(stderr, "v3d-winsys: subprof-f n=%lu per=%lu gpu=%lu\n",
+				sp_frame_idx, sp_us(per), sp_us(sp_frame_gpu));
+			sp_win.rep += sp_now() - p0;
+		}
+		sp_flip_prev = t0;
+		sp_frame_gpu = 0;
+	}
+	/* sp_report() books everything from here to its own entry (the flipstat and pace
+	 * prints) to `rep`; stamping here keeps a per-frame print from being booked twice. */
+	sp_flip_done = sp_now();
+}
+
+/* Close the window: called from the flipstat block after its own prints. cg_us is
+ * flipstat's clock_gettime window, printed beside the counter window as a check. */
+static void sp_report(uint64_t cg_us, unsigned long t_ms)
+{
+	uint64_t now = sp_now();
+	struct sp_acc *a = &sp_win;
+	uint64_t wall, busy, cpu, iocs = 0;
+	uint64_t clsum = 0;
+	int i;
+
+	if ((sp_win_t0 == 0u) || (sp_hz == 0u)) {
+		return;
+	}
+	/* The flipstat + pace fprintfs that ran since the pan belong to the instrument. */
+	a->rep += now - sp_flip_done;
+	wall = now - sp_win_t0;
+	for (i = 0; i < SPK_N; i++) {
+		iocs += a->ioc[i];
+	}
+	for (i = SP_CL_PRE; i <= SP_CL_POST; i++) {
+		clsum += a->phase[i];
+	}
+	busy = iocs + a->lock + a->flip + a->rep;
+	cpu = (wall > busy) ? (wall - busy) : 0u;
+
+	fprintf(stderr, "v3d-winsys: subprof-a t=%lums fr=%u wall=%lu cg=%lu hz=%lu ioc=%lu lock=%lu flip=%lu "
+		"rep=%lu cpu=%lu gap=%lu/%u gapmax=%lu fmin=%lu fmax=%lu gpumax=%lu\n",
+		t_ms, a->frames, sp_us(wall), (unsigned long)cg_us, (unsigned long)sp_hz, sp_us(iocs),
+		sp_us(a->lock), sp_us(a->flip), sp_us(a->rep), sp_us(cpu), sp_us(a->gap), a->gapn,
+		sp_us(a->gapmax), sp_us(a->fmin), sp_us(a->fmax), sp_us(a->gpumax));
+	fprintf(stderr, "v3d-winsys: subprof-cl t=%lums fr=%u n=%u ioc=%lu sum=%lu pre=%lu tlb=%lu l2t=%lu "
+		"fixa=%lu bin=%lu hand=%lu rend=%lu post=%lu oom=%u wedge=%u l2tto=%u tlbto=%u\n",
+		t_ms, a->frames, a->iocn[SPK_CL], sp_us(a->ioc[SPK_CL]), sp_us(clsum),
+		sp_us(a->phase[SP_CL_PRE]), sp_us(a->phase[SP_CL_TLB]), sp_us(a->phase[SP_CL_L2T]),
+		sp_us(a->phase[SP_CL_FIXA]), sp_us(a->phase[SP_CL_BIN]), sp_us(a->phase[SP_CL_HANDOFF]),
+		sp_us(a->phase[SP_CL_RENDER]), sp_us(a->phase[SP_CL_POST]),
+		a->oom, a->wedge, a->l2tto, a->tlbto);
+	fprintf(stderr, "v3d-winsys: subprof-x t=%lums fr=%u tfu=%u/%lu[%lu %lu %lu %lu] csd=%u/%lu[%lu %lu %lu] "
+		"create=%u/%lu close=%u/%lu mmap=%u/%lu unl=%u/%lu other=%u/%lu\n",
+		t_ms, a->frames, a->iocn[SPK_TFU], sp_us(a->ioc[SPK_TFU]),
+		sp_us(a->phase[SP_TFU_PRE]), sp_us(a->phase[SP_TFU_SPIN]),
+		sp_us(a->phase[SP_TFU_DIAG]), sp_us(a->phase[SP_TFU_POST]),
+		a->iocn[SPK_CSD], sp_us(a->ioc[SPK_CSD]),
+		sp_us(a->phase[SP_CSD_PRE]), sp_us(a->phase[SP_CSD_SPIN]), sp_us(a->phase[SP_CSD_POST]),
+		a->iocn[SPK_CREATE], sp_us(a->ioc[SPK_CREATE]), a->iocn[SPK_CLOSE], sp_us(a->ioc[SPK_CLOSE]),
+		a->iocn[SPK_MMAP], sp_us(a->ioc[SPK_MMAP]), a->iocn[SPK_UNLOCKED], sp_us(a->ioc[SPK_UNLOCKED]),
+		a->iocn[SPK_OTHER], sp_us(a->ioc[SPK_OTHER]));
+
+	/* Open the next window now; the cost of the three prints above is its first `rep`. */
+	memset(&sp_win, 0, sizeof(sp_win));
+	{
+		uint64_t end = sp_now();
+
+		sp_win.rep = end - now;
+		sp_win_t0 = now;
+	}
+}
+#else
+#define V3D_SP(x)
+#endif /* V3D_PHX_SUBMIT_PROFILE */
+
 /* Presented-frame counter.
  *
  * Every GL and Vulkan app on this stack presents through this one function, so a
@@ -1037,7 +1321,9 @@ void v3d_phoenix_flip(int buf)
 		if (buf < 0) buf = 0;
 		if (buf >= W.scanout_nbuf) buf = W.scanout_nbuf - 1;
 		W.scanout_disp_off = (uint32_t)buf * W.scanout_bytes;
+		V3D_SP(uint64_t sp_f0 = sp_now();)
 		v3d_phoenix_fb_flip((unsigned)buf * W.scanout_phys_h);
+		V3D_SP(sp_flip(sp_f0, sp_now());)
 
 		if (v3d_flipstat < 0) {
 			const char *e = getenv("V3D_FLIPSTAT");
@@ -1119,6 +1405,7 @@ void v3d_phoenix_flip(int buf)
 							c1_bo_pooled);
 					}
 				}
+				V3D_SP(sp_report(dt, (unsigned long)((now - v3d_flip_first_us) / 1000u));)
 				v3d_flip_window = 0;
 				v3d_flip_t0_us = now;
 			}
@@ -2262,6 +2549,7 @@ static inline void l2t_flush_wait(volatile uint32_t *c0)
 {
 	uint32_t spins;
 	for (spins = 1000000u; spins && (c0[CTL_L2TCACTL/4] & L2TCACTL_L2TFLS); spins--) {}
+	V3D_SP(if (spins == 0u) sp_win.l2tto++;)
 }
 
 /* Flush the MMU PTE cache + clear the TLB (mirror linux v3d_mmu_flush_all). ioc_create_bo
@@ -2276,6 +2564,7 @@ static void mmu_flush_tlb(volatile uint32_t *h)
 	for (spins = 1000000u; spins && (h[MMUC_CONTROL/4] & MMUC_FLUSHING); spins--) {}
 	h[MMU_CTL/4] |= MMU_CTL_TLB_CLEAR;
 	for (spins = 1000000u; spins && (h[MMU_CTL/4] & MMU_CTL_TLB_CLEARING); spins--) {}
+	V3D_SP(if (spins == 0u) sp_win.tlbto++;)
 }
 
 /* Re-apply the per-power-on core registers over the (surviving) MMU page table: MMU base +
@@ -2404,6 +2693,8 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	int job_failed = 0;     /* set if bin or render wedged */
 
 	int attempt = 0;        /* kept for the timeout-dump "attempt" field (always 0 now: no resubmit) */
+
+	V3D_SP(sp_begin();)
 
 	/* Drain CPU stores BEFORE reading the list below. Mesa writes control lists
 	 * through an uncached (Normal-NC) mapping, where stores may still sit in the
@@ -2563,6 +2854,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	 * cost); the idle core does not refill the slice caches in the interim, so the earlier drop holds.
 	 * See docs/inprogress/2026-07-26-gpu-linux-ordering-analysis.md. */
 	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;
+	V3D_SP(sp_mark(SP_CL_PRE);)
 	/* Flush the MMU PTE cache + TLB before the job. ioc_create_bo writes fresh PTEs but
 	 * never invalidated the MMU's cached translations, so a job whose CL/RT BOs were just
 	 * mapped at new GPU VAs (every Quake frame allocates fresh BOs) is fetched through a
@@ -2570,6 +2862,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	 * (The cube reuses one persistent job at stable VAs, so it never hit this.) Mirrors the
 	 * linux v3d_mmu_flush_all sequence: MMUC flush, then MMU_CTL TLB clear, each spin-waited. */
 	mmu_flush_tlb(h);
+	V3D_SP(sp_mark(SP_CL_TLB);)
 	/* DO NOT write CTL_MISCCFG here. It is {QRMAXCNT[3:1], OVRTMUOUT[0]} — writing OVRTMUOUT
 	 * (0x1) every submit CLOBBERED QRMAXCNT (the QPU-reserve-max-count that balances QPUs between
 	 * the binner's coordinate shaders and the render's fragment shaders) to 0, which intermittently
@@ -2590,6 +2883,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	l2t_flush_wait(c0);                       /* wait-old: prior L2T flush must be idle first */
 	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS;
 	l2t_flush_wait(c0);                       /* wait-new: flush must complete before the bin reads its CL/vertex data */
+	V3D_SP(sp_mark(SP_CL_L2T);)
 	/* (SLCACTL slice-cache invalidate moved to the FRONT of the submit — see the #67 ORDERING FIX
 	 * comment above the dsb. It fires right after the dsb so all these waits are its settle window.) */
 	/* "fix-A": an extra waited-L2T-flush before the CT0 kick. Its ORIGINAL purpose (settling the
@@ -2604,6 +2898,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	l2t_flush_wait(c0);
 	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS;
 	l2t_flush_wait(c0);
+	V3D_SP(sp_mark(SP_CL_FIXA);)
 	/* --- bin (CT0); wait FLDONE --- */
 	/* Also clear any latched QPU-interrupt bits (27:16). Linux's IRQ handler clears the
 	 * FULL INT status every interrupt (v3d_irq.c: INT_CLR = INT_STS); this poll-based winsys
@@ -2641,6 +2936,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 					c0[CTL_INT_CLR/4] = INT_OUTOMEM;
 					W.binovf_used += chunk;
 					ovf_armed = 1;
+					V3D_SP(sp_win.oom++;)
 					frozen = 0; last_ca = c0[0x0110/4];   /* binner just re-armed; restart frozen window */
 				}
 				else if (ovf_armed != 2) {
@@ -2657,6 +2953,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 				else { frozen = 0; last_ca = ca; }
 			}
 		}
+		V3D_SP(sp_mark(SP_CL_BIN);)
 		if (spins == 0) {
 			job_failed = 1;
 			fprintf(stderr, "v3d-winsys: BIN TIMEOUT int_sts=0x%08x ct0cs=0x%08x "
@@ -2784,6 +3081,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 	 * unless V3D_BIN_CRC=1) so a fixed-scene test can tell binner non-determinism from a CT1
 	 * read fault. Placed AFTER the flush completes and BEFORE the CT1 kick. */
 	bincrc_capture(s->qma, s->qms);
+	V3D_SP(sp_mark(SP_CL_HANDOFF);)
 	/* --- render (CT1); wait FRDONE --- */
 	c0[CLE_CT1QBA/4]=s->rcl_start; c0[CLE_CT1QEA/4]=s->rcl_end;
 	/* Wait for FRDONE, detecting a wedge two ways: (a) FAST — ct1ca FROZEN (the confirmed wedge
@@ -2814,6 +3112,7 @@ static int ioc_submit_cl(struct drm_v3d_submit_cl *s)
 			}
 		}
 	}
+	V3D_SP(sp_mark(SP_CL_RENDER);)
 	if (spins == 0) {
 		uint32_t ca1 = c0[0x0114/4];
 		v3d_phoenix_render_timeouts++;   /* stall counter for the repro harness */
@@ -2882,6 +3181,7 @@ job_retry:
 	 * re-submit freeze into a single dropped frame — the difference between unplayable and
 	 * playable. (Earlier code re-submitted up to SUBMIT_MAX_RETRIES times, stacking timeouts.) */
 	if (job_failed) {
+		V3D_SP(sp_win.wedge++;)
 		v3d_phoenix_render_recoveries++;
 		fprintf(stderr, "v3d-winsys: GPU wedged — true reset + drop this frame "
 			"(mitigation; drops=%u). Wedge is HW-marginal depth-pipeline drain stall.\n",
@@ -3034,6 +3334,7 @@ job_retry:
 			l2t_flush_wait(c0);                              /* ...and wait for the clean */
 		}
 	}
+	V3D_SP(sp_mark(SP_CL_POST);)
 	return 0;
 }
 
@@ -3212,12 +3513,14 @@ static int ioc_submit_tfu(struct drm_v3d_submit_tfu *t)
 	 * PTEs, and invalidate the slice caches + flush L2T so the TFU reads the source staging
 	 * buffer from RAM rather than a stale cached view (mirrors the ioc_submit_cl pre-bin
 	 * sequence). */
+	V3D_SP(sp_begin();)
 	__asm__ volatile("dsb sy" ::: "memory");
 	mmu_flush_tlb(h);
 	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;
 	l2t_flush_wait(c0);                        /* prior L2T flush must be idle (GFXH-1897) */
 	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS;
 	l2t_flush_wait(c0);                        /* and complete before the TFU reads source */
+	V3D_SP(sp_mark(SP_TFU_PRE);)
 
 	/* Clear any stale TFU done/fail latch so our post-kick poll sees only this job. */
 	h[HUB_INT_CLR/4] = HUB_INT_TFUC | HUB_INT_TFUF;
@@ -3254,6 +3557,7 @@ static int ioc_submit_tfu(struct drm_v3d_submit_tfu *t)
 			else if (saw_busy) break;   /* completed (mask-independent fallback) */
 		}
 	}
+	V3D_SP(sp_mark(SP_TFU_SPIN);)
 	{
 		uint32_t isr = h[HUB_INT_STS/4];
 		int failed = (spins == 0) || (isr & HUB_INT_TFUF);
@@ -3373,12 +3677,14 @@ static int ioc_submit_tfu(struct drm_v3d_submit_tfu *t)
 	 * job): wait for any in-flight L2T flush (GFXH-1897), then TMU write-combiner flush + WAIT, then
 	 * L2T clean + WAIT. The waits are essential — the prior code issued FLM_CLEAN without waiting,
 	 * so the sampling CL could start before the clean drained. */
+	V3D_SP(sp_mark(SP_TFU_DIAG);)
 	l2t_flush_wait(c0);                                  /* GFXH-1897: any prior L2T flush idle */
 	c0[CTL_L2TCACTL/4] = L2TCACTL_TMUWCF;                /* drain the TMU write combiner... */
 	for (spins = 1000000u; spins && (c0[CTL_L2TCACTL/4] & L2TCACTL_TMUWCF); spins--) {}  /* ...and wait */
 	c0[CTL_L2TCACTL/4] = L2TCACTL_L2TFLS | L2TCACTL_FLM_CLEAN;   /* write back dirty L2T lines... */
 	l2t_flush_wait(c0);                                  /* ...and wait for the clean to complete */
 	c0[CTL_SLCACTL/4] = SLCACTL_INVAL_ALL;              /* drop stale read-only slice/TMU cache view */
+	V3D_SP(sp_mark(SP_TFU_POST);)
 	return 0;
 }
 
@@ -3442,6 +3748,7 @@ static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
 	uint32_t spins, sts = 0, csd_status;
 	int i, timed_out = 0;
 
+	V3D_SP(sp_begin();)
 	__asm__ volatile("dsb sy" ::: "memory");
 	c0[CTL_SLCACTL / 4] = SLCACTL_INVAL_ALL;
 	mmu_flush_tlb(h);
@@ -3475,6 +3782,7 @@ static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
 		}
 	}
 
+	V3D_SP(sp_mark(SP_CSD_PRE);)
 	/* Kick: write CFG1..6, then CFG0 (the CFG0 write starts the dispatch). */
 	c0[CTL_INT_CLR / 4] = INT_CSDDONE;
 	for (i = 1; i <= 6; i++)
@@ -3494,6 +3802,7 @@ static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
 		if (sts & INT_CSDDONE)
 			break;
 	}
+	V3D_SP(sp_mark(SP_CSD_SPIN);)
 	if (!spins)
 		timed_out = 1;
 	csd_status = c0[CSD_STATUS / 4];
@@ -3528,6 +3837,7 @@ static int ioc_submit_csd(struct drm_v3d_submit_csd *s)
 			reset_reinit_core();
 		}
 	}
+	V3D_SP(sp_mark(SP_CSD_POST);)
 	return 0;
 }
 
@@ -3547,12 +3857,18 @@ int phoenix_v3d_ioctl(int fd, unsigned long request, void *arg)
 	 * state, so they stay outside the lock: serializing them would put every
 	 * screen-create query behind in-flight GPU work for no benefit. */
 	unsigned cmd_nr = _IOC_NR(request) - DRM_COMMAND_BASE;
+	V3D_SP(uint64_t sp_t0; uint64_t sp_t1;)
+	V3D_SP(sp_init_once(); sp_t0 = sp_now();)
 	if ((cmd_nr == DRM_V3D_GET_PARAM) || (cmd_nr == DRM_V3D_WAIT_BO)) {
+		V3D_SP(ret = v3d_ioctl_locked(fd, request, arg);)
+		V3D_SP(sp_ioctl(request, sp_t0, sp_t0, sp_now()); return ret;)
 		return v3d_ioctl_locked(fd, request, arg);
 	}
 
 	v3d_submit_lock_acquire();
+	V3D_SP(sp_t1 = sp_now();)
 	ret = v3d_ioctl_locked(fd, request, arg);
+	V3D_SP(sp_ioctl(request, sp_t0, sp_t1, sp_now());)
 	v3d_submit_lock_release();
 	return ret;
 }
