@@ -483,6 +483,90 @@ int v3d_c1_lookup_page(unsigned long page, unsigned int *handle, unsigned long *
 #endif /* V3D_C1_HUNT */
 
 
+/* ---------------------------------------------------------------------------
+ * C1 ATTRIBUTION BY PHYSICAL FRAME (always built; ~4 KiB)
+ *
+ * WHY A SECOND TABLE, AND WHY PHYSICAL. c1_seen above answers "was this CPU
+ * VIRTUAL address inside a BO's mapping". For the recycling hypothesis that is
+ * the WRONG QUESTION: when a closed BO's page goes back to the kernel and malloc
+ * is handed the frame, malloc maps it at a DIFFERENT virtual address. A VA-keyed
+ * table therefore cannot see the recycled-frame case at all -- it only matches
+ * when the VA happens to be reused, which is a separate phenomenon.
+ *
+ * What survives recycling is the PHYSICAL frame, and the physical frame is
+ * exactly what malloc can report (hpa). So attribution has to be keyed on it.
+ *
+ * WHY IT IS SMALL, AND WHY THAT MATTERS MORE THAN IT LOOKS. c1_seen is
+ * MAX_BOS(4096) x 24 B = 96 KiB, and a "passive 96 KB BSS table" is already on
+ * record in this project as SUPPRESSING C1 -- very likely this one. An instrument
+ * that silences the event cannot measure it. This table stores only what the
+ * question needs, for CLOSED BOs only:
+ *
+ *     { first frame, page count, close ordinal } = 8 bytes
+ *
+ * A run closes ~300 BOs, so 512 entries cover a whole run at 4 KiB -- 1/24th of
+ * the footprint, with no loss of coverage for the question being asked.
+ *
+ * BOs are MAP_CONTIGUOUS (see ioc_create_bo), so a BO is ONE physical range and
+ * a single {frame, count} pair describes it exactly. The frame is read out of the
+ * GPU page table at close time, immediately before those PTEs are invalidated --
+ * the last moment the mapping still exists.
+ * ------------------------------------------------------------------------- */
+#define C1_CLOSED_N 512u
+
+static struct {
+	uint32_t pfn;      /* first physical page number (PA >> PAGE_SHIFT) */
+	uint16_t npages;
+	uint16_t ord;      /* 1-based close ordinal; 0 = slot never used */
+} c1_closed[C1_CLOSED_N];
+
+static uint32_t c1_closed_next, c1_closed_ord;
+
+
+static void c1_closed_record(uint32_t pfn, uint32_t npages)
+{
+	uint32_t i = c1_closed_next % C1_CLOSED_N;
+
+	c1_closed_ord++;
+	c1_closed[i].pfn = pfn;
+	c1_closed[i].npages = (npages > 0xffffu) ? 0xffffu : (uint16_t)npages;
+	c1_closed[i].ord = (uint16_t)(c1_closed_ord & 0xffffu);
+	c1_closed_next++;
+}
+
+
+/* Was this PHYSICAL address inside a BO we closed? Returns the number of matching
+ * records (>1 means the frame has been recycled through more than one BO, which is
+ * itself worth knowing); *ord receives the MOST RECENT close ordinal and *total the
+ * number of closes recorded, so "0 matches out of 300 closes" reads as a real
+ * answer rather than a missing instrument.
+ *
+ * Declared weak on the malloc side, so a binary without this driver still links. */
+int v3d_c1_lookup_pa(unsigned long pa, unsigned int *npages, unsigned int *ord,
+	unsigned int *total)
+{
+	uint32_t i, matches = 0u, best = 0u;
+	uint32_t want = (uint32_t)(pa >> PAGE_SHIFT);
+
+	for (i = 0; i < C1_CLOSED_N; i++) {
+		if (c1_closed[i].ord == 0u) {
+			continue;
+		}
+		if ((want >= c1_closed[i].pfn) && (want < (c1_closed[i].pfn + c1_closed[i].npages))) {
+			if (c1_closed[i].ord >= best) {
+				best = c1_closed[i].ord;
+				if (npages != NULL) *npages = c1_closed[i].npages;
+			}
+			matches++;
+		}
+	}
+	if (ord != NULL) *ord = best;
+	if (total != NULL) *total = c1_closed_ord;
+	return (int)matches;
+}
+
+
+
 /* Report any recently-closed BO that overlapped this one's GPU VA or CPU address.
  * Overlap, not equality: a smaller BO reusing part of a bigger one's range is the
  * dangerous case and an equality test would miss it. */
@@ -1610,6 +1694,14 @@ static int ioc_close_bo(struct drm_gem_close *gc)
 		uint32_t first = b->gpuva >> PAGE_SHIFT;
 		uint32_t npages = b->size / _PAGE_SIZE;
 		uint32_t i;
+
+		/* Record this BO's PHYSICAL range for C1 attribution BEFORE the PTEs go,
+		 * because the page table is the only place the driver still knows it. BOs
+		 * are MAP_CONTIGUOUS, so the first entry's frame plus the page count
+		 * describes the whole BO. */
+		if ((npages > 0u) && ((W.pt[first] & PTE_V) != 0u)) {
+			c1_closed_record(W.pt[first] & ~(PTE_W | PTE_V), npages);
+		}
 
 		for (i = 0; i < npages; i++) {
 			W.pt[first + i] = 0u;   /* !PTE_V => PT_INVALID abort if ever touched */
