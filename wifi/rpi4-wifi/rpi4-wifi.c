@@ -38,6 +38,8 @@
  *   - SDHCI (Arasan) @ 0xfe300000     — the controller the 43455 sits on
  *   - BCM2711 GPIO   @ 0xfe200000     — routes GPIO 34..39 to ALT3 (SDIO)
  *   - VideoCore mbox @ 0xfe00b880     — SET_GPIO_STATE(WL_ON) power cycle
+ * The SDHCI reference clock rate (GET_CLOCK_RATE, EMMC clock) is read
+ * through the rpi4-vcmbox server (/dev/vcmbox) instead.
  *
  * Copyright 2026 Phoenix Systems
  * Author: Witold Bołt
@@ -49,6 +51,7 @@
 #include "wifi-fw-43455.h"
 #include "wifi-nvram-43455.h"
 #include "clm-43455.h"
+#include "libvcmbox.h"
 
 #include <sys/mman.h>
 #include <sys/msg.h>
@@ -277,11 +280,43 @@ static void diag_wifiPowerCycle(void)
 #define SDHCI_INT_BUF_RD_READY   0x00000020u
 #define SDHCI_INT_BUF_WR_READY   0x00000010u
 
-/* Program SDHCI to a target SD-bus clock by dividing the 250 MHz base.
+/* The Arasan controller is clocked by the EMMC clock (firmware clock id 1;
+ * Linux DT: BCM2835_CLOCK_EMMC), a CPRMAN peripheral clock the firmware may
+ * derive from the same PLL as the core clock -- so ask for its rate rather
+ * than assume one. 250 MHz is the rate observed with core_freq=250 and is
+ * only the fallback when the mailbox query fails. */
+#define VC_PROP_GET_CLOCK_RATE 0x00030002u
+#define VC_CLOCK_EMMC          1u
+#define SDHCI_BASE_HZ_DEFAULT  250000000u
+
+/* Reference clock of the SDHCI divider, queried once through /dev/vcmbox. */
+static uint32_t diag_sdhciBaseHz(void)
+{
+	static uint32_t base_hz;
+	uint32_t in[2] = { VC_CLOCK_EMMC, 0u };
+	uint32_t out[2] = { 0u, 0u };
+
+	if (base_hz != 0u) {
+		return base_hz;
+	}
+
+	if ((vcmbox_call(VC_PROP_GET_CLOCK_RATE, sizeof(in), in, 2u, out, 2u) == 0) && (out[1] != 0u)) {
+		base_hz = out[1];
+		printf("rpi4-wifi: SDHCI base clock (EMMC) = %u Hz\n", (unsigned)base_hz);
+	}
+	else {
+		base_hz = SDHCI_BASE_HZ_DEFAULT;
+		printf("rpi4-wifi: GET_CLOCK_RATE(EMMC) failed; assuming %u Hz\n", (unsigned)base_hz);
+	}
+
+	return base_hz;
+}
+
+/* Program SDHCI to a target SD-bus clock by dividing the EMMC base clock.
  * Per SDHCI 3.0 §2.2.13: divisor is 10-bit, output_hz = base / (2*N). */
 static int diag_sdhciSetClockKHz(volatile uint8_t *base, unsigned target_khz)
 {
-	uint32_t base_hz = 250000000u;
+	uint32_t base_hz = diag_sdhciBaseHz();
 	uint32_t target_hz = (uint32_t)target_khz * 1000u;
 	uint32_t divisor;
 	uint32_t clkctl;

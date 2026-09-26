@@ -38,6 +38,9 @@ NFSROOT="${NFSROOT:-${_fsid0:-/srv/phoenix-rpi4-nfs}}"
 # in tools/wifi-probe. Override if they live elsewhere.
 LWIP_PORT="${LWIP_PORT:-$REPO_ROOT/sources/phoenix-rtos-lwip/port}"
 WIFI_PROBE="${WIFI_PROBE:-$REPO_ROOT/tools/wifi-probe}"
+# The /dev/vcmbox client (SDHCI base-clock query) is compiled in from source,
+# as tools/hevc-decode/build-hevc-m1.sh does; it lives in this repo.
+VCMBOX_DIR="${VCMBOX_DIR:-$HERE/../../misc/rpi4-vcmbox}"
 
 FW_C="$LWIP_PORT/wifi-fw-43455.c"
 NVRAM_C="$LWIP_PORT/wifi-nvram-43455.c"
@@ -63,14 +66,14 @@ else
 	echo "rpi4-wifi: linking against the TOOLCHAIN's libphoenix (no buildroot sysroot found)"
 fi
 
-CFLAGS="-O2 -Wall -Wextra -std=gnu11 $SYSROOT_OPTS -I$LWIP_PORT -I$WIFI_PROBE"
+CFLAGS="-O2 -Wall -Wextra -std=gnu11 $SYSROOT_OPTS -I$LWIP_PORT -I$WIFI_PROBE -I$VCMBOX_DIR"
 # The 3.9 MB firmware array is pure data — compile it at -O0 (high opt is slow +
 # memory-heavy for zero codegen benefit), same as tools/wifi-probe/build.sh.
 CFLAGS_DATA="-O0 $SYSROOT_OPTS -I$LWIP_PORT"
 
 for f in "$GCC" "$FW_C" "$NVRAM_C" \
 	"$LWIP_PORT/wifi-fw-43455.h" "$LWIP_PORT/wifi-nvram-43455.h" \
-	"$WIFI_PROBE/clm-43455.h"; do
+	"$WIFI_PROBE/clm-43455.h" "$VCMBOX_DIR/libvcmbox.c" "$VCMBOX_DIR/libvcmbox.h"; do
 	if [ ! -e "$f" ]; then
 		echo "rpi4-wifi/build-standalone.sh: missing required input: $f" >&2
 		echo "  (firmware/nvram arrays: scripts/gen-wifi-fw-c.sh; clm: tools/wifi-probe/gen-clm.py)" >&2
@@ -83,6 +86,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "rpi4-wifi: compiling driver logic (-O2)"
 "$GCC" $CFLAGS -c "$HERE/rpi4-wifi.c" -o "$TMP/rpi4-wifi.o"
+"$GCC" $CFLAGS -c "$VCMBOX_DIR/libvcmbox.c" -o "$TMP/libvcmbox.o"
 
 echo "rpi4-wifi: compiling firmware array (-O0, ~3.9 MB)"
 "$GCC" $CFLAGS_DATA -c "$FW_C" -o "$TMP/wifi-fw-43455.o"
@@ -93,6 +97,7 @@ echo "rpi4-wifi: compiling nvram array (-O0)"
 echo "rpi4-wifi: linking driver"
 "$GCC" -O2 $SYSROOT_OPTS \
 	"$TMP/rpi4-wifi.o" \
+	"$TMP/libvcmbox.o" \
 	"$TMP/wifi-fw-43455.o" \
 	"$TMP/wifi-nvram-43455.o" \
 	-o "$HERE/rpi4-wifi"
