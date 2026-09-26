@@ -1283,6 +1283,64 @@ static void diag_sdhciResetDatCmd(volatile uint8_t *sdhci)
  * CMD53 addr 0x8000; write=incrementing, read=fixed FIFO. Small frame padded to
  * a 64-byte block (F2 blocksize set to 64 via CCCR FBR to reuse block-mode). */
 #define IOCTL_F2_ADDR 0x8000u
+
+/* F1 registers of the chip's clock and sleep control (brcmfmac sdio.h). */
+#define SBSDIO_FUNC1_CHIPCLKCSR 0x1000Eu
+#define SBSDIO_HT_AVAIL_REQ     0x10u
+#define SBSDIO_HT_AVAIL         0x80u
+#define SBSDIO_FUNC1_SLEEPCSR   0x1001Fu
+#define SBSDIO_SLEEPCSR_KSO     0x01u
+#define SBSDIO_SLEEPCSR_DEVON   0x02u
+
+static unsigned int g_ctrl_wake_retries = 0u; /* control frames re-sent after a wake */
+
+/* Make sure the chip can take an F2 transfer: awake (KSO) and on its HT
+ * backplane clock. brcmfmac does this before every control frame
+ * (brcmf_sdio_bus_txctl -> brcmf_sdio_clkctl(CLK_AVAIL)), because the chip may
+ * drop HT, or doze, while the host is idle -- and the first CMD53 to a chip in
+ * that state fails. Here that surfaced as a join whose first command
+ * (event_msgs) failed at the transport while every later command succeeded, so
+ * the firmware was never told to report join events (JOIN-RC events=0,
+ * em=-1041, 2 of 2 failures; em=0 in both successes).
+ *
+ * The first write to a dozing chip may itself be NACKed, so KSO is written until
+ * it reads back with DEVON set. The HT request stays asserted: the radio is
+ * already kept awake (mpc=0), so there is no power saving to lose.
+ * Returns the CHIPCLKCSR value found on entry (for the join report), or -1 if
+ * it could not be read. *ok is set to 1 when HT is available on return. */
+static int diag_chipWake(volatile uint8_t *sdhci, int *ok)
+{
+	uint32_t r[4] = { 0 };
+	int entry, i;
+
+	*ok = 0;
+	entry = (diag_sdioCmd52(sdhci, 0, 1, SBSDIO_FUNC1_CHIPCLKCSR, 0u, r) == 0) ? (int)(r[0] & 0xffu) : -1;
+	if ((entry >= 0) && ((entry & SBSDIO_HT_AVAIL) != 0)) {
+		*ok = 1;
+		return entry;
+	}
+
+	for (i = 0; i < 64; ++i) {
+		(void)diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_SLEEPCSR, SBSDIO_SLEEPCSR_KSO, NULL);
+		r[0] = 0u;
+		if ((diag_sdioCmd52(sdhci, 0, 1, SBSDIO_FUNC1_SLEEPCSR, 0u, r) == 0) &&
+			((r[0] & (SBSDIO_SLEEPCSR_KSO | SBSDIO_SLEEPCSR_DEVON)) == (SBSDIO_SLEEPCSR_KSO | SBSDIO_SLEEPCSR_DEVON))) {
+			break;
+		}
+		usleep(300);
+	}
+
+	(void)diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_CHIPCLKCSR, SBSDIO_HT_AVAIL_REQ, NULL);
+	for (i = 0; i < 50; ++i) {
+		r[0] = 0u;
+		if ((diag_sdioCmd52(sdhci, 0, 1, SBSDIO_FUNC1_CHIPCLKCSR, 0u, r) == 0) && ((r[0] & SBSDIO_HT_AVAIL) != 0u)) {
+			*ok = 1;
+			break;
+		}
+		usleep(1000);
+	}
+	return entry;
+}
 /* Max F2 frame we can hold: SDPCM(12) + BDC(4) + full-MTU eth(1514) + slack.
  *
  * Do not raise this without reading the following. Instrumenting the RX errors
@@ -1627,6 +1685,17 @@ static int diag_bcdcCmd(volatile uint8_t *sdhci, uint32_t sdio_core, int is_set,
 	diag_setWindow18(sdhci);
 	wlen = (total + 3u) & ~3u; /* pad to 4 */
 	rc = diag_sdioCmd53WriteByteMode(sdhci, 2, /*incr=*/1, IOCTL_F2_ADDR, wlen, g_txf);
+	if (rc != 0) {
+		/* Most likely the chip dozed or dropped HT while idle (see
+		 * diag_chipWake): wake it and send the frame once more. */
+		int awake;
+
+		diag_sdhciResetDatCmd(sdhci);
+		(void)diag_chipWake(sdhci, &awake);
+		diag_setWindow18(sdhci);
+		rc = diag_sdioCmd53WriteByteMode(sdhci, 2, /*incr=*/1, IOCTL_F2_ADDR, wlen, g_txf);
+		g_ctrl_wake_retries++;
+	}
 	if (rc != 0) {
 		diag_sdhciResetDatCmd(sdhci);
 		return -1041; /* transport error range (<= -1000), distinct from fw BCME_* */
@@ -2006,6 +2075,8 @@ static int g_join_ran = 0;
 static int g_join_em_rc = -100, g_join_infra_rc = -100, g_join_up_rc = -100;
 static int g_join_wsec_rc = -100, g_join_wpaauth_rc = -100, g_join_sup_rc = -100;
 static int g_join_pmk_rc = -100, g_join_ssid_rc = -100;
+static int g_join_clk_entry = -1, g_join_clk_ok = 0; /* diag_chipWake() at join start */
+static unsigned int g_join_wake_retries0 = 0u;
 static int g_join_attempts = 0;          /* SET_SSID attempts (retry on no-network) */
 /* Set by the `joinwpa` command: associate + 4-way-key only, and leave IP to the
  * caller. An lwip netif must own DHCP itself, so the daemon's built-in exchange
@@ -2798,6 +2869,8 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 	printf("wifi: JOIN-START (ssid=%s)\n", g_join_ssid);
 	fflush(stdout);
 	diag_sdhciResetDatCmd(sdhci);
+	g_join_clk_entry = diag_chipWake(sdhci, &g_join_clk_ok);
+	g_join_wake_retries0 = g_ctrl_wake_retries;
 
 	/* event_msgs: enable join events 0(SET_SSID),5,6,7(ASSOC),11,12,16(LINK),
 	 * 46(PSK_SUP) + keep 69(escan, harmless). mask[i/8] |= 1<<(i%8). */
@@ -2988,6 +3061,10 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 	printf("wifi: JOIN-RC events=%d em=%d glom=%d infra=%d up=%d wsec=%d wpa=%d sup=%d pmk=%d ssid=%d\n",
 		g_join_evt_total, g_join_em_rc, g_join_rxglom_rc, g_join_infra_rc, g_join_up_rc,
 		g_join_wsec_rc, g_join_wpaauth_rc, g_join_sup_rc, g_join_pmk_rc, g_join_ssid_rc);
+	/* The chip's clock state when the join began (HT_AVAIL = 0x80) and how many
+	 * control frames needed a wake-and-resend during it. */
+	printf("wifi: JOIN-WAKE clkcsr=0x%02x ht=%d resent=%u\n",
+		(unsigned int)(g_join_clk_entry & 0xff), g_join_clk_ok, g_ctrl_wake_retries - g_join_wake_retries0);
 	fflush(stdout);
 
 	/* Only an associated + 4-way-keyed STA can carry data frames, so skip the
