@@ -148,25 +148,17 @@ static mbox_outcome_t vcmbox_fifoRoundtrip(void)
 
 
 /*
- * Run a full property transaction: build the message in the bounce buffer, drive
- * the FIFO (with internal retry), and copy the firmware value words back. On
- * ultimate failure, log a one-line diagnostic distinguishing the three causes.
- * Returns 0 and fills resp on success, or sets resp->err = -EIO on failure.
+ * Run a full property transaction: build the message in the bounce buffer and
+ * drive the FIFO (with internal retry). On success the firmware's value words
+ * are left at vcmbox.buf[MBOX_MSG_HDR_WORDS..]. On ultimate failure, log a
+ * one-line diagnostic distinguishing the three causes. Returns 0 or -EIO.
  */
-static void vcmbox_transact(const vcmbox_req_t *req, vcmbox_resp_t *resp)
+static int vcmbox_run(uint32_t tag, uint32_t valBufSize, const uint32_t *in, uint32_t nIn, uint32_t valWords)
 {
-	uint32_t valWords = req->valBufSize / 4u;
 	uint32_t totalWords;
 	uint32_t i;
 	uint32_t attempt;
 	mbox_outcome_t outcome = MBOX_EMPTY;
-
-	resp->err = -EIO;
-	resp->nOut = 0;
-
-	if (valWords > VCMBOX_MAX_WORDS) {
-		valWords = VCMBOX_MAX_WORDS;
-	}
 
 	/* [bufsize, REQUEST(0), tag, valBufSize, reqresp(0), val0.., END(0)]. */
 	totalWords = MBOX_MSG_HDR_WORDS + valWords + 1u;
@@ -175,23 +167,18 @@ static void vcmbox_transact(const vcmbox_req_t *req, vcmbox_resp_t *resp)
 		memset(vcmbox.buf, 0, totalWords * 4u);
 		vcmbox.buf[0] = totalWords * 4u;
 		vcmbox.buf[1] = 0u; /* request code */
-		vcmbox.buf[2] = req->tag;
-		vcmbox.buf[3] = req->valBufSize;
+		vcmbox.buf[2] = tag;
+		vcmbox.buf[3] = valBufSize;
 		vcmbox.buf[4] = 0u; /* request indicator + response length */
-		for (i = 0; (i < req->nIn) && (i < valWords); i++) {
-			vcmbox.buf[MBOX_MSG_HDR_WORDS + i] = req->in[i];
+		for (i = 0; (i < nIn) && (i < valWords); i++) {
+			vcmbox.buf[MBOX_MSG_HDR_WORDS + i] = in[i];
 		}
 		/* END tag is already 0 from the memset. */
 
 		vcmbox.lastRacedPa = 0u;
 		outcome = vcmbox_fifoRoundtrip();
 		if (outcome == MBOX_OK) {
-			for (i = 0; (i < valWords) && (i < VCMBOX_MAX_WORDS); i++) {
-				resp->out[i] = vcmbox.buf[MBOX_MSG_HDR_WORDS + i];
-			}
-			resp->nOut = valWords;
-			resp->err = 0;
-			return;
+			return 0;
 		}
 
 		usleep(MBOX_RETRY_US);
@@ -202,25 +189,82 @@ static void vcmbox_transact(const vcmbox_req_t *req, vcmbox_resp_t *resp)
 		case MBOX_EMPTY:
 			printf("rpi4-vcmbox: tag 0x%08x FAILED - FIFO stayed empty (firmware never replied; "
 				"buf_pa=0x%08x may be above VC-addressable range)\n",
-				req->tag, vcmbox.buf_pa);
+				tag, vcmbox.buf_pa);
 			break;
 		case MBOX_WRFULL:
 			printf("rpi4-vcmbox: tag 0x%08x FAILED - write FIFO stayed full (request not posted)\n",
-				req->tag);
+				tag);
 			break;
 		case MBOX_RACED:
 			printf("rpi4-vcmbox: tag 0x%08x FAILED - consumed a non-matching FIFO entry "
 				"(cross-process race; other buf_pa+chan=0x%08x)\n",
-				req->tag, vcmbox.lastRacedPa);
+				tag, vcmbox.lastRacedPa);
 			break;
 		case MBOX_BADRESP:
 			printf("rpi4-vcmbox: tag 0x%08x FAILED - firmware returned code 0x%08x (not RESP_OK)\n",
-				req->tag, vcmbox.buf[1]);
+				tag, vcmbox.buf[1]);
 			break;
 		default:
-			printf("rpi4-vcmbox: tag 0x%08x FAILED - unknown outcome\n", req->tag);
+			printf("rpi4-vcmbox: tag 0x%08x FAILED - unknown outcome\n", tag);
 			break;
 	}
+	return -EIO;
+}
+
+
+/* The classic call: value words in msg.i.raw / msg.o.raw, at most
+ * VCMBOX_MAX_WORDS. Returns 0 and fills resp, or sets resp->err = -EIO. */
+static void vcmbox_transact(const vcmbox_req_t *req, vcmbox_resp_t *resp)
+{
+	uint32_t valWords = req->valBufSize / 4u;
+	uint32_t i;
+
+	resp->err = -EIO;
+	resp->nOut = 0;
+
+	if (valWords > VCMBOX_MAX_WORDS) {
+		valWords = VCMBOX_MAX_WORDS;
+	}
+
+	if (vcmbox_run(req->tag, req->valBufSize, req->in, req->nIn, valWords) != 0) {
+		return;
+	}
+	for (i = 0; i < valWords; i++) {
+		resp->out[i] = vcmbox.buf[MBOX_MSG_HDR_WORDS + i];
+	}
+	resp->nOut = valWords;
+	resp->err = 0;
+}
+
+
+/* The large-buffer call (VCMBOX_NIN_XL): value buffer in msg.i.data, answer in
+ * msg.o.data. The bounce buffer is one page, so VCMBOX_XL_MAX_BYTES fits with
+ * room to spare. */
+static void vcmbox_transactXL(msg_t *msg, vcmbox_resp_t *resp)
+{
+	const vcmbox_req_t *req = (const vcmbox_req_t *)msg->i.raw;
+	uint32_t valWords = req->valBufSize / 4u;
+	uint32_t in[VCMBOX_XL_MAX_BYTES / 4u];
+
+	resp->err = -EINVAL;
+	resp->nOut = 0;
+
+	if ((req->valBufSize == 0u) || (req->valBufSize > VCMBOX_XL_MAX_BYTES) || ((req->valBufSize & 3u) != 0u) ||
+			(msg->i.data == NULL) || (msg->i.size != req->valBufSize) ||
+			((msg->o.data != NULL) && (msg->o.size > req->valBufSize))) {
+		return;
+	}
+	memcpy(in, msg->i.data, req->valBufSize);
+
+	resp->err = -EIO;
+	if (vcmbox_run(req->tag, req->valBufSize, in, valWords, valWords) != 0) {
+		return;
+	}
+	if (msg->o.data != NULL) {
+		memcpy(msg->o.data, &vcmbox.buf[MBOX_MSG_HDR_WORDS], msg->o.size);
+	}
+	resp->nOut = valWords;
+	resp->err = 0;
 }
 
 
@@ -228,6 +272,11 @@ static void vcmbox_handleMsg(msg_t *msg)
 {
 	const vcmbox_req_t *req = (const vcmbox_req_t *)msg->i.raw;
 	vcmbox_resp_t *resp = (vcmbox_resp_t *)msg->o.raw;
+
+	if (req->nIn == VCMBOX_NIN_XL) {
+		vcmbox_transactXL(msg, resp);
+		return;
+	}
 
 	if (req->nIn > VCMBOX_MAX_WORDS) {
 		resp->err = -EINVAL;

@@ -72,4 +72,25 @@ int vcmbox_call(uint32_t tag, uint32_t valBufSize, const uint32_t *in, uint32_t 
 int vcmbox_prop(uint32_t tag, uint32_t arg_in, uint32_t *out);
 
 
+/*
+ * Large-buffer property call, for value buffers that do not fit msg.i.raw
+ * (SET_PLANE is 60 bytes, GET_EDID_BLOCK_DISPLAY 136). The request header
+ * still travels in msg.i.raw, with nIn = VCMBOX_NIN_XL; the value buffer goes
+ * in msg.i.data and the firmware's answer comes back in msg.o.data. A server
+ * without this extension rejects nIn > VCMBOX_MAX_WORDS with -EINVAL before
+ * touching the FIFO, so callers can probe for it.
+ */
+#define VCMBOX_NIN_XL       0x584c0000u
+#define VCMBOX_XL_MAX_BYTES 1024u
+
+/*
+ * Run one property transaction with a `valBufSize`-byte value buffer (a
+ * multiple of 4, at most VCMBOX_XL_MAX_BYTES). `in` supplies all valBufSize
+ * request bytes; `out` (valBufSize bytes) receives the response, or may be
+ * NULL. Returns 0, or a negative errno (-EINVAL from a server without the
+ * extension).
+ */
+int vcmbox_callXL(uint32_t tag, const void *in, uint32_t valBufSize, void *out);
+
+
 #endif

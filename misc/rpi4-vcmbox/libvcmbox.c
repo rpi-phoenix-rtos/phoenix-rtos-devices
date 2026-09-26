@@ -161,6 +161,45 @@ int vcmbox_call(uint32_t tag, uint32_t valBufSize, const uint32_t *in, uint32_t 
 }
 
 
+int vcmbox_callXL(uint32_t tag, const void *in, uint32_t valBufSize, void *out)
+{
+	msg_t msg;
+	vcmbox_req_t *req = (vcmbox_req_t *)msg.i.raw;
+	const vcmbox_resp_t *resp = (const vcmbox_resp_t *)msg.o.raw;
+	int err;
+
+	if ((in == NULL) || (valBufSize == 0u) || (valBufSize > VCMBOX_XL_MAX_BYTES) || ((valBufSize & 3u) != 0u)) {
+		return -EINVAL;
+	}
+
+	if (vcmbox_resolve() != 0) {
+		return -EIO;
+	}
+
+	memset(&msg, 0, sizeof(msg));
+	msg.type = mtDevCtl;
+	msg.oid = vcmbox_common.oid;
+
+	req->tag = tag;
+	req->valBufSize = valBufSize;
+	req->nIn = VCMBOX_NIN_XL;
+	msg.i.data = in;
+	msg.i.size = valBufSize;
+	msg.o.data = out;
+	msg.o.size = (out != NULL) ? valBufSize : 0u;
+
+	err = msgSend(vcmbox_common.oid.port, &msg);
+	if (err < 0) {
+		return err;
+	}
+	if (msg.o.err < 0) {
+		return msg.o.err;
+	}
+
+	return resp->err;
+}
+
+
 int vcmbox_prop(uint32_t tag, uint32_t arg_in, uint32_t *out)
 {
 	/* The property value buffer is 8 bytes = two words: word 0 is the input id
