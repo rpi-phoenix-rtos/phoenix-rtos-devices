@@ -576,6 +576,10 @@ int _libtty_ioctl(libtty_common_t *tty, pid_t sender_pid, unsigned long cmd, con
 		case TIOCSPGRP:
 			log_ioctl("TIOCSPGRP(%u)", *pid);
 			/* FIXME: check permissions */
+			/* Deliberate deviation from upstream (accepted fork change): POSIX
+			 * tcsetpgrp() passes a PROCESS GROUP id, so store it as-is. Upstream
+			 * does getpgid(*pid), which treats it as a pid and only works while
+			 * the group leader is alive. Keep this across upstream merges. */
 			tty->pgrp = *pid;
 			break;
 
