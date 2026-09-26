@@ -541,6 +541,29 @@ static uint32_t c1_closed_next, c1_closed_ord;
  * ------------------------------------------------------------------------- */
 static unsigned long c1_bo_creates, c1_bo_reuses;
 
+/* ★ THE OTHER HALF OF "RECYCLING", and the one nothing has ever counted.
+ *
+ * va_alloc() serves a GPU VA from the HOLES list -- a range some closed BO used
+ * to own -- before it bumps next_gpuva into fresh, never-used address space. So
+ * early in a run, before anything has been closed, every BO gets virgin VA; at
+ * some point the first hole fits and VA REUSE BEGINS. That transition is a real,
+ * datable event inside the driver, and it is the GPU-side twin of the
+ * physical-frame reuse that `bore` counts.
+ *
+ * Why it matters for C1: the hunt's one solid fact is that V3D_KEEP_CLOSED_BO=1
+ * suppresses it (7/19 vs 0/12, p = 0.019). With BOs never closed, va_free() never
+ * runs, the holes list stays empty and VA is never recycled -- but the physical
+ * frames are never returned either. KEEP_CLOSED_BO stops BOTH, so it cannot say
+ * which half matters. `var` against `bore` separates them on the next fire.
+ *
+ * ⚠ Deliberately NOT done by flipping V3D_VA_NO_RECYCLE (read its long comment
+ * above): that makes the two arms different BINARIES, which is the shape that has
+ * already wasted several C1 A/Bs on a layout-sensitive bug, and it doubles the
+ * page table to 2 GiB because a run that never reclaims VA needs it -- so an
+ * exhausted window would kill STK and read as "suppressed". Counting cannot do
+ * that to a run. */
+static unsigned long c1_va_allocs, c1_va_reuses;
+
 /* Heap-growth counters from libphoenix's allocator. WEAK, mirroring how malloc
  * declares v3d_c1_lookup_pa() below: neither side may fail to link because the
  * other is absent. ⚠ A weak symbol that resolves to NULL prints zeros, which is
@@ -1026,15 +1049,17 @@ void v3d_phoenix_flip(int buf)
 					}
 					if (have != 0) {
 						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
-							"bore=%lu heaps=%lu heapkb=%lu\n",
+							"bore=%lu vaa=%lu var=%lu heaps=%lu heapkb=%lu\n",
 							(unsigned long)((now - v3d_flip_first_us) / 1000u),
-							v3d_flip_total, c1_bo_creates, c1_bo_reuses, hn, hb / 1024u);
+							v3d_flip_total, c1_bo_creates, c1_bo_reuses,
+							c1_va_allocs, c1_va_reuses, hn, hb / 1024u);
 					}
 					else {
 						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
-							"bore=%lu heaps=? heapkb=?\n",
+							"bore=%lu vaa=%lu var=%lu heaps=? heapkb=?\n",
 							(unsigned long)((now - v3d_flip_first_us) / 1000u),
-							v3d_flip_total, c1_bo_creates, c1_bo_reuses);
+							v3d_flip_total, c1_bo_creates, c1_bo_reuses,
+							c1_va_allocs, c1_va_reuses);
 					}
 				}
 				v3d_flip_window = 0;
@@ -1143,10 +1168,12 @@ static struct pbo *bo_find(uint32_t handle)
  * high-water mark. Returns 0 on exhaustion. */
 static uint32_t va_alloc(uint32_t pages)
 {
+	c1_va_allocs++;
 #if !V3D_VA_NO_RECYCLE
 	for (uint32_t i = 0; i < W.nholes; i++) {
 		if (W.holes[i].pages >= pages) {
 			uint32_t va = W.holes[i].gpuva;
+			c1_va_reuses++;   /* this range belonged to a BO that has been closed */
 			if (W.holes[i].pages == pages) {
 				W.holes[i] = W.holes[--W.nholes];   /* remove */
 			}
