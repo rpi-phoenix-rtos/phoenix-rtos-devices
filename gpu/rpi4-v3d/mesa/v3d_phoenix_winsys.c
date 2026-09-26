@@ -601,6 +601,14 @@ static unsigned long c1_bo_munmap_cache, c1_bo_munmap_pool, c1_bo_munmapkb, c1_b
  * malloc heap header. */
 extern void malloc_c1HeapBoHits(unsigned long *hits, unsigned long *probes) __attribute__((weak));
 
+/* Physical span of every heap this process has created, plus the most recent.
+ * ★ Every C1 victim so far is in a ~5 MiB physical band -- but every victim is
+ * also a LATE heap, and if physical allocation marches upward as a process runs
+ * then every late heap is in a narrow band and the clustering means nothing.
+ * The SPAN is what tells those apart, so lo and hi ride along with last. */
+extern void malloc_c1HeapPaRange(unsigned long *lo, unsigned long *hi,
+	unsigned long *last) __attribute__((weak));
+
 /* Heap-growth counters from libphoenix's allocator. WEAK, mirroring how malloc
  * declares v3d_c1_lookup_pa() below: neither side may fail to link because the
  * other is absent. ⚠ A weak symbol that resolves to NULL prints zeros, which is
@@ -1079,6 +1087,7 @@ void v3d_phoenix_flip(int buf)
 				 * which is exactly the silent-zero failure this project keeps hitting. */
 				{
 					unsigned long hn = 0u, hb = 0u, bh = 0u, bp = 0u;
+					unsigned long plo = 0u, phi = 0u, plast = 0u;
 					int have = (malloc_c1Pacing != NULL) ? 1 : 0;
 
 					if (have != 0) {
@@ -1087,14 +1096,18 @@ void v3d_phoenix_flip(int buf)
 					if (malloc_c1HeapBoHits != NULL) {
 						malloc_c1HeapBoHits(&bh, &bp);
 					}
+					if (malloc_c1HeapPaRange != NULL) {
+						malloc_c1HeapPaRange(&plo, &phi, &plast);
+					}
 					if (have != 0) {
 						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
 							"bore=%lu var=%lu munc=%lu munp=%lu munkb=%lu pool=%lu "
-							"hbo=%lu hbop=%lu heaps=%lu heapkb=%lu\n",
+							"hbo=%lu hbop=%lu hpalo=%lx hpahi=%lx hpalast=%lx "
+							"heaps=%lu heapkb=%lu\n",
 							(unsigned long)((now - v3d_flip_first_us) / 1000u),
 							v3d_flip_total, c1_bo_creates, c1_bo_reuses, c1_va_reuses,
 							c1_bo_munmap_cache, c1_bo_munmap_pool, c1_bo_munmapkb,
-							c1_bo_pooled, bh, bp, hn, hb / 1024u);
+							c1_bo_pooled, bh, bp, plo, phi, plast, hn, hb / 1024u);
 					}
 					else {
 						fprintf(stderr, "v3d-winsys: pace t=%lums frames=%lu boc=%lu "
