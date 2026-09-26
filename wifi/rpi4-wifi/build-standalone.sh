@@ -42,10 +42,31 @@ WIFI_PROBE="${WIFI_PROBE:-$REPO_ROOT/tools/wifi-probe}"
 FW_C="$LWIP_PORT/wifi-fw-43455.c"
 NVRAM_C="$LWIP_PORT/wifi-nvram-43455.c"
 
-CFLAGS="-O2 -Wall -Wextra -std=gnu11 -I$LWIP_PORT -I$WIFI_PROBE"
+# Link against the TREE's libphoenix, not the toolchain's. Plain `$GCC` resolves
+# libc from the toolchain's own sysroot, which is only refreshed when the
+# toolchain is rebuilt -- so a driver built that way silently carries whatever
+# libphoenix the toolchain was last synced with, not the one the rest of the
+# image was built from (the "standalone tools link the TOOLCHAIN's libphoenix.a"
+# trap, which has bitten this project on a syscall renumber). Prefer the
+# buildroot sysroot when it exists; an explicit SYSROOT still wins, and
+# SYSROOT=none keeps the toolchain default.
+_br_sysroot="$REPO_ROOT/.buildroot/_build/aarch64a72-generic-rpi4b/sysroot"
+SYSROOT="${SYSROOT:-}"
+if [ -z "$SYSROOT" ] && [ -d "$_br_sysroot/lib" ]; then
+	SYSROOT="$_br_sysroot"
+fi
+SYSROOT_OPTS=""
+if [ -n "$SYSROOT" ] && [ "$SYSROOT" != "none" ]; then
+	SYSROOT_OPTS="--sysroot=$SYSROOT/ -B$SYSROOT/lib/"
+	echo "rpi4-wifi: linking against the tree's libphoenix ($SYSROOT)"
+else
+	echo "rpi4-wifi: linking against the TOOLCHAIN's libphoenix (no buildroot sysroot found)"
+fi
+
+CFLAGS="-O2 -Wall -Wextra -std=gnu11 $SYSROOT_OPTS -I$LWIP_PORT -I$WIFI_PROBE"
 # The 3.9 MB firmware array is pure data — compile it at -O0 (high opt is slow +
 # memory-heavy for zero codegen benefit), same as tools/wifi-probe/build.sh.
-CFLAGS_DATA="-O0 -I$LWIP_PORT"
+CFLAGS_DATA="-O0 $SYSROOT_OPTS -I$LWIP_PORT"
 
 for f in "$GCC" "$FW_C" "$NVRAM_C" \
 	"$LWIP_PORT/wifi-fw-43455.h" "$LWIP_PORT/wifi-nvram-43455.h" \
@@ -70,14 +91,14 @@ echo "rpi4-wifi: compiling nvram array (-O0)"
 "$GCC" $CFLAGS_DATA -c "$NVRAM_C" -o "$TMP/wifi-nvram-43455.o"
 
 echo "rpi4-wifi: linking driver"
-"$GCC" -O2 \
+"$GCC" -O2 $SYSROOT_OPTS \
 	"$TMP/rpi4-wifi.o" \
 	"$TMP/wifi-fw-43455.o" \
 	"$TMP/wifi-nvram-43455.o" \
 	-o "$HERE/rpi4-wifi"
 
 echo "rpi4-wifi: building wifi client"
-"$GCC" -O2 -Wall -Wextra -std=gnu11 -o "$HERE/wifi" "$HERE/wifi.c"
+"$GCC" -O2 -Wall -Wextra -std=gnu11 $SYSROOT_OPTS -o "$HERE/wifi" "$HERE/wifi.c"
 
 echo "rpi4-wifi: undefined-symbol check (expect none):"
 for b in rpi4-wifi wifi; do
