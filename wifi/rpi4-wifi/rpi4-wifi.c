@@ -4304,10 +4304,14 @@ static int wifi_bringup(void)
  * inside one boot and one binary is the only A/B here that is not confounded by
  * build or boot differences; the natural failure rate (2 of 13 loads at
  * core_freq=500, ~1 in 100 before) is far too low to grade across boots.
- * Only load 1 runs with the firmware image still to be paged in; the natural
- * failures were all first loads, so `legacypio` on the daemon covers that case. */
+ * Only load 1 runs with the firmware image still to be paged in, and the natural
+ * failures were all first loads: `legacypio` before `fwloadbench` makes load 1
+ * legacy, and `legacypio` on the daemon compares first loads across boots. */
 static int wifi_fwLoadBench(int n)
 {
+	/* `legacypio fwloadbench N` starts with the legacy wait, so the first
+	 * (cold) load can be given to either mode. */
+	int start = g_pio_legacy;
 	int i, rc, ok[2] = { 0, 0 }, runs[2] = { 0, 0 };
 
 	g_bringup_quiet = 1;
@@ -4317,7 +4321,7 @@ static int wifi_fwLoadBench(int n)
 			g_sdhci = NULL;
 		}
 		g_fw_alive = 0;
-		g_pio_legacy = i & 1;
+		g_pio_legacy = (i + start) & 1;
 		rc = wifi_bringup();
 		runs[g_pio_legacy]++;
 		if (rc == 0) {
@@ -4333,7 +4337,7 @@ static int wifi_fwLoadBench(int n)
 			(unsigned)(g_fw_dl_us / 1000u), (unsigned)g_fw_cmd53_max_us);
 		fflush(stdout);
 	}
-	g_pio_legacy = 0;
+	g_pio_legacy = start;
 	g_bringup_quiet = 0;
 	printf("rpi4-wifi: FWLOAD-BENCH-SUMMARY level=%d/%d legacy=%d/%d (loads whose firmware started)\n",
 		ok[0], runs[0], ok[1], runs[1]);
