@@ -3172,6 +3172,8 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
  * startup and leaves the SDIO controller mapped here so wifi_scan() can drive
  * escan transactions against it per client "scan" request. */
 static volatile uint8_t *g_sdhci = NULL;   /* SDHCI (Arasan) mapping, kept live after bring-up */
+static int g_fw_alive = 0;                 /* the last bring-up saw the firmware start (HT_AVAIL or CARD_INTR) */
+static int g_fw_retry_test = 0;            /* `fwretrytest`: treat the first bring-up as failed, to exercise the retry */
 static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (set by bring-up) */
 
 #define WIFI_RESP_CAP (8u * 1024u)
@@ -3935,6 +3937,7 @@ static int wifi_bringup(void)
 		if (card_intr != 0u) {
 			fw_alive = 1;
 		}
+		g_fw_alive = fw_alive;
 		r = snprintf(buf + off, cap - off,
 			"  -> fw_alive=%d %s\n", fw_alive,
 			fw_alive ? "(HT_AVAIL or CARD_INTR asserted -- firmware booted!)"
@@ -4104,7 +4107,42 @@ static int wifi_bringup(void)
 	 * one-shot bring-up logging on the console. */
 	printf("%.*s", off, buf);
 	fflush(stdout);
-	return 0;
+	return (g_fw_alive != 0) ? 0 : 6;
+}
+
+
+/* Bring the chip up, retrying when the firmware did not start. A firmware
+ * download can fail part-way at the SDIO transport (CMD53 data-phase error,
+ * `worst rc_w=-5`; 2 of ~112 loads in the log archive). The daemon then served
+ * a chip with no firmware and every join failed until the next reboot. Each
+ * wifi_bringup() begins with a WL_REG_ON power cycle, so a retry starts from a
+ * cold chip; the previous attempt's SDHCI mapping is released first. */
+static int wifi_bringupRetry(void)
+{
+	int attempt, rc = 6;
+
+	for (attempt = 1; attempt <= 3; ++attempt) {
+		if (g_sdhci != NULL) {
+			(void)munmap((void *)g_sdhci, _PAGE_SIZE);
+			g_sdhci = NULL;
+		}
+		g_fw_alive = 0;
+		rc = wifi_bringup();
+		if ((rc == 0) && (attempt == 1) && (g_fw_retry_test != 0)) {
+			printf("rpi4-wifi: fwretrytest: treating bring-up 1 as failed\n");
+			rc = 6;
+		}
+		if (rc != 6) {
+			break;
+		}
+		printf("rpi4-wifi: firmware did not start (bring-up %d of 3)%s\n", attempt,
+			(attempt < 3) ? "; power-cycling the chip and loading it again" : "");
+		fflush(stdout);
+	}
+	if (rc == 0) {
+		printf("rpi4-wifi: firmware running after bring-up %d\n", attempt);
+	}
+	return rc;
 }
 
 
@@ -4962,6 +5000,9 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[ai], "jointest") == 0) {
 			jointest = 1;
 		}
+		else if (strcmp(argv[ai], "fwretrytest") == 0) {
+			g_fw_retry_test = 1;
+		}
 	}
 
 	if (selftest != 0 || jointest != 0) {
@@ -4969,7 +5010,7 @@ int main(int argc, char **argv)
 		 * CLM channel data + brings the radio up), print. For jointest, then
 		 * exercise the association control path against a non-existent test SSID
 		 * (failure events are expected; it proves the join machinery). */
-		rc = wifi_bringup();
+		rc = wifi_bringupRetry();
 		if (rc == 0) {
 			g_resp_len = wifi_scan(g_resp, (int)sizeof(g_resp));
 			printf("rpi4-wifi selftest: scan result (%d bytes):\n%.*s",
@@ -5002,7 +5043,7 @@ int main(int argc, char **argv)
 	/* child: bring up the radio, register /dev/wifi, then serve forever */
 	signal(SIGUSR1, wifi_sigExit);
 	(void)setsid();
-	rc = wifi_bringup();
+	rc = wifi_bringupRetry();
 	if (rc != 0) {
 		printf("rpi4-wifi: bring-up failed (rc=%d)\n", rc);
 		return rc;
