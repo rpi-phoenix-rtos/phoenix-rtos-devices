@@ -3321,6 +3321,11 @@ static int g_fw_retry_test = 0;            /* `fwretrytest`: treat the first bri
 static int g_bringup_quiet = 0;            /* `fwloadbench`: print the bring-up report only when it failed */
 static uint32_t g_fw_bytes = 0u;           /* firmware bytes the last bring-up wrote */
 static int g_fw_rc_w = 0, g_fw_rc_nvram = 0; /* its first firmware / NVRAM write error */
+/* How long the firmware download took, and its slowest CMD53 (4 KB) and where.
+ * The image is compiled into this binary and paged in from the root file
+ * system on first touch, so the first load of a process can stall inside a
+ * transfer; a slow CMD53 at the offset of a failure says the host stalled. */
+static uint32_t g_fw_dl_us = 0u, g_fw_cmd53_max_us = 0u, g_fw_cmd53_max_off = 0u, g_fw_cmd53_ge2ms = 0u;
 static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (set by bring-up) */
 
 #define WIFI_RESP_CAP (8u * 1024u)
@@ -3433,6 +3438,7 @@ static int wifi_bringup(void)
 	int rc_cnt_pre = -100, rc_cnt_post = -100, rc_cnt_post2 = -100;
 	uint32_t ioctl_w2 = 0u, ioctl_w3 = 0u; /* dual ARM-wrapper CR4-identity cross-check */
 	uint32_t cr4_core = 0u, sdio_core = 0x18004000u, ram_size = 0u; /* EROM-derived bases */
+	uint64_t dl_t0;
 
 	for (i = 0; i < (int)sizeof(pre_buf); ++i) {
 		pre_buf[i] = 0;
@@ -3483,6 +3489,7 @@ static int wifi_bringup(void)
 	g_pio_timeouts = 0u;
 	g_pio_to_pres = 0u;
 	g_pio_to_int = 0u;
+	g_fw_dl_us = 0u;
 
 	{
 		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
@@ -3593,6 +3600,10 @@ static int wifi_bringup(void)
 		ram_size = diag_cr4RamSize(sdhci, cr4_core);
 		g_ram_size = ram_size;
 
+		g_fw_cmd53_max_us = 0u;
+		g_fw_cmd53_max_off = 0u;
+		g_fw_cmd53_ge2ms = 0u;
+		dl_t0 = diag_monoUs();
 		while (fw_offset < fw_target_bytes && rc_hs == 0) {
 			uint32_t addr = 0x00198000u + (uint32_t)window_idx * 0x8000u;
 			uint8_t  lo  = (uint8_t)(((addr >> 15) & 1u) ? 0x80u : 0x00u);
@@ -3610,11 +3621,21 @@ static int wifi_bringup(void)
 			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, hi,  NULL);
 
 			for (ci = 0; ci < chunks; ++ci) {
+				uint64_t c0 = diag_monoUs(), cdt;
+
 				rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
 					/*reg_addr=*/ci * bytes_per_cmd,
 					/*block_count=*/blk_count,
 					/*block_size=*/blk_size,
 					fw_img + fw_offset + ci * bytes_per_cmd);
+				cdt = diag_monoUs() - c0;
+				if (cdt > g_fw_cmd53_max_us) {
+					g_fw_cmd53_max_us = (uint32_t)cdt;
+					g_fw_cmd53_max_off = (uint32_t)(fw_offset + ci * bytes_per_cmd);
+				}
+				if (cdt >= 2000u) {
+					g_fw_cmd53_ge2ms++;
+				}
 				if (rc_w != 0) {
 					if (worst_rc_w == 0) worst_rc_w = rc_w;
 					break;
@@ -3639,6 +3660,7 @@ static int wifi_bringup(void)
 			fw_offset += this_window;
 			window_idx++;
 		}
+		g_fw_dl_us = (uint32_t)(diag_monoUs() - dl_t0);
 
 		/* NVRAM load: chip-ready blob goes at chip-internal
 		 * (rambase + ramsize - wifi_nvram_43455_len) = 0x238000 - len,
@@ -4265,9 +4287,12 @@ static int wifi_bringup(void)
 	g_fw_bytes = bytes_written;
 	g_fw_rc_w = worst_rc_w;
 	g_fw_rc_nvram = rc_nvram_w;
-	printf("rpi4-wifi: SDHCI-PIO mode=%s fw_bytes=%u rc_w=%d rc_nvram=%d slow_waits=%u slow_max_us=%u timeouts=%u\n",
+	printf("rpi4-wifi: SDHCI-PIO mode=%s fw_bytes=%u rc_w=%d rc_nvram=%d slow_waits=%u slow_max_us=%u timeouts=%u "
+		"dl_ms=%u cmd53_max_us=%u@0x%x cmd53_ge2ms=%u\n",
 		(g_pio_legacy != 0) ? "legacy" : "level", (unsigned)bytes_written, worst_rc_w, rc_nvram_w,
-		(unsigned)g_pio_slow_waits, (unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts);
+		(unsigned)g_pio_slow_waits, (unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
+		(unsigned)(g_fw_dl_us / 1000u), (unsigned)g_fw_cmd53_max_us, (unsigned)g_fw_cmd53_max_off,
+		(unsigned)g_fw_cmd53_ge2ms);
 	fflush(stdout);
 	return (g_fw_alive != 0) ? 0 : 6;
 }
@@ -4278,7 +4303,9 @@ static int wifi_bringup(void)
  * and the legacy PIO wait, one FWLOAD-BENCH line per load. Comparing the two
  * inside one boot and one binary is the only A/B here that is not confounded by
  * build or boot differences; the natural failure rate (2 of 13 loads at
- * core_freq=500, ~1 in 100 before) is far too low to grade across boots. */
+ * core_freq=500, ~1 in 100 before) is far too low to grade across boots.
+ * Only load 1 runs with the firmware image still to be paged in; the natural
+ * failures were all first loads, so `legacypio` on the daemon covers that case. */
 static int wifi_fwLoadBench(int n)
 {
 	int i, rc, ok[2] = { 0, 0 }, runs[2] = { 0, 0 };
@@ -4297,11 +4324,13 @@ static int wifi_fwLoadBench(int n)
 			ok[g_pio_legacy]++;
 		}
 		printf("rpi4-wifi: FWLOAD-BENCH load=%d/%d mode=%s rc=%d fw_alive=%d fw_bytes=%u rc_w=%d "
-			"rc_nvram=%d slow_waits=%u slow_max_us=%u timeouts=%u to_pres=0x%08x to_int=0x%08x\n",
+			"rc_nvram=%d slow_waits=%u slow_max_us=%u timeouts=%u to_pres=0x%08x to_int=0x%08x "
+			"dl_ms=%u cmd53_max_us=%u\n",
 			i + 1, n, (g_pio_legacy != 0) ? "legacy" : "level", rc, g_fw_alive,
 			(unsigned)g_fw_bytes, g_fw_rc_w, g_fw_rc_nvram,
 			(unsigned)g_pio_slow_waits, (unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
-			(unsigned)g_pio_to_pres, (unsigned)g_pio_to_int);
+			(unsigned)g_pio_to_pres, (unsigned)g_pio_to_int,
+			(unsigned)(g_fw_dl_us / 1000u), (unsigned)g_fw_cmd53_max_us);
 		fflush(stdout);
 	}
 	g_pio_legacy = 0;
@@ -5207,6 +5236,10 @@ int main(int argc, char **argv)
 		}
 		else if (strcmp(argv[ai], "fwretrytest") == 0) {
 			g_fw_retry_test = 1;
+		}
+		else if (strcmp(argv[ai], "legacypio") == 0) {
+			/* the old PIO wait, for a first-load A/B across boots */
+			g_pio_legacy = 1;
 		}
 		else if (strcmp(argv[ai], "fwloadbench") == 0) {
 			fwbench = ((ai + 1) < argc) ? atoi(argv[ai + 1]) : 20;
