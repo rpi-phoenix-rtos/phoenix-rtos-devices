@@ -5,7 +5,8 @@
  *      no disk cache) never exercises at runtime: the gallium `draw` module,
  *      SPIR-V, ASTC decode, disk cache, gallium trace, sw tgsi_exec. Stubbed to
  *      NULL/no-op (linkage is by name; generic signatures resolve the refs).
- *  (2) small libc gaps Phoenix lacks: posix_memalign. Anything libphoenix later
+ *  (2) small libc gaps Phoenix lacks (none left: posix_memalign and the pthread
+ *      barriers moved to libphoenix 2026-09-27). Anything libphoenix later
  *      implements MUST be dropped from here, or the duplicate definition breaks
  *      the link -- strtok_r and pthread_mutex_timedlock both went that way.
  * Compiled WITHOUT the compat shim. Warnings off.
@@ -54,10 +55,6 @@ void draw_set_vertex_info(void *d, const void *vi) { (void)d; (void)vi; }
 void *draw_glfeedback_stage(void *ctx, void *d) { (void)ctx; (void)d; return NULL; }
 void *draw_glselect_stage(void *ctx, void *d) { (void)ctx; (void)d; return NULL; }
 
-/* pthread barriers (Phoenix lacks) — single-thread no-ops for util_barrier_* */
-int pthread_barrier_init(void *b, const void *a, unsigned n) { (void)b; (void)a; (void)n; return 0; }
-int pthread_barrier_wait(void *b) { (void)b; return -1; /* PTHREAD_BARRIER_SERIAL_THREAD */ }
-int pthread_barrier_destroy(void *b) { (void)b; return 0; }
 unsigned util_hash_crc32(const void *data, size_t size) { (void)data; (void)size; return 0; }
 
 /* --- CPU affinity / cpu_set_t: Phoenix has no sched affinity; no-op --- */
@@ -121,19 +118,6 @@ void  pipe_get_tile_rgba(void *t, void *p, int x, int y, int w, int h, int f, vo
 const char *os_get_option_secure(const char *name) { (void)name; return NULL; }
 
 /* --- libc gaps Phoenix lacks (real impls) --- */
-int posix_memalign(void **memptr, size_t alignment, size_t size)
-{
-	if (alignment < sizeof(void *))
-		alignment = sizeof(void *);
-	void *p = NULL;
-	/* malloc + manual align with a back-pointer for free() compatibility is
-	 * fragile; Phoenix malloc returns 16-byte-aligned, enough for Mesa's uses. */
-	p = malloc(size);
-	if (!p)
-		return 12; /* ENOMEM */
-	*memptr = p;
-	return 0;
-}
 
 /* strtok_r was here as a Phoenix libc gap. libphoenix provides it now (both
  * libphoenix.a and libm.a export it), so keeping a local copy makes the link

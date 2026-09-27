@@ -134,15 +134,6 @@ int posix_memalign(void **memptr, size_t alignment, size_t size);
 /* GNU qsort_r (Phoenix has only plain qsort). Real impl is a port task. */
 void qsort_r(void *base, size_t nmemb, size_t size,
              int (*compar)(const void *, const void *, void *), void *arg);
-/* Phoenix pthread lacks barriers; provide types + decls (impls stubbed in gl_stubs.c). */
-typedef struct { int __dummy; } pthread_barrier_t;
-typedef struct { int __dummy; } pthread_barrierattr_t;
-int pthread_barrier_init(pthread_barrier_t *, const pthread_barrierattr_t *, unsigned);
-int pthread_barrier_wait(pthread_barrier_t *);
-int pthread_barrier_destroy(pthread_barrier_t *);
-#ifndef PTHREAD_BARRIER_SERIAL_THREAD
-#define PTHREAD_BARRIER_SERIAL_THREAD (-1)
-#endif
 #ifdef __cplusplus
 }
 #endif
