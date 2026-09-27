@@ -1806,6 +1806,7 @@ static int diag_bcdcCmd(volatile uint8_t *sdhci, uint32_t sdio_core, int is_set,
 #define WLC_DISASSOC_CMD 52u       /* BRCMF_C_DISASSOC: no payload, as brcmf_link_down() */
 #define WLC_SET_WSEC_PMK_CMD 268u  /* BRCMF_C_SET_WSEC_PMK: brcmf_wsec_pmk_le (passphrase) */
 #define BRCMF_C_GET_PKTCNTS 137u   /* brcmf_pktcnt_le { rx_good, rx_bad, tx_good, tx_bad, rx_ocast } */
+#define BRCMF_C_GET_RATE 12u       /* le32: current TX rate, in 500 kbit/s units (fwil.h) */
 #define SET_VAR_CMD 263u
 #define GET_VAR_CMD 262u
 #define SCAN_MAX_APS 16
@@ -4664,7 +4665,28 @@ static uint64_t wifi_nowUs(void)
  * attributed instead of guessed. */
 static int wifi_stats(char *out, int cap)
 {
-	return snprintf(out, (size_t)cap,
+	/* The negotiated PHY rate bounds what any SDIO or host change can buy, so it
+	 * is reported next to the throughput counters. Only here, on demand: like any
+	 * control command, the GET drains the shared F2 FIFO and drops the data
+	 * frames it meets, so it must not go into the periodically polled `status`. */
+	uint8_t rbuf[8] = { 0 };
+	uint32_t rlen = 0u, rate = 0u;
+	int rate_rc = -1, n, m;
+
+	if ((g_sdhci != NULL) && wifi_isJoined()) {
+		rate_rc = diag_bcdcCmd(g_sdhci, g_sdio_core, 0, BRCMF_C_GET_RATE, NULL, 4u,
+			rbuf, sizeof(rbuf), &rlen, 211u, g_data_seq++);
+		if ((rate_rc == 0) && (rlen >= 4u)) {
+			rate = diag_le32(rbuf);
+		}
+	}
+
+	n = snprintf(out, (size_t)cap, "WIFISTATS phy rate=%u.%u Mbit/s rc=%d\n",
+		(unsigned)(rate / 2u), (unsigned)((rate & 1u) * 5u), rate_rc);
+	if ((n < 0) || (n >= cap)) {
+		return n;
+	}
+	m = snprintf(out + n, (size_t)(cap - n),
 		"WIFISTATS tx_calls=%u tx_us_total=%llu tx_us_avg=%llu\n"
 		"WIFISTATS rx_hits=%u rx_hit_us_total=%llu rx_hit_us_avg=%llu\n"
 		"WIFISTATS rx_misses=%u rx_miss_us_total=%llu rx_miss_us_avg=%llu\n"
@@ -4689,6 +4711,10 @@ static int wifi_stats(char *out, int cap)
 		g_rx_big_ok, g_rx_big_ok_len, g_join_rxglom_rc,
 		g_glom_descs, g_glom_supers, g_glom_subs, g_glom_bad,
 		(unsigned)g_sbwin_writes, (unsigned)g_sbwin_skips);
+	if (m < 0) {
+		return m;
+	}
+	return ((n + m) < cap) ? (n + m) : (cap - 1);
 }
 
 
