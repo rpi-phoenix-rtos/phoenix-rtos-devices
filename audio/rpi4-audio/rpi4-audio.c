@@ -18,7 +18,11 @@
  *              cursor (SOURCE_AD) and applies backpressure so the caller blocks at
  *              playback rate. Falls back to PIO (poll STA.FULL) if the DMA ring
  *              cannot be brought up.
- *   RPI4AUDIO_GETSTATE devctl - {clock busy, PWEN, STA, underruns} for the scout.
+ *              The DMA never stops, so a sweeper thread overwrites every word it
+ *              has played with silence (rpi4-audio-ring.h): when the writer stops
+ *              (underrun, pause, close, exit) the tail plays out and the jack then
+ *              idles at mid-scale instead of repeating the ring's last ~0.19 s.
+ *   RPI4AUDIO_GETSTATE devctl - {clock busy, PWEN, STA, underruns, ring state}.
  *
  * Userspace MMIO driver in the rpi4-thermal/rpi4-gpio idiom (mmap MAP_PHYSMEM
  * uncached, portCreate + create_dev, msg loop). The *audible* sign-off needs
@@ -46,9 +50,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/threads.h>
+#include <sys/time.h>
 #include <posix/utils.h>
 
 #include "rpi4-audio.h"
+#include "rpi4-audio-ring.h"
 
 /* BCM2711 blocks (bus 0x7e... -> ARM low-peripheral 0xfe...). MAP_PHYSMEM needs a
  * page-aligned offset, so map the containing page and index in. PWM1 sits at
@@ -132,6 +139,14 @@ enum {
 #define PWM_RANGE     612u
 #define AUDIO_RATE    (27000000u / PWM_RANGE)  /* ~44117 Hz */
 
+/* The duty word for PCM 0. The format is offset binary in duty terms -- audio_duty()
+ * maps -32768..32767 to 0..RANGE -- so silence is MID-SCALE, not 0: a ring of zeros
+ * would hold the jack at one rail and click on the way there. It is also the level
+ * the ring idles at from boot, so going idle never moves the output. */
+#define DUTY_SILENCE  (PWM_RANGE / 2u)
+_Static_assert((32768u * PWM_RANGE) / 65536u == DUTY_SILENCE,
+	"PCM 0 must convert to exactly the idle duty, or every stop clicks");
+
 #define SPIN_MAX 1000000u
 
 /* BCM2711 legacy DMA controller. 15 channels, 0x100 apart, from DMA_BASE. We use
@@ -176,6 +191,27 @@ enum {
 #define RING_WORDS      16384u
 #define RING_BYTES      (RING_WORDS * 4u)
 
+/* Ring words the engine consumes per second: one FIFO word per channel per range
+ * period. Matches the start settle (1784-2352 words across a 20 ms usleep, which only
+ * ever oversleeps). Used only to tell a lap from a short move -- see audioring_consumed(). */
+#define AUDIO_WORD_RATE (2u * AUDIO_RATE)
+
+/* The sweeper's period while anything is pending. It must run at least once per lap
+ * (~186 ms) for a played word to be silenced before the engine reaches it again; 20 ms
+ * leaves 9x margin and costs ~1 800 uncached stores per wake. It sleeps on the condition
+ * variable, at no cost, whenever nothing is pending. */
+#define SWEEP_PERIOD_US 20000u
+#define SWEEP_PRIO      3
+
+/* Where a write resumes after the ring ran dry: this far ahead of the read cursor
+ * (~2.9 ms), so the engine does not fetch a word before the store that fills it has
+ * drained -- and not a whole lap behind it, which is where it would otherwise land. */
+#define RESYNC_LEAD_WORDS 256u
+
+/* At most one "close:" and one "underrun:" line per second each; the ones skipped are
+ * counted into the next line and every event is in the GETSTATE counters. */
+#define LOG_INTERVAL_US 1000000
+
 /* A started channel is one that makes PROGRESS. The ring plays free-running silence,
  * so across the 20 ms arm settle a healthy channel walks SOURCE_AD 1784-2352 words
  * (one FIFO word per channel per range period) while the stall signature — ACTIVE,
@@ -201,6 +237,12 @@ typedef struct {
 	uint32_t pad[2];
 } dma_cb_t;
 
+typedef struct {
+	time_t last;                   /* when the last line was printed; 0 = never */
+	uint32_t skipped;              /* lines suppressed since then */
+} audio_ratelimit_t;
+
+
 static struct {
 	volatile uint32_t *pwm;
 	volatile uint32_t *cprman;
@@ -208,7 +250,18 @@ static struct {
 	volatile uint32_t *dma;        /* DMA channel DMA_CHAN registers */
 	volatile uint32_t *ring;       /* persistent duty-word ring the DMA plays */
 	uintptr_t ring_pa;             /* ring physical base (for the read-cursor math) */
-	uint32_t write_idx;            /* next ring word audio_write() will fill */
+	audioring_t rs;                /* ring bookkeeping: write position, pending words */
+	time_t svc_time;               /* when rs last caught up with the cursor */
+	handle_t lock;                 /* ring + engine state: message thread vs sweeper */
+	handle_t cond;                 /* wakes the sweeper when the ring stops being idle */
+	uint32_t openers;              /* open minus close; labels the log lines only */
+	uint32_t tail_filled;          /* words silenced since the last write */
+	uint32_t drains;               /* the ring ran dry and was left all silence */
+	uint32_t drains_open;          /* ...with the device still open (underrun or pause) */
+	uint32_t laps;                 /* services that found the cursor a lap or more on */
+	uint32_t silenced;             /* words overwritten with silence, total */
+	audio_ratelimit_t log_close;
+	audio_ratelimit_t log_drain;
 	int dma_active;                /* streaming DMA running -> ring path; else PIO */
 	uint32_t underruns;
 	uint32_t start_words;          /* ring words the DMA consumed during the start settle */
@@ -217,6 +270,8 @@ static struct {
 	uint32_t stalls;               /* write paths that timed out on a non-draining engine */
 	uint32_t recoveries;           /* successful re-arms */
 } ad;
+
+static char audio_sweepStack[8192] __attribute__((aligned(8)));
 
 
 /* Mux GPIO 40 + 41 to ALT0 (PWM). */
@@ -366,27 +421,226 @@ static uint32_t audio_ringReadIdx(void)
 	return (idx < RING_WORDS) ? idx : 0u;
 }
 
-/* Convert signed 16-bit PCM to PWM duty (0..RANGE). Stereo interleaved input feeds
- * both channels (the shared FIFO alternates ch1/ch2 with both USEF set).
+static int audio_dmaArm(void);
+
+
+static time_t audio_now(void)
+{
+	time_t now = 0;
+
+	(void)gettime(&now, NULL);
+	return now;
+}
+
+
+/* Rate limiter for the tagged lines: returns 1 if this one may print, and hands back
+ * how many were skipped since the last one that did. */
+static int audio_logOk(audio_ratelimit_t *rl, time_t now, uint32_t *skipped)
+{
+	if ((rl->last != 0) && ((now - rl->last) < LOG_INTERVAL_US)) {
+		rl->skipped++;
+		return 0;
+	}
+	*skipped = rl->skipped;
+	rl->skipped = 0;
+	rl->last = now;
+	return 1;
+}
+
+
+static uint32_t audio_wordsToMs(uint32_t words)
+{
+	return (uint32_t)(((uint64_t)words * 1000u) / AUDIO_WORD_RATE);
+}
+
+
+/* The ring ran dry: the tail has played and every word now holds silence. The line
+ * carries its own proof -- the non-silent count is taken from the ring itself, and the
+ * engine state from DMA_CS -- so a UART log shows the fix acting without a microphone. */
+static void audio_logDrain(uint32_t flags, time_t now)
+{
+	uint32_t skipped, cs;
+	int open = (ad.openers != 0u);
+
+	ad.drains++;
+	if (open) {
+		ad.drains_open++;
+	}
+	if ((flags & AUDIORING_LAPPED) != 0u) {
+		ad.laps++;
+	}
+	if (audio_logOk(&ad.log_drain, now, &skipped) != 0) {
+		cs = ad.dma[DMA_CS];
+		printf("rpi4-audio: underrun: silence-filled %u words (~%u ms), dma=%s cs=0x%08x, "
+			"ring nonsilent=%u/%u, stream=%s, lapped=%u (drains=%u, %u lines skipped)\n",
+			ad.tail_filled, audio_wordsToMs(ad.tail_filled),
+			((cs & DMA_CS_ACTIVE) != 0u) ? "running" : "stopped", cs,
+			audioring_countNot(ad.ring, RING_WORDS, DUTY_SILENCE), RING_WORDS,
+			open ? "open" : "closed", ((flags & AUDIORING_LAPPED) != 0u) ? 1u : 0u,
+			ad.drains, skipped);
+	}
+	ad.tail_filled = 0;
+}
+
+
+/* Catch the bookkeeping up with the DMA's live cursor and overwrite what it played with
+ * silence. Caller holds ad.lock and has checked ad.dma_active. */
+static void audio_ringService(void)
+{
+	time_t now = audio_now();
+	uint32_t cur = audio_ringWordRaw();
+	uint64_t expected = 0;
+	uint32_t consumed, filled, flags;
+
+	if (now > ad.svc_time) {
+		expected = ((uint64_t)(now - ad.svc_time) * AUDIO_WORD_RATE) / 1000000u;
+	}
+	consumed = audioring_consumed(&ad.rs, cur, expected);
+	flags = audioring_advance(&ad.rs, ad.ring, cur, consumed, DUTY_SILENCE, &filled);
+	ad.svc_time = now;
+
+	if (filled != 0u) {
+		/* Same reason as the write path's barrier: the engine reads these from DRAM. */
+		__asm__ volatile("dsb sy" ::: "memory");
+		ad.tail_filled += filled;
+		ad.silenced += filled;
+	}
+	if ((flags & AUDIORING_DRAINED) != 0u) {
+		audio_logDrain(flags, now);
+	}
+}
+
+
+/* Keeps the played part of the ring silent while nobody is writing -- the case the
+ * write path cannot cover, because it only runs when there is something to write.
+ * Sleeps on the condition variable while nothing is pending, so an idle device costs
+ * nothing; the writer signals it when a write makes the ring non-idle. */
+static void audio_sweepThread(void *arg)
+{
+	(void)arg;
+
+	/* Held for the thread's lifetime on purpose: condWait() releases it while waiting and
+	 * holds it again on return, on a timeout too (kernel proc_lockWait() relocks unless
+	 * interrupted, and libphoenix condClockWait() relocks after -EINTR). */
+	mutexLock(ad.lock);
+	for (;;) {
+		if ((ad.dma_active != 0) && (ad.rs.pending != 0u)) {
+			audio_ringService();
+			(void)condWait(ad.cond, ad.lock, SWEEP_PERIOD_US);
+		}
+		else {
+			(void)condWait(ad.cond, ad.lock, 0);
+		}
+	}
+}
+
+
+/* The engine did not drain a single word in ~10 s. Mid-stream stall: never observed
+ * (all three 2026-09-18 captures were at 0 samples, i.e. at init), so this does exactly
+ * what the init path does and no more: one re-arm, then degrade. Caller holds ad.lock. */
+static void audio_ringStalled(void)
+{
+	ad.underruns++;
+	ad.stalls++;
+	printf("rpi4-audio: write STALLED ~10s with no drain — CS=0x%08x "
+		"DEBUG=0x%08x STA=0x%08x CTL=0x%08x RNG1=%u CM_PWMCTL=0x%08x; "
+		"re-arming\n",
+		ad.dma[DMA_CS], ad.dma[DMA_DEBUG], ad.pwm[PWM_STA],
+		ad.pwm[PWM_CTL], ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL]);
+	ad.dma[DMA_CS] = 0;
+	audio_pwmInit();
+	if (audio_dmaArm() == 0) {
+		ad.recoveries++;
+		printf("rpi4-audio: engine RECOVERED after the stall (advanced %u "
+			"words in 20ms) — the parked channel is re-armable\n",
+			ad.start_words);
+	}
+	else {
+		ad.dma_active = 0;
+		ad.null_sink = 1;
+		printf("rpi4-audio: engine did NOT recover (advanced %u words) — "
+			"/dev/audio0 degrades to a paced null sink; a PWM re-init does "
+			"not reach whatever state this is\n", ad.start_words);
+	}
+}
+
+
+/* Signed 16-bit PCM to PWM duty (0..RANGE); 0 maps to DUTY_SILENCE. */
+static uint32_t audio_duty(int16_t s)
+{
+	return (uint32_t)(((int32_t)s + 32768) * (int32_t)PWM_RANGE / 65536);
+}
+
+
+/* Streaming-DMA write: copy duty words into the free region of the ring (already
+ * silence, see rpi4-audio-ring.h) as it opens up behind the read cursor. When the ring
+ * is full of not-yet-played audio, wait for the DMA to drain some -- i.e. write() blocks
+ * at the real playback rate (backpressure), no CPU FIFO-spin. Yield (~0.5 ms) instead
+ * of busy-spinning so the driver doesn't burn a core competing with the game's render
+ * threads — the DMA drains ~44 words per 0.5 ms, so each wake bursts in a chunk.
  *
- * Streaming-DMA path (preferred): copy each duty word into the free-running ring
- * ahead of the DMA read cursor. When the ring is full of not-yet-played audio we
- * spin on SOURCE_AD until the DMA drains a slot — i.e. write() blocks at the real
- * playback rate (backpressure), no CPU FIFO-spin. PIO path (fallback if the DMA
- * never started): the old per-sample FIFO push, which spins on STA.FULL.
+ * Holds ad.lock for the whole call, waits included: the sweeper has nothing to do while
+ * a writer is here, since the writer services the ring itself on every pass. */
+static size_t audio_ringWrite(const int16_t *s, size_t n)
+{
+	size_t done = 0;
+	uint32_t waits = 0, k, i;
+	int wasIdle;
+
+	mutexLock(ad.lock);
+	while ((done < n) && (ad.dma_active != 0)) {
+		audio_ringService();
+		audioring_resync(&ad.rs, RESYNC_LEAD_WORDS);
+		k = audioring_space(&ad.rs);
+		if (k == 0u) {
+			usleep(500);
+			if (++waits > 20000u) {   /* ~10 s with no drain -> DMA stuck */
+				audio_ringStalled();
+				break;
+			}
+			continue;
+		}
+		if (k > n - done) {
+			k = (uint32_t)(n - done);
+		}
+		for (i = 0; i < k; i++) {
+			ad.ring[(ad.rs.wr + i) % RING_WORDS] = audio_duty(s[done + i]);
+		}
+		/* Bound how long these samples can sit unseen by the DMA engine. Same Normal-NC
+		 * reasoning as audio_dmaArm(): ordinary stores to uncached memory that an
+		 * external master reads from DRAM, and nothing else here orders them. It cannot
+		 * *guarantee* visibility the way the barrier in audio_dmaArm() does -- the engine
+		 * is free-running, so there is no kick to order against -- but writes land
+		 * ahead of the cursor, by RESYNC_LEAD_WORDS at the least, so this caps the
+		 * staleness well inside that lead. */
+		__asm__ volatile("dsb sy" ::: "memory");
+		wasIdle = (ad.rs.pending == 0u);
+		audioring_commit(&ad.rs, k);
+		ad.tail_filled = 0;
+		if (wasIdle) {
+			(void)condSignal(ad.cond);
+		}
+		done += k;
+		waits = 0;
+	}
+	mutexUnlock(ad.lock);
+
+	return done;
+}
+
+
+/* Stereo interleaved input feeds both channels (the shared FIFO alternates ch1/ch2 with
+ * both USEF set). Streaming-DMA path preferred (audio_ringWrite() above); PIO fallback
+ * if the DMA never started: the old per-sample FIFO push, which spins on STA.FULL.
  *
  * Either way we return the bytes *actually consumed* (len on success, a short count
  * only if the engine is genuinely stuck), so a userspace feeder (the Quakespasm
  * SNDDMA backend) advances its play cursor by exactly what was queued. */
-static int audio_dmaArm(void);
-
-
 static ssize_t audio_write(const void *buf, size_t len)
 {
 	const int16_t *s = buf;
 	size_t n = len / 2;   /* int16 samples */
 	size_t i;
-	int ring_dirty = 0;
 
 	/* Degraded mode: the engine would not stream and the driver said so at init. Accept
 	 * the data and drop it, but PACE the acceptance at the real playback rate — a sink
@@ -399,68 +653,16 @@ static ssize_t audio_write(const void *buf, size_t len)
 		return (ssize_t)len;
 	}
 
-	for (i = 0; i < n; i++) {
-		uint32_t duty = (uint32_t)(((int32_t)s[i] + 32768) * (int32_t)PWM_RANGE / 65536);
+	if (ad.dma_active != 0) {
+		return (ssize_t)(audio_ringWrite(s, n) * 2u);
+	}
 
-		if (ad.dma_active != 0) {
-			uint32_t waits = 0;
-			/* Wait for room ahead of the read cursor (keep 1 word of headroom). Yield
-			 * (~0.5 ms) instead of busy-spinning so the driver doesn't burn a core
-			 * competing with the game's render threads — the DMA drains ~44 words per
-			 * 0.5 ms, so each wake bursts in a chunk; the loop self-paces to playback. */
-			while (((ad.write_idx - audio_ringReadIdx() + RING_WORDS) % RING_WORDS) >= (RING_WORDS - 1u)) {
-				usleep(500);
-				if (++waits > 20000u) {   /* ~10 s with no drain -> DMA stuck */
-					ad.underruns++;
-					ad.stalls++;
-					/* Mid-stream stall. Never observed (all three 2026-09-18 captures were
-					 * at 0 samples, i.e. at init), so this does exactly what the init path
-					 * does and no more: one re-arm, then degrade. */
-					printf("rpi4-audio: write STALLED ~10s with no drain — CS=0x%08x "
-						"DEBUG=0x%08x STA=0x%08x CTL=0x%08x RNG1=%u CM_PWMCTL=0x%08x; "
-						"re-arming\n",
-						ad.dma[DMA_CS], ad.dma[DMA_DEBUG], ad.pwm[PWM_STA],
-						ad.pwm[PWM_CTL], ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL]);
-					ad.dma[DMA_CS] = 0;
-					audio_pwmInit();
-					if (audio_dmaArm() == 0) {
-						ad.recoveries++;
-						printf("rpi4-audio: engine RECOVERED after the stall (advanced %u "
-							"words in 20ms) — the parked channel is re-armable\n",
-							ad.start_words);
-					}
-					else {
-						ad.dma_active = 0;
-						ad.null_sink = 1;
-						printf("rpi4-audio: engine did NOT recover (advanced %u words) — "
-							"/dev/audio0 degrades to a paced null sink; a PWM re-init does "
-							"not reach whatever state this is\n", ad.start_words);
-					}
-					return (ssize_t)(i * 2);
-				}
-			}
-			ad.ring[ad.write_idx] = duty;
-			ad.write_idx = (ad.write_idx + 1u) % RING_WORDS;
-			ring_dirty = 1;
-		}
-		else if (audio_fifoPush(duty) != 0) {
+	for (i = 0; i < n; i++) {
+		if (audio_fifoPush(audio_duty(s[i])) != 0) {
 			ad.underruns++;
 			break;
 		}
 	}
-
-	/* Bound how long the samples we just wrote can sit unseen by the DMA engine. Same
-	 * Normal-NC reasoning as audio_dmaArm(): these are ordinary stores to uncached memory
-	 * that an external master reads from DRAM, and nothing else here orders them. This
-	 * cannot *guarantee* visibility the way the barrier in audio_dmaArm() does — the
-	 * engine is free-running on a self-chained CB, so there is no kick to order against
-	 * and it may still fetch a word written earlier in the loop above. It only caps the
-	 * staleness at one write() call. That is acceptable because the ring holds ~0.19 s of
-	 * audio ahead of the read cursor: bounded latency, not a correctness gap. */
-	if (ring_dirty != 0) {
-		__asm__ volatile("dsb sy" ::: "memory");
-	}
-
 	return (ssize_t)(i * 2);
 }
 
@@ -554,7 +756,9 @@ static void audio_devctl(msg_t *msg)
 			return;
 		}
 		at = *(const rpi4audio_armtrials_t *)in;
+		mutexLock(ad.lock);
 		audio_armTrials(&at);
+		mutexUnlock(ad.lock);
 		ioctl_setResponse(msg, req, EOK, &at);
 		return;
 	}
@@ -565,11 +769,47 @@ static void audio_devctl(msg_t *msg)
 		st.pwm_ctl = ad.pwm[PWM_CTL];
 		st.pwm_sta = ad.pwm[PWM_STA];
 		st.underruns = ad.underruns;
+		mutexLock(ad.lock);
+		st.dma_cs = (ad.dma != MAP_FAILED) ? ad.dma[DMA_CS] : 0u;
+		st.ring_pending = ad.rs.pending;
+		st.ring_nonsilent = (ad.ring != NULL) ?
+			audioring_countNot(ad.ring, RING_WORDS, DUTY_SILENCE) : 0u;
+		st.ring_drains = ad.drains;
+		st.ring_underruns = ad.drains_open;
+		st.ring_laps = ad.laps;
+		st.ring_silenced = ad.silenced;
+		mutexUnlock(ad.lock);
 		ioctl_setResponse(msg, req, EOK, &st);
 	}
 	else {
 		ioctl_setResponse(msg, req, -EINVAL, NULL);
 	}
+}
+
+
+/* Nothing to stop: the sweeper silences the tail once it has played, whether or not a
+ * close ever arrives, so the close only reports. The line says what is still queued, so
+ * the "underrun: ... stream=closed" line that follows it can be matched to it in a log. */
+static void audio_close(void)
+{
+	uint32_t skipped;
+	time_t now = audio_now();
+
+	mutexLock(ad.lock);
+	/* Service before the count drops: a drain that already happened happened with the
+	 * device open, and is labelled so; the close line then reports 0 words queued. */
+	if (ad.dma_active != 0) {
+		audio_ringService();
+	}
+	if (ad.openers != 0u) {
+		ad.openers--;
+	}
+	if ((ad.dma_active != 0) && (audio_logOk(&ad.log_close, now, &skipped) != 0)) {
+		printf("rpi4-audio: close: openers=%u, %u words (~%u ms) still to play, then "
+			"silence (%u lines skipped)\n", ad.openers, ad.rs.pending,
+			audio_wordsToMs(ad.rs.pending), skipped);
+	}
+	mutexUnlock(ad.lock);
 }
 
 
@@ -589,7 +829,13 @@ static void audio_thread(void *arg)
 		}
 		switch (msg.type) {
 			case mtOpen:
+				mutexLock(ad.lock);
+				ad.openers++;
+				mutexUnlock(ad.lock);
+				msg.o.err = EOK;
+				break;
 			case mtClose:
+				audio_close();
 				msg.o.err = EOK;
 				break;
 			case mtWrite:
@@ -620,8 +866,8 @@ static void audio_thread(void *arg)
 
 
 /* Start the free-running streaming DMA: a duty-word ring played to the PWM FIFO by
- * a self-chained control block (NEXTCONBK -> itself), DREQ-paced, forever. The ring
- * is pre-filled with mid-scale (silence). audio_write() then fills it ahead of the
+ * a self-chained control block (NEXTCONBK -> itself), DREQ-paced, forever. Each arm
+ * fills the ring with mid-scale (silence). audio_write() then fills it ahead of the
  * read cursor. On success sets ad.dma_active so the write path uses the ring; on any
  * failure leaves it 0 so audio_write() falls back to the PIO FIFO push. */
 /* Arm — or RE-arm — the streaming DMA on the already-allocated ring and control block,
@@ -651,7 +897,15 @@ static int audio_dmaArm(void)
 	 *
 	 * ⓘ NOT claimed as the cure for the stall: syscalls between the CB write and the
 	 * arm may already drain it incidentally on most boots. It is landed because
-	 * relying on an incidental barrier is a latent defect either way. */
+	 * relying on an incidental barrier is a latent defect either way.
+	 *
+	 * The same barrier drains the silence fill just before it: an arm starts the engine
+	 * at the ring base with nothing pending, and the sweeper's invariant (everything
+	 * outside the pending region is silence, rpi4-audio-ring.h) has to hold from the
+	 * first word. A re-arm after a stall would otherwise restart on stale audio. */
+	(void)audioring_fill(ad.ring, RING_WORDS, 0, RING_WORDS, DUTY_SILENCE);
+	audioring_init(&ad.rs, RING_WORDS);
+	ad.tail_filled = 0;
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	ad.pwm[PWM_DMAC] = PWM_DMAC_ENAB | (8u << 8) | (4u << 0);
@@ -661,7 +915,6 @@ static int audio_dmaArm(void)
 	}
 	ad.dma[DMA_DEBUG] = DMA_DBG_ERRORS;   /* W1C anything the engine had latched */
 	ad.dma[DMA_CONBLK_AD] = DRAM_BUS(ad.cb_pa);
-	ad.write_idx = 0;
 	ad.dma[DMA_CS] = DMA_CS_ACTIVE;
 
 	/* ⚠ ACTIVE with no ERROR is NOT a started channel: DMA_CS=0x21 is
@@ -681,6 +934,7 @@ static int audio_dmaArm(void)
 	 * 16 384-word ring: the cursor cannot lap and alias back to a small number. */
 	usleep(20000);
 	ad.start_words = audio_ringWordRaw();
+	ad.svc_time = audio_now();
 
 	return (ad.start_words >= DMA_START_MIN_WORDS) ? 0 : -1;
 }
@@ -688,7 +942,7 @@ static int audio_dmaArm(void)
 
 static void audio_dmaStart(void)
 {
-	uint32_t i, attempt;
+	uint32_t attempt;
 	dma_cb_t *cb;
 	uintptr_t cb_pa;
 
@@ -710,9 +964,7 @@ static void audio_dmaStart(void)
 		return;
 	}
 
-	for (i = 0; i < RING_WORDS; i++)
-		ad.ring[i] = PWM_RANGE / 2u;   /* mid-scale = silence */
-	ad.write_idx = 0;
+	/* No silence pre-fill here: audio_dmaArm() fills the ring on every arm. */
 	ad.ring_pa = (uintptr_t)va2pa((void *)ad.ring);
 
 	cb_pa = (uintptr_t)va2pa(cb);
@@ -823,6 +1075,11 @@ int main(int argc, char **argv)
 		ad.pwm[PWM_STA], ad.pwm[PWM_CTL], ad.pwm[PWM_RNG1], ad.cprman[CM_PWMCTL],
 		ad.cprman[CM_PWMDIV]);
 
+	if ((mutexCreate(&ad.lock) != EOK) || (condCreate(&ad.cond) != EOK)) {
+		printf("rpi4-audio: mutex/cond create failed\n");
+		return 1;
+	}
+
 	/* P1 bring-up: GPIO ALT0, PWM clock, PWM engine. */
 	audio_gpioAlt0();
 	clkok = audio_clockInit();
@@ -856,11 +1113,25 @@ int main(int argc, char **argv)
 		printf("rpi4-audio: dma channel mmap failed (PIO fallback)\n");
 	}
 
+	/* Started whenever the ring exists, not only when the first arm streamed: an
+	 * ARMTRIALS run can bring a null-sinking engine back to streaming, and the sweeper
+	 * checks dma_active itself. Before the self-test, which is the first writer. */
+	if ((ad.ring != NULL) &&
+		(beginthread(audio_sweepThread, SWEEP_PRIO, audio_sweepStack, sizeof(audio_sweepStack), NULL) != EOK)) {
+		printf("rpi4-audio: sweeper thread failed to start — the ring will repeat its "
+			"last ~0.19 s whenever the writer stops\n");
+	}
+
 	/* Boot self-test: feed a short 440 Hz square wave through the s16->duty write path
 	 * end-to-end. With the streaming DMA up this fills the ring (paced by the ring
 	 * backpressure to the ~44.1 kHz drain rate); underruns==0 confirms the path keeps
 	 * up. Audible as a brief blip on the jack (headphones = the attended sign-off); the
-	 * self-log is the autonomous verification. No libm: square wave via integer phase. */
+	 * self-log is the autonomous verification. No libm: square wave via integer phase.
+	 *
+	 * ⓘ Before the sweeper existed this was not a blip: nothing overwrote the tone after
+	 * it played, so the self-chained DMA pulsed it (~0.10 s tone, ~0.08 s silence) from
+	 * boot until the first program wrote. It is now the first writer the sweeper drains,
+	 * so every boot log carries one "underrun: ... stream=closed" line right after this. */
 	if (clkok == 0) {
 		int16_t tone[256];
 		uint32_t total = AUDIO_RATE / 5u;            /* ~0.2 s */
@@ -917,7 +1188,7 @@ int main(int argc, char **argv)
 						"CM_PWMCTL=0x%08x CM_PWMDIV=0x%08x PWM_CTL=0x%08x PWM_DMAC=0x%08x "
 						"RNG1=%u DAT1=%u STA+2ms=0x%08x DEBUG=0x%08x CONBLK=0x%08x "
 						"SRC=0x%08x DEST=0x%08x LEN=%u NEXT=0x%08x start_words=%u\n",
-						fed, ad.pwm[PWM_STA], ad.dma[DMA_CS], ad.write_idx,
+						fed, ad.pwm[PWM_STA], ad.dma[DMA_CS], ad.rs.wr,
 						audio_ringReadIdx(), ad.cprman[CM_PWMCTL], ad.cprman[CM_PWMDIV],
 						ad.pwm[PWM_CTL], ad.pwm[PWM_DMAC], ad.pwm[PWM_RNG1],
 						ad.pwm[PWM_DAT1], (usleep(2000), ad.pwm[PWM_STA]),
