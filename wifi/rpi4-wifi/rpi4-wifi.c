@@ -289,9 +289,16 @@ static void diag_wifiPowerCycle(void)
  * derive from the same PLL as the core clock -- so ask for its rate rather
  * than assume one. 250 MHz is the rate observed with core_freq=250 and is
  * only the fallback when the mailbox query fails. */
-#define VC_PROP_GET_CLOCK_RATE 0x00030002u
+#define VC_PROP_GET_CLOCK_RATE          0x00030002u
+#define VC_PROP_GET_CLOCK_RATE_MEASURED 0x00030047u
 #define VC_CLOCK_EMMC          1u
 #define SDHCI_BASE_HZ_DEFAULT  250000000u
+
+/* The EMMC clock as the firmware MEASURES it (0 if the query failed). The rate
+ * GET_CLOCK_RATE reports is the one the firmware set; the measured one is what
+ * the CPRMAN counter sees, so a PLL that moved underneath the setting (e.g. with
+ * core_freq) would show up as a difference between the two. */
+static uint32_t g_sdhci_measured_hz;
 
 /* Reference clock of the SDHCI divider, queried once through /dev/vcmbox. */
 static uint32_t diag_sdhciBaseHz(void)
@@ -311,6 +318,12 @@ static uint32_t diag_sdhciBaseHz(void)
 	else {
 		base_hz = SDHCI_BASE_HZ_DEFAULT;
 		printf("rpi4-wifi: GET_CLOCK_RATE(EMMC) failed; assuming %u Hz\n", (unsigned)base_hz);
+	}
+
+	out[0] = 0u;
+	out[1] = 0u;
+	if (vcmbox_call(VC_PROP_GET_CLOCK_RATE_MEASURED, sizeof(in), in, 2u, out, 2u) == 0) {
+		g_sdhci_measured_hz = out[1];
 	}
 
 	return base_hz;
@@ -369,6 +382,12 @@ static int diag_sdhciSetClockKHz(volatile uint8_t *base, unsigned target_khz)
 		v |= (1u << 2);
 		*(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET) = v;
 	}
+
+	/* The whole derivation on one line, so a boot log shows the bus clock the
+	 * card actually got rather than the one that was asked for. */
+	printf("rpi4-wifi: SDIO-CLK target=%u kHz base=%u Hz measured=%u Hz div=%u sd=%u Hz\n",
+		target_khz, (unsigned)base_hz, (unsigned)g_sdhci_measured_hz, (unsigned)divisor,
+		(unsigned)(base_hz / (2u * divisor)));
 
 	return 0;
 }
@@ -546,6 +565,153 @@ static int diag_sdioGoHighSpeed(volatile uint8_t *sdhci)
 	return 0;
 }
 
+/* ---- Waiting on the controller -------------------------------------------
+ *
+ * Every wait in this file is a fixed count of 100000 register reads. That is a
+ * budget in bus cycles, not in time: an uncached read of this controller
+ * crosses the VideoCore peripheral bus, so the same count may last only about
+ * half as long at core_freq=500 as it did at 250. SDHCI-POLL below prints what
+ * it lasts on the running board. The block-mode CMD53 helpers now fall back to
+ * a wall-clock bound when the spin runs out.
+ *
+ * Their PIO loops also had an ordering hazard. They waited on the LATCHED
+ * buffer-ready bit in INT_STATUS before every word and cleared it after each
+ * block. If the controller raises "ready" for the next block before that clear
+ * lands -- the thread is interrupted or preempted between the last word and the
+ * clear while the previous block drains -- the clear erases it, nothing sets it
+ * again, and the loop times out with no error bit. That is rc -5 from
+ * diag_sdioCmd53Write, the signature of all three natural firmware-download
+ * failures in the log archive; whether it is also their cause is what
+ * `fwloadbench` measures. Linux's driver for this controller (bcm2835-mmc.c,
+ * bcm2835_mmc_transfer_pio) acknowledges first and then tests the LEVEL bits in
+ * PRESENT_STATE, which a lost edge cannot hide. That is the default here now.
+ * The old loop is kept, selectable at run time, only so `fwloadbench` can
+ * compare the two in one boot; remove it once that comparison is graded. */
+#define SDHCI_PRES_SPACE_AVAILABLE 0x00000400u /* Buffer Write Enable (level) */
+#define SDHCI_PRES_DATA_AVAILABLE  0x00000800u /* Buffer Read Enable (level) */
+#define SDHCI_SPIN_ITERS    100000u /* the historical budget, in register reads */
+#define SDHCI_SLOW_WAIT_US  100000u /* wall-clock grace once the spin runs out */
+
+static int g_pio_legacy = 0;          /* 1 = the old latched-bit loop, spin budget only */
+static uint32_t g_pio_slow_waits = 0; /* waits that outlasted the spin and then succeeded */
+static uint32_t g_pio_slow_max_us = 0;
+static uint32_t g_pio_timeouts = 0;
+static uint32_t g_pio_to_pres = 0, g_pio_to_int = 0; /* registers at the last timeout */
+
+static uint64_t diag_monoUs(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0u;
+	}
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+/* 0 when (reg & mask) != 0, -1 when INT_STATUS reports an error first, -2 on
+ * timeout: the spin budget, then (unless legacy) up to SDHCI_SLOW_WAIT_US of
+ * wall-clock time, checking once more after the deadline so that being
+ * preempted across it cannot fake a timeout. */
+static int diag_sdhciWaitSet(volatile uint8_t *sdhci, uint32_t reg, uint32_t mask)
+{
+	uint64_t t0, dt;
+	uint32_t i, st;
+	int last;
+
+	/* One read per iteration when waiting on INT_STATUS itself, exactly as the
+	 * loops this replaces did, so the legacy mode keeps their timing. */
+	for (i = 0; i < SDHCI_SPIN_ITERS; ++i) {
+		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+			return -1;
+		}
+		if ((((reg == SDHCI_INT_STATUS) ? st : *(volatile uint32_t *)(sdhci + reg)) & mask) != 0u) {
+			return 0;
+		}
+	}
+	if (g_pio_legacy != 0) {
+		return -2;
+	}
+
+	t0 = diag_monoUs();
+	do {
+		dt = diag_monoUs() - t0;
+		last = (dt >= SDHCI_SLOW_WAIT_US);
+		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+			return -1;
+		}
+		if ((((reg == SDHCI_INT_STATUS) ? st : *(volatile uint32_t *)(sdhci + reg)) & mask) != 0u) {
+			g_pio_slow_waits++;
+			if (dt > g_pio_slow_max_us) {
+				g_pio_slow_max_us = (uint32_t)dt;
+			}
+			return 0;
+		}
+	} while (last == 0);
+	return -2;
+}
+
+/* Record, and report the first few of, the PIO waits that timed out. SPACE/DATA
+ * are the level bits, WR/RD the latched ones: level=1 with latched=0 is a lost
+ * edge; level=0 means the controller really had no room (or no data). */
+static void diag_pioNoteTimeout(volatile uint8_t *sdhci, const char *dir, uint32_t blk, uint32_t nblk)
+{
+	g_pio_to_pres = *(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE);
+	g_pio_to_int = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+	if (g_pio_timeouts++ < 8u) {
+		printf("rpi4-wifi: SDHCI-TIMEOUT dir=%s mode=%s blk=%u/%u pres=0x%08x int=0x%08x "
+			"space=%u data=%u wr_rdy=%u rd_rdy=%u\n",
+			dir, (g_pio_legacy != 0) ? "legacy" : "level", (unsigned)blk, (unsigned)nblk,
+			(unsigned)g_pio_to_pres, (unsigned)g_pio_to_int,
+			(unsigned)((g_pio_to_pres >> 10) & 1u), (unsigned)((g_pio_to_pres >> 11) & 1u),
+			(unsigned)((g_pio_to_int >> 4) & 1u), (unsigned)((g_pio_to_int >> 5) & 1u));
+	}
+}
+
+/* Time the spin budget once: how long SDHCI_SPIN_ITERS reads of INT_STATUS
+ * take on this board, at this core clock. */
+static void diag_sdhciPollCalibrate(volatile uint8_t *sdhci)
+{
+	static int done = 0;
+	uint64_t t0, dt;
+	uint32_t i;
+
+	if (done != 0) {
+		return;
+	}
+	done = 1;
+	t0 = diag_monoUs();
+	for (i = 0; i < SDHCI_SPIN_ITERS; ++i) {
+		(void)*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+	}
+	dt = diag_monoUs() - t0;
+	printf("rpi4-wifi: SDHCI-POLL spin=%u reads took %u us (%u ns/read)\n",
+		(unsigned)SDHCI_SPIN_ITERS, (unsigned)dt,
+		(unsigned)((dt * 1000u) / SDHCI_SPIN_ITERS));
+}
+
+/* One DATA_PORT word to/from a little-endian byte buffer (NULL = discard). */
+static void diag_pioReadWord(volatile uint8_t *sdhci, uint8_t *buf, uint32_t i)
+{
+	uint32_t data = *(volatile uint32_t *)(sdhci + SDHCI_DATA_PORT);
+
+	if (buf != NULL) {
+		buf[i * 4 + 0] = (uint8_t)(data & 0xffu);
+		buf[i * 4 + 1] = (uint8_t)((data >> 8) & 0xffu);
+		buf[i * 4 + 2] = (uint8_t)((data >> 16) & 0xffu);
+		buf[i * 4 + 3] = (uint8_t)((data >> 24) & 0xffu);
+	}
+}
+
+static void diag_pioWriteWord(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t i)
+{
+	*(volatile uint32_t *)(sdhci + SDHCI_DATA_PORT) = (uint32_t)buf[i * 4 + 0] |
+		((uint32_t)buf[i * 4 + 1] << 8) |
+		((uint32_t)buf[i * 4 + 2] << 16) |
+		((uint32_t)buf[i * 4 + 3] << 24);
+}
+
 /* CMD53 (IO_RW_EXTENDED) block-mode READ via SDHCI PIO. buf must point
  * to a 4-byte-aligned destination of at least block_count*block_size
  * bytes. */
@@ -555,12 +721,12 @@ static int diag_sdioCmd53Read(volatile uint8_t *sdhci, int fn,
 	uint8_t *buf)
 {
 	uint32_t arg, cmd_word;
-	uint32_t st;
 	uint32_t bytes_total = block_count * block_size;
 	uint32_t words_total = bytes_total / 4u;
+	uint32_t wpb = block_size / 4u; /* words per block */
 	uint32_t bytes_in_block = 0;
-	uint32_t i;
-	int deadline;
+	uint32_t i, blk;
+	int deadline, rc;
 
 	/* Wait for CMD line idle. */
 	for (deadline = 100000; deadline > 0; --deadline) {
@@ -596,64 +762,51 @@ static int diag_sdioCmd53Read(volatile uint8_t *sdhci, int fn,
 		((uint32_t)53u << 24);
 	*(volatile uint32_t *)(sdhci + SDHCI_TRANS_CMD) = cmd_word;
 
-	for (deadline = 100000; deadline > 0; --deadline) {
-		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
-		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
-			return -2;
-		}
-		if ((st & SDHCI_INT_CMD_COMPLETE) != 0u) {
-			break;
-		}
-	}
-	if (deadline == 0) {
-		return -3;
+	rc = diag_sdhciWaitSet(sdhci, SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+	if (rc != 0) {
+		return (rc == -1) ? -2 : -3;
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
 
-	/* PIO read loop: drain DATA_PORT one word at a time; clear
-	 * BUFFER_READ_READY after each block-worth. */
-	for (i = 0; i < words_total; ++i) {
-		for (deadline = 100000; deadline > 0; --deadline) {
-			st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
-			if ((st & SDHCI_INT_ERR_ANY) != 0u) {
-				return -4;
+	if (g_pio_legacy != 0) {
+		/* The old loop: latched ready bit before every word, cleared after each
+		 * block (see "Waiting on the controller"). */
+		for (i = 0; i < words_total; ++i) {
+			rc = diag_sdhciWaitSet(sdhci, SDHCI_INT_STATUS, SDHCI_INT_BUF_RD_READY);
+			if (rc != 0) {
+				if (rc == -2) {
+					diag_pioNoteTimeout(sdhci, "rd", i / wpb, block_count);
+				}
+				return (rc == -1) ? -4 : -5;
 			}
-			if ((st & SDHCI_INT_BUF_RD_READY) != 0u) {
-				break;
-			}
-		}
-		if (deadline == 0) {
-			return -5;
-		}
-
-		{
-			uint32_t data = *(volatile uint32_t *)(sdhci + SDHCI_DATA_PORT);
-			if (buf != NULL) {
-				buf[i * 4 + 0] = (uint8_t)(data & 0xffu);
-				buf[i * 4 + 1] = (uint8_t)((data >> 8) & 0xffu);
-				buf[i * 4 + 2] = (uint8_t)((data >> 16) & 0xffu);
-				buf[i * 4 + 3] = (uint8_t)((data >> 24) & 0xffu);
+			diag_pioReadWord(sdhci, buf, i);
+			bytes_in_block += 4u;
+			if (bytes_in_block >= block_size) {
+				bytes_in_block = 0u;
+				*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_BUF_RD_READY;
 			}
 		}
-
-		bytes_in_block += 4u;
-		if (bytes_in_block >= block_size) {
-			bytes_in_block = 0u;
+	}
+	else {
+		/* Acknowledge, then wait for the LEVEL bit, then drain one block. */
+		for (blk = 0; blk < block_count; ++blk) {
 			*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_BUF_RD_READY;
+			rc = diag_sdhciWaitSet(sdhci, SDHCI_PRES_STATE, SDHCI_PRES_DATA_AVAILABLE);
+			if (rc != 0) {
+				if (rc == -2) {
+					diag_pioNoteTimeout(sdhci, "rd", blk, block_count);
+				}
+				return (rc == -1) ? -4 : -5;
+			}
+			for (i = blk * wpb; i < (blk + 1u) * wpb; ++i) {
+				diag_pioReadWord(sdhci, buf, i);
+			}
 		}
 	}
 
-	for (deadline = 100000; deadline > 0; --deadline) {
-		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
-		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
-			return -6;
-		}
-		if ((st & SDHCI_INT_XFER_COMPLETE) != 0u) {
-			break;
-		}
-	}
-	if (deadline == 0) {
-		return -7;
+	rc = diag_sdhciWaitSet(sdhci, SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE);
+	if (rc != 0) {
+		return (rc == -1) ? -6 : -7;
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
 	return 0;
@@ -826,21 +979,21 @@ static int diag_sdioCmd53WriteByteMode(volatile uint8_t *sdhci, int fn,
 }
 
 /* CMD53 (IO_RW_EXTENDED) block-mode WRITE via SDHCI PIO. Mirror of the
- * read: arg bit31 = 1, TRANSFER_MODE bit4 = 0, polls BUFFER_WRITE_READY,
- * writes DATA_PORT. Source is a little-endian byte buffer of at least
- * block_count*block_size bytes. */
+ * read: arg bit31 = 1, TRANSFER_MODE bit4 = 0, waits for buffer space (see
+ * "Waiting on the controller"), writes DATA_PORT. Source is a little-endian
+ * byte buffer of at least block_count*block_size bytes. */
 static int diag_sdioCmd53Write(volatile uint8_t *sdhci, int fn,
 	int incr_addr, uint32_t reg_addr,
 	uint32_t block_count, uint32_t block_size,
 	const uint8_t *buf)
 {
 	uint32_t arg, cmd_word;
-	uint32_t st;
 	uint32_t bytes_total = block_count * block_size;
 	uint32_t words_total = bytes_total / 4u;
+	uint32_t wpb = block_size / 4u; /* words per block */
 	uint32_t bytes_in_block = 0;
-	uint32_t i;
-	int deadline;
+	uint32_t i, blk;
+	int deadline, rc;
 
 	for (deadline = 100000; deadline > 0; --deadline) {
 		if ((*(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE) &
@@ -871,60 +1024,51 @@ static int diag_sdioCmd53Write(volatile uint8_t *sdhci, int fn,
 		((uint32_t)53u << 24);
 	*(volatile uint32_t *)(sdhci + SDHCI_TRANS_CMD) = cmd_word;
 
-	for (deadline = 100000; deadline > 0; --deadline) {
-		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
-		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
-			return -2;
-		}
-		if ((st & SDHCI_INT_CMD_COMPLETE) != 0u) {
-			break;
-		}
-	}
-	if (deadline == 0) {
-		return -3;
+	rc = diag_sdhciWaitSet(sdhci, SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+	if (rc != 0) {
+		return (rc == -1) ? -2 : -3;
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
 
-	for (i = 0; i < words_total; ++i) {
-		for (deadline = 100000; deadline > 0; --deadline) {
-			st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
-			if ((st & SDHCI_INT_ERR_ANY) != 0u) {
-				return -4;
+	if (g_pio_legacy != 0) {
+		/* The old loop: latched ready bit before every word, cleared after each
+		 * block (see "Waiting on the controller"). */
+		for (i = 0; i < words_total; ++i) {
+			rc = diag_sdhciWaitSet(sdhci, SDHCI_INT_STATUS, SDHCI_INT_BUF_WR_READY);
+			if (rc != 0) {
+				if (rc == -2) {
+					diag_pioNoteTimeout(sdhci, "wr", i / wpb, block_count);
+				}
+				return (rc == -1) ? -4 : -5;
 			}
-			if ((st & SDHCI_INT_BUF_WR_READY) != 0u) {
-				break;
+			diag_pioWriteWord(sdhci, buf, i);
+			bytes_in_block += 4u;
+			if (bytes_in_block >= block_size) {
+				bytes_in_block = 0u;
+				*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_BUF_WR_READY;
 			}
 		}
-		if (deadline == 0) {
-			return -5;
-		}
-
-		{
-			uint32_t data = (uint32_t)buf[i * 4 + 0] |
-				((uint32_t)buf[i * 4 + 1] << 8) |
-				((uint32_t)buf[i * 4 + 2] << 16) |
-				((uint32_t)buf[i * 4 + 3] << 24);
-			*(volatile uint32_t *)(sdhci + SDHCI_DATA_PORT) = data;
-		}
-
-		bytes_in_block += 4u;
-		if (bytes_in_block >= block_size) {
-			bytes_in_block = 0u;
+	}
+	else {
+		/* Acknowledge, then wait for the LEVEL bit, then fill one block. */
+		for (blk = 0; blk < block_count; ++blk) {
 			*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_BUF_WR_READY;
+			rc = diag_sdhciWaitSet(sdhci, SDHCI_PRES_STATE, SDHCI_PRES_SPACE_AVAILABLE);
+			if (rc != 0) {
+				if (rc == -2) {
+					diag_pioNoteTimeout(sdhci, "wr", blk, block_count);
+				}
+				return (rc == -1) ? -4 : -5;
+			}
+			for (i = blk * wpb; i < (blk + 1u) * wpb; ++i) {
+				diag_pioWriteWord(sdhci, buf, i);
+			}
 		}
 	}
 
-	for (deadline = 100000; deadline > 0; --deadline) {
-		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
-		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
-			return -6;
-		}
-		if ((st & SDHCI_INT_XFER_COMPLETE) != 0u) {
-			break;
-		}
-	}
-	if (deadline == 0) {
-		return -7;
+	rc = diag_sdhciWaitSet(sdhci, SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE);
+	if (rc != 0) {
+		return (rc == -1) ? -6 : -7;
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
 	return 0;
@@ -3214,6 +3358,14 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 static volatile uint8_t *g_sdhci = NULL;   /* SDHCI (Arasan) mapping, kept live after bring-up */
 static int g_fw_alive = 0;                 /* the last bring-up saw the firmware start (HT_AVAIL or CARD_INTR) */
 static int g_fw_retry_test = 0;            /* `fwretrytest`: treat the first bring-up as failed, to exercise the retry */
+static int g_bringup_quiet = 0;            /* `fwloadbench`: print the bring-up report only when it failed */
+static uint32_t g_fw_bytes = 0u;           /* firmware bytes the last bring-up wrote */
+static int g_fw_rc_w = 0, g_fw_rc_nvram = 0; /* its first firmware / NVRAM write error */
+/* How long the firmware download took, and its slowest CMD53 (4 KB) and where.
+ * The image is compiled into this binary and paged in from the root file
+ * system on first touch, so the first load of a process can stall inside a
+ * transfer; a slow CMD53 at the offset of a failure says the host stalled. */
+static uint32_t g_fw_dl_us = 0u, g_fw_cmd53_max_us = 0u, g_fw_cmd53_max_off = 0u, g_fw_cmd53_ge2ms = 0u;
 static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (set by bring-up) */
 
 #define WIFI_RESP_CAP (8u * 1024u)
@@ -3326,6 +3478,7 @@ static int wifi_bringup(void)
 	int rc_cnt_pre = -100, rc_cnt_post = -100, rc_cnt_post2 = -100;
 	uint32_t ioctl_w2 = 0u, ioctl_w3 = 0u; /* dual ARM-wrapper CR4-identity cross-check */
 	uint32_t cr4_core = 0u, sdio_core = 0x18004000u, ram_size = 0u; /* EROM-derived bases */
+	uint64_t dl_t0;
 
 	for (i = 0; i < (int)sizeof(pre_buf); ++i) {
 		pre_buf[i] = 0;
@@ -3371,10 +3524,18 @@ static int wifi_bringup(void)
 		return 2;
 	}
 
+	g_pio_slow_waits = 0u;
+	g_pio_slow_max_us = 0u;
+	g_pio_timeouts = 0u;
+	g_pio_to_pres = 0u;
+	g_pio_to_int = 0u;
+	g_fw_dl_us = 0u;
+
 	{
 		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
 		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
 
+		diag_sdhciPollCalibrate(sdhci);
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
@@ -3479,6 +3640,10 @@ static int wifi_bringup(void)
 		ram_size = diag_cr4RamSize(sdhci, cr4_core);
 		g_ram_size = ram_size;
 
+		g_fw_cmd53_max_us = 0u;
+		g_fw_cmd53_max_off = 0u;
+		g_fw_cmd53_ge2ms = 0u;
+		dl_t0 = diag_monoUs();
 		while (fw_offset < fw_target_bytes && rc_hs == 0) {
 			uint32_t addr = 0x00198000u + (uint32_t)window_idx * 0x8000u;
 			uint8_t  lo  = (uint8_t)(((addr >> 15) & 1u) ? 0x80u : 0x00u);
@@ -3496,11 +3661,21 @@ static int wifi_bringup(void)
 			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, hi,  NULL);
 
 			for (ci = 0; ci < chunks; ++ci) {
+				uint64_t c0 = diag_monoUs(), cdt;
+
 				rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
 					/*reg_addr=*/ci * bytes_per_cmd,
 					/*block_count=*/blk_count,
 					/*block_size=*/blk_size,
 					fw_img + fw_offset + ci * bytes_per_cmd);
+				cdt = diag_monoUs() - c0;
+				if (cdt > g_fw_cmd53_max_us) {
+					g_fw_cmd53_max_us = (uint32_t)cdt;
+					g_fw_cmd53_max_off = (uint32_t)(fw_offset + ci * bytes_per_cmd);
+				}
+				if (cdt >= 2000u) {
+					g_fw_cmd53_ge2ms++;
+				}
 				if (rc_w != 0) {
 					if (worst_rc_w == 0) worst_rc_w = rc_w;
 					break;
@@ -3525,6 +3700,7 @@ static int wifi_bringup(void)
 			fw_offset += this_window;
 			window_idx++;
 		}
+		g_fw_dl_us = (uint32_t)(diag_monoUs() - dl_t0);
 
 		/* NVRAM load: chip-ready blob goes at chip-internal
 		 * (rambase + ramsize - wifi_nvram_43455_len) = 0x238000 - len,
@@ -4145,9 +4321,68 @@ static int wifi_bringup(void)
 
 	/* The probe emitted this telemetry as its whole reason to exist; here it is
 	 * one-shot bring-up logging on the console. */
-	printf("%.*s", off, buf);
+	if ((g_bringup_quiet == 0) || (g_fw_alive == 0)) {
+		printf("%.*s", off, buf);
+	}
+	g_fw_bytes = bytes_written;
+	g_fw_rc_w = worst_rc_w;
+	g_fw_rc_nvram = rc_nvram_w;
+	printf("rpi4-wifi: SDHCI-PIO mode=%s fw_bytes=%u rc_w=%d rc_nvram=%d slow_waits=%u slow_max_us=%u timeouts=%u "
+		"dl_ms=%u cmd53_max_us=%u@0x%x cmd53_ge2ms=%u\n",
+		(g_pio_legacy != 0) ? "legacy" : "level", (unsigned)bytes_written, worst_rc_w, rc_nvram_w,
+		(unsigned)g_pio_slow_waits, (unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
+		(unsigned)(g_fw_dl_us / 1000u), (unsigned)g_fw_cmd53_max_us, (unsigned)g_fw_cmd53_max_off,
+		(unsigned)g_fw_cmd53_ge2ms);
 	fflush(stdout);
 	return (g_fw_alive != 0) ? 0 : 6;
+}
+
+
+/* `fwloadbench N`: load the firmware N times in one boot (each load starts with
+ * the WL_REG_ON power cycle wifi_bringup() always does), alternating the level
+ * and the legacy PIO wait, one FWLOAD-BENCH line per load. Comparing the two
+ * inside one boot and one binary is the only A/B here that is not confounded by
+ * build or boot differences; the natural failure rate (2 of 13 loads at
+ * core_freq=500, ~1 in 100 before) is far too low to grade across boots.
+ * Only load 1 runs with the firmware image still to be paged in, and the natural
+ * failures were all first loads: `legacypio` before `fwloadbench` makes load 1
+ * legacy, and `legacypio` on the daemon compares first loads across boots. */
+static int wifi_fwLoadBench(int n)
+{
+	/* `legacypio fwloadbench N` starts with the legacy wait, so the first
+	 * (cold) load can be given to either mode. */
+	int start = g_pio_legacy;
+	int i, rc, ok[2] = { 0, 0 }, runs[2] = { 0, 0 };
+
+	g_bringup_quiet = 1;
+	for (i = 0; i < n; ++i) {
+		if (g_sdhci != NULL) {
+			(void)munmap((void *)g_sdhci, _PAGE_SIZE);
+			g_sdhci = NULL;
+		}
+		g_fw_alive = 0;
+		g_pio_legacy = (i + start) & 1;
+		rc = wifi_bringup();
+		runs[g_pio_legacy]++;
+		if (rc == 0) {
+			ok[g_pio_legacy]++;
+		}
+		printf("rpi4-wifi: FWLOAD-BENCH load=%d/%d mode=%s rc=%d fw_alive=%d fw_bytes=%u rc_w=%d "
+			"rc_nvram=%d slow_waits=%u slow_max_us=%u timeouts=%u to_pres=0x%08x to_int=0x%08x "
+			"dl_ms=%u cmd53_max_us=%u\n",
+			i + 1, n, (g_pio_legacy != 0) ? "legacy" : "level", rc, g_fw_alive,
+			(unsigned)g_fw_bytes, g_fw_rc_w, g_fw_rc_nvram,
+			(unsigned)g_pio_slow_waits, (unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
+			(unsigned)g_pio_to_pres, (unsigned)g_pio_to_int,
+			(unsigned)(g_fw_dl_us / 1000u), (unsigned)g_fw_cmd53_max_us);
+		fflush(stdout);
+	}
+	g_pio_legacy = start;
+	g_bringup_quiet = 0;
+	printf("rpi4-wifi: FWLOAD-BENCH-SUMMARY level=%d/%d legacy=%d/%d (loads whose firmware started)\n",
+		ok[0], runs[0], ok[1], runs[1]);
+	fflush(stdout);
+	return 0;
 }
 
 
@@ -4696,6 +4931,7 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS rxxfer hdr=%u oversize=%u body=%u max_announced_len=%u chan=%u (cap %u)\n"
 		"WIFISTATS rxbig ok=%u max_len=%u rxglom_off_rc=%d\n"
 		"WIFISTATS glom descs=%u supers=%u subframes=%u bad=%u\n"
+		"WIFISTATS pio mode=%s slow_waits=%u slow_max_us=%u timeouts=%u\n"
 		"WIFISTATS sbwin writes=%u skips=%u\n",
 		g_tx_calls, (unsigned long long)g_tx_us,
 		(unsigned long long)(g_tx_calls ? g_tx_us / g_tx_calls : 0u),
@@ -4710,6 +4946,8 @@ static int wifi_stats(char *out, int cap)
 		g_rxe_hdr, g_rxe_big, g_rxe_body, g_rxe_big_len, g_rxe_big_chan, (unsigned)F2_FRAME_MAX,
 		g_rx_big_ok, g_rx_big_ok_len, g_join_rxglom_rc,
 		g_glom_descs, g_glom_supers, g_glom_subs, g_glom_bad,
+		(g_pio_legacy != 0) ? "legacy" : "level", (unsigned)g_pio_slow_waits,
+		(unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
 		(unsigned)g_sbwin_writes, (unsigned)g_sbwin_skips);
 	if (m < 0) {
 		return m;
@@ -5055,7 +5293,7 @@ static void wifi_sigExit(int sig)
 
 int main(int argc, char **argv)
 {
-	int selftest = 0, jointest = 0, ai, rc;
+	int selftest = 0, jointest = 0, fwbench = 0, ai, rc;
 	uint32_t port;
 	oid_t dev;
 	pid_t pid;
@@ -5070,6 +5308,24 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[ai], "fwretrytest") == 0) {
 			g_fw_retry_test = 1;
 		}
+		else if (strcmp(argv[ai], "legacypio") == 0) {
+			/* the old PIO wait, for a first-load A/B across boots */
+			g_pio_legacy = 1;
+		}
+		else if (strcmp(argv[ai], "fwloadbench") == 0) {
+			fwbench = ((ai + 1) < argc) ? atoi(argv[ai + 1]) : 20;
+			if (fwbench <= 0) {
+				fwbench = 20;
+			}
+		}
+	}
+
+	if (fwbench > 0) {
+		/* One-shot, like selftest: the chip is left powered with the last load's
+		 * firmware, and nothing is registered. */
+		rc = wifi_fwLoadBench(fwbench);
+		usleep(100 * 1000); /* let the log flush */
+		return rc;
 	}
 
 	if (selftest != 0 || jointest != 0) {
