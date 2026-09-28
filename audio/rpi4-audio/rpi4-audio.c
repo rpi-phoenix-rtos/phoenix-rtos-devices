@@ -519,6 +519,9 @@ static void audio_sweepThread(void *arg)
 {
 	(void)arg;
 
+	/* Held for the thread's lifetime on purpose: condWait() releases it while waiting and
+	 * holds it again on return, on a timeout too (kernel proc_lockWait() relocks unless
+	 * interrupted, and libphoenix condClockWait() relocks after -EINTR). */
 	mutexLock(ad.lock);
 	for (;;) {
 		if ((ad.dma_active != 0) && (ad.rs.pending != 0u)) {
@@ -793,11 +796,13 @@ static void audio_close(void)
 	time_t now = audio_now();
 
 	mutexLock(ad.lock);
-	if (ad.openers != 0u) {
-		ad.openers--;
-	}
+	/* Service before the count drops: a drain that already happened happened with the
+	 * device open, and is labelled so; the close line then reports 0 words queued. */
 	if (ad.dma_active != 0) {
 		audio_ringService();
+	}
+	if (ad.openers != 0u) {
+		ad.openers--;
 	}
 	if ((ad.dma_active != 0) && (audio_logOk(&ad.log_close, now, &skipped) != 0)) {
 		printf("rpi4-audio: close: openers=%u, %u words (~%u ms) still to play, then "
