@@ -16,7 +16,8 @@
  * they only touch slot 0, which this server never hands out.
  *
  * Usage: rpi4-kms [-f] [-b plane|pan] [-o overlays] [-p pool_mib] [-m <max_end>] [-c]
- *                 [-V irq|hvs|fwvsync|timer] [-g gate_us] [-K] [-L guard_us] [-G] [-B] [-C] [-F] [-v] [&]
+ *                 [-V irq|hvs|fwvsync|timer] [-g gate_us] [-K] [-L guard_us] [-G] [-B] [-C] [-F]
+ *                 [-M native] [-v] [&]
  *        rpi4-kms -R        restore the display (unset planes, unblank, pan to 0, fbcon on) and exit
  *   (detaches itself: psh has no job control; a stray "&" argument is ignored)
  *   -f          stay in the foreground
@@ -40,6 +41,16 @@
  *   -C          console handover: FBCONSETMODE(DISABLED) while a plane is shown
  *               (pl011-tty then also releases /dev/kbd0)
  *   -F          start even if the firmware fb is not panned to 0 (someone else flips)
+ *   -M native   list and accept only the native mode (no scaled modes: the g8 behaviour)
+ *
+ * Scaled modes (M9, kms_modes.h; plane backend): the connector also lists lower
+ * modes (1600x900, 1440x1080, 1280x720, 1024x768, 960x540, 800x600, 640x480 below a
+ * 1920x1080 screen). The HDMI link keeps the native timing: a client that sets a
+ * lower mode draws in its coordinates and every plane is scaled to the screen by
+ * the HVS, aspect preserved and centred (the firmware fb is blanked while a
+ * pillarboxed mode shows, so the bars are black). The mode goes back to native
+ * as soon as the primary plane is off (SetCrtc fb 0, ACTIVE 0, RMFB of the shown
+ * framebuffer, the owner's exit) or its setter closes its descriptor.
  *
  * Copyright 2026 Phoenix Systems
  * Author: Witold Bołt
@@ -469,10 +480,78 @@ static uint32_t plane_type(uint32_t p)
 }
 
 
-static void state_fullscreen(const kms_crtc_state_t *c, const kms_fb_t *fb, uint32_t p, kms_atomic_plane_t *st)
+/* The size of the CRTC's current mode (M9: a lower mode, else the native one). */
+static uint32_t umode_w(const kms_crtc_state_t *c)
 {
-	uint32_t w = (srv.be->id == KMS_BACKEND_PAN) ? srv.fb_w : c->mode.hdisplay;
-	uint32_t h = (srv.be->id == KMS_BACKEND_PAN) ? srv.fb_h : c->mode.vdisplay;
+	return (c->umode_w != 0u) ? c->umode_w : c->mode.hdisplay;
+}
+
+
+static uint32_t umode_h(const kms_crtc_state_t *c)
+{
+	return (c->umode_w != 0u) ? c->umode_h : c->mode.vdisplay;
+}
+
+
+static void umode_info(const kms_crtc_state_t *c, kms_modeinfo_t *m)
+{
+	if (c->umode_w != 0u) {
+		kms_mode_scaled(&c->mode, c->refresh_mhz, c->umode_w, c->umode_h, m);
+	}
+	else {
+		*m = c->mode;
+	}
+}
+
+
+/* May a client set a WxH mode? 0 and the mode in uw, uh (0x0 = native), or -EINVAL. */
+static int umode_lookup(const kms_crtc_state_t *c, uint32_t w, uint32_t h, uint16_t *uw, uint16_t *uh)
+{
+	if ((w == c->mode.hdisplay) && (h == c->mode.vdisplay)) {
+		*uw = 0u;
+		*uh = 0u;
+		return 0;
+	}
+	if ((srv.be->id != KMS_BACKEND_PLANE) || srv.native_only || !kms_mode_offered(&c->mode, w, h)) {
+		return -EINVAL;
+	}
+	*uw = (uint16_t)w;
+	*uh = (uint16_t)h;
+	return 0;
+}
+
+
+/* Make WxH (0x0 = native) the CRTC's mode: fit, MODE_ID blob, one tagged line.
+ * Plane state is not touched (the callers re-apply what is on screen). */
+static void umode_set(kms_crtc_state_t *c, uint16_t uw, uint16_t uh, uint32_t client, const char *why)
+{
+	kms_modeinfo_t mi;
+
+	c->umode_w = uw;
+	c->umode_h = uh;
+	c->umode_client = (uw != 0u) ? client : 0u;
+	c->fit = kms_fit(c->mode.hdisplay, c->mode.vdisplay, uw, uh);
+	if (uw != 0u) {
+		kms_srvblob_t *b = kms_blob_get(c->umode_blob);
+		umode_info(c, &mi);
+		if ((b != NULL) && (b->len == sizeof(mi))) {
+			memcpy(b->data, &mi, sizeof(mi));
+		}
+		else {
+			c->umode_blob = kms_blob_create(0u, &mi, sizeof(mi));   /* 0: MODE_ID falls back to the native blob */
+		}
+	}
+	KMS_LOG("mode crtc=%d %ux%u %s client=%u why=%s screen=%ux%u+%d+%d bars=%d", c->idx, umode_w(c), umode_h(c),
+		(uw != 0u) ? "scaled" : "native", (unsigned)client, why, c->fit.fw, c->fit.fh, (int)c->fit.ox, (int)c->fit.oy,
+		kms_fit_bars(&c->fit));
+}
+
+
+static void state_fullscreen(const kms_crtc_state_t *c, const kms_fb_t *fb, uint32_t p, uint32_t mw, uint32_t mh,
+	kms_atomic_plane_t *st)
+{
+	uint32_t w = (srv.be->id == KMS_BACKEND_PAN) ? srv.fb_w : mw;
+	uint32_t h = (srv.be->id == KMS_BACKEND_PAN) ? srv.fb_h : mh;
 
 	memset(st, 0, sizeof(*st));
 	st->plane_id = KMS_ID_PLANE((uint32_t)c->idx, p);
@@ -518,16 +597,19 @@ static void console_update(void)
 	uint32_t p, on = 0u;
 	const kms_crtc_state_t *c = &srv.crtc[0];
 
-	if (srv.blank_fb && (srv.be->id == KMS_BACKEND_PLANE)) {
+	/* -B blanks the firmware fb while the primary shows; a pillarboxed lower mode
+	 * (M9) does too, or the console would show in the bars. */
+	if (srv.be->id == KMS_BACKEND_PLANE) {
 		int prim = (c->cur[0].fb_id != 0u) || ((c->pend != KMS_PEND_NONE) && ((c->pmask & 1u) != 0u) &&
 			(c->pst[0].fb_id != 0u));
-		if (prim != srv.fb_blanked) {
-			int rc = kms_fw_blank(prim);
+		int want = prim && (srv.blank_fb || kms_fit_bars(&c->fit));
+		if (want != srv.fb_blanked) {
+			int rc = kms_fw_blank(want);
 			if (rc == 0) {
-				srv.fb_blanked = prim;
+				srv.fb_blanked = want;
 			}
-			if (srv.verbose || (rc != 0)) {
-				KMS_LOG("fb blank=%d rc=%d", prim, rc);
+			if (srv.verbose || (rc != 0) || !srv.blank_fb) {
+				KMS_LOG("fb blank=%d rc=%d%s", want, rc, srv.blank_fb ? "" : " (scaled mode bars)");
 			}
 		}
 	}
@@ -548,6 +630,26 @@ static void console_update(void)
 		KMS_LOG("console handover enable rc=%d", kms_fw_console(1));
 		srv.console_disabled = 0;
 	}
+}
+
+
+/* Back to the native mode at once, outside a commit (M9): re-map every plane still
+ * on screen. The firmware latches the new rectangles at the next vblank. */
+static void umode_native(kms_crtc_state_t *c, const char *why)
+{
+	uint32_t p;
+
+	if (c->umode_w == 0u) {
+		return;
+	}
+	umode_set(c, 0u, 0u, 0u, why);
+	for (p = 0u; p < KMS_PLANES_PER_CRTC; p++) {
+		kms_fb_t *fb = kms_fb_lookup(c->cur[p].fb_id);
+		if (fb != NULL) {
+			(void)srv.be->apply(c, p, &c->cur[p], fb, &srv.bos[fb->bo], NULL);
+		}
+	}
+	console_update();
 }
 
 
@@ -694,12 +796,18 @@ void kms_on_vblank(kms_crtc_state_t *c, uint64_t cnt, uint32_t nvbl, kms_parked_
 }
 
 
-/* Accept a commit (lock held). Returns 0 (queued/applied) or -errno. */
+/* Accept a commit (lock held). Returns 0 (queued/applied) or -errno.
+ * newmode (M9): NULL = keep the CRTC's mode, else {w, h} of the mode to set
+ * ({0, 0} = native). A lower mode never outlives the primary plane: a commit that
+ * leaves it off also goes back to native. A mode change re-applies the planes the
+ * commit does not touch, since their screen rectangles move with the mode. */
 static int commit(uint32_t client, kms_crtc_state_t *c, const kms_atomic_plane_t *sts, uint32_t nst, uint32_t flags,
-	uint64_t user, kms_flip_resp_t *out)
+	uint64_t user, kms_flip_resp_t *out, const uint16_t *newmode)
 {
-	uint32_t i, p, mask = 0u, idx[KMS_ATOMIC_MAX_PLANES];
-	int rc;
+	uint32_t i, p, mask = 0u, carry = 0u, prim, idx[KMS_ATOMIC_MAX_PLANES];
+	uint16_t uw = c->umode_w, uh = c->umode_h;
+	kms_fit_t fit0 = c->fit;
+	int rc = 0;
 
 	if (nst > KMS_ATOMIC_MAX_PLANES) {
 		return -E2BIG;
@@ -714,22 +822,67 @@ static int commit(uint32_t client, kms_crtc_state_t *c, const kms_atomic_plane_t
 		}
 		mask |= 1u << p;
 		idx[i] = p;
-		rc = validate(client, c, p, &sts[i]);
+	}
+	if (newmode != NULL) {
+		uw = newmode[0];
+		uh = newmode[1];
+	}
+	prim = c->cur[0].fb_id;
+	for (i = 0u; i < nst; i++) {
+		if (idx[i] == 0u) {
+			prim = sts[i].fb_id;
+		}
+	}
+	if (prim == 0u) {
+		uw = 0u;
+		uh = 0u;
+	}
+	if ((uw != c->umode_w) || (uh != c->umode_h)) {
+		c->fit = kms_fit(c->mode.hdisplay, c->mode.vdisplay, uw, uh);   /* check the planes in the new mode's space */
+		for (p = 0u; p < KMS_PLANES_PER_CRTC; p++) {
+			if (((mask & (1u << p)) == 0u) && (c->cur[p].fb_id != 0u)) {
+				carry |= 1u << p;
+			}
+		}
+	}
+	for (i = 0u; i < nst; i++) {
+		rc = validate(client, c, idx[i], &sts[i]);
 		if (rc != 0) {
+			c->fit = fit0;
 			return rc;
 		}
 	}
-	if ((flags & KMS_ATOMIC_TEST_ONLY) != 0u) {
-		return 0;
-	}
-	if (c->pend != KMS_PEND_NONE) {
-		return -EBUSY;   /* one commit in flight per CRTC, as DRM */
+	if (((flags & KMS_ATOMIC_TEST_ONLY) != 0u) || (c->pend != KMS_PEND_NONE)) {
+		c->fit = fit0;
+		return ((flags & KMS_ATOMIC_TEST_ONLY) != 0u) ? 0 : -EBUSY;   /* one commit in flight per CRTC, as DRM */
 	}
 	for (i = 0u; i < nst; i++) {
 		p = idx[i];
 		c->pst[p] = sts[i];
 		c->pst[p].crtc_id = (sts[i].fb_id != 0u) ? KMS_ID_CRTC((uint32_t)c->idx) : 0u;
 		kms_fb_ref(kms_fb_lookup(sts[i].fb_id));
+	}
+	for (p = 0u; p < KMS_PLANES_PER_CRTC; p++) {
+		kms_fb_t *fb;
+		if ((carry & (1u << p)) == 0u) {
+			continue;
+		}
+		fb = kms_fb_lookup(c->cur[p].fb_id);
+		c->pst[p] = c->cur[p];
+		if ((fb == NULL) || (srv.be->check(c, p, &c->pst[p], fb, &srv.bos[fb->bo]) != 0)) {
+			memset(&c->pst[p], 0, sizeof(c->pst[p]));   /* off the new mode's range: take it off */
+			c->pst[p].plane_id = KMS_ID_PLANE((uint32_t)c->idx, p);
+		}
+		else {
+			kms_fb_ref(fb);
+		}
+		mask |= 1u << p;
+	}
+	if ((uw != c->umode_w) || (uh != c->umode_h)) {
+		umode_set(c, uw, uh, client, (prim == 0u) ? "primary_off" : "commit");
+	}
+	else if ((newmode != NULL) && (uw != 0u)) {
+		c->umode_client = client;   /* the same lower mode set again: its setter now */
 	}
 	c->pmask = mask;
 	c->pclient = client;
@@ -780,6 +933,10 @@ static uint32_t planes_off(kms_crtc_state_t *c, uint32_t client, uint32_t fb_id)
 		kms_fb_unref(fb);
 		n++;
 	}
+	if ((c->cur[0].fb_id == 0u) &&
+			!((c->pend != KMS_PEND_NONE) && ((c->pmask & 1u) != 0u) && (c->pst[0].fb_id != 0u))) {
+		umode_native(c, "primary_off");   /* a lower mode never outlives the primary plane (M9) */
+	}
 	console_update();
 	return n;
 }
@@ -827,6 +984,9 @@ static void client_close(id_t id, kms_parked_t *answer, uint32_t *n)
 		}
 	}
 	off = planes_off(c, (uint32_t)id, 0u);   /* the console comes back when a client dies */
+	if (c->umode_client == (uint32_t)id) {
+		umode_native(c, "client_closed");   /* its lower mode goes with it, whoever shows the planes */
+	}
 	kms_bo_client_gone((uint32_t)id);
 	cl->used = 0;
 	KMS_LOG("srv client %u closed planes_off=%u dropped_events=%u", (unsigned)id, off, cl->dropped);
@@ -923,7 +1083,7 @@ static uint32_t obj_props(uint32_t obj, kms_prop_value_t *out, uint32_t max)
 	}
 	else if (obj == KMS_ID_CRTC(0)) {
 		PV(KMS_PROP_ACTIVE, 1);
-		PV(KMS_PROP_MODE_ID, c->mode_blob);
+		PV(KMS_PROP_MODE_ID, ((c->umode_w != 0u) && (c->umode_blob != 0u)) ? c->umode_blob : c->mode_blob);
 		PV(KMS_PROP_OUT_FENCE_PTR, 0);
 		PV(KMS_PROP_VRR_ENABLED, 0);
 	}
@@ -1016,6 +1176,8 @@ static int get_cap(uint64_t cap, uint64_t *v)
 static int op_get_connector(uint32_t id, kms_connector_t *o, msg_t *msg, uint32_t max)
 {
 	const kms_crtc_state_t *c = &srv.crtc[0];
+	kms_modeinfo_t modes[KMS_MAX_MODES];
+	uint32_t n, fit;
 
 	if (id != KMS_ID_CONNECTOR(0)) {
 		return -ENOENT;
@@ -1027,11 +1189,17 @@ static int op_get_connector(uint32_t id, kms_connector_t *o, msg_t *msg, uint32_
 	o->mm_height = c->mm_h;
 	o->subpixel = 1u;   /* DRM_MODE_SUBPIXEL_UNKNOWN */
 	o->encoder_id = KMS_ID_ENCODER(0);
-	o->nmodes = 1u;
+	/* the native mode first (PREFERRED), then the scaled ones (M9) */
+	n = kms_mode_list(&c->mode, c->refresh_mhz, (srv.be->id == KMS_BACKEND_PLANE) && !srv.native_only, modes,
+		KMS_MAX_MODES);
+	o->nmodes = n;
 	o->nprops = obj_props(id, NULL, 0u);
 	o->fw_display_id = c->fw_display_id;
-	if ((max >= 1u) && (msg->o.data != NULL) && (msg->o.size >= sizeof(kms_modeinfo_t))) {
-		memcpy(msg->o.data, &c->mode, sizeof(kms_modeinfo_t));
+	if (msg->o.data != NULL) {
+		fit = (uint32_t)(msg->o.size / sizeof(kms_modeinfo_t));
+		fit = (fit < max) ? fit : max;
+		fit = (fit < n) ? fit : n;
+		memcpy(msg->o.data, modes, fit * sizeof(kms_modeinfo_t));
 	}
 	return 0;
 }
@@ -1091,10 +1259,10 @@ static int op_page_flip(uint32_t client, const kms_page_flip_req_t *rq, kms_flip
 		st.src_h = fb->h << 16;
 	}
 	else {
-		state_fullscreen(c, fb, 0u, &st);
+		state_fullscreen(c, fb, 0u, umode_w(c), umode_h(c), &st);
 	}
 	st.in_fence = rq->in_fence;
-	return commit(client, c, &st, 1u, rq->flags & KMS_PAGE_FLIP_EVENT, rq->user_data, out);
+	return commit(client, c, &st, 1u, rq->flags & KMS_PAGE_FLIP_EVENT, rq->user_data, out, NULL);
 }
 
 
@@ -1104,6 +1272,8 @@ static int op_set_crtc(uint32_t client, const kms_set_crtc_req_t *rq)
 	kms_atomic_plane_t sts[KMS_PLANES_PER_CRTC];
 	kms_fb_t *fb;
 	uint32_t p, n = 0u;
+	uint16_t nm[2] = { 0u, 0u };
+	const uint16_t *newmode = NULL;
 
 	if (c == NULL) {
 		return -ENOENT;
@@ -1117,18 +1287,25 @@ static int op_set_crtc(uint32_t client, const kms_set_crtc_req_t *rq)
 				n++;
 			}
 		}
-		return commit(client, c, sts, n, 0u, 0u, NULL);
+		return commit(client, c, sts, n, 0u, 0u, NULL, nm);   /* and the native mode */
 	}
-	if ((rq->x != 0) || (rq->y != 0) || ((rq->mode_hdisplay != 0u) && ((rq->mode_hdisplay != c->mode.hdisplay) ||
-			(rq->mode_vdisplay != c->mode.vdisplay)))) {
-		return -EINVAL;   /* Stage A cannot change the firmware's mode */
+	if ((rq->x != 0) || (rq->y != 0)) {
+		return -EINVAL;
+	}
+	if (rq->mode_hdisplay != 0u) {
+		/* the native mode or a listed lower one (M9); the HDMI timing never changes */
+		if (umode_lookup(c, rq->mode_hdisplay, rq->mode_vdisplay, &nm[0], &nm[1]) != 0) {
+			return -EINVAL;
+		}
+		newmode = nm;
 	}
 	fb = kms_fb_lookup(rq->fb_id);
 	if (fb == NULL) {
 		return -ENOENT;
 	}
-	state_fullscreen(c, fb, 0u, &sts[0]);
-	return commit(client, c, sts, 1u, 0u, 0u, NULL);
+	state_fullscreen(c, fb, 0u, (newmode == NULL) ? umode_w(c) : ((nm[0] != 0u) ? nm[0] : c->mode.hdisplay),
+		(newmode == NULL) ? umode_h(c) : ((nm[0] != 0u) ? nm[1] : c->mode.vdisplay), &sts[0]);
+	return commit(client, c, sts, 1u, 0u, 0u, NULL, newmode);
 }
 
 
@@ -1137,6 +1314,8 @@ static int op_atomic(uint32_t client, const kms_atomic_req_t *rq, const msg_t *m
 	kms_crtc_state_t *c = crtc_by_id(rq->crtc_id);
 	kms_atomic_plane_t sts[KMS_PLANES_PER_CRTC];
 	uint32_t n = rq->nplanes, p;
+	uint16_t nm[2] = { 0u, 0u };
+	const uint16_t *newmode = NULL;
 
 	if (c == NULL) {
 		return -ENOENT;
@@ -1144,10 +1323,11 @@ static int op_atomic(uint32_t client, const kms_atomic_req_t *rq, const msg_t *m
 	if (rq->mode_blob != 0u) {
 		kms_srvblob_t *b = kms_blob_get(rq->mode_blob);
 		const kms_modeinfo_t *mi = (b != NULL) ? (const kms_modeinfo_t *)b->data : NULL;
-		if ((b == NULL) || (b->len < sizeof(kms_modeinfo_t)) || (mi->hdisplay != c->mode.hdisplay) ||
-				(mi->vdisplay != c->mode.vdisplay)) {
-			return -EINVAL;   /* Stage A: only the current mode */
+		if ((b == NULL) || (b->len < sizeof(kms_modeinfo_t)) ||
+				(umode_lookup(c, mi->hdisplay, mi->vdisplay, &nm[0], &nm[1]) != 0)) {
+			return -EINVAL;   /* the native mode or a listed lower one (M9) */
 		}
+		newmode = nm;
 	}
 	if (rq->active == 0u) {
 		n = 0u;
@@ -1166,7 +1346,7 @@ static int op_atomic(uint32_t client, const kms_atomic_req_t *rq, const msg_t *m
 		}
 		memcpy(sts, msg->i.data, n * sizeof(kms_atomic_plane_t));
 	}
-	return commit(client, c, sts, n, rq->flags, rq->user_data, out);
+	return commit(client, c, sts, n, rq->flags, rq->user_data, out, newmode);
 }
 
 
@@ -1324,13 +1504,15 @@ static int handle_raw(msg_t *msg, msg_rid_t rid, kms_parked_t *answer, uint32_t 
 			}
 			r->u.crtc.fb_id = c->cur[0].fb_id;
 			r->u.crtc.mode_valid = 1u;
-			r->u.crtc.hdisplay = c->mode.hdisplay;
-			r->u.crtc.vdisplay = c->mode.vdisplay;
+			r->u.crtc.hdisplay = umode_w(c);   /* M9: the mode clients see, not the link timing */
+			r->u.crtc.vdisplay = umode_h(c);
 			r->u.crtc.vrefresh = c->mode.vrefresh;
 			r->u.crtc.sequence = c->seq;
 			r->u.crtc.pending_fb = (c->pend != KMS_PEND_NONE) ? c->pst[0].fb_id : 0u;
 			if ((msg->o.data != NULL) && (msg->o.size >= sizeof(kms_modeinfo_t))) {
-				memcpy(msg->o.data, &c->mode, sizeof(kms_modeinfo_t));
+				kms_modeinfo_t mi;
+				umode_info(c, &mi);
+				memcpy(msg->o.data, &mi, sizeof(kms_modeinfo_t));
 			}
 			rc = 0;
 			break;
@@ -1612,8 +1794,8 @@ static void handle_ioctl(msg_t *msg)
 	h.ncrtc = srv.ncrtc;
 	h.buf_port = srv.buf_port;
 	h.refresh_mhz = srv.crtc[0].refresh_mhz;
-	h.width = (srv.be->id == KMS_BACKEND_PAN) ? srv.fb_w : srv.crtc[0].mode.hdisplay;
-	h.height = (srv.be->id == KMS_BACKEND_PAN) ? srv.fb_h : srv.crtc[0].mode.vdisplay;
+	h.width = (srv.be->id == KMS_BACKEND_PAN) ? srv.fb_w : umode_w(&srv.crtc[0]);
+	h.height = (srv.be->id == KMS_BACKEND_PAN) ? srv.fb_h : umode_h(&srv.crtc[0]);
 	(void)mutexUnlock(srv.lock);
 	ioctl_setResponse(msg, request, 0, &h);
 }
@@ -1895,7 +2077,7 @@ static void on_signal(int sig)
 static void usage(const char *prog)
 {
 	printf("usage: %s [-f] [-b plane|pan] [-o overlays] [-p pool_mib] [-m <max_end>] [-c] "
-		"[-V irq|hvs|fwvsync|timer] [-g gate_us] [-K] [-L guard_us] [-G] [-B] [-C] [-F] [-v]\n"
+		"[-V irq|hvs|fwvsync|timer] [-g gate_us] [-K] [-L guard_us] [-G] [-B] [-C] [-F] [-M native] [-v]\n"
 		"       %s -R   (restore the display and exit)\n",
 		prog, prog);
 }
@@ -1940,7 +2122,7 @@ int main(int argc, char **argv)
 	srv.next_fb = KMS_ID_FB_BASE;
 	srv.next_blob = KMS_ID_BLOB_BASE;
 
-	while ((c = getopt(argc, argv, "fb:o:p:m:cV:g:KL:GBCFvRh")) != -1) {
+	while ((c = getopt(argc, argv, "fb:o:p:m:cV:g:KL:GBCFM:vRh")) != -1) {
 		switch (c) {
 			case 'f': srv.foreground = 1; break;
 			case 'b': bname = optarg; break;
@@ -1965,6 +2147,13 @@ int main(int argc, char **argv)
 			case 'B': srv.blank_fb = 1; break;
 			case 'C': srv.console_off = 1; break;
 			case 'F': srv.force = 1; break;
+			case 'M':
+				if (strcmp(optarg, "native") != 0) {
+					usage(argv[0]);
+					return 1;
+				}
+				srv.native_only = 1;
+				break;
 			case 'v': srv.verbose = 1; break;
 			case 'R': restore = 1; break;
 			default: usage(argv[0]); return 1;
@@ -2092,12 +2281,15 @@ int main(int argc, char **argv)
 	}
 
 	KMS_LOG("srv ready dev=/dev/%s buf=%s backend=%s planes=0x%02x vblank_src=%s mode=%ux%u refresh_mhz=%u xl=%d "
-		"pool=%d pool_mib=%u slots=%u fmt=%.4s bus=%s v3d=%d console_off=%d blank_fb=%d guard_us=%u gate_us=%u kick=%d proto=%u..%u import=v3dbuf,kmsbuf",
+		"pool=%d pool_mib=%u slots=%u fmt=%.4s bus=%s v3d=%d console_off=%d blank_fb=%d guard_us=%u gate_us=%u kick=%d proto=%u..%u import=v3dbuf,kmsbuf modes=%u scaler=%s",
 		KMS_DEV_NAME, KMS_BUF_NS, srv.be->name, srv.crtc[0].plane_mask, kms_vbl_name(srv.vbl_src),
 		srv.crtc[0].mode.hdisplay, srv.crtc[0].mode.vdisplay, srv.crtc[0].refresh_mhz, srv.xl, srv.pool_ok,
 		srv.pool_mib, srv.fb_slots, (const char *)&srv.fb_format, srv.bus_c0 ? "c0" : "raw", srv.v3d_fp != NULL,
 		srv.console_off, srv.blank_fb, srv.latch_guard_us, srv.gate_us, !srv.no_kick, KMS_PROTO_BASE,
-		KMS_PROTO_VERSION);
+		KMS_PROTO_VERSION,
+		kms_mode_list(&srv.crtc[0].mode, srv.crtc[0].refresh_mhz,
+			(srv.be->id == KMS_BACKEND_PLANE) && !srv.native_only, NULL, 0u),
+		((srv.be->id == KMS_BACKEND_PLANE) && !srv.native_only) ? "fit" : "off");
 
 	if (readyfd >= 0) {
 		char r = 'R';

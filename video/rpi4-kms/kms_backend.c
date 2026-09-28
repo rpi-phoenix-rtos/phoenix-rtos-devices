@@ -16,6 +16,9 @@
  *           KMS" interface) for buffers from our own contiguous pool: primary,
  *           cursor, optional overlays, hardware scaling, per-plane alpha,
  *           rotate-180/reflect. Needs the /dev/vcmbox large-buffer call. Default.
+ *           The only backend that offers lower (scaled) modes (M9, kms_modes.h):
+ *           plane coordinates are in the mode's space and dst is mapped to the
+ *           screen through the CRTC's fit.
  *           E3: 1201 flips in 20 s at 60/s, 0 missed, SET_PLANE p50 100 us,
  *           overlay p50 75 us, our pool buffers scanned below 1 GiB.
  *
@@ -248,6 +251,17 @@ static int plane_check(const kms_crtc_state_t *c, uint32_t p, const kms_atomic_p
 	if ((st->rotation & ~(DRM_ROTATE_0 | DRM_ROTATE_180 | DRM_REFLECT_X | DRM_REFLECT_Y)) != 0u) {
 		return -EINVAL;
 	}
+	{
+		/* M9: the rectangle the firmware gets, after the mode's scaling */
+		int32_t dx, dy;
+		uint32_t dw, dh;
+
+		kms_fit_rect(&c->fit, st->crtc_x, st->crtc_y, st->crtc_w, st->crtc_h, &dx, &dy, &dw, &dh);
+		if ((dw == 0u) || (dh == 0u) || (dw > 0xffffu) || (dh > 0xffffu) || (dx < -32768) || (dx > 32767) ||
+				(dy < -32768) || (dy > 32767)) {
+			return -ERANGE;
+		}
+	}
 	return 0;
 }
 
@@ -283,7 +297,8 @@ static int plane_apply(kms_crtc_state_t *c, uint32_t p, const kms_atomic_plane_t
 	const kms_bo_t *bo, uint32_t *lat_us)
 {
 	fw_plane_t fp;
-	uint32_t bus = 0u, o[15];
+	uint32_t bus = 0u, o[15], dw, dh;
+	int32_t dx, dy;
 	uint64_t t0;
 	int rc;
 
@@ -305,10 +320,13 @@ static int plane_apply(kms_crtc_state_t *c, uint32_t p, const kms_atomic_plane_t
 		fp.src_y = st->src_y;
 		fp.src_w = st->src_w;
 		fp.src_h = st->src_h;
-		fp.dst_x = (int16_t)st->crtc_x;
-		fp.dst_y = (int16_t)st->crtc_y;
-		fp.dst_w = (uint16_t)st->crtc_w;
-		fp.dst_h = (uint16_t)st->crtc_h;
+		/* src stays in framebuffer pixels, dst goes to the screen: in a lower mode
+		 * (M9) the HVS scales the plane by the mode's fit. */
+		kms_fit_rect(&c->fit, st->crtc_x, st->crtc_y, st->crtc_w, st->crtc_h, &dx, &dy, &dw, &dh);
+		fp.dst_x = (int16_t)dx;
+		fp.dst_y = (int16_t)dy;
+		fp.dst_w = (uint16_t)dw;
+		fp.dst_h = (uint16_t)dh;
 		fp.alpha = (uint8_t)((st->alpha > 0xffffu ? 0xffffu : st->alpha) >> 8);
 		fp.num_planes = 1u;
 		fp.planes[0] = bus;

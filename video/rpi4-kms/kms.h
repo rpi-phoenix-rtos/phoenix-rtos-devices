@@ -23,6 +23,7 @@
 #include <sys/types.h>
 
 #include "kms_proto.h"
+#include "kms_modes.h"
 
 
 #ifndef _PAGE_SIZE
@@ -154,6 +155,15 @@ typedef struct {
 	uint32_t edid_blob;          /* 0 = none */
 	uint32_t mm_w, mm_h;
 
+	/* M9 scaled modes (kms_modes.h): the mode clients see. The HDMI link always
+	 * runs `mode` (native); a lower mode is scanned out through the HVS scaler.
+	 * umode_w == 0: the native mode. Plane coordinates (cur, pst) are in the
+	 * mode's space; `fit` maps them to the screen when a backend applies them. */
+	uint16_t umode_w, umode_h;
+	uint32_t umode_client;       /* the client that set the lower mode */
+	uint32_t umode_blob;         /* MODE_ID blob of the lower mode (made on first use) */
+	kms_fit_t fit;               /* mode space -> screen (identity at native) */
+
 	/* planes (index 0 primary, 1..6 overlay, 7 cursor, as the firmware numbers them) */
 	uint32_t plane_mask;         /* planes the backend exposes */
 	kms_atomic_plane_t cur[KMS_PLANES_PER_CRTC];   /* state on screen (fb_id 0 = off) */
@@ -261,6 +271,7 @@ typedef struct {
 	int connect_v3d;             /* -G: map rpi4-v3d-async's fence page for in-fences */
 	uint32_t latch_guard_us;     /* -L: a call returning later than frame - guard after a vblank misses the next one */
 	int blank_fb;                /* -B: FRAMEBUFFER_BLANK the firmware fb while the primary plane shows */
+	int native_only;             /* -M native: list and accept only the native mode (the g8 behaviour) */
 	int fb_blanked;
 
 	/* ports */
