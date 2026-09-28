@@ -37,6 +37,8 @@ DEFAULT_COMPONENTS += rpi4-thermal
 DEFAULT_COMPONENTS += rpi4-hwrng
 # VideoCore HDMI framebuffer (/dev/fb0): read/write byte access + geometry
 # devctl over the plo-allocated 32-bpp surface (pctl_graphmode + MAP_PHYSMEM).
+# TODO(TD-27): started at boot only in an RPI4B_GPU_LEGACY=1 image; its last default-image
+# users (hevc-play, fbprobe) move to a KMS dumb buffer, then this goes with P3.
 DEFAULT_COMPONENTS += rpi4-fb
 # BCM2711 GPIO observer (/dev/gpio @ 0xfe200000): read-only register snapshot +
 # per-pin {fsel,level,pull} devctl. Outputs deferred to an attended bench session.
@@ -57,7 +59,17 @@ DEFAULT_COMPONENTS += rpi4-sysinfo
 # user.plo.yaml yet: launching it takes exclusive GPU ownership, which conflicts with
 # the current in-process-winsys GPU apps (Xphoenix-glamor, quakes). Auto-start lands
 # together with daemon-client builds of those apps (productization follow-on).
+# TODO(TD-24): the old GPU stack, kept only so an RPI4B_GPU_LEGACY=1 image still builds (P3 deletes it).
 DEFAULT_COMPONENTS += rpi4-v3d
+# The GPU stack (DRM-shaped), started at boot from user.plo.yaml in this order:
+#  - rpi4-v3d-async: the V3D render server (/dev/v3d-async, /dev/dri/renderD128,
+#    /dev/dri/card1, /v3dbuf): sole owner of the GPU, async queues, fences, BOs.
+#  - rpi4-kms: the display server (/dev/kms = /dev/dri/card0, /kmsbuf): firmware
+#    planes, vblank events, atomic flips gated on the render server's fences (-G).
+#  - shmsrv: anonymous shared memory (/shm) for Wayland wl_shm and DRI3 xshmfence.
+# Clients reach them through libdrm (the libdrm_phoenix port), Mesa (mesa_drm), SDL2
+# KMSDRM (sdl2_kmsdrm), Xorg modesetting (xorg_server_drm) and Wayland.
+DEFAULT_COMPONENTS += rpi4-v3d-async rpi4-kms shmsrv
 # Kernel-log capture daemon (task #31): reads the klog ring and appends it to
 # /var/log/messages. Always bundled (a few KB); only LAUNCHED in the USER logging
 # mode (RPI4_LOG_TO_FILE), where it is the file-capture half of suppressing the
