@@ -213,8 +213,12 @@ static uint32_t diag_mboxPower(uint32_t tag, uint32_t device_id, uint32_t state)
  * re-assert, settle. NB: a 20x-longer power-down was tested and did NOT
  * make the 43455 firmware execute (the fw-exec gate is not a reset-timing
  * issue); 50/150 ms is the established, enumeration-tested baseline. */
+static void diag_sbwinForget(void);
+
 static void diag_wifiPowerCycle(void)
 {
+	diag_sbwinForget(); /* the chip comes back with its reset window */
+
 	/* Report a failed toggle instead of discarding it. diag_mboxPower() returns
 	 * 0xFFFFFFFF when the mailbox times out or the request cannot be addressed,
 	 * and dropping that made the consequence appear far downstream as a chip that
@@ -471,13 +475,33 @@ static int diag_sdhciCmd(volatile uint8_t *base, uint8_t cmd_index,
 	return 0;
 }
 
+/* The chip's backplane window (F1 SBADDR low/mid/high, 0x1000A..0x1000C) as
+ * last written. Every F2 frame, and every empty RX probe, used to rewrite all
+ * three bytes first -- three CMD52s that usually rewrote the value already
+ * there. brcmfmac keeps the same shadow (sdiodev->sbwad in bcmsdh.c) and writes
+ * the window only when it changes. Kept up to date by every CMD52 write, so the
+ * many places that set the window by hand stay correct; forgotten when the chip
+ * is power-cycled or a write to it failed. */
+#define SBSDIO_FUNC1_SBADDRLOW 0x1000Au
+static uint8_t g_sbwin[3];
+static uint8_t g_sbwin_valid[3];
+static uint32_t g_sbwin_writes = 0u, g_sbwin_skips = 0u;
+
+static void diag_sbwinForget(void)
+{
+	g_sbwin_valid[0] = 0u;
+	g_sbwin_valid[1] = 0u;
+	g_sbwin_valid[2] = 0u;
+}
+
 /* CMD52 (IO_RW_DIRECT). arg layout: bit31 R/W, bits30:28 FN, bits25:9
- * 17-bit REG, bits7:0 DATA. resp_out must be a 4-element uint32_t array
- * (diag_sdhciCmd unconditionally dumps all four response slots). */
+ * 17-bit REG, bits7:0 DATA. resp_out is NULL or a 4-element uint32_t array
+ * (diag_sdhciCmd fills all four response slots). */
 static int diag_sdioCmd52(volatile uint8_t *sdhci, int write, int fn,
 	uint32_t reg, uint8_t data, uint32_t *resp_out)
 {
 	uint32_t arg = 0;
+	int rc;
 
 	arg |= (write ? 1u : 0u) << 31;
 	arg |= ((uint32_t)fn & 7u) << 28;
@@ -485,7 +509,12 @@ static int diag_sdioCmd52(volatile uint8_t *sdhci, int write, int fn,
 	if (write) {
 		arg |= (uint32_t)data;
 	}
-	return diag_sdhciCmd(sdhci, 52u, arg, SDHCI_RESP_R5, resp_out);
+	rc = diag_sdhciCmd(sdhci, 52u, arg, SDHCI_RESP_R5, resp_out);
+	if ((write != 0) && (fn == 1) && (reg >= SBSDIO_FUNC1_SBADDRLOW) && (reg < (SBSDIO_FUNC1_SBADDRLOW + 3u))) {
+		g_sbwin[reg - SBSDIO_FUNC1_SBADDRLOW] = data;
+		g_sbwin_valid[reg - SBSDIO_FUNC1_SBADDRLOW] = (rc == 0) ? 1u : 0u;
+	}
+	return rc;
 }
 
 /* Switch SDIO to High-Speed (25 MHz) on a 4-bit data bus. Call after
@@ -1524,11 +1553,21 @@ static uint32_t diag_le32(const uint8_t *p)
 		((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* Point the backplane window at 0x18000000 (the F2 FIFO and the SDIO core),
+ * writing only the bytes that differ from what the chip already holds. */
 static void diag_setWindow18(volatile uint8_t *sdhci)
 {
-	(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
-	(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
-	(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+	static const uint8_t want[3] = { 0x00u, 0x00u, 0x18u };
+	uint32_t k;
+
+	for (k = 0; k < 3u; ++k) {
+		if ((g_sbwin_valid[k] != 0u) && (g_sbwin[k] == want[k])) {
+			g_sbwin_skips++;
+			continue;
+		}
+		(void)diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_SBADDRLOW + k, want[k], NULL);
+		g_sbwin_writes++;
+	}
 }
 
 /* SDPCM flow control. The firmware advertises, in EVERY frame it sends us, how
@@ -1911,6 +1950,7 @@ static int diag_bcdcCmd(volatile uint8_t *sdhci, uint32_t sdio_core, int is_set,
 #define WLC_DISASSOC_CMD 52u       /* BRCMF_C_DISASSOC: no payload, as brcmf_link_down() */
 #define WLC_SET_WSEC_PMK_CMD 268u  /* BRCMF_C_SET_WSEC_PMK: brcmf_wsec_pmk_le (passphrase) */
 #define BRCMF_C_GET_PKTCNTS 137u   /* brcmf_pktcnt_le { rx_good, rx_bad, tx_good, tx_bad, rx_ocast } */
+#define BRCMF_C_GET_RATE 12u       /* le32: current TX rate, in 500 kbit/s units (fwil.h) */
 #define SET_VAR_CMD 263u
 #define GET_VAR_CMD 262u
 #define SCAN_MAX_APS 16
@@ -4860,7 +4900,28 @@ static uint64_t wifi_nowUs(void)
  * attributed instead of guessed. */
 static int wifi_stats(char *out, int cap)
 {
-	return snprintf(out, (size_t)cap,
+	/* The negotiated PHY rate bounds what any SDIO or host change can buy, so it
+	 * is reported next to the throughput counters. Only here, on demand: like any
+	 * control command, the GET drains the shared F2 FIFO and drops the data
+	 * frames it meets, so it must not go into the periodically polled `status`. */
+	uint8_t rbuf[8] = { 0 };
+	uint32_t rlen = 0u, rate = 0u;
+	int rate_rc = -1, n, m;
+
+	if ((g_sdhci != NULL) && wifi_isJoined()) {
+		rate_rc = diag_bcdcCmd(g_sdhci, g_sdio_core, 0, BRCMF_C_GET_RATE, NULL, 4u,
+			rbuf, sizeof(rbuf), &rlen, 211u, g_data_seq++);
+		if ((rate_rc == 0) && (rlen >= 4u)) {
+			rate = diag_le32(rbuf);
+		}
+	}
+
+	n = snprintf(out, (size_t)cap, "WIFISTATS phy rate=%u.%u Mbit/s rc=%d\n",
+		(unsigned)(rate / 2u), (unsigned)((rate & 1u) * 5u), rate_rc);
+	if ((n < 0) || (n >= cap)) {
+		return n;
+	}
+	m = snprintf(out + n, (size_t)(cap - n),
 		"WIFISTATS tx_calls=%u tx_us_total=%llu tx_us_avg=%llu\n"
 		"WIFISTATS rx_hits=%u rx_hit_us_total=%llu rx_hit_us_avg=%llu\n"
 		"WIFISTATS rx_misses=%u rx_miss_us_total=%llu rx_miss_us_avg=%llu\n"
@@ -4870,7 +4931,8 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS rxxfer hdr=%u oversize=%u body=%u max_announced_len=%u chan=%u (cap %u)\n"
 		"WIFISTATS rxbig ok=%u max_len=%u rxglom_off_rc=%d\n"
 		"WIFISTATS glom descs=%u supers=%u subframes=%u bad=%u\n"
-		"WIFISTATS pio mode=%s slow_waits=%u slow_max_us=%u timeouts=%u\n",
+		"WIFISTATS pio mode=%s slow_waits=%u slow_max_us=%u timeouts=%u\n"
+		"WIFISTATS sbwin writes=%u skips=%u\n",
 		g_tx_calls, (unsigned long long)g_tx_us,
 		(unsigned long long)(g_tx_calls ? g_tx_us / g_tx_calls : 0u),
 		g_rx_hits, (unsigned long long)g_rx_hit_us,
@@ -4885,7 +4947,12 @@ static int wifi_stats(char *out, int cap)
 		g_rx_big_ok, g_rx_big_ok_len, g_join_rxglom_rc,
 		g_glom_descs, g_glom_supers, g_glom_subs, g_glom_bad,
 		(g_pio_legacy != 0) ? "legacy" : "level", (unsigned)g_pio_slow_waits,
-		(unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts);
+		(unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
+		(unsigned)g_sbwin_writes, (unsigned)g_sbwin_skips);
+	if (m < 0) {
+		return m;
+	}
+	return ((n + m) < cap) ? (n + m) : (cap - 1);
 }
 
 
