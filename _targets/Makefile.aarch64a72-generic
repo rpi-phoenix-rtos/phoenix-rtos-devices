@@ -37,9 +37,13 @@ DEFAULT_COMPONENTS += rpi4-thermal
 DEFAULT_COMPONENTS += rpi4-hwrng
 # VideoCore HDMI framebuffer (/dev/fb0): read/write byte access + geometry
 # devctl over the plo-allocated 32-bpp surface (pctl_graphmode + MAP_PHYSMEM).
-# TODO(TD-27): started at boot only in an RPI4B_GPU_LEGACY=1 image; its last default-image
-# users (hevc-play, fbprobe) move to a KMS dumb buffer, then this goes with P3.
+# Built (and started at boot) only for an RPI4B_GPU_LEGACY=1 image: the default
+# image's display is rpi4-kms. TODO(TD-27): its last users outside the old GPU
+# stack (hevc-play, fbprobe) move to a KMS dumb buffer, then it goes with P3.
+RPI4B_GPU_LEGACY_ON := $(filter-out 0 n no false,$(RPI4B_GPU_LEGACY))
+ifneq ($(RPI4B_GPU_LEGACY_ON),)
 DEFAULT_COMPONENTS += rpi4-fb
+endif
 # BCM2711 GPIO observer (/dev/gpio @ 0xfe200000): read-only register snapshot +
 # per-pin {fsel,level,pull} devctl. Outputs deferred to an attended bench session.
 DEFAULT_COMPONENTS += rpi4-gpio
@@ -59,8 +63,10 @@ DEFAULT_COMPONENTS += rpi4-sysinfo
 # user.plo.yaml yet: launching it takes exclusive GPU ownership, which conflicts with
 # the current in-process-winsys GPU apps (Xphoenix-glamor, quakes). Auto-start lands
 # together with daemon-client builds of those apps (productization follow-on).
-# TODO(TD-24): the old GPU stack, kept only so an RPI4B_GPU_LEGACY=1 image still builds (P3 deletes it).
+# TODO(TD-24): the old GPU stack, built only for an RPI4B_GPU_LEGACY=1 image (P3 deletes it).
+ifneq ($(RPI4B_GPU_LEGACY_ON),)
 DEFAULT_COMPONENTS += rpi4-v3d
+endif
 # The GPU stack (DRM-shaped), started at boot from user.plo.yaml in this order:
 #  - rpi4-v3d-async: the V3D render server (/dev/v3d-async, /dev/dri/renderD128,
 #    /dev/dri/card1, /v3dbuf): sole owner of the GPU, async queues, fences, BOs.
