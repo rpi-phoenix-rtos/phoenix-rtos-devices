@@ -34,7 +34,8 @@
  *               behaviour before 2026-09-27; every GPU-rendered flip takes 2 vblanks)
  *   -L us       firmware latch guard (default 2000; E3: the list is written ~1.6 ms
  *               before the vblank)
- *   -G          connect to rpi4-v3d-async and map its fence page (in-fences)
+ *   -G          connect to rpi4-v3d-async and map its fence page (in-fences); waits
+ *               up to 10 s for /dev/v3d-async (both servers start together at boot)
  *   -B          blank the firmware fb while the primary plane shows (E3 stack 3/4)
  *   -C          console handover: FBCONSETMODE(DISABLED) while a plane is shown
  *               (pl011-tty then also releases /dev/kbd0)
@@ -366,15 +367,26 @@ void kms_answer(kms_parked_t *list, uint32_t n)
 /* Render-server fences (optional, -G)                                        */
 /* ========================================================================= */
 
+/* How long -G waits for the render server's node. At boot both servers are spawned
+ * together from the plo script, so /dev/v3d-async may appear a little after this
+ * server starts; without the wait every flip would be served ungated. */
+#define KMS_V3D_WAIT_MS 10000u
+#define KMS_V3D_POLL_MS 50u
+
+
 static void v3d_connect(void)
 {
 	v3da_hello_t h;
 	void *p;
+	uint32_t waited_ms = 0u;
 	int fd;
 
-	fd = open("/dev/" V3DA_DEV_NAME, O_RDONLY);
+	while (((fd = open("/dev/" V3DA_DEV_NAME, O_RDONLY)) < 0) && (waited_ms < KMS_V3D_WAIT_MS)) {
+		usleep(KMS_V3D_POLL_MS * 1000u);
+		waited_ms += KMS_V3D_POLL_MS;
+	}
 	if (fd < 0) {
-		KMS_LOG("v3d connect=0 why=no_/dev/%s (in-fences refused)", V3DA_DEV_NAME);
+		KMS_LOG("v3d connect=0 why=no_/dev/%s waited_ms=%u (in-fences refused)", V3DA_DEV_NAME, waited_ms);
 		return;
 	}
 	memset(&h, 0, sizeof(h));
@@ -392,8 +404,8 @@ static void v3d_connect(void)
 		return;
 	}
 	srv.v3d_fp = p;   /* keep fd open: closing it frees our client slot in the render server */
-	KMS_LOG("v3d connect=1 fence_pa=0x%llx client=%u server_pid=%u", (unsigned long long)h.fence_page.addr,
-		h.client_id, h.server_pid);
+	KMS_LOG("v3d connect=1 fence_pa=0x%llx client=%u server_pid=%u waited_ms=%u", (unsigned long long)h.fence_page.addr,
+		h.client_id, h.server_pid, waited_ms);
 }
 
 
