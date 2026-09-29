@@ -9,6 +9,11 @@
  *   wifi disconnect             remove /etc/wifi.conf; the netif leaves
  *   wifi status                 wanted network, daemon state, netif address
  *
+ * The rpi4-wifi daemon starts at boot, and /etc/wifi.conf lives on the root
+ * file system, so a network saved with `wifi connect` is joined again after a
+ * reboot. No network is configured out of the box; /etc/wifi.conf.example
+ * documents the file for anyone who prefers to write it by hand.
+ *
  * The remaining commands talk to the daemon directly and bypass lwip. They are
  * bring-up diagnostics: `netup` and `join` run their own association (and
  * `netup` its own DHCP client) inside the daemon, which fights the netif if it
@@ -24,6 +29,7 @@
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -125,11 +131,20 @@ static void print_addr(const char *label, uint32_t addr, const char *ifname)
 
 /* Replace /etc/wifi.conf in one step: write a new file beside it, then rename
  * over the old one, so the netif (which re-reads it every few seconds) never
- * sees half a file. */
+ * sees half a file. The file holds the passphrase, so only its owner may read
+ * it. */
 static int conf_write(const char *ssid, const char *psk)
 {
-	FILE *f = fopen(WIFI_CONF_TMP, "w");
+	FILE *f = NULL;
+	int fd;
 
+	fd = open(WIFI_CONF_TMP, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+	if (fd >= 0) {
+		f = fdopen(fd, "w");
+		if (f == NULL) {
+			close(fd);
+		}
+	}
 	if (f == NULL) {
 		printf("wifi: cannot create %s: %s\n", WIFI_CONF_TMP, strerror(errno));
 		return -1;
@@ -151,8 +166,11 @@ static int conf_write(const char *ssid, const char *psk)
 }
 
 
-/* A WPA2 passphrase is 8..63 printable characters; 64 characters is a raw hex
- * key. Anything else the firmware would reject 30 s later, so say so now. */
+/* A WPA2 passphrase is 8..63 printable characters. Anything else would fail
+ * only 30 s later, inside the join, so say so now. Two limits are this
+ * driver's, not WPA2's: the daemon's join command separates the ssid from the
+ * passphrase at the first space, so an ssid may not contain one, and it takes
+ * the passphrase form only, not a 64-digit hex key. */
 static int creds_valid(const char *ssid, const char *psk)
 {
 	size_t sl = strlen(ssid), pl = strlen(psk);
@@ -161,8 +179,12 @@ static int creds_valid(const char *ssid, const char *psk)
 		printf("wifi: ssid must be 1-32 characters\n");
 		return 0;
 	}
-	if ((pl < 8) || (pl > 64)) {
-		printf("wifi: WPA2 passphrase must be 8-63 characters (or 64 hex digits)\n");
+	if (strchr(ssid, ' ') != NULL) {
+		printf("wifi: an ssid containing a space is not supported yet\n");
+		return 0;
+	}
+	if ((pl < 8) || (pl > 63)) {
+		printf("wifi: WPA2 passphrase must be 8-63 characters\n");
 		return 0;
 	}
 	if ((strchr(ssid, '\n') != NULL) || (strchr(psk, '\n') != NULL)) {
@@ -262,7 +284,8 @@ static int do_status(void)
 
 	fd = open(WIFI_DEV, O_RDWR);
 	if (fd < 0) {
-		printf("daemon:  not running (%s absent -- start rpi4-wifi)\n", WIFI_DEV);
+		printf("daemon:  not running (%s absent: the boot log says why -- look for\n"
+			"         \"rpi4-wifi: WiFi disabled\" -- or start it by hand: rpi4-wifi)\n", WIFI_DEV);
 	}
 	else {
 		printf("daemon:  ");
@@ -439,6 +462,7 @@ int main(int argc, char **argv)
 	printf("usage: wifi scan | wifi connect <ssid> <psk> | wifi disconnect | wifi status\n"
 	       "  connect:    save the network to %s and wait for the DHCP lease;\n"
 	       "              the WiFi netif (wl) joins it and rejoins after a reboot\n"
+	       "              (WPA2-PSK; the file format is in /etc/wifi.conf.example)\n"
 	       "  disconnect: forget the network; the netif releases its lease and leaves\n"
 	       "diagnostics (talk to the daemon directly, bypassing the netif -- do not use\n"
 	       "while it is connected):\n"
