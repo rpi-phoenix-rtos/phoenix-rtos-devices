@@ -25,7 +25,7 @@ static void sysinfo_inventory(void)
 	static const char *const nodes[] = {
 		"/dev/console", "/dev/null", "/dev/zero", "/dev/urandom",
 		"/dev/hwrng", "/dev/thermal", "/dev/throttled", "/dev/gpio",
-		"/dev/fb0", "/dev/audio0", "/dev/kbd0", "/dev/mouse0",
+		"/dev/kms", "/dev/v3d-async", "/dev/audio0", "/dev/kbd0", "/dev/mouse0",
 	};
 	size_t i;
 	struct stat st;
