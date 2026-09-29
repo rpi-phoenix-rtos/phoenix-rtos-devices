@@ -24,7 +24,18 @@ typedef struct {
 	uint32_t cm_pwmctl; /* clock-manager PWM control (bit7 = BUSY) */
 	uint32_t pwm_ctl;   /* PWM control (PWEN1/PWEN2 = running) */
 	uint32_t pwm_sta;   /* PWM status (FULL/EMPT/WERR) */
-	uint32_t underruns; /* FIFO-full drops since start */
+	uint32_t underruns; /* FIFO-full drops and write stalls since start */
+
+	/* Streaming ring. The DMA loops over it forever and is never stopped; after the
+	 * writer stops, the driver overwrites every played word with silence, so an idle
+	 * device reads dma_cs ACTIVE with ring_pending == 0 and ring_nonsilent == 0. */
+	uint32_t dma_cs;         /* DMA channel CS (bit 0 = ACTIVE) */
+	uint32_t ring_pending;   /* words queued ahead of the cursor, not yet played */
+	uint32_t ring_nonsilent; /* ring words not holding silence, counted on this call */
+	uint32_t ring_drains;    /* times the ring ran dry and was left all silence */
+	uint32_t ring_underruns; /* ...of those, with the device still open (underrun/pause) */
+	uint32_t ring_laps;      /* services that found the cursor a lap or more on */
+	uint32_t ring_silenced;  /* words overwritten with silence, total */
 } rpi4audio_state_t;
 
 
