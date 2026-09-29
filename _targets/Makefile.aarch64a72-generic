@@ -35,15 +35,9 @@ DEFAULT_COMPONENTS += rpi4-vcmbox
 DEFAULT_COMPONENTS += rpi4-thermal
 # Hardware RNG (BCM2711 iproc RNG200 @ 0xfe104000) -> /dev/hwrng entropy source.
 DEFAULT_COMPONENTS += rpi4-hwrng
-# VideoCore HDMI framebuffer (/dev/fb0): read/write byte access + geometry
-# devctl over the plo-allocated 32-bpp surface (pctl_graphmode + MAP_PHYSMEM).
-# Built (and started at boot) only for an RPI4B_GPU_LEGACY=1 image: the default
-# image's display is rpi4-kms. TODO(TD-27): its last users outside the old GPU
-# stack (hevc-play, fbprobe) move to a KMS dumb buffer, then it goes with P3.
-RPI4B_GPU_LEGACY_ON := $(filter-out 0 n no false,$(RPI4B_GPU_LEGACY))
-ifneq ($(RPI4B_GPU_LEGACY_ON),)
-DEFAULT_COMPONENTS += rpi4-fb
-endif
+# video/rpi4-fb (/dev/fb0, the plo firmware framebuffer as a byte device) is NOT a
+# component: the display is rpi4-kms. TODO(TD-27): its last user, hevc-play (built by
+# hand, not by the image), moves to a KMS dumb buffer; then video/rpi4-fb is deleted.
 # BCM2711 GPIO observer (/dev/gpio @ 0xfe200000): read-only register snapshot +
 # per-pin {fsel,level,pull} devctl. Outputs deferred to an attended bench session.
 DEFAULT_COMPONENTS += rpi4-gpio
@@ -54,19 +48,6 @@ DEFAULT_COMPONENTS += rpi4-audio
 # Boot system-info banner: build stamp, uptime, a hardware-RNG entropy sample, and a
 # Pi 4 device-node inventory. Bounded/non-blocking (stat/getentropy/clock); "alive" touch.
 DEFAULT_COMPONENTS += rpi4-sysinfo
-# Concurrent-GPU V3D server (/dev/v3d-srv): sole owner of the single V3D GPU
-# (power + MMU page table + VA allocator + BO table), serializing GPU submits from
-# multiple clients over a message port so an accelerated X desktop and a second GPU
-# app can run at once (HW-proven end-to-end, docs/inprogress/2026-08-22-concurrent-
-# gpu-v3d-server-feasibility.md). Built as a first-class component here; the client
-# lib (libv3d-client) is consumed by daemon-client apps. NOT auto-launched from
-# user.plo.yaml yet: launching it takes exclusive GPU ownership, which conflicts with
-# the current in-process-winsys GPU apps (Xphoenix-glamor, quakes). Auto-start lands
-# together with daemon-client builds of those apps (productization follow-on).
-# TODO(TD-24): the old GPU stack, built only for an RPI4B_GPU_LEGACY=1 image (P3 deletes it).
-ifneq ($(RPI4B_GPU_LEGACY_ON),)
-DEFAULT_COMPONENTS += rpi4-v3d
-endif
 # The GPU stack (DRM-shaped), started at boot from user.plo.yaml in this order:
 #  - rpi4-v3d-async: the V3D render server (/dev/v3d-async, /dev/dri/renderD128,
 #    /dev/dri/card1, /v3dbuf): sole owner of the GPU, async queues, fences, BOs.
@@ -86,17 +67,10 @@ DEFAULT_COMPONENTS += rpi4-klogd
 # getentropy). NOT a default component (re-add here + to user.plo.yaml to re-run).
 # Verdict 2026-06-17: AF_UNIX READY + getrandom/getentropy READY (HW-verified).
 # DEFAULT_COMPONENTS += rpi4-ipcprobe
-# The V3D GPU bring-up diagnostics (rpi4-v3d-scout, rpi4-v3d-mesa, rpi4-v3d-stalltest,
-# rpi4-v3dv-tier0) and the GL demo rungs (rpi4-glclear, rpi4-gldraw, rpi4-glcube) were
-# removed: their hypotheses are resolved (V3D powers on, GL renders on HDMI, Vulkan
-# tier-4b renders a real pipeline) and the showcase capstone is rpi4-quake (now in
-# phoenix-rtos-project/_user/). Recoverable from git history if a future probe is needed.
-#
-# rpi4-quake (GLQuake capstone) + rpi4-vkquake are applications, not drivers: they
-# now live in phoenix-rtos-project/_user/ and are built by that project's
-# `make -C _user all install`, not here. The loader.disk bundle + the
-# `app -x rpi4-quake` launch in user.plo.yaml are unchanged (basename lookup out of
-# PREFIX_PROG_STRIPPED, which both repos populate identically).
+# Removed, recoverable from git history: the V3D bring-up probes and GL demo rungs, and
+# the first GPU stack (the in-process Mesa winsys + its build scripts, its GPU daemon on
+# /dev/v3d-srv and that daemon's client library), superseded by rpi4-v3d-async + rpi4-kms. The games are ports
+# (phoenix-rtos-ports *_drm), not device components.
 # Note: the standalone `pcie` daemon is intentionally NOT listed here.
 # Pi 4 (the only aarch64a72 project today) merges PCIe bridge bring-up
 # into the usb daemon via libusbxhci's bcm2711_pcie_initVL805(), so
