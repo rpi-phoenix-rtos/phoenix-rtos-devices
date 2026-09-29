@@ -76,6 +76,12 @@ endif
 # Clients reach them through libdrm (the libdrm_phoenix port), Mesa (mesa_drm), SDL2
 # KMSDRM (sdl2_kmsdrm), Xorg modesetting (xorg_server_drm) and Wayland.
 DEFAULT_COMPONENTS += rpi4-v3d-async rpi4-kms shmsrv
+# BCM43455 WiFi: the rpi4-wifi daemon owns the chip on the Arasan SDIO bus and serves
+# /dev/wifi (commands) + /dev/wifidata (frames for the lwip wifi43455 netif); `wifi`
+# (/bin) is the user's control client. Started at boot from user.plo.yaml. It reads
+# the vendor firmware from /lib/firmware/brcm/ (fetched by the image build, never in
+# git) and, without it, logs one line and exits: the image builds either way.
+DEFAULT_COMPONENTS += rpi4-wifi wifi
 # Kernel-log capture daemon (task #31): reads the klog ring and appends it to
 # /var/log/messages. Always bundled (a few KB); only LAUNCHED in the USER logging
 # mode (RPI4_LOG_TO_FILE), where it is the file-capture half of suppressing the
