@@ -12,7 +12,11 @@
  * At startup it runs the full firmware bring-up ONCE (power-cycle WL_ON
  * via the VideoCore mailbox, SDIO enumeration, 643 KB firmware download
  * into the CR4 TCM, NVRAM + CLM regulatory blob, ARM-CR4 reset release,
- * SDPCM function-2 enable), then serves /dev/wifi.
+ * SDPCM function-2 enable), then serves /dev/wifi and /dev/wifidata (the
+ * frame seam of the lwip wifi43455 netif, which joins the network named in
+ * /etc/wifi.conf). The firmware, NVRAM and CLM come from /lib/firmware/brcm/
+ * (see WIFI_FW_*). The image starts it at boot with -f; started from the shell
+ * it forks and returns once /dev/wifi is up.
  *
  * PROVENANCE
  * ----------
@@ -37,9 +41,9 @@
  * thermal/hwrng/vcmbox drivers use):
  *   - SDHCI (Arasan) @ 0xfe300000     — the controller the 43455 sits on
  *   - BCM2711 GPIO   @ 0xfe200000     — routes GPIO 34..39 to ALT3 (SDIO)
- *   - VideoCore mbox @ 0xfe00b880     — SET_GPIO_STATE(WL_ON) power cycle
- * The SDHCI reference clock rate (GET_CLOCK_RATE, EMMC clock) is read
- * through the rpi4-vcmbox server (/dev/vcmbox) instead.
+ * The VideoCore mailbox is not touched directly: the WL_REG_ON power cycle
+ * (SET/GET_GPIO_STATE) and the SDHCI reference clock rate (GET_CLOCK_RATE,
+ * EMMC clock) go through the rpi4-vcmbox server (/dev/vcmbox).
  *
  * Copyright 2026 Phoenix Systems
  * Author: Witold Bołt
@@ -48,9 +52,6 @@
  *
  * %LICENSE%
  */
-#include "wifi-fw-43455.h"
-#include "wifi-nvram-43455.h"
-#include "clm-43455.h"
 #include "libvcmbox.h"
 
 #include <sys/mman.h>
@@ -60,6 +61,8 @@
 #include <sys/threads.h>
 #include <posix/utils.h>
 
+#include <ctype.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +71,202 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+
+/* ------------------------------------------------------------------ */
+/* Firmware files. The BCM43455 needs three vendor files, read from the root
+ * file system at start-up under the names and in the layout Linux brcmfmac and
+ * linux-firmware use. They are not part of this source tree (the firmware and
+ * the CLM blob are under the Cypress licence, /lib/firmware/LICENSES/); the
+ * image build fetches them, pinned by commit and sha256. */
+
+#define WIFI_FW_DIR       "/lib/firmware/brcm/"
+#define WIFI_FW_BIN       WIFI_FW_DIR "brcmfmac43455-sdio.bin"
+#define WIFI_FW_CLM       WIFI_FW_DIR "brcmfmac43455-sdio.clm_blob"
+/* NVRAM: the board-specific file first, then the generic name, as brcmfmac does. */
+#define WIFI_FW_NVRAM     WIFI_FW_DIR "brcmfmac43455-sdio.raspberrypi,4-model-b.txt"
+#define WIFI_FW_NVRAM_ALT WIFI_FW_DIR "brcmfmac43455-sdio.txt"
+
+#define WIFI_FW_BIN_MAX   (1024u * 1024u) /* 643651 B in the pinned release */
+#define WIFI_FW_CLM_MAX   (64u * 1024u)   /* 4733 B */
+#define WIFI_FW_NVRAM_MAX (16u * 1024u)   /* 1883 B of text */
+
+/* With -f (the boot launch) the daemon can start before the root file system
+ * holding /lib/firmware is mounted -- on nfsroot it is taken over after lwip
+ * brings the network up -- so it waits this long for the files to appear. */
+#define WIFI_FW_WAIT_S    60
+
+typedef struct {
+	uint8_t *data;
+	size_t len;
+} wifi_blob_t;
+
+static wifi_blob_t g_fw;    /* the CR4 firmware image, loaded verbatim into SOCRAM */
+static wifi_blob_t g_nvram; /* the NVRAM in the chip's format (wifi_nvramPack) */
+static wifi_blob_t g_clm;   /* the CLM regulatory blob, sent with the "clmload" iovar */
+
+
+/* Read a whole file of at most `max` bytes into a new buffer. */
+static int wifi_readFile(const char *path, size_t max, wifi_blob_t *out)
+{
+	struct stat st;
+	uint8_t *data;
+	size_t len = 0u;
+	ssize_t n;
+	int fd, err = 0;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		return -errno;
+	}
+	if (fstat(fd, &st) != 0) {
+		err = -errno;
+	}
+	else if ((st.st_size <= 0) || ((size_t)st.st_size > max)) {
+		err = -EFBIG;
+	}
+	if (err != 0) {
+		close(fd);
+		return err;
+	}
+
+	data = malloc((size_t)st.st_size);
+	if (data == NULL) {
+		close(fd);
+		return -ENOMEM;
+	}
+	while (len < (size_t)st.st_size) {
+		n = read(fd, data + len, (size_t)st.st_size - len);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			err = -errno;
+			break;
+		}
+		if (n == 0) {
+			err = -EIO; /* shorter than fstat() said */
+			break;
+		}
+		len += (size_t)n;
+	}
+	close(fd);
+	if (err != 0) {
+		free(data);
+		return err;
+	}
+
+	out->data = data;
+	out->len = len;
+	return 0;
+}
+
+
+/* Convert the NVRAM text (key=value lines, '#' comments) into the image the
+ * chip's boot loader expects at the top of its RAM, as brcmfmac does:
+ *   - each non-blank, non-comment line, whitespace-trimmed, NUL-terminated;
+ *   - one more NUL, then zeros to a 4-byte boundary;
+ *   - more zeros so that the image INCLUDING the trailer is a multiple of 64
+ *     bytes, which lets the loader write it as whole 64-byte CMD53 blocks (the
+ *     zeros land between the variables and the trailer; the firmware accepts
+ *     that);
+ *   - a 4-byte little-endian trailer (~words << 16) | words, where words is
+ *     the length before the trailer in 32-bit words.
+ * Byte-identical to scripts/gen-wifi-nvram-py.py, which produced the image the
+ * driver shipped with before it read the file at run time. */
+static int wifi_nvramPack(const uint8_t *text, size_t len, wifi_blob_t *out)
+{
+	uint8_t *img;
+	size_t pos = 0u, n = 0u, b, e;
+	uint32_t words, token;
+
+	/* Worst case: every byte kept, plus the two NULs, the 4-byte and the
+	 * 64-byte padding and the trailer. */
+	img = calloc(1u, len + 2u + 3u + 63u + 4u);
+	if (img == NULL) {
+		return -ENOMEM;
+	}
+
+	while (pos < len) {
+		b = pos;
+		while ((pos < len) && (text[pos] != '\n')) {
+			pos++;
+		}
+		e = pos;
+		pos++; /* past the '\n' */
+
+		while ((b < e) && (isspace(text[b]) != 0)) {
+			b++;
+		}
+		while ((e > b) && (isspace(text[e - 1u]) != 0)) {
+			e--;
+		}
+		if ((b == e) || (text[b] == '#')) {
+			continue;
+		}
+		memcpy(img + n, text + b, e - b);
+		n += e - b;
+		img[n++] = 0u;
+	}
+	img[n++] = 0u;                             /* the list terminator */
+	n = (n + 3u) & ~(size_t)3u;                /* 4-byte boundary */
+	n = ((n + 4u + 63u) & ~(size_t)63u) - 4u;  /* image + trailer = k * 64 */
+
+	words = (uint32_t)(n / 4u);
+	token = ((~words & 0xffffu) << 16) | (words & 0xffffu);
+	img[n++] = (uint8_t)(token & 0xffu);
+	img[n++] = (uint8_t)((token >> 8) & 0xffu);
+	img[n++] = (uint8_t)((token >> 16) & 0xffu);
+	img[n++] = (uint8_t)((token >> 24) & 0xffu);
+
+	out->data = img;
+	out->len = n;
+	return 0;
+}
+
+
+/* Load the three firmware files, once: every bring-up (and each retry) reuses
+ * them. Returns 0, or a negative errno with the file that failed in *failed. */
+static int wifi_fwLoad(const char **failed)
+{
+	static int loaded = 0;
+	wifi_blob_t text = { NULL, 0u };
+	int err;
+
+	if (loaded != 0) {
+		return 0;
+	}
+
+	*failed = WIFI_FW_BIN;
+	err = wifi_readFile(WIFI_FW_BIN, WIFI_FW_BIN_MAX, &g_fw);
+	if (err == 0) {
+		*failed = WIFI_FW_NVRAM;
+		err = wifi_readFile(WIFI_FW_NVRAM, WIFI_FW_NVRAM_MAX, &text);
+		if (err == -ENOENT) {
+			*failed = WIFI_FW_NVRAM_ALT;
+			err = wifi_readFile(WIFI_FW_NVRAM_ALT, WIFI_FW_NVRAM_MAX, &text);
+		}
+	}
+	if (err == 0) {
+		err = wifi_nvramPack(text.data, text.len, &g_nvram);
+		free(text.data);
+	}
+	if (err == 0) {
+		*failed = WIFI_FW_CLM;
+		err = wifi_readFile(WIFI_FW_CLM, WIFI_FW_CLM_MAX, &g_clm);
+	}
+	if (err != 0) {
+		free(g_fw.data);
+		free(g_nvram.data);
+		g_fw.data = NULL;
+		g_nvram.data = NULL;
+		return err;
+	}
+
+	printf("rpi4-wifi: loaded %s (%zu B), clm_blob (%zu B), nvram (%zu B chip image)\n",
+		WIFI_FW_BIN, g_fw.len, g_clm.len, g_nvram.len);
+	loaded = 1;
+	return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* BCM2711 GPIO block (function-select for the SDIO alt-function). */
@@ -89,123 +288,28 @@ static void diag_gpioSetFsel(volatile uint8_t *base, unsigned pin, unsigned fn)
 }
 
 /* ------------------------------------------------------------------ */
-/* VideoCore mailbox (property channel). Used only for the WL_ON expander
- * GPIO power cycle. Pi 4 mailbox base hardcoded (the port has no
- * board_config.h include path). */
-
-#define RPI_PI4_MAILBOX_BASE  0xfe00b880u
-
-#define VC_MBOX_READ          0x00u
-#define VC_MBOX_STATUS        0x18u
-#define VC_MBOX_WRITE         0x20u
-#define VC_MBOX_STATUS_FULL   0x80000000u
-#define VC_MBOX_STATUS_EMPTY  0x40000000u
-#define VC_MBOX_RESP_OK       0x80000000u
-#define VC_MBOX_PROP_CHANNEL  8u
+/* WL_REG_ON, the chip's power line, is a Pi 4 expander GPIO owned by the
+ * VideoCore firmware, set and read with property calls. They go through the
+ * rpi4-vcmbox server like every other mailbox call: the FIFO has no hardware
+ * arbitration, and this daemon starts at boot, while other mailbox clients
+ * (thermal, the display and GPU servers) are busy. */
 
 #define VC_PROP_SET_GPIO_STATE  0x00038041u
 #define VC_PROP_GET_GPIO_STATE  0x00030041u
 
 #define EXPGPIO_WL_ON           129u  /* expgpio[1] = "WL_ON" per Pi 4 DT */
 
-/* Get / set VideoCore device power state (here: an expander GPIO via
- * SET_GPIO_STATE). Returns the resulting state on success, 0xFFFFFFFF on
- * failure. */
-static uint32_t diag_mboxPower(uint32_t tag, uint32_t device_id, uint32_t state)
+/* Set (SET_GPIO_STATE) or read (GET_GPIO_STATE) an expander GPIO. Returns the
+ * state the firmware reports, or 0xFFFFFFFF on failure. */
+static uint32_t diag_expGpio(uint32_t tag, uint32_t gpio, uint32_t state)
 {
-	addr_t pa_base = (addr_t)RPI_PI4_MAILBOX_BASE & ~(addr_t)(_PAGE_SIZE - 1);
-	addr_t pa_offs = (addr_t)RPI_PI4_MAILBOX_BASE & (addr_t)(_PAGE_SIZE - 1);
-	volatile uint32_t *mbox;
-	uint32_t *msg;
-	uintptr_t msg_pa;
-	uint32_t request;
-	uint32_t result = 0xFFFFFFFFu;
-	uint32_t deadline;
-	void *mbox_page;
-	void *msg_page;
+	uint32_t in[2] = { gpio, state };
+	uint32_t out[2] = { 0u, 0u };
 
-	mbox_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
-		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
-		-1, pa_base);
-	if (mbox_page == MAP_FAILED) {
+	if (vcmbox_call(tag, sizeof(in), in, 2u, out, 2u) != 0) {
 		return 0xFFFFFFFFu;
 	}
-	mbox = (volatile uint32_t *)((volatile uint8_t *)mbox_page + pa_offs);
-
-	msg_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
-		MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
-	if (msg_page == MAP_FAILED) {
-		munmap(mbox_page, _PAGE_SIZE);
-		return 0xFFFFFFFFu;
-	}
-	msg = msg_page;
-
-	/* GET takes (device_id) and returns (device_id, state).
-	 * SET takes (device_id, state) and returns (device_id, state). */
-	msg[0] = 32;
-	msg[1] = 0;
-	msg[2] = tag;
-	msg[3] = 8;
-	msg[4] = 0;
-	msg[5] = device_id;
-	msg[6] = state;
-	msg[7] = 0;
-
-	msg_pa = (uintptr_t)va2pa(msg);
-	/* The mailbox request carries a 32-bit bus address; reject an unmapped page
-	 * (-1) or one whose PA doesn't fit in 32 bits (a >4 GiB contiguous alloc on a
-	 * large Pi 4) rather than silently truncating it and pointing VideoCore at the
-	 * wrong physical page. */
-	if ((msg_pa == (uintptr_t)-1) || ((uint64_t)msg_pa > 0xffffffffULL)) {
-		munmap(msg_page, _PAGE_SIZE);
-		munmap(mbox_page, _PAGE_SIZE);
-		return 0xFFFFFFFFu;
-	}
-	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
-
-	/* Bound every mailbox spin (cf. the SDHCI helpers' 100000-iteration caps): a
-	 * wedged/unresponsive VideoCore must fail bring-up, not hang the WiFi thread
-	 * forever (which would leave /dev/wifi unregistered and the parent blocked). */
-	for (deadline = 100000u; ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u) && (deadline > 0u); --deadline) {
-	}
-	if (deadline == 0u) {
-		munmap(msg_page, _PAGE_SIZE);
-		munmap(mbox_page, _PAGE_SIZE);
-		return 0xFFFFFFFFu;
-	}
-	mbox[VC_MBOX_WRITE / 4] = request;
-
-	for (deadline = 100000u; deadline > 0u; --deadline) {
-		if ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) != 0u) {
-			continue; /* no response yet */
-		}
-		if (mbox[VC_MBOX_READ / 4] == request) {
-			break; /* our response */
-		}
-		/* else: a response for a different request — drain and keep waiting */
-	}
-	if (deadline == 0u) {
-		/* The doorbell already handed the firmware this page's PHYSICAL address, and
-		 * it writes its reply into msg[1] -- offset +4 -- whenever it gets round to
-		 * it, whether or not we are still waiting. Returning the page to the kernel
-		 * here would let that late reply land at +4 of whatever owns the page next,
-		 * in any address space, since a physical write goes through no MMU. That is
-		 * issue C1. Leak it on purpose instead, and say so. */
-		fprintf(stderr, "rpi4-wifi: mailbox tag 0x%08x timed out AFTER the doorbell; "
-			"leaking its message page on purpose -- the firmware still owns PA 0x%08x "
-			"and would write the reply into it (see C1)\n",
-			tag, (unsigned)msg_pa);
-		munmap(mbox_page, _PAGE_SIZE);   /* MMIO window: returns no RAM, always safe */
-		return 0xFFFFFFFFu;
-	}
-
-	if (msg[1] == VC_MBOX_RESP_OK) {
-		result = msg[6];  /* returned state */
-	}
-
-	munmap(msg_page, _PAGE_SIZE);
-	munmap(mbox_page, _PAGE_SIZE);
-	return result;
+	return out[1];
 }
 
 /* Cold-power-cycle the BCM43455 WiFi chip via its WL_REG_ON line (a Pi 4
@@ -219,23 +323,23 @@ static void diag_wifiPowerCycle(void)
 {
 	diag_sbwinForget(); /* the chip comes back with its reset window */
 
-	/* Report a failed toggle instead of discarding it. diag_mboxPower() returns
-	 * 0xFFFFFFFF when the mailbox times out or the request cannot be addressed,
-	 * and dropping that made the consequence appear far downstream as a chip that
+	/* Report a failed toggle instead of discarding it. diag_expGpio() returns
+	 * 0xFFFFFFFF when the mailbox call fails, and dropping that made the
+	 * consequence appear far downstream as a chip that
 	 * "does not respond" -- the shape of a hardware-marginality story rather than
 	 * of a diagnosable failure. Read the line back afterwards, as rpi4-hci does,
 	 * so the log says whether the radio is actually powered. */
-	if (diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u) == 0xFFFFFFFFu) {
+	if (diag_expGpio(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u) == 0xFFFFFFFFu) {
 		printf("rpi4-wifi: WL_REG_ON off failed (mailbox); chip may not reset\n");
 	}
 	usleep(50 * 1000);
-	if (diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u) == 0xFFFFFFFFu) {
+	if (diag_expGpio(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u) == 0xFFFFFFFFu) {
 		printf("rpi4-wifi: WL_REG_ON on failed (mailbox); chip will not power up\n");
 	}
 	usleep(150 * 1000);
 
 	printf("rpi4-wifi: WL_REG_ON readback=%d (expect 1)\n",
-		(int)diag_mboxPower(VC_PROP_GET_GPIO_STATE, EXPGPIO_WL_ON, 0u));
+		(int)diag_expGpio(VC_PROP_GET_GPIO_STATE, EXPGPIO_WL_ON, 0u));
 }
 
 /* ------------------------------------------------------------------ */
@@ -2020,16 +2124,16 @@ static int diag_clmLoad(volatile uint8_t *sdhci, uint32_t sdio_core,
 	int rc = 0;
 
 	g_clm_chunks = 0;
-	while (off < clm_43455_len) {
+	while (off < (uint32_t)g_clm.len) {
 		uint16_t flag = 0x1000u; /* DLOAD_HANDLER_VER<<12 */
-		chunk = clm_43455_len - off;
+		chunk = (uint32_t)g_clm.len - off;
 		if (chunk > CLM_CHUNK) {
 			chunk = CLM_CHUNK;
 		}
 		if (off == 0u) {
 			flag |= 0x0002u; /* DL_BEGIN */
 		}
-		if (off + chunk >= clm_43455_len) {
+		if (off + chunk >= (uint32_t)g_clm.len) {
 			flag |= 0x0004u; /* DL_END */
 		}
 		clmbuf[0] = (uint8_t)(flag & 0xffu);
@@ -2042,7 +2146,7 @@ static int diag_clmLoad(volatile uint8_t *sdhci, uint32_t sdio_core,
 		clmbuf[7] = 0u;
 		clmbuf[8] = 0u; clmbuf[9] = 0u; clmbuf[10] = 0u; clmbuf[11] = 0u; /* crc=0 */
 		for (i = 0u; i < chunk; ++i) {
-			clmbuf[12 + i] = clm_43455[off + i];
+			clmbuf[12 + i] = g_clm.data[off + i];
 		}
 		rc = diag_iovar(sdhci, sdio_core, 1, "clmload", clmbuf, 12u + chunk,
 			NULL, 0u, NULL, (*reqid)++, (*seq)++);
@@ -3358,13 +3462,14 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 static volatile uint8_t *g_sdhci = NULL;   /* SDHCI (Arasan) mapping, kept live after bring-up */
 static int g_fw_alive = 0;                 /* the last bring-up saw the firmware start (HT_AVAIL or CARD_INTR) */
 static int g_fw_retry_test = 0;            /* `fwretrytest`: treat the first bring-up as failed, to exercise the retry */
-static int g_bringup_quiet = 0;            /* `fwloadbench`: print the bring-up report only when it failed */
+static int g_bringup_quiet = 0;            /* the daemon, `fwloadbench`: print the bring-up report only when it failed */
 static uint32_t g_fw_bytes = 0u;           /* firmware bytes the last bring-up wrote */
 static int g_fw_rc_w = 0, g_fw_rc_nvram = 0; /* its first firmware / NVRAM write error */
 /* How long the firmware download took, and its slowest CMD53 (4 KB) and where.
- * The image is compiled into this binary and paged in from the root file
- * system on first touch, so the first load of a process can stall inside a
- * transfer; a slow CMD53 at the offset of a failure says the host stalled. */
+ * The image is read into RAM before the first bring-up (wifi_fwLoad), so the
+ * transfer no longer pages it in from the root file system as it did while it
+ * was compiled into the binary; a slow CMD53 at the offset of a failure still
+ * says the host stalled. */
 static uint32_t g_fw_dl_us = 0u, g_fw_cmd53_max_us = 0u, g_fw_cmd53_max_off = 0u, g_fw_cmd53_ge2ms = 0u;
 static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (set by bring-up) */
 
@@ -3472,8 +3577,8 @@ static int wifi_bringup(void)
 	const uint32_t blk_size = 64u;
 	const uint32_t blk_count = 64u;
 	/* #91 trivial-program test extras (baseline path ignores these). */
-	const uint8_t *fw_img = wifi_fw_43455;
-	const size_t fw_img_len = (size_t)wifi_fw_43455_len;
+	const uint8_t *fw_img = g_fw.data;
+	const size_t fw_img_len = g_fw.len;
 	uint8_t cnt_pre[4] = { 0 }, cnt_post[4] = { 0 }, cnt_post2[4] = { 0 };
 	int rc_cnt_pre = -100, rc_cnt_post = -100, rc_cnt_post2 = -100;
 	uint32_t ioctl_w2 = 0u, ioctl_w3 = 0u; /* dual ARM-wrapper CR4-identity cross-check */
@@ -3493,7 +3598,7 @@ static int wifi_bringup(void)
 
 	if (fw_img_len == 0u) {
 		r = snprintf(buf + off, cap - off,
-			"error: firmware blob not staged\n.\n");
+			"error: firmware not loaded (wifi_fwLoad)\n.\n");
 		off += (r > 0) ? r : 0;
 		printf("%.*s", off, buf);
 		return 1;
@@ -3703,7 +3808,7 @@ static int wifi_bringup(void)
 		g_fw_dl_us = (uint32_t)(diag_monoUs() - dl_t0);
 
 		/* NVRAM load: chip-ready blob goes at chip-internal
-		 * (rambase + ramsize - wifi_nvram_43455_len) = 0x238000 - len,
+		 * (rambase + ramsize - g_nvram.len) = 0x238000 - len,
 		 * inside SBADDR window 19, padded to a 64-byte boundary so it
 		 * lands as a single CMD53 multi-block write. Skipped in the
 		 * trivial-program test: the counter needs no NVRAM, and skipping
@@ -3713,12 +3818,12 @@ static int wifi_bringup(void)
 			 * hardcoded 0x238000. The bootloader reads the length-magic token
 			 * at ram_top-4; a wrong ram-top => fw never finds NVRAM. */
 			uint32_t nv_ramtop = (ram_size != 0u) ? (0x198000u + ram_size) : 0x238000u;
-			uint32_t nv_start = nv_ramtop - (uint32_t)wifi_nvram_43455_len;
+			uint32_t nv_start = nv_ramtop - (uint32_t)g_nvram.len;
 			uint8_t  nv_lo  = (uint8_t)(((nv_start >> 15) & 1u) ? 0x80u : 0x00u);
 			uint8_t  nv_mid = (uint8_t)((nv_start >> 16) & 0xffu);
 			uint8_t  nv_hi  = (uint8_t)((nv_start >> 24) & 0xffu);
 			uint32_t nv_f1_offset = nv_start & 0x7FFFu;
-			uint32_t nv_blocks = (uint32_t)(wifi_nvram_43455_len / 64u);
+			uint32_t nv_blocks = (uint32_t)(g_nvram.len / 64u);
 
 			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, nv_lo,  NULL);
 			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, nv_mid, NULL);
@@ -3727,7 +3832,7 @@ static int wifi_bringup(void)
 			rc_nvram_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
 				/*reg_addr=*/nv_f1_offset,
 				/*block_count=*/nv_blocks,
-				/*block_size=*/64u, wifi_nvram_43455);
+				/*block_size=*/64u, g_nvram.data);
 		}
 
 		/* Snapshot SOCRAM[0..63] BEFORE release — should match source
@@ -3924,7 +4029,7 @@ static int wifi_bringup(void)
 					scan_buf);
 				if (scan_rc[s] == 0) {
 					for (k = 0; k < 64; ++k) {
-						if (scan_buf[k] != wifi_fw_43455[scan_off[s] + (uint32_t)k]) {
+						if (scan_buf[k] != fw_img[scan_off[s] + (uint32_t)k]) {
 							++d;
 						}
 					}
@@ -4010,8 +4115,8 @@ static int wifi_bringup(void)
 
 	r = snprintf(buf + off, cap - off,
 		"nvram: %zu bytes -> chip 0x%06x (ram-top 0x%06x from bankinfo)  rc_nvram_w=%d  HT_clk_csr=0x%02x (HT_AVAIL=0x80)\n",
-		wifi_nvram_43455_len,
-		(unsigned)(((ram_size != 0u) ? (0x198000u + ram_size) : 0x238000u) - (uint32_t)wifi_nvram_43455_len),
+		g_nvram.len,
+		(unsigned)(((ram_size != 0u) ? (0x198000u + ram_size) : 0x238000u) - (uint32_t)g_nvram.len),
 		(unsigned)((ram_size != 0u) ? (0x198000u + ram_size) : 0x238000u),
 		rc_nvram_w, (unsigned)ht_clk_csr);
 	if (r > 0 && (size_t)r < cap - off) {
@@ -4137,8 +4242,8 @@ static int wifi_bringup(void)
 		"SDHCI CARD_INTR=%u  SOCRAM-tail rc=%d  trailer[12..15]=%02x %02x %02x %02x (blob trailer=%02x %02x %02x %02x)\n",
 		card_intr, rc_tail,
 		socram_tail[12], socram_tail[13], socram_tail[14], socram_tail[15],
-		wifi_nvram_43455[wifi_nvram_43455_len - 4], wifi_nvram_43455[wifi_nvram_43455_len - 3],
-		wifi_nvram_43455[wifi_nvram_43455_len - 2], wifi_nvram_43455[wifi_nvram_43455_len - 1]);
+		g_nvram.data[g_nvram.len - 4], g_nvram.data[g_nvram.len - 3],
+		g_nvram.data[g_nvram.len - 2], g_nvram.data[g_nvram.len - 1]);
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}
@@ -4344,9 +4449,10 @@ static int wifi_bringup(void)
  * inside one boot and one binary is the only A/B here that is not confounded by
  * build or boot differences; the natural failure rate (2 of 13 loads at
  * core_freq=500, ~1 in 100 before) is far too low to grade across boots.
- * Only load 1 runs with the firmware image still to be paged in, and the natural
- * failures were all first loads: `legacypio` before `fwloadbench` makes load 1
- * legacy, and `legacypio` on the daemon compares first loads across boots. */
+ * The natural failures were all first loads (while the image was compiled in,
+ * load 1 was also the one that paged it in): `legacypio` before `fwloadbench`
+ * makes load 1 legacy, and `legacypio` on the daemon compares first loads
+ * across boots. */
 static int wifi_fwLoadBench(int n)
 {
 	/* `legacypio fwloadbench N` starts with the legacy wait, so the first
@@ -5291,15 +5397,49 @@ static void wifi_sigExit(int sig)
 }
 
 
+/* Load the firmware files. At boot (`wait` set) the root file system holding
+ * them may not be mounted yet -- or be in the middle of the NFS takeover of
+ * "/" -- so any failure is retried for up to WIFI_FW_WAIT_S. A failure that
+ * outlasts that disables WiFi with one line saying which file. */
+static int wifi_fwLoadOrWait(int wait)
+{
+	const char *failed = WIFI_FW_BIN;
+	int err, waited = 0;
+
+	for (;;) {
+		err = wifi_fwLoad(&failed);
+		if ((err == 0) || (wait == 0) || (waited >= WIFI_FW_WAIT_S)) {
+			break;
+		}
+		sleep(1);
+		waited++;
+	}
+	if (err != 0) {
+		printf("rpi4-wifi: WiFi disabled: cannot read %s (%s)%s\n", failed, strerror(-err),
+			(err == -ENOENT) ? " -- this image was built without the WiFi firmware" : "");
+	}
+	return err;
+}
+
+
 int main(int argc, char **argv)
 {
-	int selftest = 0, jointest = 0, fwbench = 0, ai, rc;
+	int selftest = 0, jointest = 0, fwbench = 0, foreground = 0, verbose = 0, ai, rc;
 	uint32_t port;
 	oid_t dev;
 	pid_t pid;
 
 	for (ai = 1; ai < argc; ++ai) {
-		if (strcmp(argv[ai], "selftest") == 0) {
+		if (strcmp(argv[ai], "-f") == 0) {
+			/* Stay in the foreground: the boot launch (user.plo.yaml), where
+			 * nothing waits for the daemon to detach. */
+			foreground = 1;
+		}
+		else if (strcmp(argv[ai], "verbose") == 0) {
+			/* the full bring-up report even when the firmware starts */
+			verbose = 1;
+		}
+		else if (strcmp(argv[ai], "selftest") == 0) {
 			selftest = 1;
 		}
 		else if (strcmp(argv[ai], "jointest") == 0) {
@@ -5318,6 +5458,20 @@ int main(int argc, char **argv)
 				fwbench = 20;
 			}
 		}
+	}
+
+	/* One owner of the SDIO bus: the daemon started at boot answers on
+	 * /dev/wifi, and a second instance (or a one-shot mode) would drive the
+	 * same chip underneath it. */
+	rc = open("/dev/wifi", O_RDWR);
+	if (rc >= 0) {
+		close(rc);
+		printf("rpi4-wifi: already running (/dev/wifi is served); nothing to do\n");
+		return 0;
+	}
+
+	if (wifi_fwLoadOrWait(foreground) != 0) {
+		return 1;
 	}
 
 	if (fwbench > 0) {
@@ -5347,25 +5501,33 @@ int main(int argc, char **argv)
 		return rc;
 	}
 
-	/* Resident daemon: fork so the shell returns once /dev/wifi is up while the
-	 * child keeps serving (canonical Phoenix pattern, cf. rpi4-hci). */
-	signal(SIGUSR1, wifi_sigExit);
-	pid = fork();
-	if (pid < 0) {
-		printf("rpi4-wifi: fork failed\n");
-		return 1;
-	}
-	if (pid > 0) {
-		/* Wait to be signalled by the child once /dev/wifi is up. Generous
-		 * fallback: WiFi bring-up (643 KB SDIO fw download + CLM + settle) is
-		 * much slower than BT; only reached if the child fails to come up. */
-		(void)sleep(120);
-		return 1;
+	/* The resident daemon prints its ~16 KB bring-up report only when the
+	 * firmware did not start (or with `verbose`); the one-line summary and the
+	 * "firmware running" line are always printed. */
+	g_bringup_quiet = (verbose == 0) ? 1 : 0;
+
+	if (foreground == 0) {
+		/* Started from the shell: fork so the shell returns once /dev/wifi is up
+		 * while the child keeps serving (canonical Phoenix pattern, cf. rpi4-hci). */
+		signal(SIGUSR1, wifi_sigExit);
+		pid = fork();
+		if (pid < 0) {
+			printf("rpi4-wifi: fork failed\n");
+			return 1;
+		}
+		if (pid > 0) {
+			/* Wait to be signalled by the child once /dev/wifi is up. Generous
+			 * fallback: WiFi bring-up (643 KB SDIO fw download + CLM + settle) is
+			 * much slower than BT; only reached if the child fails to come up. */
+			(void)sleep(120);
+			return 1;
+		}
+		signal(SIGUSR1, wifi_sigExit);
+		(void)setsid();
 	}
 
-	/* child: bring up the radio, register /dev/wifi, then serve forever */
-	signal(SIGUSR1, wifi_sigExit);
-	(void)setsid();
+	/* The daemon (or the forked child): bring up the radio, register /dev/wifi,
+	 * then serve forever. */
 	rc = wifi_bringupRetry();
 	if (rc != 0) {
 		printf("rpi4-wifi: bring-up failed (rc=%d)\n", rc);
@@ -5396,7 +5558,9 @@ int main(int argc, char **argv)
 		return 5;
 	}
 
-	kill(getppid(), SIGUSR1);
+	if (foreground == 0) {
+		kill(getppid(), SIGUSR1);
+	}
 	for (;;) {
 		usleep(1000 * 1000); /* the message thread does the work */
 	}
