@@ -446,10 +446,8 @@ int kms_bo_checksum(uint32_t client, const kms_checksum_req_t *rq, kms_checksum_
 /* PRIME import of a foreign buffer (gap G7)                                  */
 /* ========================================================================= */
 
-/* Imports are rare (once per client buffer), so the success lines are capped only
- * against a runaway client; every failure is logged. */
-#define KMS_IMPORT_LOG_MAX 64u
-static uint32_t import_notes, release_notes;
+/* Every failure is logged. A successful import or release is a per-buffer trace
+ * line (-v); one that cannot be scanned out directly (why=) is always logged. */
 
 
 /* Open the exporter's name, size it, map it with the export's memory type and
@@ -626,10 +624,8 @@ static int import_alias(uint32_t client, const kms_prime_import_req_t *rq, kms_d
 	srv.st.bos_live++;
 	srv.aliases_live++;
 	import_reply(b, out);
-	if (import_notes++ < KMS_IMPORT_LOG_MAX) {
-		KMS_LOG("import client=%u ns=kmsbuf id=%u handle=%u owner=%u pa0=0x%llx size=%zu alias=1 live=%u", client, id,
-			b->handle, src->owner, (unsigned long long)b->pa, b->size, srv.aliases_live);
-	}
+	KMS_VLOG("import client=%u ns=kmsbuf id=%u handle=%u owner=%u pa0=0x%llx size=%zu alias=1 live=%u", client, id,
+		b->handle, src->owner, (unsigned long long)b->pa, b->size, srv.aliases_live);
 	return 0;
 }
 
@@ -707,7 +703,7 @@ int kms_import_install(uint32_t client, const kms_prime_import_req_t *rq, kms_im
 		srv.st.bos_live++;
 		srv.imports_live++;
 		import_reply(b, out);
-		if ((b->imp_why != NULL) || (import_notes++ < KMS_IMPORT_LOG_MAX)) {
+		if ((b->imp_why != NULL) || srv.verbose) {
 			KMS_LOG("import client=%u ns=v3dbuf id=%llu handle=%u pages=%u pa0=0x%llx contiguous=1 scanout=%d why=%s "
 				"live=%u", client, (unsigned long long)rq->id, b->handle, im->pages, (unsigned long long)im->pa,
 				(b->imp_why == NULL) ? 1 : 0, (b->imp_why != NULL) ? b->imp_why : "-", srv.imports_live);
@@ -762,8 +758,8 @@ void kms_reap(void)
 		if (list[i].fd >= 0) {
 			(void)close(list[i].fd);   /* the exporter's mtClose: its reference on the buffer goes */
 		}
-		if ((list[i].handle != 0u) && (release_notes++ < KMS_IMPORT_LOG_MAX)) {
-			KMS_LOG("import released handle=%u id=%llu (descriptor closed)", list[i].handle,
+		if (list[i].handle != 0u) {
+			KMS_VLOG("import released handle=%u id=%llu (descriptor closed)", list[i].handle,
 				(unsigned long long)list[i].id);
 		}
 	}
@@ -1085,7 +1081,7 @@ void kms_bufns_thread(void *arg)
 					msg.o.attr.val = (b != NULL) ? (long long)b->size : 0;
 					msg.o.err = (b != NULL) ? 0 : -ENOENT;
 					if ((b != NULL) && (bufns_size_notes++ == 0u)) {
-						KMS_LOG("srv kmsbuf atSize id=%u size=%zu (first; G3)", (unsigned)msg.oid.id, b->size);
+						KMS_VLOG("srv kmsbuf atSize id=%u size=%zu (first; G3)", (unsigned)msg.oid.id, b->size);
 					}
 					(void)mutexUnlock(srv.lock);
 				}
@@ -1119,7 +1115,7 @@ void kms_bufns_thread(void *arg)
 				}
 				else {
 					if ((b != NULL) && (client_pid(b->owner) != msg.pid) && !b->prime && (bufns_pid_notes++ == 0u)) {
-						KMS_LOG("srv note: %s/%u opened by pid %d, owner pid %d (allowed in Stage A)", KMS_BUF_NS,
+						KMS_VLOG("srv note: %s/%u opened by pid %d, owner pid %d (allowed in Stage A)", KMS_BUF_NS,
 							(unsigned)msg.oid.id, msg.pid, client_pid(b->owner));
 					}
 					msg.o.err = 0;

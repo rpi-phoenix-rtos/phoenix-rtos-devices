@@ -26,10 +26,14 @@
  *               old lane's full sequence; 0xaf = Linux's per-job L2T sequence, E2b H7)
  *   -c KiB      binner-overflow chunk size (default 1024; pool 32 MiB)
  *   -w ms       watchdog: no control-list progress this long = wedge (default 500)
- *   -s ms       periodic "V3DA srv qstat" line while GPU jobs run (default 5000, 0 = off)
+ *   -s ms       periodic "V3DA srv qstat" line every ms while GPU jobs run (default 0 = off;
+ *               the same counters on demand: `v3dasync-ping qstats`)
  *   -L MiB      low-memory budget of scan-out BOs (V3DA_BO_LOWMEM, proto 5): how much of
  *               the low 1 GiB their blocks may hold (buddy footprint, default 64;
  *               0 = never place them, the pre-proto-5 behaviour)
+ *   -v          verbose: also log each client open/close, BO import/export/release,
+ *               /v3dbuf open/close, the first fstat and the first pid mismatch, and every
+ *               `V3DA srv low` placement past the first 64 (per-buffer traffic)
  *
  * Serves: HELLO, GET_INFO, GET_PARAM, BO create/close/mmap/offset/wait (incl.
  * scanout BOs), BO_IMPORT (PRIME import of a /kmsbuf or /v3dbuf export), BO_EXPORT
@@ -179,7 +183,7 @@ static int client_hello(id_t id, int pid, v3da_hello_t *h)
 	if ((h->proto < V3DA_PROTO_BASE) || (h->proto > V3DA_PROTO_VERSION)) {
 		return -EPROTO;
 	}
-	if ((pid != c->pid) && (m.pid_mismatch++ == 0u)) {
+	if ((srv.verbose != 0) && (pid != c->pid) && (m.pid_mismatch++ == 0u)) {
 		printf("V3DA srv note: HELLO pid %d != mtOpen pid %d (logged once, not enforced in part 1)\n",
 			pid, c->pid);
 	}
@@ -275,7 +279,7 @@ static int handle_raw(msg_t *msg, msg_rid_t rid, v3da_wait_t **answer)
 		r->err = -EBADF;
 		return 1;
 	}
-	if ((msg->pid != c->pid) && (m.pid_mismatch++ == 0u)) {
+	if ((srv.verbose != 0) && (msg->pid != c->pid) && (m.pid_mismatch++ == 0u)) {
 		printf("V3DA srv note: request pid %d != client pid %d (logged once, not enforced in part 1)\n",
 			msg->pid, c->pid);
 	}
@@ -533,7 +537,7 @@ static int attr_all(msg_t *msg, uint32_t port)
 {
 	int rc = v3da_attr_all(msg, S_IFCHR | 0666, 0u, port);
 
-	if ((rc == 0) && (m.attr_notes++ == 0u)) {
+	if ((srv.verbose != 0) && (rc == 0) && (m.attr_notes++ == 0u)) {
 		printf("V3DA srv fstat answered (mtGetAttrAll, G2) port=%s client=%u pid=%d\n",
 			(port == srv.port) ? "render" : "card1", (unsigned)msg->oid.id, msg->pid);
 	}
@@ -777,7 +781,7 @@ int main(int argc, char **argv)
 	srv.knobs = 0u;
 	srv.ovf_chunk_kib = 1024u;
 	srv.wedge_ms = 500u;
-	srv.stat_ms = 5000u;
+	srv.stat_ms = 0u;   /* -s: the periodic qstat line is a measurement tool, not a boot log */
 	srv.low_budget = (uint64_t)V3DA_LOWMEM_BUDGET_MIB << 20;
 
 	while ((c = getopt(argc, argv, "fiI:r:p:m:k:c:w:s:L:vh")) != -1) {

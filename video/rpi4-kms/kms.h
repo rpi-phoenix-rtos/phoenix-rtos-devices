@@ -337,6 +337,13 @@ typedef struct {
 extern kms_srv_t srv;
 
 #define KMS_LOG(...) kms_log(__VA_ARGS__)
+/* Per-client and per-buffer trace (imports, releases, first fstat, pid notes): -v only */
+#define KMS_VLOG(...) \
+	do { \
+		if (srv.verbose) { \
+			kms_log(__VA_ARGS__); \
+		} \
+	} while (0)
 void kms_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 

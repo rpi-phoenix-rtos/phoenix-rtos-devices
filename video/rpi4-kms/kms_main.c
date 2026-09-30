@@ -42,6 +42,8 @@
  *               (pl011-tty then also releases /dev/kbd0)
  *   -F          start even if the firmware fb is not panned to 0 (someone else flips)
  *   -M native   list and accept only the native mode (no scaled modes: the g8 behaviour)
+ *   -v          verbose: also log each client open, dumb BO, PRIME import and release,
+ *               fb blank change, the first fstat and the first pid mismatch
  *
  * Scaled modes (M9, kms_modes.h; plane backend): the connector also lists lower
  * modes (1600x900, 1440x1080, 1280x720, 1024x768, 960x540, 800x600, 640x480 below a
@@ -253,24 +255,6 @@ static void msg_rebase(msg_t *dst, const msg_t *src)
 }
 
 
-/* The first reads served get one tagged line each: the proof, on the next Pi run,
- * that the bytes the client receives are the event (rate-limited, lock held). */
-static void read_dump(const char *path, const msg_t *msg, int bytes)
-{
-	static uint32_t ndump;
-	const uint32_t *w = (const uint32_t *)msg->o.data;
-	int packed = ((msg->o.data != NULL) && ((const uint8_t *)msg->o.data >= msg->o.raw) &&
-		((const uint8_t *)msg->o.data < msg->o.raw + sizeof(msg->o.raw))) ? 1 : 0;
-
-	if ((ndump >= 3u) || (bytes < 16) || (w == NULL)) {
-		return;
-	}
-	ndump++;
-	KMS_LOG("srv read_dump n=%u path=%s o.size=%zu o.data=%p packed=%d bytes=%d first16=%08x %08x %08x %08x", ndump,
-		path, msg->o.size, msg->o.data, packed, bytes, w[0], w[1], w[2], w[3]);
-}
-
-
 static int park(int kind, uint32_t client, uint32_t crtc, uint64_t target, const msg_t *msg, msg_rid_t rid)
 {
 	uint32_t i;
@@ -337,7 +321,6 @@ static void serve_reads(kms_parked_t *answer, uint32_t *n)
 		c = client_get(p->client);
 		if ((c != NULL) && (c->evhead != c->evtail)) {
 			p->msg.o.err = ev_fill(c, p->msg.o.data, p->msg.o.size);
-			read_dump("parked", &p->msg, p->msg.o.err);
 			claim(i, answer, n);
 		}
 	}
@@ -1425,7 +1408,7 @@ static int handle_raw(msg_t *msg, msg_rid_t rid, kms_parked_t *answer, uint32_t 
 		return 1;
 	}
 	if ((msg->pid != cl->pid) && (m.pid_notes++ == 0u)) {
-		KMS_LOG("srv note: request pid %d != client pid %d (logged once, not enforced in Stage A)", msg->pid, cl->pid);
+		KMS_VLOG("srv note: request pid %d != client pid %d (logged once, not enforced in Stage A)", msg->pid, cl->pid);
 	}
 	max = rq.u.obj.max;
 
@@ -1962,7 +1945,6 @@ static void dispatch_loop(void)
 				}
 				else if (cl->evhead != cl->evtail) {
 					msg.o.err = ev_fill(cl, msg.o.data, msg.o.size);
-					read_dump("immediate", &msg, msg.o.err);
 				}
 				else if ((msg.i.io.mode & O_NONBLOCK) != 0u) {
 					msg.o.err = -EAGAIN;
@@ -2025,7 +2007,7 @@ static void dispatch_loop(void)
 				 * one node, two names - share one dev_t. */
 				msg.o.err = kms_attr_all(&msg, S_IFCHR | 0666, 0u, srv.port);
 				if ((msg.o.err == 0) && (m.attr_notes++ == 0u)) {
-					KMS_LOG("srv fstat answered (mtGetAttrAll, G2) client=%u pid=%d", (unsigned)msg.oid.id, msg.pid);
+					KMS_VLOG("srv fstat answered (mtGetAttrAll, G2) client=%u pid=%d", (unsigned)msg.oid.id, msg.pid);
 				}
 				break;
 

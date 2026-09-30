@@ -444,7 +444,9 @@ static void export_withdraw(v3da_bo_t *b)
 	oid.id = b->handle;
 	(void)memUnexport(&oid);
 	srv.exports--;
-	printf("V3DA srv export withdrawn handle=0x%x live=%u\n", b->handle, srv.exports);
+	if (srv.verbose != 0) {
+		printf("V3DA srv export withdrawn handle=0x%x live=%u\n", b->handle, srv.exports);
+	}
 }
 
 
@@ -656,8 +658,10 @@ void v3da_bo_quarantine_poll(void)
 			 * (block_get zeroes pooled blocks - it would wipe the exporter's buffer). */
 			(void)munmap(b->cpu, (size_t)b->pages * _PAGE_SIZE);
 			srv.imports--;
-			printf("V3DA srv import released handle=0x%x id=%llu pages=%u live=%u\n", b->handle,
-				(unsigned long long)b->imp_mem.addr, b->pages, srv.imports);
+			if (srv.verbose != 0) {
+				printf("V3DA srv import released handle=0x%x id=%llu pages=%u live=%u\n", b->handle,
+					(unsigned long long)b->imp_mem.addr, b->pages, srv.imports);
+			}
 		}
 		else {
 			if (b->low != 0) {
@@ -933,8 +937,10 @@ static int import_v3dbuf(uint32_t client, const v3da_bo_import_req_t *rq, v3da_b
 		out->size = b->pages * (uint32_t)_PAGE_SIZE;
 		out->scanout = 0u;
 		export_memref(b, &out->mem);
-		printf("V3DA srv import handle=0x%x client=%u ns=v3dbuf id=%llu pages=%u owner=%u self=%d refs=%u opens=%u\n",
-			b->handle, client, (unsigned long long)rq->id, b->pages, b->owner, self, b->refs, b->fd_opens);
+		if (srv.verbose != 0) {
+			printf("V3DA srv import handle=0x%x client=%u ns=v3dbuf id=%llu pages=%u owner=%u self=%d refs=%u opens=%u\n",
+				b->handle, client, (unsigned long long)rq->id, b->pages, b->owner, self, b->refs, b->fd_opens);
+		}
 		rc = 0;
 	}
 	(void)mutexUnlock(srv.lock);
@@ -1038,10 +1044,12 @@ int v3da_bo_import(uint32_t client, const v3da_bo_import_req_t *rq, v3da_bo_crea
 			b->imp_mem.addr = rq->id;
 			srv.imports++;
 			import_reply(b, out);
-			printf("V3DA srv import handle=0x%x client=%u ns=kmsbuf id=%llu pages=%u pa0=0x%08llx contiguous=%d "
-				"gpuva=0x%08x cache=%s live=%u\n", b->handle, client, (unsigned long long)rq->id, pages,
-				(unsigned long long)pa[0], contig, gpuva, (rq->cache == V3DA_CACHE_CACHED) ? "cached" : "uncached",
-				srv.imports);
+			if (srv.verbose != 0) {
+				printf("V3DA srv import handle=0x%x client=%u ns=kmsbuf id=%llu pages=%u pa0=0x%08llx contiguous=%d "
+					"gpuva=0x%08x cache=%s live=%u\n", b->handle, client, (unsigned long long)rq->id, pages,
+					(unsigned long long)pa[0], contig, gpuva, (rq->cache == V3DA_CACHE_CACHED) ? "cached" : "uncached",
+					srv.imports);
+			}
 			rc = 0;
 		}
 	}
@@ -1089,8 +1097,10 @@ int v3da_bo_export(uint32_t client, uint32_t handle, v3da_bo_resp_t *out)
 		}
 		b->exported = 1;
 		srv.exports++;
-		printf("V3DA srv export handle=0x%x client=%u ns=v3dbuf id=%u pages=%u pa=0x%08llx gpuva=0x%08x live=%u\n",
-			b->handle, client, b->handle, b->pages, (unsigned long long)b->pa, b->gpuva, srv.exports);
+		if (srv.verbose != 0) {
+			printf("V3DA srv export handle=0x%x client=%u ns=v3dbuf id=%u pages=%u pa=0x%08llx gpuva=0x%08x live=%u\n",
+				b->handle, client, b->handle, b->pages, (unsigned long long)b->pa, b->gpuva, srv.exports);
+		}
 	}
 	out->gpuva = b->gpuva;
 	out->size = b->pages * (uint32_t)_PAGE_SIZE;
@@ -1114,7 +1124,6 @@ static v3da_bo_t *bo_by_export(uint64_t id)
  * Each open descriptor of an exported BO holds one reference on it (fd_opens). */
 void v3da_bufns_thread(void *arg)
 {
-	static uint32_t notes;
 	msg_t msg;
 	msg_rid_t rid;
 	char name[24], *end;
@@ -1206,8 +1215,7 @@ void v3da_bufns_thread(void *arg)
 					b->fd_opens++;
 					b->refs++;
 					msg.o.err = 0;
-					if ((srv.verbose != 0) || (notes < 64u)) {
-						notes++;
+					if (srv.verbose != 0) {
 						printf("V3DA srv v3dbuf open id=%u pid=%d opens=%u refs=%u\n", b->handle, msg.pid, b->fd_opens,
 							b->refs);
 					}
@@ -1220,8 +1228,7 @@ void v3da_bufns_thread(void *arg)
 				b = ((msg.oid.id != 0u) && (msg.oid.id <= 0xffffffffu)) ? bo_lookup((uint32_t)msg.oid.id) : NULL;
 				if ((b != NULL) && (b->fd_opens > 0u)) {
 					b->fd_opens--;
-					if ((srv.verbose != 0) || (notes < 64u)) {
-						notes++;
+					if (srv.verbose != 0) {
 						printf("V3DA srv v3dbuf close id=%u pid=%d opens=%u refs=%u\n", b->handle, msg.pid, b->fd_opens,
 							b->refs - 1u);
 					}
