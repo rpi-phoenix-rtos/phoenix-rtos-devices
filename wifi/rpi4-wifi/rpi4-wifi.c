@@ -3475,33 +3475,45 @@ static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (s
 
 #define WIFI_RESP_CAP (8u * 1024u)
 /* Two device ids on one port: 0 = /dev/wifi (text commands + text result),
- * 1 = /dev/wifidata (raw 802.3 frames, the lwip netif seam). */
-/* How long a /dev/wifidata read waits for a frame before reporting "none", and
- * how often it probes the FIFO while waiting. The wait keeps the caller's RX
- * thread off the message bus; the probe interval is what actually bounds
- * receive latency. */
-/* READ THIS BEFORE TUNING THESE CONSTANTS.
+ * 1 = /dev/wifidata (raw 802.3 frames, the lwip netif seam).
  *
- * A waiting read (WAIT>0), a spin before sleeping, and a bus mutex with a
- * multi-threaded message loop were all tried on hardware. None of them showed a
- * benefit that survives the measurement noise: the SAME code measured 1.73 and
- * 0.66 MB/s TX on two runs, a 2.6x spread, so single-run A/B of throughput on
- * this link proves nothing. They were reverted for adding complexity without
- * demonstrated gain, and WAIT=0 keeps the simplest behaviour: probe once,
- * return.
+ * RECEIVE IS POLLED, and the poll rate is the CLIENT's: a /dev/wifidata read
+ * probes the F2 FIFO once and returns (0 = nothing queued). The lwip netif
+ * paces those reads -- fast while frames flow, backing off to 10 ms on an idle
+ * link (drivers/wifi43455.c). A waiting read, a spin before sleeping, and a bus
+ * mutex with a multi-threaded message loop were all tried here on hardware and
+ * none showed a benefit that survives the measurement noise (the SAME code
+ * measured 1.73 and 0.66 MB/s TX on two runs), so they were reverted.
  *
  * What IS solid, because it averages thousands of samples inside one run:
  *   transmit  132 us per frame
  *   receive   178 us per frame
  *   empty probe 22 us, and there were 1.1 MILLION of them (24.9 s of bus time)
  *
- * So the radio and the SDIO transfers are not the limit -- per-frame overhead
- * and the empty polling are. The fix is an interrupt-driven RX (SDIO CARD_INTR)
- * plus frame batching, which removes the per-frame wakeup instead of re-timing
- * it. Re-measure with n>=3 runs per config. */
-#define WIFI_RX_WAIT_US  0u
-#define WIFI_RX_PROBE_US 150u
-#define WIFI_RX_SPIN_US  0u
+ * The real fix for the empty probes is an interrupt-driven RX: the chip raises
+ * the SDIO card interrupt (SDHCI INT_STATUS bit 8) when the firmware queues a
+ * frame. It is NOT a local change, for two reasons found by reading the code:
+ *
+ *   1. The Arasan controller's interrupt (GIC SPI 126, IRQ 158) is SHARED with
+ *      emmc2, the SD card controller. bcm2711-emmc's sdhost_isr claims every
+ *      dispatch of that line unconditionally -- zeroes its SIGNAL_ENABLE and
+ *      wakes its command waiter -- and _sdio_cmdExecutionWait then treats the
+ *      early wakeup as a timeout and resets CMD/DAT under an in-flight SD
+ *      command. So each WiFi interrupt would abort SD I/O until sdhost_isr
+ *      checks (INTR_STATUS & SIGNAL_ENABLE) and returns -1 when it is not its
+ *      interrupt.
+ *   2. Nothing here enables the interrupt: neither the SDIO core's
+ *      hostintmask (core + 0x24) nor CCCR IEN (0x04) is ever written, and the
+ *      Arasan's INT_STATUS_EN / SIGNAL_EN (0x34 / 0x38) are left as the boot
+ *      firmware set them.
+ *
+ * An interrupt path would: set hostintmask to I_HMB_SW_MASK | I_CHIPACTIVE (as
+ * brcmfmac), enable CCCR IEN master + F1 + F2 and INT_STATUS_EN/SIGNAL_EN bit
+ * 8; in the handler, return -1 unless bit 8 is pending, else mask SIGNAL_EN
+ * bit 8 and wake a waiter; the waiter drains the FIFO under a bus lock, acks
+ * the core intstatus (write-1-to-clear core + 0x20; SMB_INT_ACK for a mailbox
+ * interrupt) and re-enables bit 8. Keep a timed poll as the fallback, and
+ * validate on SD boot with SD I/O running, since that is where (1) bites. */
 
 #define WIFI_DEV_TEXT_ID 0
 #define WIFI_DEV_DATA_ID 1
@@ -5231,9 +5243,9 @@ static int wifi_frameRead(void *dst, size_t cap)
 	if (g_sdhci == NULL) {
 		return -EIO;
 	}
-	/* One probe, no lock, no wait: measured fastest. See the WIFI_RX_* block
-	 * for the full comparison -- a waiting read, a spin, and a bus mutex were
-	 * all tried on hardware and every one of them cost more than it saved. */
+	/* One probe, no lock, no wait: measured fastest. The caller paces the
+	 * probes; see the "RECEIVE IS POLLED" notes above WIFI_DEV_TEXT_ID for
+	 * what was tried instead and what an interrupt-driven path needs. */
 	{
 		WIFI_T0(t0);
 		int rc = diag_wifiFrameRx(g_sdhci, frame, sizeof(frame), &elen);
