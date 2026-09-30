@@ -962,6 +962,10 @@ static void poolthr(void *arg)
 
 		switch (msg.type) {
 			case mtOpen:
+				libtty_acquire(&pl011_common.uart.tty, msg.pid, msg.i.openclose.flags);
+				msg.o.err = EOK;
+				break;
+
 			case mtClose:
 				msg.o.err = EOK;
 				break;
