@@ -26,8 +26,8 @@
  *               old lane's full sequence; 0xaf = Linux's per-job L2T sequence, E2b H7)
  *   -c KiB      binner-overflow chunk size (default 1024; pool 32 MiB)
  *   -w ms       watchdog: no control-list progress this long = wedge (default 500)
- *   -s ms       periodic "V3DA srv qstat" line every ms while GPU jobs run (default 0 = off;
- *               the same counters on demand: `v3dasync-ping qstats`)
+ *   -s ms       a "V3DA srv qstat" line every <ms> milliseconds while GPU jobs run
+ *               (default 0 = off; the same counters on demand: `v3dasync-ping qstats`)
  *   -L MiB      low-memory budget of scan-out BOs (V3DA_BO_LOWMEM, proto 5): how much of
  *               the low 1 GiB their blocks may hold (buddy footprint, default 64;
  *               0 = never place them, the pre-proto-5 behaviour)
