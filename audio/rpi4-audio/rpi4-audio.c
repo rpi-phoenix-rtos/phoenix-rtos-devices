@@ -456,7 +456,12 @@ static uint32_t audio_wordsToMs(uint32_t words)
 
 /* The ring ran dry: the tail has played and every word now holds silence. The line
  * carries its own proof -- the non-silent count is taken from the ring itself, and the
- * engine state from DMA_CS -- so a UART log shows the fix acting without a microphone. */
+ * engine state from DMA_CS -- so a UART log shows the fix acting without a microphone.
+ *
+ * Printed only while the device is open, i.e. for a real underrun or a pause. A drain
+ * after the last close is the normal end of a stream (the "close:" line already said
+ * the rest plays and then silence) and happens on every boot, after the self-test; it
+ * is still counted (drains, GETSTATE). */
 static void audio_logDrain(uint32_t flags, time_t now)
 {
 	uint32_t skipped, cs;
@@ -469,7 +474,7 @@ static void audio_logDrain(uint32_t flags, time_t now)
 	if ((flags & AUDIORING_LAPPED) != 0u) {
 		ad.laps++;
 	}
-	if (audio_logOk(&ad.log_drain, now, &skipped) != 0) {
+	if (open && (audio_logOk(&ad.log_drain, now, &skipped) != 0)) {
 		cs = ad.dma[DMA_CS];
 		printf("rpi4-audio: underrun: silence-filled %u words (~%u ms), dma=%s cs=0x%08x, "
 			"ring nonsilent=%u/%u, stream=%s, lapped=%u (drains=%u, %u lines skipped)\n",
@@ -788,8 +793,8 @@ static void audio_devctl(msg_t *msg)
 
 
 /* Nothing to stop: the sweeper silences the tail once it has played, whether or not a
- * close ever arrives, so the close only reports. The line says what is still queued, so
- * the "underrun: ... stream=closed" line that follows it can be matched to it in a log. */
+ * close ever arrives, so the close only reports what is still queued. The drain that
+ * follows is not logged once the last opener is gone (audio_logDrain). */
 static void audio_close(void)
 {
 	uint32_t skipped;
@@ -1130,8 +1135,8 @@ int main(int argc, char **argv)
 	 *
 	 * ⓘ Before the sweeper existed this was not a blip: nothing overwrote the tone after
 	 * it played, so the self-chained DMA pulsed it (~0.10 s tone, ~0.08 s silence) from
-	 * boot until the first program wrote. It is now the first writer the sweeper drains,
-	 * so every boot log carries one "underrun: ... stream=closed" line right after this. */
+	 * boot until the first program wrote. It is now the first writer the sweeper drains
+	 * (with no opener, so that drain is counted but not logged). */
 	if (clkok == 0) {
 		int16_t tone[256];
 		uint32_t total = AUDIO_RATE / 5u;            /* ~0.2 s */
