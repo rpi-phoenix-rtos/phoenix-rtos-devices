@@ -409,6 +409,11 @@ static void diag_wifiPowerCycle(void)
  * core_freq) would show up as a difference between the two. */
 static uint32_t g_sdhci_measured_hz;
 
+/* The SD bus clock as last programmed: the requested target and what the
+ * divider actually gives. */
+static unsigned g_sdclk_khz;
+static uint32_t g_sdhci_sd_hz;
+
 /* Reference clock of the SDHCI divider, queried once through /dev/vcmbox. */
 static uint32_t diag_sdhciBaseHz(void)
 {
@@ -492,11 +497,14 @@ static int diag_sdhciSetClockKHz(volatile uint8_t *base, unsigned target_khz)
 		*(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET) = v;
 	}
 
+	g_sdclk_khz = target_khz;
+	g_sdhci_sd_hz = base_hz / (2u * divisor);
+
 	/* The whole derivation on one line, so a boot log shows the bus clock the
 	 * card actually got rather than the one that was asked for. */
 	printf("rpi4-wifi: SDIO-CLK target=%u kHz base=%u Hz measured=%u Hz div=%u sd=%u Hz\n",
 		target_khz, (unsigned)base_hz, (unsigned)g_sdhci_measured_hz, (unsigned)divisor,
-		(unsigned)(base_hz / (2u * divisor)));
+		(unsigned)g_sdhci_sd_hz);
 
 	return 0;
 }
@@ -626,10 +634,11 @@ static int diag_sdioCmd52(volatile uint8_t *sdhci, int write, int fn,
 	return rc;
 }
 
-/* Switch SDIO to High-Speed (25 MHz) on a 4-bit data bus. Call after
- * CMD0/5/3/7 + F1 enable + IORDY. Sequence per BCM43455c0 / SDIO 2.0:
+/* Switch the card to high-speed timing on a 4-bit data bus, at 25 MHz. Call
+ * after CMD0/5/3/7 + F1 enable + IORDY. Sequence per BCM43455c0 / SDIO 2.0:
  * CCCR 0x13 SHS check + EHS set, CCCR 0x07 4-bit width, SDHCI HCTL1
- * 4BIT+HIGH_SPEED, reprogram clock to 25 MHz. */
+ * 4BIT+HIGH_SPEED, reprogram clock to 25 MHz. diag_sdioClockUp() raises the
+ * clock later, once the backplane can hold its test pattern. */
 static int diag_sdioGoHighSpeed(volatile uint8_t *sdhci)
 {
 	uint32_t hs_resp[4] = {0};
@@ -1181,6 +1190,191 @@ static int diag_sdioCmd53Write(volatile uint8_t *sdhci, int fn,
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
 	return 0;
+}
+
+/* ---- SDIO high speed: a data clock above 25 MHz ----------------------------
+ *
+ * diag_sdioGoHighSpeed() selects high-speed timing on the card (CCCR EHS), which
+ * allows up to 50 MHz, but the bus always ran at 25 MHz, the default-speed limit.
+ * Every byte of firmware and every frame crosses this bus, and at 25 MHz the
+ * transfers are close to wire-bound: the 643 648-byte download takes 67 ms against
+ * 51.5 ms of pure wire time, and a 4 KB CMD53 429 us against 328 us.
+ *
+ * This divider only gives base / (2 N), so from the 250 MHz EMMC clock the fastest
+ * rate within 50 MHz is N = 3, 41.67 MHz. That is the rate Linux runs this chip at
+ * on the Pi (bcm2835_mmc_set_clock with brcm,overclock-50 = <0>, bcm270x.dtsi).
+ * Above 25 MHz this driver also programs the host the way Linux does:
+ *   - HOST_CONTROL's HISPD bit stays clear: Linux never sets it on this controller
+ *     (SDHCI_QUIRK_NO_HISPD_BIT in sdhci-iproc.c; bcm2835_mmc_set_ios);
+ *   - the data timeout is the maximum, 0xE, as bcm2835_mmc_prepare_data writes it
+ *     before every data command. It counts SD clocks here
+ *     (SDHCI_QUIRK_DATA_TIMEOUT_USES_SDCLK), so a faster clock shortens it.
+ * At 25 MHz nothing changes from before (HISPD set, the timeout the firmware left),
+ * so `sdclk=25000` gives exactly the bus of older builds.
+ *
+ * The new clock is proven before the firmware goes over it. A 512-byte pattern is
+ * written to SOCRAM and read back at 25 MHz, which checks the test itself. It is
+ * read back again at the new clock, then its complement is written and read back
+ * there. Every block carries a CRC both ways, so a marginal bus shows up as a
+ * command error or a mismatch. Either one returns the bus to 25 MHz and the line
+ * says why. The download that follows overwrites the pattern. */
+#define SDIO_CLK_DS_KHZ    25000u  /* default speed: the bus of every earlier build */
+#define SDIO_CLK_HS_KHZ    50000u  /* high speed: 250 MHz / 6 = 41.67 MHz here */
+#define SDHCI_HOST_CTL     0x28u   /* HOST_CONTROL (low byte of the dword) */
+#define SDHCI_HCTL_HISPD   0x04u
+#define SDHCI_TIMEOUT_MAX  0xEu    /* TIMEOUT_CONTROL, byte 0x2E: TMCLK x 2^27 */
+#define SDIO_CCCR_BUS_SPEED 0x13u
+#define SDIO_CCCR_EHS      0x02u
+#define SDIO_HS_TEST_LEN   512u
+#define SOCRAM_BASE_43455  0x198000u
+
+static unsigned g_sdclk_want_khz = SDIO_CLK_HS_KHZ; /* `sdclk=<kHz>` */
+static unsigned g_sdclk_try_khz = SDIO_CLK_HS_KHZ;  /* this bring-up's target; a retry uses 25 MHz */
+static int g_hs_hispd = 0;                /* `hispd=1`: keep HISPD set above 25 MHz as well */
+static uint32_t g_hs_timeout_boot = 0xffu; /* TIMEOUT_CONTROL as found before the first raise */
+static uint32_t g_hs_ups = 0u, g_hs_fallbacks = 0u;
+static char g_hs_why[96];                 /* why the last raise fell back ("" = it did not) */
+static uint8_t g_hs_pat[SDIO_HS_TEST_LEN] __attribute__((aligned(4)));
+static uint8_t g_hs_rb[SDIO_HS_TEST_LEN] __attribute__((aligned(4)));
+
+/* Program the host for a data clock of `khz`: HISPD, the data timeout, the
+ * divider. The card side needs nothing: EHS, set at bring-up, allows any clock
+ * up to 50 MHz. Between commands only. */
+static int diag_sdhciDataClock(volatile uint8_t *sdhci, unsigned khz)
+{
+	volatile uint32_t *hctl = (volatile uint32_t *)(sdhci + SDHCI_HOST_CTL);
+	volatile uint32_t *ctr = (volatile uint32_t *)(sdhci + SDHCI_CLK_TIMEOUT_RESET);
+	uint32_t v;
+
+	v = *hctl;
+	if ((khz <= SDIO_CLK_DS_KHZ) || (g_hs_hispd != 0)) {
+		v |= SDHCI_HCTL_HISPD;
+	}
+	else {
+		v &= ~SDHCI_HCTL_HISPD;
+	}
+	*hctl = v;
+
+	if (khz > SDIO_CLK_DS_KHZ) {
+		/* The 32-bit write keeps CLOCK_CTL and leaves the reset bits at 0. */
+		v = *ctr;
+		if (g_hs_timeout_boot == 0xffu) {
+			g_hs_timeout_boot = (v >> 16) & 0xfu;
+		}
+		*ctr = (v & 0x0000ffffu) | (SDHCI_TIMEOUT_MAX << 16);
+	}
+	return diag_sdhciSetClockKHz(sdhci, khz);
+}
+
+/* Fill g_hs_pat (xorshift32: every DAT line toggles, no period within 512 bytes),
+ * complemented when `invert` is set. */
+static void diag_hsPattern(int invert)
+{
+	uint32_t x = 0x2545f491u, i;
+
+	for (i = 0; i < SDIO_HS_TEST_LEN; ++i) {
+		x ^= x << 13;
+		x ^= x >> 17;
+		x ^= x << 5;
+		g_hs_pat[i] = (uint8_t)(((invert != 0) ? ~x : x) & 0xffu);
+	}
+}
+
+/* Optionally write g_hs_pat to SOCRAM, then read it back and compare. 0 when the
+ * pattern came back intact; otherwise -1 and the reason in g_hs_why. */
+static int diag_hsRoundTrip(volatile uint8_t *sdhci, int write, const char *phase)
+{
+	const uint32_t nblk = SDIO_HS_TEST_LEN / 64u;
+	uint32_t i;
+	int rc;
+
+	/* The window as the download sets it for its first 32 KB (0x198000). */
+	rc = diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_SBADDRLOW, 0x80u, NULL);
+	rc |= diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_SBADDRLOW + 1u, (uint8_t)((SOCRAM_BASE_43455 >> 16) & 0xffu), NULL);
+	rc |= diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_SBADDRLOW + 2u, (uint8_t)((SOCRAM_BASE_43455 >> 24) & 0xffu), NULL);
+	if (rc != 0) {
+		(void)snprintf(g_hs_why, sizeof(g_hs_why), "%s: window CMD52 failed", phase);
+		return -1;
+	}
+	if (write != 0) {
+		rc = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1, SOCRAM_BASE_43455 & 0x7fffu, nblk, 64u, g_hs_pat);
+		if (rc != 0) {
+			(void)snprintf(g_hs_why, sizeof(g_hs_why), "%s: write rc=%d", phase, rc);
+			return -1;
+		}
+	}
+	memset(g_hs_rb, 0, sizeof(g_hs_rb));
+	rc = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1, SOCRAM_BASE_43455 & 0x7fffu, nblk, 64u, g_hs_rb);
+	if (rc != 0) {
+		(void)snprintf(g_hs_why, sizeof(g_hs_why), "%s: read rc=%d", phase, rc);
+		return -1;
+	}
+	for (i = 0; i < SDIO_HS_TEST_LEN; ++i) {
+		if (g_hs_rb[i] != g_hs_pat[i]) {
+			(void)snprintf(g_hs_why, sizeof(g_hs_why), "%s: byte %u read 0x%02x, wrote 0x%02x",
+				phase, (unsigned)i, (unsigned)g_hs_rb[i], (unsigned)g_hs_pat[i]);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Raise the data clock from 25 MHz to `khz` at bring-up: the backplane clock is
+ * up and the CR4 is halted, so SOCRAM is free until the download. Returns 0 at
+ * the new clock; on any failure the bus is back at 25 MHz and -1 is returned.
+ * Never fatal: the caller downloads the firmware either way. */
+static int diag_sdioClockUp(volatile uint8_t *sdhci, unsigned khz)
+{
+	uint32_t cccr[4] = { 0 };
+	int rc;
+
+	g_hs_why[0] = '\0';
+	if ((diag_sdioCmd52(sdhci, 0, 0, SDIO_CCCR_BUS_SPEED, 0u, cccr) != 0) ||
+		((cccr[0] & SDIO_CCCR_EHS) == 0u)) {
+		(void)snprintf(g_hs_why, sizeof(g_hs_why), "CCCR 0x13 reads 0x%02x, EHS not set",
+			(unsigned)(cccr[0] & 0xffu));
+		rc = -2; /* nothing was changed */
+	}
+	else {
+		diag_hsPattern(0);
+		rc = diag_hsRoundTrip(sdhci, 1, "25MHz write+read");
+		if (rc == 0) {
+			rc = diag_sdhciDataClock(sdhci, khz);
+			if (rc != 0) {
+				(void)snprintf(g_hs_why, sizeof(g_hs_why), "clock rc=%d", rc);
+			}
+		}
+		if (rc == 0) {
+			rc = diag_hsRoundTrip(sdhci, 0, "fast read");
+		}
+		if (rc == 0) {
+			diag_hsPattern(1);
+			rc = diag_hsRoundTrip(sdhci, 1, "fast write+read");
+		}
+	}
+
+	if (rc == 0) {
+		g_hs_ups++;
+		printf("rpi4-wifi: SDIO-HS on: sd=%u Hz hctl=0x%02x timeout=0x%x (was 0x%x) cccr13=0x%02x "
+			"check=pass (%u B written+read at 25 MHz and at the new clock)\n",
+			(unsigned)g_sdhci_sd_hz,
+			(unsigned)(*(volatile uint32_t *)(sdhci + SDHCI_HOST_CTL) & 0xffu),
+			(unsigned)((*(volatile uint32_t *)(sdhci + SDHCI_CLK_TIMEOUT_RESET) >> 16) & 0xfu),
+			(unsigned)g_hs_timeout_boot, (unsigned)(cccr[0] & 0xffu), (unsigned)SDIO_HS_TEST_LEN);
+		return 0;
+	}
+
+	g_hs_fallbacks++;
+	if (rc != -2) {
+		/* A transfer may have died mid-data: clear both ends before 25 MHz. */
+		(void)diag_sdhciResetCmdDat(sdhci);
+		(void)diag_sdhciDataClock(sdhci, SDIO_CLK_DS_KHZ);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x06u, 0x01u, NULL); /* CCCR abort, function 1 */
+		(void)diag_sdhciResetCmdDat(sdhci);
+	}
+	printf("rpi4-wifi: SDIO-HS fallback: %s; the bus stays at %u kHz\n", g_hs_why,
+		(unsigned)g_sdclk_khz);
+	return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -3753,6 +3947,12 @@ static int wifi_bringup(void)
 		ram_size = diag_cr4RamSize(sdhci, cr4_core);
 		g_ram_size = ram_size;
 
+		/* The download and everything after it at the high-speed clock. A check
+		 * that fails leaves the bus at 25 MHz; rc_hs stays 0 either way. */
+		if ((rc_hs == 0) && (g_sdclk_try_khz > SDIO_CLK_DS_KHZ)) {
+			(void)diag_sdioClockUp(sdhci, g_sdclk_try_khz);
+		}
+
 		g_fw_cmd53_max_us = 0u;
 		g_fw_cmd53_max_off = 0u;
 		g_fw_cmd53_ge2ms = 0u;
@@ -4441,11 +4641,11 @@ static int wifi_bringup(void)
 	g_fw_rc_w = worst_rc_w;
 	g_fw_rc_nvram = rc_nvram_w;
 	printf("rpi4-wifi: SDHCI-PIO mode=%s fw_bytes=%u rc_w=%d rc_nvram=%d slow_waits=%u slow_max_us=%u timeouts=%u "
-		"dl_ms=%u cmd53_max_us=%u@0x%x cmd53_ge2ms=%u\n",
+		"dl_ms=%u cmd53_max_us=%u@0x%x cmd53_ge2ms=%u sd=%u Hz\n",
 		(g_pio_legacy != 0) ? "legacy" : "level", (unsigned)bytes_written, worst_rc_w, rc_nvram_w,
 		(unsigned)g_pio_slow_waits, (unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
 		(unsigned)(g_fw_dl_us / 1000u), (unsigned)g_fw_cmd53_max_us, (unsigned)g_fw_cmd53_max_off,
-		(unsigned)g_fw_cmd53_ge2ms);
+		(unsigned)g_fw_cmd53_ge2ms, (unsigned)g_sdhci_sd_hz);
 	fflush(stdout);
 	return (g_fw_alive != 0) ? 0 : 6;
 }
@@ -4510,6 +4710,7 @@ static int wifi_bringupRetry(void)
 {
 	int attempt, rc = 6;
 
+	g_sdclk_try_khz = g_sdclk_want_khz;
 	for (attempt = 1; attempt <= 3; ++attempt) {
 		if (g_sdhci != NULL) {
 			(void)munmap((void *)g_sdhci, _PAGE_SIZE);
@@ -4526,6 +4727,11 @@ static int wifi_bringupRetry(void)
 		}
 		printf("rpi4-wifi: firmware did not start (bring-up %d of 3)%s\n", attempt,
 			(attempt < 3) ? "; power-cycling the chip and loading it again" : "");
+		/* Whatever the cause, the retries run on the bus every earlier build used. */
+		if ((attempt < 3) && (g_sdclk_try_khz > SDIO_CLK_DS_KHZ)) {
+			g_sdclk_try_khz = SDIO_CLK_DS_KHZ;
+			printf("rpi4-wifi: SDIO-HS off for the retry: it runs at %u kHz\n", (unsigned)SDIO_CLK_DS_KHZ);
+		}
 		fflush(stdout);
 	}
 	if (rc == 0) {
@@ -5781,6 +5987,22 @@ int main(int argc, char **argv)
 			/* no RX interrupt: /dev/wifiirq is not created, the netif polls */
 			rxirq = 0;
 		}
+		else if (strncmp(argv[ai], "sdclk=", 6) == 0) {
+			/* the SDIO data clock: 50000 (default, 41.67 MHz) or 25000 (every
+			 * earlier build); anything from 1000 to 50000 kHz is accepted */
+			int khz = atoi(argv[ai] + 6);
+
+			if ((khz >= 1000) && (khz <= (int)SDIO_CLK_HS_KHZ)) {
+				g_sdclk_want_khz = (unsigned)khz;
+			}
+			else {
+				printf("rpi4-wifi: ignoring %s (1000..%u kHz)\n", argv[ai], (unsigned)SDIO_CLK_HS_KHZ);
+			}
+		}
+		else if (strcmp(argv[ai], "hispd=1") == 0) {
+			/* keep HOST_CONTROL HISPD set above 25 MHz too (Linux clears it) */
+			g_hs_hispd = 1;
+		}
 		else if (strcmp(argv[ai], "legacypio") == 0) {
 			/* the old PIO wait, for a first-load A/B across boots */
 			g_pio_legacy = 1;
@@ -5792,6 +6014,8 @@ int main(int argc, char **argv)
 			}
 		}
 	}
+
+	g_sdclk_try_khz = g_sdclk_want_khz; /* fwloadbench uses it as given */
 
 	/* One owner of the SDIO bus: the daemon started at boot answers on
 	 * /dev/wifi, and a second instance (or a one-shot mode) would drive the
