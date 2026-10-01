@@ -1377,6 +1377,98 @@ static int diag_sdioClockUp(volatile uint8_t *sdhci, unsigned khz)
 	return -1;
 }
 
+/* The time each bus transfer takes, read from the generic timer (CNTVCT_EL0,
+ * enabled for EL0 by the kernel): two register reads per frame, against the
+ * syscall pair WIFI_STATS_TIMING costs. Full-size frames (> 1024 bytes) are what
+ * bulk TCP moves, so they are counted apart; an empty probe is the 12-byte header
+ * read that finds nothing queued. */
+static uint64_t g_bt_freq;
+static uint64_t g_bt_tx_ticks, g_bt_rx_ticks, g_bt_empty_ticks;
+static uint32_t g_bt_tx_n, g_bt_rx_n, g_bt_empty_n;
+
+static inline uint64_t diag_ticks(void)
+{
+	uint64_t v;
+
+	__asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+}
+
+static void diag_busTimeReset(void)
+{
+	g_bt_tx_ticks = 0u;
+	g_bt_rx_ticks = 0u;
+	g_bt_empty_ticks = 0u;
+	g_bt_tx_n = 0u;
+	g_bt_rx_n = 0u;
+	g_bt_empty_n = 0u;
+}
+
+/* Mean of `ticks` over `n`, in tenths of a microsecond. */
+static unsigned diag_busTimeAvg(uint64_t ticks, uint32_t n)
+{
+	if (g_bt_freq == 0u) {
+		__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(g_bt_freq));
+	}
+	if ((n == 0u) || (g_bt_freq == 0u)) {
+		return 0u;
+	}
+	return (unsigned)(((ticks / n) * 10000000u) / g_bt_freq);
+}
+
+static int diag_busTimeLine(char *out, int cap)
+{
+	unsigned tx = diag_busTimeAvg(g_bt_tx_ticks, g_bt_tx_n);
+	unsigned rx = diag_busTimeAvg(g_bt_rx_ticks, g_bt_rx_n);
+	unsigned em = diag_busTimeAvg(g_bt_empty_ticks, g_bt_empty_n);
+
+	return snprintf(out, (size_t)cap,
+		"WIFISTATS bustime sd=%u Hz tx_big=%u avg_us=%u.%u rx_big=%u avg_us=%u.%u empty=%u avg_us=%u.%u\n",
+		(unsigned)g_sdhci_sd_hz, (unsigned)g_bt_tx_n, tx / 10u, tx % 10u,
+		(unsigned)g_bt_rx_n, rx / 10u, rx % 10u, (unsigned)g_bt_empty_n, em / 10u, em % 10u);
+}
+
+/* A read-only check of the bus while the firmware runs (SOCRAM may not be
+ * written): CCCR 0x13 still selects high speed, and the image's first block in
+ * SOCRAM -- the reset vectors, unchanged after release in every boot that logged
+ * them -- reads back as the image. 0, or -1 with the reason in g_hs_why. */
+static int diag_hsCheckLive(volatile uint8_t *sdhci, const char *phase)
+{
+	uint32_t cccr[4] = { 0 };
+	uint32_t i;
+	int rc;
+
+	if ((g_fw.len < 64u) || (g_fw.data == NULL)) {
+		(void)snprintf(g_hs_why, sizeof(g_hs_why), "%s: no firmware image to compare", phase);
+		return -1;
+	}
+	if ((diag_sdioCmd52(sdhci, 0, 0, SDIO_CCCR_BUS_SPEED, 0u, cccr) != 0) ||
+		((cccr[0] & SDIO_CCCR_EHS) == 0u)) {
+		(void)snprintf(g_hs_why, sizeof(g_hs_why), "%s: CCCR 0x13 reads 0x%02x", phase,
+			(unsigned)(cccr[0] & 0xffu));
+		return -1;
+	}
+	rc = diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_SBADDRLOW, 0x80u, NULL);
+	rc |= diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_SBADDRLOW + 1u, (uint8_t)((SOCRAM_BASE_43455 >> 16) & 0xffu), NULL);
+	rc |= diag_sdioCmd52(sdhci, 1, 1, SBSDIO_FUNC1_SBADDRLOW + 2u, (uint8_t)((SOCRAM_BASE_43455 >> 24) & 0xffu), NULL);
+	if (rc == 0) {
+		memset(g_hs_rb, 0, 64u);
+		rc = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1, SOCRAM_BASE_43455 & 0x7fffu, 1u, 64u, g_hs_rb);
+	}
+	if (rc != 0) {
+		(void)snprintf(g_hs_why, sizeof(g_hs_why), "%s: SOCRAM read rc=%d", phase, rc);
+		return -1;
+	}
+	for (i = 0; i < 64u; ++i) {
+		if (g_hs_rb[i] != g_fw.data[i]) {
+			(void)snprintf(g_hs_why, sizeof(g_hs_why), "%s: SOCRAM byte %u reads 0x%02x, image 0x%02x",
+				phase, (unsigned)i, (unsigned)g_hs_rb[i], (unsigned)g_fw.data[i]);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* ---- #91 EROM (DMP) walk -------------------------------------------------
  * Replicates brcmfmac's brcmf_chip_dmp_erom_scan (external/linux .../chip.c)
@@ -2919,6 +3011,7 @@ static uint32_t g_frame_rx_ok = 0, g_frame_rx_err = 0, g_frame_rx_garbage = 0;
 static int diag_wifiFrameTx(volatile uint8_t *sdhci, const uint8_t *eth, uint32_t elen)
 {
 	uint32_t total, padded, i;
+	uint64_t t0;
 	int rc;
 
 	if ((sdhci == NULL) || (eth == NULL) || (elen < 14u) || ((elen + 16u) > F2_FRAME_MAX)) {
@@ -2970,11 +3063,16 @@ static int diag_wifiFrameTx(volatile uint8_t *sdhci, const uint8_t *eth, uint32_
 	g_txf[12] = 0x20u;
 
 	diag_setWindow18(sdhci);
+	t0 = diag_ticks();
 	rc = diag_f2Write(sdhci, g_txf, total);
 	if (rc != 0) {
 		diag_sdhciResetDatCmd(sdhci);
 		g_frame_tx_err++;
 		return rc;
+	}
+	if (total > 1024u) {
+		g_bt_tx_ticks += diag_ticks() - t0;
+		g_bt_tx_n++;
 	}
 	g_frame_tx_ok++;
 	return 0;
@@ -3125,6 +3223,7 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 	uint16_t flen = 0u;
 	uint8_t chan = 0u;
 	uint32_t sdoff, ethoff, n, i;
+	uint64_t t0, dt;
 	int rc;
 
 	/* Hand out what is already in the superframe before touching the bus. */
@@ -3135,7 +3234,17 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 		}
 	}
 
+	t0 = diag_ticks();
 	rc = diag_f2RecvFrame(sdhci, g_glomf, F2_GLOM_MAX, &flen, &chan);
+	dt = diag_ticks() - t0;
+	if (rc == 1) {
+		g_bt_empty_ticks += dt;
+		g_bt_empty_n++;
+	}
+	else if ((rc == 0) && (chan == 2u) && (flen > 1024u)) {
+		g_bt_rx_ticks += dt;
+		g_bt_rx_n++;
+	}
 	if (rc != 0) {
 		/* -31 is an inconsistent SDPCM header: either an empty FIFO (the common,
 		 * harmless case) or a stream that has lost frame alignment. They look
@@ -5414,6 +5523,58 @@ static void wifi_irqAck(volatile uint8_t *sdhci)
 }
 
 
+/* `sdclk <kHz>`: change the data clock while the daemon runs, for an A/B of the
+ * two clocks in one boot. Runs on the message thread, which owns the bus, so no
+ * transfer is in flight. The bus is checked before (nothing changes if that
+ * fails) and after (a failure restores the old clock). The reply carries the
+ * bus times of the clock being left, and they start again from zero. */
+static int wifi_sdclk(const char *arg, char *out, int cap)
+{
+	unsigned old_khz = g_sdclk_khz;
+	int khz = atoi(arg), n, m;
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "SDCLK error: controller not initialized\n");
+	}
+	if ((khz < 1000) || (khz > (int)SDIO_CLK_HS_KHZ)) {
+		return snprintf(out, (size_t)cap, "SDCLK error: %d kHz outside 1000..%u (now %u kHz, %u Hz)\n",
+			khz, (unsigned)SDIO_CLK_HS_KHZ, old_khz, (unsigned)g_sdhci_sd_hz);
+	}
+	n = snprintf(out, (size_t)cap, "SDCLK leaving %u kHz: ", old_khz);
+	if ((n < 0) || (n >= cap)) {
+		return n;
+	}
+	m = diag_busTimeLine(out + n, cap - n);
+	if ((m < 0) || (m >= (cap - n))) {
+		return n;
+	}
+	n += m;
+
+	if (diag_hsCheckLive(g_sdhci, "before") != 0) {
+		m = snprintf(out + n, (size_t)(cap - n), "SDCLK refused: %s; the bus stays at %u kHz\n", g_hs_why, old_khz);
+		return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
+	}
+	if ((diag_sdhciDataClock(g_sdhci, (unsigned)khz) != 0) || (diag_hsCheckLive(g_sdhci, "after") != 0)) {
+		g_hs_fallbacks++;
+		(void)diag_sdhciResetCmdDat(g_sdhci);
+		(void)diag_sdhciDataClock(g_sdhci, old_khz);
+		(void)diag_sdioCmd52(g_sdhci, 1, 0, 0x06u, 0x01u, NULL); /* CCCR abort, function 1 */
+		(void)diag_sdhciResetCmdDat(g_sdhci);
+		m = snprintf(out + n, (size_t)(cap - n), "SDCLK fallback: %s; the bus is back at %u kHz (%u Hz)\n",
+			g_hs_why, (unsigned)g_sdclk_khz, (unsigned)g_sdhci_sd_hz);
+	}
+	else {
+		if ((unsigned)khz > SDIO_CLK_DS_KHZ) {
+			g_hs_ups++;
+		}
+		m = snprintf(out + n, (size_t)(cap - n), "SDCLK ok: %u kHz -> %u kHz, sd=%u Hz hctl=0x%02x (bus times reset)\n",
+			old_khz, (unsigned)khz, (unsigned)g_sdhci_sd_hz,
+			(unsigned)(*(volatile uint32_t *)(g_sdhci + SDHCI_HOST_CTL) & 0xffu));
+	}
+	diag_busTimeReset();
+	return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
+}
+
 /* `rxpoll`: switch the interrupt path off for the rest of this boot. The netif
  * sees its next /dev/wifiirq read fail and goes back to polling -- the same
  * binary and the same boot measured both ways. */
@@ -5545,6 +5706,7 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS glom descs=%u supers=%u subframes=%u bad=%u\n"
 		"WIFISTATS pio mode=%s slow_waits=%u slow_max_us=%u timeouts=%u\n"
 		"WIFISTATS sbwin writes=%u skips=%u\n"
+		"WIFISTATS sdio target=%u kHz sd=%u Hz hctl=0x%02x timeout=0x%x hs_ups=%u hs_fallbacks=%u%s%s\n"
 		"WIFISTATS rxirq mode=%s%s%s waits=%u wakes=%u level=%u timeouts=%u\n"
 		"WIFISTATS rxirq isr claimed=%u declined=%u acks=%u acks_noframe=%u ack_errs=%u drained=%u\n",
 		g_tx_calls, (unsigned long long)g_tx_us,
@@ -5563,6 +5725,11 @@ static int wifi_stats(char *out, int cap)
 		(g_pio_legacy != 0) ? "legacy" : "level", (unsigned)g_pio_slow_waits,
 		(unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
 		(unsigned)g_sbwin_writes, (unsigned)g_sbwin_skips,
+		g_sdclk_khz, (unsigned)g_sdhci_sd_hz,
+		(g_sdhci != NULL) ? (unsigned)(*(volatile uint32_t *)(g_sdhci + SDHCI_HOST_CTL) & 0xffu) : 0u,
+		(g_sdhci != NULL) ? (unsigned)((*(volatile uint32_t *)(g_sdhci + SDHCI_CLK_TIMEOUT_RESET) >> 16) & 0xfu) : 0u,
+		(unsigned)g_hs_ups, (unsigned)g_hs_fallbacks,
+		(g_hs_why[0] != '\0') ? " last_fail=" : "", g_hs_why,
 		((g_irq.ready != 0) && (g_irq.disabled == 0)) ? "irq" : "poll",
 		(g_irq.why[0] != '\0') ? " off=" : "", g_irq.why,
 		(unsigned)g_irq.waits, (unsigned)g_irq.wakes, (unsigned)g_irq.level, (unsigned)g_irq.timeouts,
@@ -5570,6 +5737,14 @@ static int wifi_stats(char *out, int cap)
 		(unsigned)g_irq.acks_noframe, (unsigned)g_irq.ack_errs, (unsigned)g_irq.drained);
 	if (m < 0) {
 		return m;
+	}
+	if ((n + m) >= cap) {
+		return cap - 1;
+	}
+	n += m;
+	m = diag_busTimeLine(out + n, cap - n);
+	if (m < 0) {
+		return n;
 	}
 	return ((n + m) < cap) ? (n + m) : (cap - 1);
 }
@@ -5891,6 +6066,17 @@ static void wifi_thread(void *arg)
 				}
 				else if (msg.i.size >= 5 && memcmp(msg.i.data, "stats", 5) == 0) {
 					g_resp_len = wifi_stats(g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 7 && memcmp(msg.i.data, "sdclk ", 6) == 0) {
+					char arg[16];
+					size_t an = msg.i.size - 6u;
+
+					if (an >= sizeof(arg)) {
+						an = sizeof(arg) - 1u;
+					}
+					memcpy(arg, (const char *)msg.i.data + 6, an);
+					arg[an] = '\0';
+					g_resp_len = wifi_sdclk(arg, g_resp, (int)sizeof(g_resp));
 				}
 				else if (msg.i.size >= 6 && memcmp(msg.i.data, "rxpoll", 6) == 0) {
 					g_resp_len = wifi_rxPoll(g_resp, (int)sizeof(g_resp));

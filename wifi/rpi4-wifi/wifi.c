@@ -376,6 +376,23 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
+	if (argc >= 3 && strcmp(argv[1], "sdclk") == 0) {
+		/* Change the SDIO data clock (kHz: 50000 = 41.67 MHz, 25000 = the old
+		 * bus) until reboot, for an A/B of the two clocks within one boot. */
+		int n = snprintf(cmd, sizeof(cmd), "sdclk %s", argv[2]);
+		if (n < 0 || n >= (int)sizeof(cmd)) {
+			printf("wifi: argument too long\n");
+			return 2;
+		}
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		rc = cmd_run(fd, cmd, n);
+		close(fd);
+		return rc;
+	}
 	if (argc >= 2 && strcmp(argv[1], "mac") == 0) {
 		fd = open(WIFI_DEV, O_RDWR);
 		if (fd < 0) {
@@ -480,6 +497,7 @@ int main(int argc, char **argv)
 	       "while it is connected):\n"
 	       "  wifi mac | wifi stats | wifi joinwpa <ssid> <psk> | wifi leave |\n"
 	       "  wifi netup <ssid> <psk> | wifi join <ssid> | wifi mtu |\n"
-	       "  wifi rxpoll (RX interrupt off until reboot; the netif polls)\n", WIFI_CONF);
+	       "  wifi rxpoll (RX interrupt off until reboot; the netif polls) |\n"
+	       "  wifi sdclk <kHz> (SDIO data clock until reboot: 50000 = 41.67 MHz, 25000)\n", WIFI_CONF);
 	return 2;
 }
