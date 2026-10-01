@@ -4208,46 +4208,10 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 		}
 	}
 
-	/* Tearing down the DEFAULT CONTROL endpoint (DCI 1) means the device is
-	 * going away -- either a disconnect or an enumeration retry. Release the
-	 * hardware slot as well, not just this software state: the framework's retry
-	 * (usb/hub.c) calls exactly this pipeDestroy and then re-enumerates, and
-	 * without a Disable Slot it re-drives a slot the controller may still hold
-	 * halted from the failure that triggered the retry, which comes back as
-	 * Context State Error every time. Only for DCI 1, so destroying a device's
-	 * interrupt pipe does not take its slot down with it. */
-	if ((priv->endpointId == 1u) && (priv->slotId != 0u)) {
-		unsigned s;
-
-		(void)xhci_cmdDisableSlot(xhci, priv->slotId);
-
-		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
-			if (xhci->slots[s].slotId == priv->slotId) {
-				/* Forget the addressed/fixed-up state with the slot it described,
-				 * so a later Enable Slot cannot inherit stale flags. */
-				xhci->slots[s].addressed = 0u;
-				xhci->slots[s].hubFixedUp = 0u;
-				/* And unbind the device: usb_devFree() is about to release that
-				 * usb_dev_t, and slots are matched by pointer. A recycled
-				 * allocation at the same address would otherwise be handed this
-				 * dead slot. */
-				xhci->slots[s].dev = NULL;
-
-				if (s != 0u) {
-					/* Release the table entry itself. Non-primary slots are
-					 * enabled on demand and the hardware slot was just disabled,
-					 * so an entry that keeps its id is simply lost -- there are
-					 * only eight, and a board with a USB 2 hub, a SuperSpeed
-					 * device and two HID devices already re-enumerates enough to
-					 * run out. The buffers are kept and reused
-					 * (xhci_allocSlotSpace). The PRIMARY slot's id is allocated
-					 * once in xhci_init and is deliberately left alone. */
-					xhci->slots[s].slotId = 0u;
-				}
-			}
-		}
-	}
-
+	/* Only interrupt and bulk pipes get here: they are the only ones xhci_initPipe
+	 * gives a private part. The default control pipe has none, so its teardown
+	 * returns above and the device's slot is not released here; a failed Address
+	 * Device replaces its slot itself (xhci_slotRenew). */
 	if (priv->ring != NULL) {
 		usb_freeAligned(priv->ring, priv->ringSize);
 	}
