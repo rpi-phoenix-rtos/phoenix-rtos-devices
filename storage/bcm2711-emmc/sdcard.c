@@ -361,8 +361,22 @@ static int sdhost_isr(unsigned int n, void *arg)
 	 * This means that ISR has to remove the reason for interrupt (zero out bit in STATUS register)
 	 * or disable the interrupt (zero out bit in SIGNAL_ENABLE register) - otherwise we get stuck
 	 * in infinite interrupt loop.
+	 *
+	 * The line is SHARED: on the BCM2711 the legacy EMMC controller that drives
+	 * the WiFi chip over SDIO (0xfe300000) raises the same GIC SPI 126 as EMMC2,
+	 * and the kernel calls every handler registered on it. So claim only what
+	 * this controller signalled. Returning -1 leaves eventCond alone: a wakeup
+	 * here for someone else's interrupt would end _sdio_cmdExecutionWait early,
+	 * which then reads as a timeout and resets CMD/DAT under an in-flight
+	 * command.
 	 */
 	sdcard_hostData_t *host = (sdcard_hostData_t *)arg;
+	uint32_t pending = *(host->base + SDHOST_REG_INTR_STATUS) & *(host->base + SDHOST_REG_INTR_SIGNAL_ENABLE);
+
+	(void)n;
+	if (pending == 0u) {
+		return -1;
+	}
 	*(host->base + SDHOST_REG_INTR_SIGNAL_ENABLE) = 0;
 	return 0;
 }
