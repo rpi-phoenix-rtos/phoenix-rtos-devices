@@ -1935,8 +1935,23 @@ static int diag_chipWake(volatile uint8_t *sdhci, int *ok)
 /* SDIO function-2 block size, programmed into FBR 0x210 during bring-up.
  * Block mode is the ONLY way to move more than 512 bytes (see the guards in
  * the byte-mode helpers), so every MTU-sized data frame goes through it.
- * 64 is what brcmfmac uses for this chip. */
-#define F2_BLKSZ     64u
+ *
+ * 64 is what this driver has always used. brcmfmac uses 512 for this chip
+ * (SDIO_FUNC2_BLOCKSIZE; only the 4329, 4354/4356/4359 and 4373 get less, in
+ * brcmf_sdiod_probe), and the block size costs time: every block carries its
+ * own CRC, CRC-status token and busy phase. The firmware download measures that
+ * at ~1.6 us per 64-byte block at 25 MHz (a 4 KB CMD53 takes 429 us against 328
+ * us of data), so a 1536-byte TX frame spends ~38 us of its ~160 us on 24 block
+ * trailers; at 512 it has 3.
+ *
+ * Only TX is affected on this side: the receive path reads F2 in byte mode (see
+ * F2_RX_ONE_CMD). What the firmware does with the value is not known here --
+ * it may align what it sends us to it -- so 512 is opt-in until measured:
+ * `f2blk=512` sets it at bring-up (Linux's order), `wifi f2blk <n>` at run time.
+ * The glom/garbage/resync counters in `stats` are the ones to watch. */
+#define F2_BLKSZ_DEFAULT 64u
+static uint32_t g_f2_blksz = F2_BLKSZ_DEFAULT;      /* what FBR 0x210 holds */
+static uint32_t g_f2_blksz_want = F2_BLKSZ_DEFAULT; /* `f2blk=<n>` */
 static int g_evt_seen = 0;             /* chan-1 (event) frames demuxed past */
 static int g_ctrl_seen = 0;            /* chan-0 (control) frames read */
 static uint16_t g_last_evt_len = 0u;
@@ -2049,9 +2064,28 @@ static void diag_f2RxFail(volatile uint8_t *sdhci)
  * prerequisite for an lwip netif. These wrappers pick the addressing mode by
  * length: byte mode below the cap (the HW-proven path, untouched), block mode
  * above it. Block mode moves whole blocks, so the length is rounded up to
- * F2_BLKSZ; the SDPCM header still tells both sides where the real frame ends,
+ * the F2 block size; the SDPCM header still tells both sides where the real frame ends,
  * and the TX tail padding is zeroed so nothing stale goes on the air.
  */
+/* Program the function-2 block size (FBR2 0x210/0x211) and read it back. 0 when
+ * the card holds `sz`; g_f2_blksz follows what was written either way, so a TX
+ * never uses a block size the card was not given. */
+static int diag_f2SetBlockSize(volatile uint8_t *sdhci, uint32_t sz)
+{
+	uint32_t lo[4] = { 0 }, hi[4] = { 0 };
+	int rc;
+
+	rc = diag_sdioCmd52(sdhci, 1, 0, 0x210u, (uint8_t)(sz & 0xffu), NULL);
+	rc |= diag_sdioCmd52(sdhci, 1, 0, 0x211u, (uint8_t)((sz >> 8) & 0xffu), NULL);
+	g_f2_blksz = sz;
+	rc |= diag_sdioCmd52(sdhci, 0, 0, 0x210u, 0u, lo);
+	rc |= diag_sdioCmd52(sdhci, 0, 0, 0x211u, 0u, hi);
+	if (rc != 0) {
+		return -1;
+	}
+	return ((((hi[0] & 0xffu) << 8) | (lo[0] & 0xffu)) == sz) ? 0 : -2;
+}
+
 static int diag_f2Write(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t len)
 {
 	uint32_t wlen = (len + 3u) & ~3u; /* pad to 4 for the PIO word loop */
@@ -2060,7 +2094,7 @@ static int diag_f2Write(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t le
 		return diag_sdioCmd53WriteByteMode(sdhci, 2, /*incr=*/1, IOCTL_F2_ADDR, wlen, buf);
 	}
 	return diag_sdioCmd53Write(sdhci, 2, /*incr=*/1, IOCTL_F2_ADDR,
-		(len + F2_BLKSZ - 1u) / F2_BLKSZ, F2_BLKSZ, buf);
+		(len + g_f2_blksz - 1u) / g_f2_blksz, g_f2_blksz, buf);
 }
 
 
@@ -2094,7 +2128,7 @@ static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
 	}
 #if F2_RX_ONE_CMD
 	return diag_sdioCmd53Read(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
-		(len + F2_BLKSZ - 1u) / F2_BLKSZ, F2_BLKSZ, buf);
+		(len + g_f2_blksz - 1u) / g_f2_blksz, g_f2_blksz, buf);
 #else
 	while (done < len) {
 		uint32_t chunk = len - done;
@@ -3033,7 +3067,7 @@ static int diag_wifiFrameTx(volatile uint8_t *sdhci, const uint8_t *eth, uint32_
 	}
 
 	total = 16u + elen;
-	padded = ((total + F2_BLKSZ - 1u) / F2_BLKSZ) * F2_BLKSZ;
+	padded = ((total + g_f2_blksz - 1u) / g_f2_blksz) * g_f2_blksz;
 	if (padded > F2_FRAME_MAX) {
 		padded = F2_FRAME_MAX;
 	}
@@ -4033,8 +4067,11 @@ static int wifi_bringup(void)
 		 * F2's never was, because nothing used block mode on the data path --
 		 * which is precisely why data frames were stuck under the 512-byte
 		 * byte-mode cap. FBR2's block size lives at 0x210/0x211. */
-		(void)diag_sdioCmd52(sdhci, 1, 0, 0x210u, (uint8_t)(F2_BLKSZ & 0xffu), NULL);
-		(void)diag_sdioCmd52(sdhci, 1, 0, 0x211u, (uint8_t)((F2_BLKSZ >> 8) & 0xffu), NULL);
+		if ((diag_f2SetBlockSize(sdhci, g_f2_blksz_want) != 0) && (g_f2_blksz_want != F2_BLKSZ_DEFAULT)) {
+			printf("rpi4-wifi: F2 block size %u did not read back; using %u\n",
+				(unsigned)g_f2_blksz_want, (unsigned)F2_BLKSZ_DEFAULT);
+			(void)diag_f2SetBlockSize(sdhci, F2_BLKSZ_DEFAULT);
+		}
 
 		/* #91: enumerate cores over the backplane (read-only) now that the
 		 * ALP clock is up, so the report can replace the hardcoded core-
@@ -5140,7 +5177,7 @@ static int wifi_mtu(char *out, int cap)
 	n += snprintf(out + n, (size_t)(cap - n),
 		"WiFi MTU test (bound %u.%u.%u.%u, F2 block size %u)\n",
 		g_dhcp_bound[0], g_dhcp_bound[1], g_dhcp_bound[2], g_dhcp_bound[3],
-		(unsigned)F2_BLKSZ);
+		(unsigned)g_f2_blksz);
 	for (i = 0; i < 3; ++i) {
 		n += snprintf(out + n, (size_t)(cap - n),
 			"  TX udp payload=%4u eth=%4u frame=%4u mode=%-5s rc=%d %s\n",
@@ -5575,6 +5612,52 @@ static int wifi_sdclk(const char *arg, char *out, int cap)
 	return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
 }
 
+/* Block sizes `f2blk` accepts: powers of two the card's FBR takes, up to the
+ * 512 bytes brcmfmac uses for this chip. */
+static int wifi_f2blkValid(int sz)
+{
+	return (sz == 64) || (sz == 128) || (sz == 256) || (sz == 512);
+}
+
+/* `f2blk <n>`: change the function-2 block size while the daemon runs, for an
+ * A/B of TX block sizes in one boot (see F2_BLKSZ_DEFAULT). Message thread, so
+ * no transfer is in flight. Linux sets it once, before the firmware starts;
+ * `f2blk=<n>` on the command line does that. The reply carries the bus times of
+ * the size being left, and they start again from zero. */
+static int wifi_f2blk(const char *arg, char *out, int cap)
+{
+	uint32_t old = g_f2_blksz;
+	int sz = atoi(arg), n, m, rc;
+
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "F2BLK error: controller not initialized\n");
+	}
+	if (wifi_f2blkValid(sz) == 0) {
+		return snprintf(out, (size_t)cap, "F2BLK error: %d is not 64, 128, 256 or 512 (now %u)\n",
+			sz, (unsigned)old);
+	}
+	n = snprintf(out, (size_t)cap, "F2BLK leaving %u: ", (unsigned)old);
+	if ((n < 0) || (n >= cap)) {
+		return n;
+	}
+	m = diag_busTimeLine(out + n, cap - n);
+	if ((m < 0) || (m >= (cap - n))) {
+		return n;
+	}
+	n += m;
+	rc = diag_f2SetBlockSize(g_sdhci, (uint32_t)sz);
+	if (rc != 0) {
+		(void)diag_f2SetBlockSize(g_sdhci, old);
+		m = snprintf(out + n, (size_t)(cap - n), "F2BLK failed: rc=%d; back at %u\n", rc, (unsigned)g_f2_blksz);
+	}
+	else {
+		m = snprintf(out + n, (size_t)(cap - n), "F2BLK ok: %u -> %u (read back; bus times reset)\n",
+			(unsigned)old, (unsigned)g_f2_blksz);
+	}
+	diag_busTimeReset();
+	return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
+}
+
 /* `rxpoll`: switch the interrupt path off for the rest of this boot. The netif
  * sees its next /dev/wifiirq read fail and goes back to polling -- the same
  * binary and the same boot measured both ways. */
@@ -5706,7 +5789,7 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS glom descs=%u supers=%u subframes=%u bad=%u\n"
 		"WIFISTATS pio mode=%s slow_waits=%u slow_max_us=%u timeouts=%u\n"
 		"WIFISTATS sbwin writes=%u skips=%u\n"
-		"WIFISTATS sdio target=%u kHz sd=%u Hz hctl=0x%02x timeout=0x%x hs_ups=%u hs_fallbacks=%u%s%s\n"
+		"WIFISTATS sdio target=%u kHz sd=%u Hz hctl=0x%02x timeout=0x%x f2blk=%u hs_ups=%u hs_fallbacks=%u%s%s\n"
 		"WIFISTATS rxirq mode=%s%s%s waits=%u wakes=%u level=%u timeouts=%u\n"
 		"WIFISTATS rxirq isr claimed=%u declined=%u acks=%u acks_noframe=%u ack_errs=%u drained=%u\n",
 		g_tx_calls, (unsigned long long)g_tx_us,
@@ -5728,7 +5811,7 @@ static int wifi_stats(char *out, int cap)
 		g_sdclk_khz, (unsigned)g_sdhci_sd_hz,
 		(g_sdhci != NULL) ? (unsigned)(*(volatile uint32_t *)(g_sdhci + SDHCI_HOST_CTL) & 0xffu) : 0u,
 		(g_sdhci != NULL) ? (unsigned)((*(volatile uint32_t *)(g_sdhci + SDHCI_CLK_TIMEOUT_RESET) >> 16) & 0xfu) : 0u,
-		(unsigned)g_hs_ups, (unsigned)g_hs_fallbacks,
+		(unsigned)g_f2_blksz, (unsigned)g_hs_ups, (unsigned)g_hs_fallbacks,
 		(g_hs_why[0] != '\0') ? " last_fail=" : "", g_hs_why,
 		((g_irq.ready != 0) && (g_irq.disabled == 0)) ? "irq" : "poll",
 		(g_irq.why[0] != '\0') ? " off=" : "", g_irq.why,
@@ -6078,6 +6161,17 @@ static void wifi_thread(void *arg)
 					arg[an] = '\0';
 					g_resp_len = wifi_sdclk(arg, g_resp, (int)sizeof(g_resp));
 				}
+				else if (msg.i.size >= 7 && memcmp(msg.i.data, "f2blk ", 6) == 0) {
+					char arg[16];
+					size_t an = msg.i.size - 6u;
+
+					if (an >= sizeof(arg)) {
+						an = sizeof(arg) - 1u;
+					}
+					memcpy(arg, (const char *)msg.i.data + 6, an);
+					arg[an] = '\0';
+					g_resp_len = wifi_f2blk(arg, g_resp, (int)sizeof(g_resp));
+				}
 				else if (msg.i.size >= 6 && memcmp(msg.i.data, "rxpoll", 6) == 0) {
 					g_resp_len = wifi_rxPoll(g_resp, (int)sizeof(g_resp));
 				}
@@ -6183,6 +6277,17 @@ int main(int argc, char **argv)
 			}
 			else {
 				printf("rpi4-wifi: ignoring %s (1000..%u kHz)\n", argv[ai], (unsigned)SDIO_CLK_HS_KHZ);
+			}
+		}
+		else if (strncmp(argv[ai], "f2blk=", 6) == 0) {
+			/* the function-2 block size set at bring-up: 64 (default) .. 512 */
+			int sz = atoi(argv[ai] + 6);
+
+			if (wifi_f2blkValid(sz) != 0) {
+				g_f2_blksz_want = (uint32_t)sz;
+			}
+			else {
+				printf("rpi4-wifi: ignoring %s (64, 128, 256 or 512)\n", argv[ai]);
 			}
 		}
 		else if (strcmp(argv[ai], "hispd=1") == 0) {
