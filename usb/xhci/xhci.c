@@ -2077,17 +2077,9 @@ static int xhci_cmdEnableSlot(xhci_t *xhci, uint8_t *slotId)
 
 /* Release a slot back to the controller.
  *
- * This is the recovery half the driver was missing. A transfer error leaves the
- * endpoint halted, and the controller then rejects any further work on that
- * slot with Context State Error -- so an enumeration retry that recreates the
- * pipe in software but leaves the slot alone retries onto a slot the hardware
- * still considers broken. That is exactly the observed 1-in-3 no-input boot:
- * one transient Split Transaction Error (code 36) on the first descriptor
- * fetch, then Context State Error (19) on both retries.
- *
- * Disable Slot discards the whole slot context, so the retry's Enable Slot
- * starts from a clean one. Best effort: on failure there is nothing further to
- * unwind, and the caller is already on a teardown path. */
+ * Disable Slot discards the whole slot context, whatever state it is in (it is
+ * valid in every state but Disabled), so a following Enable Slot starts from a
+ * clean one. See xhci_slotRenew for the caller. */
 static int xhci_cmdDisableSlot(xhci_t *xhci, uint8_t slotId)
 {
 	if ((slotId == 0u) || (slotId > xhci->nslots)) {
@@ -2479,6 +2471,111 @@ static int xhci_cmdHubSlotFixup(xhci_t *xhci, xhci_slot_t *hubSlot, usb_dev_t *h
 }
 
 
+/* Replace a slot whose Address Device failed with a freshly enabled one.
+ *
+ * Addressing is two-step (xhci_addressSlot): BSR=1 moves the slot from Enabled
+ * to Default without touching the bus, then BSR=0 sends SET_ADDRESS. When that
+ * second step fails on the wire the slot stays in Default, and BSR=1 is only
+ * valid in Enabled (xHCI 1.2 section 4.6.5) -- so the framework's retry
+ * (usb/hub.c resets the port and enumerates again) would get Context State
+ * Error on every attempt, however healthy the link has become.
+ *
+ * That is the failure seen on about 2 % of Pi 4 boots. In the one failing boot
+ * that traced port status, the first port reset trained the VL805's internal
+ * hub at full speed instead of high speed and Address Device failed with Split
+ * Transaction Error (36); the second reset trained at high speed, and both
+ * retries still failed with Context State Error (19). The board then has no
+ * keyboard or mouse.
+ *
+ * Linux does the same here on a transaction error (xhci_setup_device): disable
+ * the slot and enable a new one. A fresh slot context also means the speed the
+ * retry's port reset negotiated is the one the next Address Device programs.
+ *
+ * The slot table entry stays bound to `dev`, so the retry finds it through
+ * xhci_slotForDev and addresses it again. If no new slot can be had, the entry
+ * is released and the retry falls back to xhci_allocSlotForDev. */
+static void xhci_slotRenew(xhci_t *xhci, xhci_slot_t *slot, const usb_dev_t *dev)
+{
+	uint64_t *dcbaa = (uint64_t *)xhci->dcbaa;
+	uint8_t oldId = slot->slotId;
+	uint8_t newId = 0u;
+	int err;
+
+	(void)xhci_cmdDisableSlot(xhci, oldId);
+	if ((oldId != 0u) && (oldId <= xhci->nslots)) {
+		/* Enable Slot may hand back a different id; do not leave the old one
+		 * pointing at a context that now belongs to it. */
+		dcbaa[oldId] = 0u;
+	}
+
+	slot->slotId = 0u;
+	slot->addressed = 0u;
+	slot->hubFixedUp = 0u;
+
+	err = xhci_cmdEnableSlot(xhci, &newId);
+	if (err == EOK) {
+		slot->slotId = newId;
+		err = xhci_allocSlotSpace(xhci, slot);
+	}
+
+	if (err < 0) {
+		if (slot->slotId != 0u) {
+			(void)xhci_cmdDisableSlot(xhci, slot->slotId);
+			slot->slotId = 0u;
+		}
+		slot->dev = NULL;
+		fprintf(stderr, "xhci: Address Device failed on slot %u, no new slot for the retry (rc=%d)\n",
+			oldId, err);
+		return;
+	}
+
+	fprintf(stderr, "xhci: Address Device failed on slot %u (port %d, speed=%u), retrying on slot %u\n",
+		oldId, dev->port, xhci_usbSpeedToPsi(dev->speed), newId);
+}
+
+
+/* Address `slot` for `dev`: fresh ep0 ring, slot + ep0 input context, then the
+ * two-step Address Device (Linux xhci_setup_device scheme, #129). BSR=1
+ * (setAddress==0) sets up the slot + ep0 context WITHOUT issuing SET_ADDRESS on
+ * the wire -- it reads the input context only. BSR=0 (setAddress==1) then
+ * assigns the address. The single-step BSR=0 form intermittently never
+ * completes on the Pi4 VL805 (~3/4 cold boots); the controller dequeues
+ * EnableSlot fine but the BSR=0 AddressDevice produces no completion at all.
+ * Splitting it isolates the wire step from the context read. Safe here: the
+ * ep0 ring was just initialised and no ep0 transfer has happened yet, so the
+ * BSR=0 step's trDequeuePtr (re)load is a no-op.
+ *
+ * A failed Address Device leaves the slot unusable for a retry, so the slot is
+ * replaced before returning the error (xhci_slotRenew). */
+static int xhci_addressSlot(xhci_t *xhci, xhci_slot_t *slot, usb_dev_t *dev)
+{
+	int err;
+
+	err = xhci_initEp0Ring(xhci, slot);
+	if (err < 0) {
+		return err;
+	}
+
+	err = xhci_prepareAddressContext(xhci, slot, dev);
+	if (err < 0) {
+		return err;
+	}
+
+	err = xhci_cmdAddressDevice(xhci, slot, 0);
+	if (err == EOK) {
+		err = xhci_cmdAddressDevice(xhci, slot, 1);
+	}
+
+	if (err < 0) {
+		xhci_slotRenew(xhci, slot, dev);
+		return err;
+	}
+
+	slot->addressed = 1u;
+	return EOK;
+}
+
+
 /* Find the slot table entry already bound to `dev`, or NULL.
  *
  * Includes slots[0]: the primary slot used to be matched by topology ("any
@@ -2543,11 +2640,6 @@ static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
 		return NULL;
 	}
 
-	*err = xhci_initEp0Ring(xhci, slot);
-	if (*err < 0) {
-		return NULL;
-	}
-
 	/* Ensure the parent hub's slot ctx declares Hub=1/NumPorts/TTT before the
 	 * keyboard slot is addressed, so the controller can route split transactions
 	 * down to it. The framework drives the hub's class-descriptor read through
@@ -2568,24 +2660,13 @@ static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
 		}
 	}
 
-	*err = xhci_prepareAddressContext(xhci, slot, dev);
+	/* On failure the entry stays bound to `dev` on a renewed slot, so the
+	 * framework's retry addresses it again via xhci_slotForDev. */
+	*err = xhci_addressSlot(xhci, slot, dev);
 	if (*err < 0) {
 		return NULL;
 	}
 
-	/* Two-step addressing (BSR=1 context-only, then BSR=0 assign) — see the
-	 * root-port path in xhci_handlePipeTransfer for the rationale (#129). */
-	*err = xhci_cmdAddressDevice(xhci, slot, 0);
-	if (*err < 0) {
-		return NULL;
-	}
-
-	*err = xhci_cmdAddressDevice(xhci, slot, 1);
-	if (*err < 0) {
-		return NULL;
-	}
-
-	slot->addressed = 1u;
 	return slot;
 }
 
@@ -2606,8 +2687,11 @@ static xhci_slot_t *xhci_slotForDev(xhci_t *xhci, usb_dev_t *dev)
 	}
 
 	/* A device behind a non-root hub always needs its own slot (route string +
-	 * TT), so it never claims the primary one even when that is free. */
-	if ((dev->hub != NULL) && (dev->hub->hub == NULL) && (xhci->slots[0].dev == NULL)) {
+	 * TT), so it never claims the primary one even when that is free. Nor does
+	 * anything claim a primary entry left without a slot id (xhci_slotRenew
+	 * could not replace its slot); the device then gets one of its own. */
+	if ((dev->hub != NULL) && (dev->hub->hub == NULL) &&
+		(xhci->slots[0].dev == NULL) && (xhci->slots[0].slotId != 0u)) {
 		xhci->slots[0].dev = dev;
 		return &xhci->slots[0];
 	}
@@ -3928,37 +4012,12 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 			}
 		}
 		else if (xhci->cur->addressed == 0u) {
-			err = xhci_initEp0Ring(xhci, xhci->cur);
+			/* The primary slot on first contact, or any slot on an enumeration
+			 * retry after a failed Address Device (xhci_slotRenew). */
+			err = xhci_addressSlot(xhci, xhci->cur, pipe->dev);
 			if (err < 0) {
 				return err;
 			}
-
-			err = xhci_prepareAddressContext(xhci, xhci->cur, pipe->dev);
-			if (err < 0) {
-				return err;
-			}
-
-			/* Two-step addressing (Linux xhci_setup_device scheme, #129). BSR=1
-			 * (setAddress==0) sets up the slot + ep0 context WITHOUT issuing
-			 * SET_ADDRESS on the wire — it reads the input context only. BSR=0
-			 * (setAddress==1) then assigns the address. The single-step BSR=0 form
-			 * intermittently never completes on the Pi4 VL805 (~3/4 cold boots);
-			 * the controller dequeues EnableSlot fine but the BSR=0 AddressDevice
-			 * produces no completion at all. Splitting it isolates the wire step
-			 * from the context read and matches what Linux does to be deterministic.
-			 * Safe here: the ep0 ring was just initialised and no ep0 transfer has
-			 * happened yet, so the BSR=0 step's trDequeuePtr (re)load is a no-op. */
-			err = xhci_cmdAddressDevice(xhci, xhci->cur, 0);
-			if (err < 0) {
-				return err;
-			}
-
-			err = xhci_cmdAddressDevice(xhci, xhci->cur, 1);
-			if (err < 0) {
-				return err;
-			}
-
-			xhci->cur->addressed = 1u;
 		}
 
 		if ((setup != NULL) && (setup->bRequest == REQ_SET_ADDRESS)) {
