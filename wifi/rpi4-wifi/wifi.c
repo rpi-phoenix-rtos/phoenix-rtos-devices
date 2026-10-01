@@ -364,6 +364,18 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
+	if (argc >= 2 && strcmp(argv[1], "rxpoll") == 0) {
+		/* Turn the RX interrupt off until reboot; the netif goes back to
+		 * polling. For an A/B of the two RX paths within one boot. */
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		rc = cmd_run(fd, "rxpoll", 6);
+		close(fd);
+		return rc;
+	}
 	if (argc >= 2 && strcmp(argv[1], "mac") == 0) {
 		fd = open(WIFI_DEV, O_RDWR);
 		if (fd < 0) {
@@ -467,6 +479,7 @@ int main(int argc, char **argv)
 	       "diagnostics (talk to the daemon directly, bypassing the netif -- do not use\n"
 	       "while it is connected):\n"
 	       "  wifi mac | wifi stats | wifi joinwpa <ssid> <psk> | wifi leave |\n"
-	       "  wifi netup <ssid> <psk> | wifi join <ssid> | wifi mtu\n", WIFI_CONF);
+	       "  wifi netup <ssid> <psk> | wifi join <ssid> | wifi mtu |\n"
+	       "  wifi rxpoll (RX interrupt off until reboot; the netif polls)\n", WIFI_CONF);
 	return 2;
 }

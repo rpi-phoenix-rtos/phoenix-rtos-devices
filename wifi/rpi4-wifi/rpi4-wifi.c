@@ -57,6 +57,7 @@
 #include <sys/mman.h>
 #include <sys/msg.h>
 #include <sys/file.h>
+#include <sys/interrupt.h>
 #include <sys/stat.h>
 #include <sys/threads.h>
 #include <posix/utils.h>
@@ -387,6 +388,10 @@ static void diag_wifiPowerCycle(void)
 #define SDHCI_INT_XFER_COMPLETE  0x00000002u
 #define SDHCI_INT_BUF_RD_READY   0x00000020u
 #define SDHCI_INT_BUF_WR_READY   0x00000010u
+
+#define SDHCI_INT_STATUS_EN 0x34u        /* Normal + Error Interrupt Status Enable */
+#define SDHCI_SIGNAL_EN     0x38u        /* Normal + Error Interrupt Signal Enable */
+#define SDHCI_INT_CARD      0x00000100u  /* Card Interrupt: the SDIO card's DAT1 line, read-only */
 
 /* The Arasan controller is clocked by the EMMC clock (firmware clock id 1;
  * Linux DT: BCM2835_CLOCK_EMMC), a CPRMAN peripheral clock the firmware may
@@ -2906,8 +2911,14 @@ static int diag_glomNext(uint8_t *eth, uint32_t cap, uint32_t *elen)
 }
 
 
-/* Receive one 802.3 frame. Returns 0 with *elen set, 1 if nothing is ready (or
- * the frame was not DATA), <0 on error.
+/* What diag_wifiFrameRx returns when it has no 802.3 frame to hand out. The
+ * difference matters to a reader that sleeps until the next card interrupt:
+ * after WIFI_RX_NODATA more may be queued behind the frame it consumed. */
+#define WIFI_RX_NONE   1 /* nothing queued */
+#define WIFI_RX_NODATA 2 /* a frame was consumed, but it carried no 802.3 data */
+
+/* Receive one 802.3 frame. Returns 0 with *elen set, WIFI_RX_NONE if nothing is
+ * ready, WIFI_RX_NODATA if the frame read was not DATA, <0 on error.
  *
  * NOTE for the netif work: a non-channel-2 frame read here is DISCARDED, and
  * the control/event paths drain the same FIFO into the same g_rxf. That is
@@ -2942,7 +2953,7 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 				g_rx_badhdr_run = 0;
 				diag_f2RxFail(sdhci);
 			}
-			return 1;
+			return WIFI_RX_NONE;
 		}
 		if (rc < 0) {
 			g_frame_rx_err++;
@@ -2978,7 +2989,7 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 			d += 2u;
 		}
 		g_glom_descs++;
-		return 1;
+		return WIFI_RX_NODATA;
 	}
 	if (chan == 3u) {
 		/* Glom superframe: start walking it, and return its first data subframe. */
@@ -2986,7 +2997,7 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 
 		if ((soff < 12u) || (soff > (uint32_t)flen)) {
 			g_glom_bad++;
-			return 1;
+			return WIFI_RX_NODATA;
 		}
 		/* Subframes live in the descriptor's SLOTS, measured from the START of
 		 * the superframe: slot k spans [sum(lens[0..k-1]), +lens[k]). Slot 0 also
@@ -3007,13 +3018,13 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 			g_frame_rx_ok++;
 			return 0;
 		}
-		return 1;
+		return WIFI_RX_NODATA;
 	}
 	if (chan != 2u) {
 		if (chan == 1u) {
 			wifi_noteEvent(g_glomf, (uint32_t)flen);
 		}
-		return 1;
+		return WIFI_RX_NODATA;
 	}
 	/* eth offset = SDPCM data_offset + BDC(4) + BDC.doff words (<<2), exactly
 	 * as brcmf_proto_bcdc_hdrpull computes it. Never assume a fixed 16. */
@@ -3474,49 +3485,32 @@ static uint32_t g_fw_dl_us = 0u, g_fw_cmd53_max_us = 0u, g_fw_cmd53_max_off = 0u
 static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (set by bring-up) */
 
 #define WIFI_RESP_CAP (8u * 1024u)
-/* Two device ids on one port: 0 = /dev/wifi (text commands + text result),
- * 1 = /dev/wifidata (raw 802.3 frames, the lwip netif seam).
+/* Three device ids, on two ports: 0 = /dev/wifi (text commands + text result),
+ * 1 = /dev/wifidata (raw 802.3 frames, the lwip netif seam), both served by the
+ * one message thread that owns the SDIO bus; 2 = /dev/wifiirq, served by its own
+ * thread on its own port, which waits for the chip's RX interrupt and never
+ * touches the bus (see "RX interrupt" below).
  *
- * RECEIVE IS POLLED, and the poll rate is the CLIENT's: a /dev/wifidata read
- * probes the F2 FIFO once and returns (0 = nothing queued). The lwip netif
- * paces those reads -- fast while frames flow, backing off to 10 ms on an idle
- * link (drivers/wifi43455.c). A waiting read, a spin before sleeping, and a bus
- * mutex with a multi-threaded message loop were all tried here on hardware and
- * none showed a benefit that survives the measurement noise (the SAME code
- * measured 1.73 and 0.66 MB/s TX on two runs), so they were reverted.
+ * A /dev/wifidata read probes the F2 FIFO once and returns (0 = nothing
+ * queued); it never blocks, because a blocked read would stall every other
+ * request on the message thread, TX included. The client decides when to read:
+ * the lwip netif sleeps in a /dev/wifiirq read until the chip interrupts, and
+ * falls back to a paced poll (fast while frames flow, 10 ms on an idle link)
+ * when that device is absent or misbehaves (drivers/wifi43455.c). A waiting
+ * data read, a spin before sleeping, and a bus mutex with a multi-threaded
+ * message loop were all tried here on hardware and none showed a benefit that
+ * survives the measurement noise (the SAME code measured 1.73 and 0.66 MB/s TX
+ * on two runs), so they were reverted.
  *
  * What IS solid, because it averages thousands of samples inside one run:
  *   transmit  132 us per frame
  *   receive   178 us per frame
  *   empty probe 22 us, and there were 1.1 MILLION of them (24.9 s of bus time)
- *
- * The real fix for the empty probes is an interrupt-driven RX: the chip raises
- * the SDIO card interrupt (SDHCI INT_STATUS bit 8) when the firmware queues a
- * frame. It is NOT a local change, for two reasons found by reading the code:
- *
- *   1. The Arasan controller's interrupt (GIC SPI 126, IRQ 158) is SHARED with
- *      emmc2, the SD card controller. bcm2711-emmc's sdhost_isr claims every
- *      dispatch of that line unconditionally -- zeroes its SIGNAL_ENABLE and
- *      wakes its command waiter -- and _sdio_cmdExecutionWait then treats the
- *      early wakeup as a timeout and resets CMD/DAT under an in-flight SD
- *      command. So each WiFi interrupt would abort SD I/O until sdhost_isr
- *      checks (INTR_STATUS & SIGNAL_ENABLE) and returns -1 when it is not its
- *      interrupt.
- *   2. Nothing here enables the interrupt: neither the SDIO core's
- *      hostintmask (core + 0x24) nor CCCR IEN (0x04) is ever written, and the
- *      Arasan's INT_STATUS_EN / SIGNAL_EN (0x34 / 0x38) are left as the boot
- *      firmware set them.
- *
- * An interrupt path would: set hostintmask to I_HMB_SW_MASK | I_CHIPACTIVE (as
- * brcmfmac), enable CCCR IEN master + F1 + F2 and INT_STATUS_EN/SIGNAL_EN bit
- * 8; in the handler, return -1 unless bit 8 is pending, else mask SIGNAL_EN
- * bit 8 and wake a waiter; the waiter drains the FIFO under a bus lock, acks
- * the core intstatus (write-1-to-clear core + 0x20; SMB_INT_ACK for a mailbox
- * interrupt) and re-enables bit 8. Keep a timed poll as the fallback, and
- * validate on SD boot with SD I/O running, since that is where (1) bites. */
+ * -- those empty probes are what the interrupt path removes. */
 
 #define WIFI_DEV_TEXT_ID 0
 #define WIFI_DEV_DATA_ID 1
+#define WIFI_DEV_IRQ_ID  2
 
 static char g_resp[WIFI_RESP_CAP]; /* most recent scan result text, served over mtRead */
 static int g_resp_len = 0;
@@ -3525,6 +3519,8 @@ static int g_resp_len = 0;
  * -> diag_sdioCmd53*) runs on the message thread, so give it a generous stack
  * (cf. MEMORY #152 pool-thread stack-overflow history). */
 static char g_msgStack[16 * 1024] __attribute__((aligned(8)));
+/* The /dev/wifiirq waiter only takes a lock and waits on a cond. */
+static char g_irqStack[4 * 1024] __attribute__((aligned(8)));
 
 /* WiFi P3 final: full-firmware load + release ARM-CR4 + look for fw boot.
  *
@@ -4790,7 +4786,7 @@ static int wifi_mtu(char *out, int cap)
 	/* --- RX: drain channel 2 for ~3 s --- */
 	for (tries = 0; tries < 600; ++tries) {
 		int r = diag_wifiFrameRx(g_sdhci, rxeth, sizeof(rxeth), &elen);
-		if (r == 1) {
+		if ((r == WIFI_RX_NONE) || (r == WIFI_RX_NODATA)) {
 			usleep(5000);
 			continue;
 		}
@@ -4980,6 +4976,298 @@ static int wifi_status(char *out, int cap)
 }
 
 
+/* ---- RX interrupt: the SDIO card interrupt, served on /dev/wifiirq --------
+ *
+ * The chip drives the SDIO card interrupt (DAT1, which the controller shows as
+ * INT_STATUS bit 8, CARD_INT) while its SDIO core's intstatus & hostintmask is
+ * non-zero. hostintmask is set to I_HMB_FRAME_IND alone, so the line means "the
+ * firmware queued a frame" and nothing else. The pieces, after Linux sdhci +
+ * brcmfmac:
+ *
+ *   handler  IRQ 158, which this controller SHARES with the SD card's EMMC2
+ *            (bcm2711.dtsi: &sdhci and emmc2 are both GIC SPI 126, level).
+ *            Returns -1 unless INT_STATUS & SIGNAL_EN has CARD_INT, else masks
+ *            SIGNAL_EN and wakes the waiter. It cannot ack the source: the card
+ *            holds the level until intstatus is cleared, which takes an SDIO
+ *            command, i.e. the bus.
+ *   waiter   a /dev/wifiirq read. Restarts card-interrupt detection, arms
+ *            SIGNAL_EN, sleeps until the handler fires or WIFI_IRQ_WAIT_US
+ *            passes, disarms. Returns 1 byte for an interrupt, 0 for a timeout.
+ *            Runs on its own thread and port and never issues an SDIO command.
+ *   ack      the next /dev/wifidata read (the bus owner) write-1-clears
+ *            intstatus BEFORE it drains the FIFO, so a frame queued during the
+ *            drain raises the line again -- brcmf_sdio_dpc's order.
+ *
+ * SIGNAL_EN is armed only while a waiter sleeps. Without a /dev/wifiirq client
+ * (a netif that polls, `rxpoll`, the `pollrx` argument) this controller never
+ * drives the shared line, as before this path existed. The timeout is the idle
+ * poll interval the netif used without it, so a lost interrupt costs one idle
+ * poll, never a hang. */
+#define WIFI_IRQ          (32u + 126u)
+#define WIFI_IRQ_WAIT_US  10000u
+#define WIFI_RX_DRAIN_MAX 16u     /* non-data frames a data read may skip past */
+
+#define SDIOD_INTSTATUS   0x20u   /* SDIO-DEV core registers (brcmfmac sdpcmd_regs) */
+#define SDIOD_HOSTINTMASK 0x24u
+#define I_HMB_FRAME_IND   0x40u   /* I_HMB_SW2: frame indication */
+
+#define SDIO_CCCR_IEN     0x04u   /* function 0: Int Enable */
+#define SDIO_CCCR_IEN_ALL 0x07u   /* IENM (master) + function 1 + function 2, as sdio_claim_irq */
+
+/* The only state the handler touches, besides the controller's registers. */
+typedef struct {
+	volatile uint8_t *sdhci;
+	volatile int fired;          /* set by the handler, cleared before each arm */
+	volatile uint32_t claimed;   /* dispatches that were this controller's */
+	volatile uint32_t declined;  /* dispatches of the shared line that were not */
+} wifi_irqHandlerState_t;
+
+static struct {
+	wifi_irqHandlerState_t h;
+	handle_t lock;
+	handle_t cond;
+	handle_t inth;
+	int ready;    /* set up, /dev/wifiirq served; written before any thread starts */
+	int disabled; /* `rxpoll`: waits fail, so the netif returns to polling (under lock) */
+	int need_ack; /* an interrupt was handed out; the next data read acks the chip */
+	uint32_t boot_status_en, boot_signal_en; /* as the boot firmware left them */
+	uint32_t waits, wakes, level, timeouts;  /* waiter (under lock) */
+	uint32_t acks, acks_noframe, ack_errs, drained; /* data path (message thread) */
+	char why[48]; /* why the path is off, for `stats` */
+} g_irq;
+
+
+static int wifi_irqHandler(unsigned int n, void *arg)
+{
+	wifi_irqHandlerState_t *h = arg;
+	uint32_t st = *(volatile uint32_t *)(h->sdhci + SDHCI_INT_STATUS);
+	uint32_t en = *(volatile uint32_t *)(h->sdhci + SDHCI_SIGNAL_EN);
+
+	(void)n;
+	/* SIGNAL_EN never holds anything but CARD_INT (wifi_irqSetup clears it), so
+	 * this is exactly "this controller is driving the line". */
+	if ((st & en & SDHCI_INT_CARD) == 0u) {
+		h->declined++;
+		return -1;
+	}
+	*(volatile uint32_t *)(h->sdhci + SDHCI_SIGNAL_EN) = 0u;
+	h->fired = 1;
+	h->claimed++;
+	return 0;
+}
+
+
+static void wifi_irqUndo(volatile uint8_t *sdhci)
+{
+	diag_bpWrite32(sdhci, g_sdio_core + SDIOD_HOSTINTMASK, 0u);
+	(void)diag_sdioCmd52(sdhci, 1, 0, SDIO_CCCR_IEN, 0u, NULL);
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS_EN) = g_irq.boot_status_en;
+}
+
+
+/* Enable the chip's frame interrupt and register the handler. Runs once, after
+ * bring-up and before the message thread starts, so it may use the bus. With
+ * want == 0 it only silences the controller. Returns 0 when /dev/wifiirq can be
+ * served; otherwise g_irq.why says why not and nothing is left enabled. */
+static int wifi_irqSetup(int want)
+{
+	volatile uint8_t *sdhci = g_sdhci;
+	uint32_t r[4] = { 0 };
+	uint32_t mask;
+
+	g_irq.boot_status_en = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS_EN);
+	g_irq.boot_signal_en = *(volatile uint32_t *)(sdhci + SDHCI_SIGNAL_EN);
+	/* Nothing on this controller may drive the shared line before a handler
+	 * that can take it is in place. Nothing here used its interrupts so far. */
+	*(volatile uint32_t *)(sdhci + SDHCI_SIGNAL_EN) = 0u;
+
+	if (want == 0) {
+		(void)snprintf(g_irq.why, sizeof(g_irq.why), "pollrx");
+		return -1;
+	}
+	/* The ack is two CMD52s through the window diag_setWindow18 keeps. */
+	if ((g_sdio_core & ~0x7fffu) != 0x18000000u) {
+		(void)snprintf(g_irq.why, sizeof(g_irq.why), "SDIO core 0x%08x outside window",
+			(unsigned)g_sdio_core);
+		return -1;
+	}
+
+	diag_bpWrite32(sdhci, g_sdio_core + SDIOD_HOSTINTMASK, I_HMB_FRAME_IND);
+	mask = diag_bpRead32(sdhci, g_sdio_core + SDIOD_HOSTINTMASK);
+	(void)diag_sdioCmd52(sdhci, 1, 0, SDIO_CCCR_IEN, SDIO_CCCR_IEN_ALL, NULL);
+	if ((diag_sdioCmd52(sdhci, 0, 0, SDIO_CCCR_IEN, 0u, r) != 0) ||
+		((r[0] & 0xffu) != SDIO_CCCR_IEN_ALL) || (mask != I_HMB_FRAME_IND)) {
+		(void)snprintf(g_irq.why, sizeof(g_irq.why), "readback hostintmask=0x%x ien=0x%02x",
+			(unsigned)mask, (unsigned)(r[0] & 0xffu));
+		wifi_irqUndo(sdhci);
+		return -1;
+	}
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS_EN) = g_irq.boot_status_en | SDHCI_INT_CARD;
+
+	g_irq.h.sdhci = sdhci;
+	/* Run the handler once from thread context (SIGNAL_EN is 0, so it only
+	 * declines) to have its code resident before it runs in interrupt context. */
+	(void)wifi_irqHandler(WIFI_IRQ, &g_irq.h);
+	g_irq.h.declined = 0u;
+
+	if ((mutexCreate(&g_irq.lock) != EOK) || (condCreate(&g_irq.cond) != EOK) ||
+		(interrupt(WIFI_IRQ, wifi_irqHandler, &g_irq.h, g_irq.cond, &g_irq.inth) < 0)) {
+		(void)snprintf(g_irq.why, sizeof(g_irq.why), "interrupt() registration failed");
+		wifi_irqUndo(sdhci);
+		return -1;
+	}
+	g_irq.ready = 1;
+	return 0;
+}
+
+
+/* A /dev/wifiirq read: wait for the next frame interrupt. 1 = interrupt (one
+ * byte written), 0 = timeout, -EIO once `rxpoll` has switched the path off. */
+static int wifi_irqWait(void *dst, size_t size)
+{
+	volatile uint8_t *sdhci = g_irq.h.sdhci;
+	volatile uint32_t *signal_en = (volatile uint32_t *)(sdhci + SDHCI_SIGNAL_EN);
+	volatile uint32_t *status_en = (volatile uint32_t *)(sdhci + SDHCI_INT_STATUS_EN);
+	uint32_t en;
+	int got;
+
+	if (size == 0u) {
+		return 0;
+	}
+	mutexLock(g_irq.lock);
+	if (g_irq.disabled != 0) {
+		mutexUnlock(g_irq.lock);
+		return -EIO;
+	}
+	g_irq.waits++;
+
+	/* Restart card-interrupt detection before sampling it. SDHCI 2.2.18 has the
+	 * host clear Card Interrupt Status Enable while it services the card and set
+	 * it again afterwards; sdhci_enable_sdio_irq does the same. Only this thread
+	 * writes STATUS_EN after setup, and SIGNAL_EN is 0 here, so the handler
+	 * cannot run in between. */
+	en = *status_en;
+	*status_en = en & ~SDHCI_INT_CARD;
+	*status_en = en | SDHCI_INT_CARD;
+
+	if ((*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) & SDHCI_INT_CARD) != 0u) {
+		/* Still asserted: a frame was indicated after the last ack. */
+		g_irq.level++;
+		got = 1;
+	}
+	else {
+		/* An interrupt between the arm and condWait is not lost: a broadcast
+		 * with nobody waiting leaves the cond pending, and condWait returns at
+		 * once. A stale pending wakeup returns with fired == 0 -- a timeout. */
+		__atomic_store_n(&g_irq.h.fired, 0, __ATOMIC_SEQ_CST);
+		*signal_en = SDHCI_INT_CARD;
+		(void)condWait(g_irq.cond, g_irq.lock, WIFI_IRQ_WAIT_US);
+		*signal_en = 0u;
+		got = (__atomic_load_n(&g_irq.h.fired, __ATOMIC_SEQ_CST) != 0) ? 1 : 0;
+		if (got != 0) {
+			g_irq.wakes++;
+		}
+		else {
+			g_irq.timeouts++;
+		}
+	}
+	if (got != 0) {
+		__atomic_store_n(&g_irq.need_ack, 1, __ATOMIC_SEQ_CST);
+		*(uint8_t *)dst = (uint8_t)'i';
+	}
+	mutexUnlock(g_irq.lock);
+	return got;
+}
+
+
+/* Clear the frame indication that raised the interrupt: read intstatus' low
+ * byte (I_HMB_SW*) and write the bits back (write-1-to-clear). Message thread
+ * only: it owns the bus. */
+static void wifi_irqAck(volatile uint8_t *sdhci)
+{
+	uint32_t reg = (g_sdio_core + SDIOD_INTSTATUS) & 0x7fffu;
+	uint32_t r[4] = { 0 };
+	uint8_t st;
+
+	diag_setWindow18(sdhci);
+	if (diag_sdioCmd52(sdhci, 0, 1, reg, 0u, r) != 0) {
+		g_irq.ack_errs++;
+		return;
+	}
+	st = (uint8_t)(r[0] & 0xffu);
+	if ((st != 0u) && (diag_sdioCmd52(sdhci, 1, 1, reg, st, NULL) != 0)) {
+		g_irq.ack_errs++;
+		return;
+	}
+	if ((st & I_HMB_FRAME_IND) != 0u) {
+		g_irq.acks++;
+	}
+	else {
+		g_irq.acks_noframe++;
+	}
+}
+
+
+/* `rxpoll`: switch the interrupt path off for the rest of this boot. The netif
+ * sees its next /dev/wifiirq read fail and goes back to polling -- the same
+ * binary and the same boot measured both ways. */
+static int wifi_rxPoll(char *out, int cap)
+{
+	if (g_irq.ready == 0) {
+		return snprintf(out, (size_t)cap, "RXPOLL already polling (%s)\n", g_irq.why);
+	}
+	mutexLock(g_irq.lock);
+	g_irq.disabled = 1;
+	mutexUnlock(g_irq.lock);
+	(void)snprintf(g_irq.why, sizeof(g_irq.why), "rxpoll");
+	return snprintf(out, (size_t)cap, "RXPOLL ok: /dev/wifiirq reads now fail; the netif polls\n");
+}
+
+
+static void wifi_irqThread(void *arg)
+{
+	uint32_t port = (uint32_t)(uintptr_t)arg;
+	msg_t msg;
+	msg_rid_t rid;
+	int err;
+
+	for (;;) {
+		err = msgRecv(port, &msg, &rid);
+		if (err < 0) {
+			if (err == -EINTR) {
+				continue;
+			}
+			break;
+		}
+		switch (msg.type) {
+			case mtOpen:
+			case mtClose:
+				msg.o.err = EOK;
+				break;
+
+			case mtRead:
+				msg.o.err = wifi_irqWait(msg.o.data, msg.o.size);
+				break;
+
+			case mtGetAttr:
+				if (msg.i.attr.type == atMode) {
+					msg.o.attr.val = S_IFCHR | 0400;
+					msg.o.err = EOK;
+				}
+				else {
+					msg.o.err = -EINVAL;
+				}
+				break;
+
+			default:
+				msg.o.err = -ENOSYS;
+				break;
+		}
+		msgRespond(port, &msg, rid);
+	}
+}
+
+
 /* Where the per-frame time actually goes. RX measured ~10 ms/frame end to end,
  * which is far more than the poll interval explains, so the read path is timed
  * here and split into HIT (a frame came back) vs MISS (empty FIFO): the two have
@@ -5050,7 +5338,9 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS rxbig ok=%u max_len=%u rxglom_off_rc=%d\n"
 		"WIFISTATS glom descs=%u supers=%u subframes=%u bad=%u\n"
 		"WIFISTATS pio mode=%s slow_waits=%u slow_max_us=%u timeouts=%u\n"
-		"WIFISTATS sbwin writes=%u skips=%u\n",
+		"WIFISTATS sbwin writes=%u skips=%u\n"
+		"WIFISTATS rxirq mode=%s%s%s waits=%u wakes=%u level=%u timeouts=%u\n"
+		"WIFISTATS rxirq isr claimed=%u declined=%u acks=%u acks_noframe=%u ack_errs=%u drained=%u\n",
 		g_tx_calls, (unsigned long long)g_tx_us,
 		(unsigned long long)(g_tx_calls ? g_tx_us / g_tx_calls : 0u),
 		g_rx_hits, (unsigned long long)g_rx_hit_us,
@@ -5066,7 +5356,12 @@ static int wifi_stats(char *out, int cap)
 		g_glom_descs, g_glom_supers, g_glom_subs, g_glom_bad,
 		(g_pio_legacy != 0) ? "legacy" : "level", (unsigned)g_pio_slow_waits,
 		(unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
-		(unsigned)g_sbwin_writes, (unsigned)g_sbwin_skips);
+		(unsigned)g_sbwin_writes, (unsigned)g_sbwin_skips,
+		((g_irq.ready != 0) && (g_irq.disabled == 0)) ? "irq" : "poll",
+		(g_irq.why[0] != '\0') ? " off=" : "", g_irq.why,
+		(unsigned)g_irq.waits, (unsigned)g_irq.wakes, (unsigned)g_irq.level, (unsigned)g_irq.timeouts,
+		(unsigned)g_irq.h.claimed, (unsigned)g_irq.h.declined, (unsigned)g_irq.acks,
+		(unsigned)g_irq.acks_noframe, (unsigned)g_irq.ack_errs, (unsigned)g_irq.drained);
 	if (m < 0) {
 		return m;
 	}
@@ -5243,12 +5538,31 @@ static int wifi_frameRead(void *dst, size_t cap)
 	if (g_sdhci == NULL) {
 		return -EIO;
 	}
+	/* The first read after an interrupt clears the chip's frame indication,
+	 * BEFORE draining, so a frame queued meanwhile raises the line again. */
+	if (__atomic_exchange_n(&g_irq.need_ack, 0, __ATOMIC_SEQ_CST) != 0) {
+		wifi_irqAck(g_sdhci);
+	}
 	/* One probe, no lock, no wait: measured fastest. The caller paces the
-	 * probes; see the "RECEIVE IS POLLED" notes above WIFI_DEV_TEXT_ID for
-	 * what was tried instead and what an interrupt-driven path needs. */
+	 * probes, or waits on /dev/wifiirq between them; see the notes above
+	 * WIFI_DEV_TEXT_ID. */
 	{
 		WIFI_T0(t0);
-		int rc = diag_wifiFrameRx(g_sdhci, frame, sizeof(frame), &elen);
+		unsigned int skipped = 0u;
+		int rc;
+
+		for (;;) {
+			rc = diag_wifiFrameRx(g_sdhci, frame, sizeof(frame), &elen);
+			/* An interrupt client sleeps after a 0, until the line rises again,
+			 * so 0 must mean "FIFO empty" -- not "an event frame was drained",
+			 * which may have a data frame queued right behind it. */
+			if ((rc != WIFI_RX_NODATA) || (g_irq.ready == 0) || (g_irq.disabled != 0) ||
+				(skipped >= WIFI_RX_DRAIN_MAX)) {
+				break;
+			}
+			skipped++;
+			g_irq.drained++;
+		}
 		if (rc != 0) {
 			WIFI_ACC(g_rx_miss_us, t0);
 			g_rx_misses++;
@@ -5372,6 +5686,9 @@ static void wifi_thread(void *arg)
 				else if (msg.i.size >= 5 && memcmp(msg.i.data, "stats", 5) == 0) {
 					g_resp_len = wifi_stats(g_resp, (int)sizeof(g_resp));
 				}
+				else if (msg.i.size >= 6 && memcmp(msg.i.data, "rxpoll", 6) == 0) {
+					g_resp_len = wifi_rxPoll(g_resp, (int)sizeof(g_resp));
+				}
 				else if (msg.i.size >= 3 && memcmp(msg.i.data, "mac", 3) == 0) {
 					g_resp_len = wifi_mac(g_resp, (int)sizeof(g_resp));
 				}
@@ -5436,8 +5753,8 @@ static int wifi_fwLoadOrWait(int wait)
 
 int main(int argc, char **argv)
 {
-	int selftest = 0, jointest = 0, fwbench = 0, foreground = 0, verbose = 0, ai, rc;
-	uint32_t port;
+	int selftest = 0, jointest = 0, fwbench = 0, foreground = 0, verbose = 0, rxirq = 1, ai, rc;
+	uint32_t port, irqport;
 	oid_t dev;
 	pid_t pid;
 
@@ -5459,6 +5776,10 @@ int main(int argc, char **argv)
 		}
 		else if (strcmp(argv[ai], "fwretrytest") == 0) {
 			g_fw_retry_test = 1;
+		}
+		else if (strcmp(argv[ai], "pollrx") == 0) {
+			/* no RX interrupt: /dev/wifiirq is not created, the netif polls */
+			rxirq = 0;
 		}
 		else if (strcmp(argv[ai], "legacypio") == 0) {
 			/* the old PIO wait, for a first-load A/B across boots */
@@ -5546,6 +5867,19 @@ int main(int argc, char **argv)
 		return rc;
 	}
 
+	/* Before the message thread exists: the setup uses the bus. */
+	if (wifi_irqSetup(rxirq) == 0) {
+		printf("rpi4-wifi: RX interrupt on IRQ %u (SDIO card interrupt, hostintmask=0x%02x); "
+			"controller enables at boot: status=0x%08x signal=0x%08x\n",
+			WIFI_IRQ, (unsigned)I_HMB_FRAME_IND,
+			(unsigned)g_irq.boot_status_en, (unsigned)g_irq.boot_signal_en);
+	}
+	else {
+		printf("rpi4-wifi: RX interrupt off (%s); the netif polls. "
+			"Controller enables at boot: status=0x%08x signal=0x%08x\n",
+			g_irq.why, (unsigned)g_irq.boot_status_en, (unsigned)g_irq.boot_signal_en);
+	}
+
 	if (portCreate(&port) != EOK) {
 		printf("rpi4-wifi: portCreate failed\n");
 		return 3;
@@ -5556,6 +5890,27 @@ int main(int argc, char **argv)
 		printf("rpi4-wifi: could not create /dev/wifi\n");
 		return 4;
 	}
+	/* /dev/wifiirq BEFORE /dev/wifidata: the netif opens the pair as soon as
+	 * /dev/wifidata appears and looks for this one only then. On any failure
+	 * here it finds no device and polls; with no waiter the controller never
+	 * signals, so nothing needs undoing. */
+	if (g_irq.ready != 0) {
+		rc = -1;
+		if (portCreate(&irqport) == EOK) {
+			dev.port = irqport;
+			dev.id = WIFI_DEV_IRQ_ID;
+			if (beginthread(wifi_irqThread, 3, g_irqStack, sizeof(g_irqStack),
+					(void *)(uintptr_t)irqport) == EOK) {
+				rc = create_dev(&dev, "wifiirq");
+			}
+		}
+		if (rc < 0) {
+			g_irq.disabled = 1;
+			(void)snprintf(g_irq.why, sizeof(g_irq.why), "no /dev/wifiirq");
+			printf("rpi4-wifi: WARNING could not serve /dev/wifiirq; the netif polls\n");
+		}
+	}
+	dev.port = port;
 	dev.id = WIFI_DEV_DATA_ID;
 	if (create_dev(&dev, "wifidata") < 0) {
 		/* Not fatal: the text device still works, only the netif seam is gone. */
