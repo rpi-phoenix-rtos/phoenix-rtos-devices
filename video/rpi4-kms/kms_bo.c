@@ -219,7 +219,7 @@ static int bo_from_slot(kms_bo_t *b, uint32_t w, uint32_t h)
 	if ((srv.be->id != KMS_BACKEND_PAN) || (w != srv.fb_w) || (h != srv.fb_h)) {
 		return -ENOENT;
 	}
-	for (s = 1u; s < srv.fb_slots; s++) {   /* never slot 0: fbcon + /dev/fb0 */
+	for (s = 1u; s < srv.fb_slots; s++) {   /* never slot 0: fbcon */
 		if ((srv.slot_used & (1u << s)) == 0u) {
 			break;
 		}

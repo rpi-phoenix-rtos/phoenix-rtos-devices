@@ -35,9 +35,6 @@ DEFAULT_COMPONENTS += rpi4-vcmbox
 DEFAULT_COMPONENTS += rpi4-thermal
 # Hardware RNG (BCM2711 iproc RNG200 @ 0xfe104000) -> /dev/hwrng entropy source.
 DEFAULT_COMPONENTS += rpi4-hwrng
-# video/rpi4-fb (/dev/fb0, the plo firmware framebuffer as a byte device) is NOT a
-# component: the display is rpi4-kms. TODO(TD-27): its last user, hevc-play (built by
-# hand, not by the image), moves to a KMS dumb buffer; then video/rpi4-fb is deleted.
 # BCM2711 GPIO observer (/dev/gpio @ 0xfe200000): read-only register snapshot +
 # per-pin {fsel,level,pull} devctl. Outputs deferred to an attended bench session.
 DEFAULT_COMPONENTS += rpi4-gpio

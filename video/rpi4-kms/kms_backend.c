@@ -11,7 +11,7 @@
  *           framebuffer is 3 screens tall (plo, max_framebuffer_height) and a
  *           flip is SET_VIRTUAL_OFFSET to slot k. Only a primary plane; only
  *           full-screen buffers that ARE firmware-fb slots 1..n-1 (slot 0 is
- *           where fbcon and rpi4-fb draw). Fallback (-b pan).
+ *           where fbcon draws). Fallback (-b pan).
  *   plane - the firmware plane API (SET_PLANE, 60-byte value buffer, the "fake
  *           KMS" interface) for buffers from our own contiguous pool: primary,
  *           cursor, optional overlays, hardware scaling, per-plane alpha,

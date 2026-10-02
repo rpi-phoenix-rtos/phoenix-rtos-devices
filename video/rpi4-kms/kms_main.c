@@ -12,8 +12,8 @@
  *
  * It must not run next to an old-lane full-screen app (any game, SDL2, the
  * glamor X server): the in-process winsys pans the same firmware framebuffer
- * through the raw mailbox FIFO. rpi4-fb (/dev/fb0) and fbcon may keep running:
- * they only touch slot 0, which this server never hands out.
+ * through the raw mailbox FIFO. fbcon may keep running: it only touches slot 0,
+ * which this server never hands out.
  *
  * Usage: rpi4-kms [-f] [-b plane|pan] [-o overlays] [-p pool_mib] [-m <max_end>] [-c]
  *                 [-V irq|hvs|fwvsync|timer] [-g gate_us] [-K] [-L guard_us] [-G] [-B] [-C] [-F]
