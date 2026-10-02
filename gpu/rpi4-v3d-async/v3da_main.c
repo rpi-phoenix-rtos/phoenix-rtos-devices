@@ -632,7 +632,7 @@ static void dispatch_loop(void *arg)
 
 			case mtGetAttr:
 				/* Path resolution asks every component for atMode (the symlink check in
-				 * libphoenix _readlink_abs); answer like rpi4-fb does. */
+				 * libphoenix _readlink_abs); answer as a character device. */
 				if (msg.i.attr.type == atMode) {
 					msg.o.attr.val = S_IFCHR | 0666;
 					msg.o.err = EOK;

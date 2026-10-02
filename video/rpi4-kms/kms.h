@@ -286,7 +286,7 @@ typedef struct {
 	uint32_t ncrtc;
 	kms_crtc_state_t crtc[KMS_MAX_CRTCS];
 
-	/* firmware framebuffer (plo-allocated; fbcon + /dev/fb0 draw into slot 0) */
+	/* firmware framebuffer (plo-allocated; fbcon draws into slot 0) */
 	uint64_t fb_pa;
 	uint32_t fb_w, fb_h, fb_pitch, fb_virt_h, fb_yoff0, fb_pixel_order, fb_format;
 	int32_t fb_layer;
