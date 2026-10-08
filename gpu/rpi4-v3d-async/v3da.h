@@ -25,6 +25,7 @@
 
 #include "v3da_proto.h"
 #include "v3da_lowmem.h"   /* v3da_pool_block_t, the scan-out placement policy */
+#include "v3da_pool.h"     /* the pool's byte cap and idle trim */
 
 
 #define V3DA_MAX_CLIENTS  V3DA_FENCE_NSLOTS   /* one fence-page row each */
@@ -356,6 +357,17 @@ typedef struct {
 	uint32_t nbos;                /* high-water mark of slots ever used */
 	v3da_pool_block_t pool[V3DA_MAX_POOL];
 	uint32_t npool;
+	/* Pool bound (v3da_pool.h): the `V3DA srv pool` lines and the qstat line's pool= */
+	uint64_t pool_cap;            /* -P: footprint bytes the pool may keep */
+	uint64_t pool_idle_us;        /* -T: a block unused this long goes back (0 = never) */
+	uint64_t pool_bytes;          /* footprint of the pooled blocks now */
+	uint64_t pool_peak;
+	uint64_t pool_scan_us;        /* next idle sweep */
+	uint64_t pool_trimmed;        /* footprint given back by trims, in total */
+	uint32_t pool_trims;          /* blocks given back by trims, in total */
+	uint64_t pool_note_bytes;     /* given back since the last `pool trim` line */
+	uint32_t pool_note_blocks, pool_note_idle, pool_note_cap;
+	uint64_t pool_note_us;        /* the next `pool trim` line may print from here */
 	/* Scan-out placement (V3DA_BO_LOWMEM, proto 5; v3da_lowmem.h): the qstat line's
 	 * `low=<live>/<budget>KiB` and the `V3DA srv low` lines */
 	uint64_t low_budget;          /* -L: bytes of low memory LOWMEM BOs may hold (buddy footprint) */
@@ -382,8 +394,8 @@ typedef struct {
 	uint32_t nops_done;
 	uint32_t resets;
 	uint32_t bo_quarantine_passed;
-	uint32_t pages_to_kernel;
-	uint32_t stray_fldone;        /* FLDONE with no active bin job (self-test) */
+	uint32_t pages_to_kernel;     /* freed with the pool at V3DA_MAX_POOL blocks (trims: pool_trims) */
+	uint32_t stray_fldone;       /* FLDONE with no active bin job (self-test) */
 	uint32_t stray_tfuc;          /* TFUC with no active TFU job (self-test) */
 } v3da_srv_t;
 
@@ -455,6 +467,10 @@ void v3da_bo_client_gone(uint32_t client);
 void v3da_bo_quarantine_poll(void);
 void v3da_bo_counts(uint32_t *live, uint32_t *quar, uint32_t *pooled);
 void v3da_bo_low_counts(uint64_t *live, uint64_t *budget, uint32_t *bos, uint32_t *fallback);   /* qstat low= */
+/* Locked. The pool's idle sweep (at most once a second; `soon`: at the next call,
+ * e.g. after a client went) and the rate-limited `V3DA srv pool trim` line. */
+void v3da_bo_pool_tick(uint64_t now, int soon);
+void v3da_bo_pool_counts(uint64_t *bytes, uint64_t *peak, uint32_t *blocks, uint64_t *trimmed);   /* qstat pool= */
 v3da_bo_t *v3da_bo_find(uint32_t handle);
 /* BO_IMPORT. Called UNLOCKED (it opens and maps another server's buffer name, IPC
  * that must not stall the event thread); takes srv.lock itself for the table work. */

@@ -1405,8 +1405,8 @@ static void stat_print(uint64_t now)
 {
 	const v3da_queue_t *b = &srv.q[V3DA_Q_BIN], *r = &srv.q[V3DA_Q_RENDER];
 	const v3da_queue_t *t = &srv.q[V3DA_Q_TFU], *c = &srv.q[V3DA_Q_CSD];
-	uint64_t low_live, low_budget;
-	uint32_t low_bos, low_fb;
+	uint64_t low_live, low_budget, pool_bytes, pool_peak, pool_trimmed;
+	uint32_t low_bos, low_fb, pool_blocks;
 
 	if ((srv.stat_ms == 0u) || (now < srv.stat_next_us)) {
 		return;
@@ -1418,9 +1418,11 @@ static void stat_print(uint64_t now)
 	srv.stat_jobs_seen = 0u;
 	acct(now);
 	v3da_bo_low_counts(&low_live, &low_budget, &low_bos, &low_fb);
+	v3da_bo_pool_counts(&pool_bytes, &pool_peak, &pool_blocks, &pool_trimmed);
 	printf("V3DA srv qstat t=%llums mode=%s knobs=0x%02x bin=%u/%llums render=%u/%llums tfu=%u/%llums csd=%u/%llums "
 		"busy=%llums overlap=%llums win=%llums oom=%u starved=%u err=%u wedges=%u flips=%u pan_err=%u px_chg=%u/%u "
-		"rej=%u bclwrap=%u ronly=%u low=%llu/%lluKiB lowbos=%u lowfb=%u\n",
+		"rej=%u bclwrap=%u ronly=%u low=%llu/%lluKiB lowbos=%u lowfb=%u pool=%u/%lluKiB poolpeak=%lluKiB "
+		"pooltrim=%lluKiB\n",
 		(unsigned long long)(now / 1000u), (srv.mode == V3DA_MODE_SERIAL) ? "serial" : "pipeline", srv.knobs,
 		b->st_jobs, (unsigned long long)(b->st_busy_us / 1000u), r->st_jobs, (unsigned long long)(r->st_busy_us / 1000u),
 		t->st_jobs, (unsigned long long)(t->st_busy_us / 1000u), c->st_jobs, (unsigned long long)(c->st_busy_us / 1000u),
@@ -1428,7 +1430,9 @@ static void stat_print(uint64_t now)
 		(unsigned long long)((now - srv.acct_t0_us) / 1000u), b->st_oom, srv.ovf.starved,
 		b->st_errors + r->st_errors + t->st_errors + c->st_errors, srv.wedges, srv.scan.flips, srv.scan.pan_err,
 		srv.scan.px_changed, srv.scan.px_sampled, srv.submit_rejects, srv.cl_bcl_wrap, srv.cl_render_only,
-		(unsigned long long)(low_live / 1024u), (unsigned long long)(low_budget / 1024u), low_bos, low_fb);
+		(unsigned long long)(low_live / 1024u), (unsigned long long)(low_budget / 1024u), low_bos, low_fb, pool_blocks,
+		(unsigned long long)(pool_bytes / 1024u), (unsigned long long)(pool_peak / 1024u),
+		(unsigned long long)(pool_trimmed / 1024u));
 }
 
 

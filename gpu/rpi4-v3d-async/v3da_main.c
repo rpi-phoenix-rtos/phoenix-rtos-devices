@@ -10,7 +10,8 @@
  * has one page-table base register and no arbitration, and this server resets it.
  *
  * Usage: rpi4-v3d-async [-f] [-i] [-I irq] [-r threads] [-p poll_us] [-m serial|pipeline]
- *                       [-k knobs] [-c chunk_kib] [-w wedge_ms] [-s stat_ms] [-L lowmem_mib] [-v] [&]
+ *                       [-k knobs] [-c chunk_kib] [-w wedge_ms] [-s stat_ms] [-L lowmem_mib]
+ *                       [-P pool_mib] [-T pool_idle_s] [-v] [&]
  *   (detaches itself: psh has no job control, so `cmd &` would run in the
  *    foreground; a stray "&" argument is accepted and ignored)
  *   -f          stay in the foreground (no fork)
@@ -31,6 +32,11 @@
  *   -L MiB      low-memory budget of scan-out BOs (V3DA_BO_LOWMEM, proto 5): how much of
  *               the low 1 GiB their blocks may hold (buddy footprint, default 64;
  *               0 = never place them, the pre-proto-5 behaviour)
+ *   -P MiB      freed BO blocks the server keeps for reuse (pool footprint: one buddy
+ *               block, the next power of two, per block; default 64; 0 = keep none:
+ *               every block goes back to the kernel once its quarantine passed)
+ *   -T s        a pooled block unused this long goes back to the kernel (default 10;
+ *               0 = only the -P cap bounds the pool)
  *   -v          verbose: also log each client open/close, BO import/export/release,
  *               /v3dbuf open/close, the first fstat and the first pid mismatch, and every
  *               `V3DA srv low` placement past the first 64 (per-buffer traffic)
@@ -130,9 +136,10 @@ static int client_open(int pid)
 static void client_close(id_t id, v3da_wait_t **answer)
 {
 	v3da_client_t *c = client_get(id);
-	static uint32_t g6_seen, low_seen_bos, low_seen_fb;
-	static uint64_t low_seen_live;
-	uint32_t g6;
+	static uint32_t g6_seen, low_seen_bos, low_seen_fb, pool_seen_blocks;
+	static uint64_t low_seen_live, pool_seen_bytes, pool_seen_trimmed;
+	uint64_t pool_bytes, pool_peak, pool_trimmed;
+	uint32_t g6, pool_blocks;
 
 	if (c == NULL) {
 		return;
@@ -163,6 +170,19 @@ static void client_close(id_t id, v3da_wait_t **answer)
 			"rejected=%u\n", (unsigned)id, (unsigned long long)(srv.low_live / 1024u),
 			(unsigned long long)(srv.low_budget / 1024u), (unsigned long long)(srv.low_peak / 1024u), srv.low_bos,
 			srv.low_from_pool, srv.low_fallback, srv.low_tries, srv.low_rejected);
+	}
+	/* The BO pool (C17), whenever it changed since the last close: what the server
+	 * holds for reuse beyond the live BOs - invisible in any process's anonymous memory */
+	v3da_bo_pool_counts(&pool_bytes, &pool_peak, &pool_blocks, &pool_trimmed);
+	if ((pool_bytes != pool_seen_bytes) || (pool_blocks != pool_seen_blocks) || (pool_trimmed != pool_seen_trimmed)) {
+		pool_seen_bytes = pool_bytes;
+		pool_seen_blocks = pool_blocks;
+		pool_seen_trimmed = pool_trimmed;
+		printf("V3DA srv pool stats client=%u blocks=%u pool_kb=%llu peak_kb=%llu cap_kb=%llu idle_s=%llu trimmed_kb=%llu "
+			"trims=%u full_kb=%llu\n", (unsigned)id, pool_blocks, (unsigned long long)(pool_bytes / 1024u),
+			(unsigned long long)(pool_peak / 1024u), (unsigned long long)(srv.pool_cap / 1024u),
+			(unsigned long long)(srv.pool_idle_us / 1000000u), (unsigned long long)(pool_trimmed / 1024u), srv.pool_trims,
+			(unsigned long long)srv.pages_to_kernel * (_PAGE_SIZE / 1024u));
 	}
 }
 
@@ -765,7 +785,7 @@ static int bufns_register(void)
 static void usage(const char *prog)
 {
 	printf("usage: %s [-f] [-i] [-I irq] [-r threads] [-p poll_us] [-m serial|pipeline] [-k knobs] [-c chunk_kib] "
-		"[-w wedge_ms] [-s stat_ms] [-L lowmem_mib] [-v]\n", prog);
+		"[-w wedge_ms] [-s stat_ms] [-L lowmem_mib] [-P pool_mib] [-T pool_idle_s] [-v]\n", prog);
 }
 
 
@@ -783,8 +803,10 @@ int main(int argc, char **argv)
 	srv.wedge_ms = 500u;
 	srv.stat_ms = 0u;   /* -s: the periodic qstat line is a measurement tool, not a boot log */
 	srv.low_budget = (uint64_t)V3DA_LOWMEM_BUDGET_MIB << 20;
+	srv.pool_cap = (uint64_t)V3DA_POOL_CAP_MIB << 20;
+	srv.pool_idle_us = (uint64_t)V3DA_POOL_IDLE_S * 1000000u;
 
-	while ((c = getopt(argc, argv, "fiI:r:p:m:k:c:w:s:L:vh")) != -1) {
+	while ((c = getopt(argc, argv, "fiI:r:p:m:k:c:w:s:L:P:T:vh")) != -1) {
 		switch (c) {
 			case 'm':
 				if (strcmp(optarg, "pipeline") == 0) {
@@ -803,6 +825,8 @@ int main(int argc, char **argv)
 			case 'w': srv.wedge_ms = (uint32_t)strtoul(optarg, NULL, 0); break;
 			case 's': srv.stat_ms = (uint32_t)strtoul(optarg, NULL, 0); break;
 			case 'L': srv.low_budget = (uint64_t)strtoul(optarg, NULL, 0) << 20; break;
+			case 'P': srv.pool_cap = (uint64_t)strtoul(optarg, NULL, 0) << 20; break;
+			case 'T': srv.pool_idle_us = (uint64_t)strtoul(optarg, NULL, 0) * 1000000u; break;
 			case 'f': foreground = 1; break;
 			case 'i': irq_at_start = 1; break;
 			case 'I': srv.hw.irq_num = (unsigned)strtoul(optarg, NULL, 0); break;
@@ -937,11 +961,13 @@ int main(int argc, char **argv)
 	m.bufns = bufns_register();
 
 	printf("V3DA srv ready dev=/dev/%s irq=%s irqnum=%u threads=%d poll_us=%u fence_pa=0x%08lx slots=%u "
-		"mode=%s knobs=0x%02x ovf=%ux%uKiB wedge_ms=%u proto=%u..%u bufns=%d lowmem_mib=%llu\n",
+		"mode=%s knobs=0x%02x ovf=%ux%uKiB wedge_ms=%u proto=%u..%u bufns=%d lowmem_mib=%llu pool_mib=%llu "
+		"pool_idle_s=%llu\n",
 		V3DA_DEV_NAME, (srv.hw.irq_on != 0) ? "on" : "off", srv.hw.irq_num, nthreads, srv.poll_us,
 		(unsigned long)srv.fp_pa, V3DA_FENCE_NSLOTS, (srv.mode == V3DA_MODE_SERIAL) ? "serial" : "pipeline",
 		srv.knobs, srv.ovf.nchunks, srv.ovf.chunk_bytes / 1024u, srv.wedge_ms, V3DA_PROTO_BASE, V3DA_PROTO_VERSION, m.bufns,
-		(unsigned long long)(srv.low_budget >> 20));
+		(unsigned long long)(srv.low_budget >> 20), (unsigned long long)(srv.pool_cap >> 20),
+		(unsigned long long)(srv.pool_idle_us / 1000000u));
 
 	if (readyfd >= 0) {
 		char r = 'R';

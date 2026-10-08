@@ -608,6 +608,7 @@ void v3da_event_thread(void *arg)
 		v3da_jobs_events(core, hub, now);
 		v3da_jobs_tick(now);
 		v3da_bo_quarantine_poll();
+		v3da_bo_pool_tick(now, 0);
 		v3da_sched_run();
 
 		answer = NULL;

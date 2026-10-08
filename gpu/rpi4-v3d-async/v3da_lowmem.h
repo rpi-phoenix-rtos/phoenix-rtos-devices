@@ -51,6 +51,7 @@ typedef struct {
 	uintptr_t pa;
 	uint32_t pages;
 	uint32_t cached;
+	uint64_t freed_us;   /* when it entered the pool (the trim's age, v3da_pool.h) */
 } v3da_pool_block_t;
 
 

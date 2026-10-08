@@ -29,10 +29,16 @@
  *   - Scan-out placement (proto 5): a V3DA_BO_LOWMEM BO's block lies below 1 GiB,
  *     where the firmware display plane can fetch it (v3da_lowmem.h: pooled low
  *     block, else fresh blocks until one lands low, within the -L budget).
- *   - Blocks go to a server-owned POOL, not back to the kernel: a stale device or
- *     stale client MAP_PHYSMEM write then lands in another GPU buffer, never in a
- *     malloc heap (the C1 class), and the last-munmap-of-a-contiguous-object kernel
- *     bug (E1 section 6) is not exercised.
+ *   - Blocks go to a server-owned POOL first, not straight back to the kernel: a
+ *     stale device or stale client MAP_PHYSMEM write soon after a free then lands in
+ *     another GPU buffer, never in a malloc heap (the C1 class). The pool is bounded
+ *     (v3da_pool.h, C17): over its byte cap (-P) the oldest blocks go back to the
+ *     kernel, and so does every block left unused for the idle limit (-T). The trade
+ *     accepted for those: a client that keeps writing through its MAP_PHYSMEM view of
+ *     a BO it closed more than -T seconds ago, or while the pool is over its cap,
+ *     writes into memory the kernel recycles (Mesa unmaps before GEM_CLOSE; a dead
+ *     client's address space is gone before its close reaches us). Export windows
+ *     are safe either way: the kernel frees their pages with the last mapping.
  *
  * All functions run with srv.lock held, except v3da_bo_import (takes it itself) and
  * the namespace thread v3da_bufns_thread.
@@ -143,6 +149,7 @@ static void *block_get(uint32_t pages, int cached, int want_low, uintptr_t *pa, 
 	if (i >= 0) {
 		cpu = srv.pool[i].cpu;
 		*pa = srv.pool[i].pa;
+		srv.pool_bytes -= v3da_pool_block_bytes(&srv.pool[i], (uint32_t)_PAGE_SIZE);
 		srv.pool[i] = srv.pool[--srv.npool];
 		memset(cpu, 0, bytes);
 		pl->src = "pool";
@@ -173,23 +180,109 @@ static void *block_get(uint32_t pages, int cached, int want_low, uintptr_t *pa, 
 }
 
 
-static void block_put(void *cpu, uintptr_t pa, uint32_t pages, int cached)
+/* A pooled block goes back to the kernel (v3da_pool_trim's release). Its device
+ * mapping went with the quarantine; see the file header for client views. */
+static void pool_release(void *ctx, const v3da_pool_block_t *pb)
 {
-	if (srv.npool < V3DA_MAX_POOL) {
-		srv.pool[srv.npool].cpu = cpu;
-		srv.pool[srv.npool].pa = pa;
-		srv.pool[srv.npool].pages = pages;
-		srv.pool[srv.npool].cached = (uint32_t)cached;
-		srv.npool++;
+	(void)ctx;
+	(void)munmap(pb->cpu, (size_t)pb->pages * _PAGE_SIZE);
+}
+
+
+#define POOL_SCAN_US 1000000u   /* idle sweep period */
+#define POOL_NOTE_US 1000000u   /* at most one `pool trim` line per period */
+
+
+/* The `V3DA srv pool trim` line: what trims gave back since the last line, at most
+ * one line per POOL_NOTE_US (a cap trim may happen at every free while a client
+ * churns sizes); the remainder is printed by a later call. */
+static void pool_note(uint64_t now)
+{
+	if ((srv.pool_note_blocks == 0u) || (now < srv.pool_note_us)) {
 		return;
 	}
-	/* Pool full: the only path that returns pages to the kernel. Counted, and
-	 * loud once - the design expects pages_to_kernel == 0 (section 9.2). */
+	srv.pool_note_us = now + POOL_NOTE_US;
+	printf("V3DA srv pool trim freed_kb=%llu blocks=%u idle=%u cap=%u pool_kb=%llu pool_blocks=%u peak_kb=%llu "
+		"cap_kb=%llu idle_s=%llu trimmed_kb=%llu trims=%u\n", (unsigned long long)(srv.pool_note_bytes / 1024u),
+		srv.pool_note_blocks, srv.pool_note_idle, srv.pool_note_cap, (unsigned long long)(srv.pool_bytes / 1024u),
+		srv.npool, (unsigned long long)(srv.pool_peak / 1024u), (unsigned long long)(srv.pool_cap / 1024u),
+		(unsigned long long)(srv.pool_idle_us / 1000000u), (unsigned long long)(srv.pool_trimmed / 1024u),
+		srv.pool_trims);
+	srv.pool_note_bytes = 0u;
+	srv.pool_note_blocks = 0u;
+	srv.pool_note_idle = 0u;
+	srv.pool_note_cap = 0u;
+}
+
+
+/* Bound the pool: blocks idle for idle_us (0: skip that part), then down to the cap. */
+static void pool_trim(uint64_t now, uint64_t idle_us)
+{
+	v3da_pool_freed_t f;
+
+	v3da_pool_trim(srv.pool, &srv.npool, &srv.pool_bytes, srv.pool_cap, now, idle_us, (uint32_t)_PAGE_SIZE,
+		pool_release, NULL, &f);
+	if (f.blocks == 0u) {
+		return;
+	}
+	srv.pool_trimmed += f.bytes;
+	srv.pool_trims += f.blocks;
+	srv.pool_note_bytes += f.bytes;
+	srv.pool_note_blocks += f.blocks;
+	srv.pool_note_idle += f.idle;
+	srv.pool_note_cap += f.cap;
+	pool_note(now);
+}
+
+
+static void block_put(void *cpu, uintptr_t pa, uint32_t pages, int cached)
+{
+	v3da_pool_block_t *pb;
+	uint64_t now;
+
+	if (srv.npool < V3DA_MAX_POOL) {
+		now = v3da_now_us();
+		pb = &srv.pool[srv.npool++];
+		pb->cpu = cpu;
+		pb->pa = pa;
+		pb->pages = pages;
+		pb->cached = (uint32_t)cached;
+		pb->freed_us = now;
+		srv.pool_bytes += v3da_pool_block_bytes(pb, (uint32_t)_PAGE_SIZE);
+		if (srv.pool_bytes > srv.pool_peak) {
+			srv.pool_peak = srv.pool_bytes;
+		}
+		if (srv.pool_bytes > srv.pool_cap) {
+			pool_trim(now, 0u);   /* the oldest blocks go; the idle sweep is the tick's */
+		}
+		return;
+	}
+	/* Pool full by count (V3DA_MAX_POOL blocks, all under the byte cap: many small
+	 * blocks). Counted, and loud once. */
 	if (srv.pages_to_kernel == 0u) {
 		printf("V3DA srv pool full (%u blocks): returning a block to the kernel\n", V3DA_MAX_POOL);
 	}
 	srv.pages_to_kernel += pages;
 	(void)munmap(cpu, (size_t)pages * _PAGE_SIZE);
+}
+
+
+void v3da_bo_pool_tick(uint64_t now, int soon)
+{
+	if ((soon != 0) || (now >= srv.pool_scan_us)) {
+		srv.pool_scan_us = now + POOL_SCAN_US;
+		pool_trim(now, srv.pool_idle_us);
+	}
+	pool_note(now);
+}
+
+
+void v3da_bo_pool_counts(uint64_t *bytes, uint64_t *peak, uint32_t *blocks, uint64_t *trimmed)
+{
+	*bytes = srv.pool_bytes;
+	*peak = srv.pool_peak;
+	*blocks = srv.npool;
+	*trimmed = srv.pool_trimmed;
 }
 
 
@@ -761,6 +854,10 @@ void v3da_bo_client_gone(uint32_t client)
 		}
 	}
 	v3da_bo_quarantine_poll();
+	/* What its BOs left in the pool past the idle limit goes now, not at the next
+	 * sweep; the byte cap already held at every block_put. Blocks still quarantined
+	 * (a job in flight) follow through the event thread's quarantine poll. */
+	v3da_bo_pool_tick(v3da_now_us(), 1);
 }
 
 
