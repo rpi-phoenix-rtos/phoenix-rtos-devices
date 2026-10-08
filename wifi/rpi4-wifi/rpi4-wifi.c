@@ -2420,7 +2420,7 @@ static uint32_t diag_be32(const uint8_t *p)
 }
 
 /* Issue an iovar (SET if is_set, else GET): payload = "name\0" + data. */
-static uint8_t g_iov[512];
+static uint8_t g_iov[1536]; /* `dump` text replies need more than the 512 the setup iovars do */
 static int diag_iovar(volatile uint8_t *sdhci, uint32_t sdio_core, int is_set,
 	const char *name, const uint8_t *data, uint32_t dlen,
 	uint8_t *rx, uint32_t rxcap, uint32_t *rxlen, uint32_t reqid, uint8_t seq)
@@ -3501,6 +3501,160 @@ static int diag_wifiUdpTx(volatile uint8_t *sdhci, uint32_t plen, uint16_t dport
 	return diag_wifiFrameTx(sdhci, g_udpf, elen);
 }
 
+
+/* ---- Radio settings applied at every join ---------------------------------
+ *
+ * Throughput on this link is bounded by the air as much as by the bus: a 1x1
+ * HT20 association runs at 72 Mbit/s at best, and the chip can do 150 (HT40) or
+ * 433 (5 GHz, VHT80). Some of what decides that can only be set while the radio
+ * is DOWN -- brcmfmac sets `bw_cap` that way, before its first WLC_UP -- so these
+ * are queued and applied by the join, between the CLM download and WLC_UP:
+ *
+ *   country   ISO 3166 code, revision 0 (what brcmfmac sends for this chip,
+ *             brmcf_use_iso3166_ccode_fallback). Without one the firmware runs
+ *             its built-in default locale, which may leave 5 GHz out or passive.
+ *   iovars    any integer iovar, as little-endian words: `bw_cap` {band, cap},
+ *             `ampdu_ba_wsize`, `ampdu_mpdu`, ...
+ *
+ * With nothing queued the join sends exactly what it always did (no WLC_DOWN).
+ * The join runs on every `joinwpa`, so a queued change takes effect at the next
+ * association: `leave` makes the netif rejoin within one status poll. */
+#define WIFI_ATJOIN_MAX   8u
+#define WIFI_ATJOIN_WORDS 4u
+#define WIFI_IOVAR_NAME   32u
+
+/* bw_cap's band numbers (WLC_BAND_*, brcmu_wifi.h) and its bit sets */
+#define WLC_BAND_5G       1u
+#define WLC_BAND_2G       2u
+#define WLC_BW_CAP_20MHZ  0x1u
+#define WLC_BW_CAP_40MHZ  0x3u
+#define WLC_BW_CAP_80MHZ  0x7u
+
+#define WLC_DOWN_CMD      3u
+#define BRCMF_C_GET_PM    85u
+#define BRCMF_C_SET_PM    86u
+
+typedef struct {
+	char name[WIFI_IOVAR_NAME];
+	uint32_t nwords;
+	uint32_t w[WIFI_ATJOIN_WORDS];
+	int rc; /* result at the last join */
+} wifi_atjoin_t;
+
+static wifi_atjoin_t g_atjoin[WIFI_ATJOIN_MAX];
+static uint32_t g_atjoin_n = 0u;
+static char g_country[3] = { 0 };   /* "" = the firmware's default locale */
+static int g_country_rc = -100;     /* at the last join, or the last `country` */
+static int g_join_down_rc = -100;   /* WLC_DOWN at the last join; -100 = not sent */
+
+
+static void wifi_putLe32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v & 0xffu);
+	p[1] = (uint8_t)((v >> 8) & 0xffu);
+	p[2] = (uint8_t)((v >> 16) & 0xffu);
+	p[3] = (uint8_t)((v >> 24) & 0xffu);
+}
+
+
+/* brcmf_fil_country_le: country_abbrev[4], le32 rev, ccode[4]. */
+static void wifi_countryPayload(uint8_t p[12], const char *cc)
+{
+	memset(p, 0, 12u);
+	p[0] = (uint8_t)cc[0];
+	p[1] = (uint8_t)cc[1];
+	p[8] = (uint8_t)cc[0];
+	p[9] = (uint8_t)cc[1];
+}
+
+
+/* Queue (or replace, by name) an iovar for every following join. 0, or -1 when
+ * the list is full or the name does not fit. */
+static int wifi_atjoinAdd(const char *name, const uint32_t *w, uint32_t n)
+{
+	uint32_t i, k;
+
+	if ((strlen(name) >= WIFI_IOVAR_NAME) || (n == 0u) || (n > WIFI_ATJOIN_WORDS)) {
+		return -1;
+	}
+	for (i = 0u; i < g_atjoin_n; ++i) {
+		if (strcmp(g_atjoin[i].name, name) == 0) {
+			break;
+		}
+	}
+	if (i == g_atjoin_n) {
+		if (g_atjoin_n >= WIFI_ATJOIN_MAX) {
+			return -1;
+		}
+		g_atjoin_n++;
+	}
+	strcpy(g_atjoin[i].name, name);
+	g_atjoin[i].nwords = n;
+	for (k = 0u; k < n; ++k) {
+		g_atjoin[i].w[k] = w[k];
+	}
+	g_atjoin[i].rc = -100;
+	return 0;
+}
+
+
+/* `bw_cap` for one band: band is WLC_BAND_2G/5G, mhz 20, 40 or 80. */
+static int wifi_atjoinBw(uint32_t band, int mhz)
+{
+	uint32_t w[2];
+
+	w[0] = band;
+	if (mhz == 20) {
+		w[1] = WLC_BW_CAP_20MHZ;
+	}
+	else if (mhz == 40) {
+		w[1] = WLC_BW_CAP_40MHZ;
+	}
+	else if ((mhz == 80) && (band == WLC_BAND_5G)) {
+		w[1] = WLC_BW_CAP_80MHZ;
+	}
+	else {
+		return -1;
+	}
+	return wifi_atjoinAdd("bw_cap", w, 2u);
+}
+
+
+/* The join's hook: radio down, country, queued iovars. Nothing at all when
+ * nothing is queued. */
+static void diag_joinSettings(volatile uint8_t *sdhci, uint32_t sdio_core, uint32_t *reqid, uint8_t *seq)
+{
+	uint8_t buf[4u * WIFI_ATJOIN_WORDS];
+	uint8_t one[4] = { 1u, 0u, 0u, 0u };
+	uint32_t i, k;
+
+	if ((g_atjoin_n == 0u) && (g_country[0] == '\0')) {
+		g_join_down_rc = -100;
+		return;
+	}
+	g_join_down_rc = diag_bcdcCmd(sdhci, sdio_core, 1, WLC_DOWN_CMD, one, 4u, NULL, 0u, NULL, (*reqid)++, (*seq)++);
+	if (g_country[0] != '\0') {
+		uint8_t cc[12];
+
+		wifi_countryPayload(cc, g_country);
+		g_country_rc = diag_iovar(sdhci, sdio_core, 1, "country", cc, 12u, NULL, 0u, NULL, (*reqid)++, (*seq)++);
+	}
+	for (i = 0u; i < g_atjoin_n; ++i) {
+		for (k = 0u; k < g_atjoin[i].nwords; ++k) {
+			wifi_putLe32(buf + 4u * k, g_atjoin[i].w[k]);
+		}
+		g_atjoin[i].rc = diag_iovar(sdhci, sdio_core, 1, g_atjoin[i].name, buf, 4u * g_atjoin[i].nwords,
+			NULL, 0u, NULL, (*reqid)++, (*seq)++);
+	}
+
+	printf("wifi: JOIN-SETTINGS down=%d country=%s rc=%d", g_join_down_rc,
+		(g_country[0] != '\0') ? g_country : "-", (g_country[0] != '\0') ? g_country_rc : 0);
+	for (i = 0u; i < g_atjoin_n; ++i) {
+		printf(" %s=%d", g_atjoin[i].name, g_atjoin[i].rc);
+	}
+	printf("\n");
+}
+
 /* WPA2-PSK join of g_join_ssid/g_join_psk, then (on success) the full DHCP
  * exchange over SDPCM channel 2. Faithful copy of the probe's proven
  * diag_wifiJoin + its `jointxcnt` DHCP block; results land in the g_join_* /
@@ -3571,6 +3725,9 @@ static void diag_wifiJoinWpa2(volatile uint8_t *sdhci, uint32_t sdio_core)
 
 	/* CLM (regulatory) before UP so the radio has channels (same as scan). */
 	(void)diag_clmLoad(sdhci, sdio_core, &reqid, &seq);
+
+	/* Queued radio settings (country, bw_cap, ...): these need the radio down. */
+	diag_joinSettings(sdhci, sdio_core, &reqid, &seq);
 
 	/* infra=1 then WLC_UP */
 	val4[0] = 1u; val4[1] = 0u; val4[2] = 0u; val4[3] = 0u;
@@ -5690,6 +5847,450 @@ static int wifi_rxPoll(char *out, int cap)
 }
 
 
+/* ---- Radio probes and settings (`iovar`, `ioctl`, `atjoin`, `country`, `bw`,
+ * `chanspecs`, `dump`) ------------------------------------------------------
+ *
+ * What the radio negotiated and how the firmware aggregates bound throughput
+ * before any host-side change does, so these read and set it at run time, in
+ * the boot being measured. Like every control command they run on the message
+ * thread (the bus owner), and the reply wait drains the shared F2 FIFO, dropping
+ * the data frames it meets: use them between transfers, not during one. */
+#define WIFI_CMD_TOKS  12
+#define WIFI_CMD_WORDS 16u
+
+static uint32_t g_cmd_reqid = 0u;
+static uint8_t g_cmd_rx[1536];
+
+/* BCDC request ids for these commands: 0x400..0x7ff, clear of the join's small
+ * counters and the fixed ids of `stats`/`leave`/`mac`. */
+static uint32_t wifi_cmdReqid(void)
+{
+	return 0x400u + ((g_cmd_reqid++) & 0x3ffu);
+}
+
+
+/* Split a command written to /dev/wifi (not NUL-terminated) into blank-separated
+ * tokens inside `line`. Returns the token count. */
+static int wifi_cmdTokens(const void *data, size_t size, char *line, size_t cap, char **tok, int max)
+{
+	size_t n = (size < (cap - 1u)) ? size : (cap - 1u);
+	char *p = line;
+	int nt = 0;
+
+	memcpy(line, data, n);
+	line[n] = '\0';
+	while ((*p != '\0') && (nt < max)) {
+		while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r')) {
+			*p++ = '\0';
+		}
+		if (*p == '\0') {
+			break;
+		}
+		tok[nt++] = p;
+		while ((*p != '\0') && (*p != ' ') && (*p != '\t') && (*p != '\n') && (*p != '\r')) {
+			p++;
+		}
+	}
+	return nt;
+}
+
+
+/* One 32-bit word: decimal, 0x hex, or negative. 0, or -1 if it is not a number. */
+static int wifi_cmdWord(const char *s, uint32_t *w)
+{
+	char *end;
+	long long v = strtoll(s, &end, 0);
+
+	if ((end == s) || (*end != '\0') || (v < -2147483648LL) || (v > 0xffffffffLL)) {
+		return -1;
+	}
+	*w = (uint32_t)v;
+	return 0;
+}
+
+
+/* Words of tok[from..nt) into w[] (at most WIFI_CMD_WORDS). Count, or -1. */
+static int wifi_cmdWords(char **tok, int from, int nt, uint32_t *w)
+{
+	int i;
+
+	if ((nt - from) > (int)WIFI_CMD_WORDS) {
+		return -1;
+	}
+	for (i = from; i < nt; ++i) {
+		if (wifi_cmdWord(tok[i], &w[i - from]) != 0) {
+			return -1;
+		}
+	}
+	return (nt > from) ? (nt - from) : 0;
+}
+
+
+/* A reply as little-endian words, up to the last non-zero one (at least one). */
+static int wifi_fmtWords(char *out, int cap, const uint8_t *b, uint32_t len)
+{
+	uint32_t nw = len / 4u, last = 0u, i;
+	int n = 0, m;
+
+	if (nw > WIFI_CMD_WORDS) {
+		nw = WIFI_CMD_WORDS;
+	}
+	for (i = 0u; i < nw; ++i) {
+		if (diag_le32(b + 4u * i) != 0u) {
+			last = i + 1u;
+		}
+	}
+	if ((last == 0u) && (nw != 0u)) {
+		last = 1u;
+	}
+	for (i = 0u; i < last; ++i) {
+		uint32_t v = diag_le32(b + 4u * i);
+
+		m = snprintf(out + n, (size_t)(cap - n), " %d(0x%x)", (int)(int32_t)v, (unsigned)v);
+		if ((m < 0) || (m >= (cap - n))) {
+			break;
+		}
+		n += m;
+	}
+	return n;
+}
+
+
+/* Chanspec, d11ac encoding (brcmu_d11.h): channel 7:0, bandwidth 13:11, band 15:14. */
+static unsigned wifi_chspecMhz(uint32_t cs)
+{
+	switch (cs & 0x3800u) {
+		case 0x1000u: return 20u;
+		case 0x1800u: return 40u;
+		case 0x2000u: return 80u;
+		case 0x2800u: return 160u;
+		default: return 0u;
+	}
+}
+
+static const char *wifi_chspecBand(uint32_t cs)
+{
+	switch (cs & 0xc000u) {
+		case 0x0000u: return "2g";
+		case 0xc000u: return "5g";
+		default: return "?";
+	}
+}
+
+
+/* `iovar get <name> [in-words]` / `iovar set <name> <words>`. A GET may need
+ * input words (`bw_cap` takes the band). */
+static int wifi_iovarCmd(char **tok, int nt, char *out, int cap)
+{
+	uint8_t in[4u * WIFI_CMD_WORDS];
+	uint32_t w[WIFI_CMD_WORDS], rlen = 0u, dlen;
+	int is_set, nw, rc, n, k;
+
+	if ((nt < 3) || ((strcmp(tok[1], "get") != 0) && (strcmp(tok[1], "set") != 0)) ||
+			(strlen(tok[2]) >= WIFI_IOVAR_NAME)) {
+		return snprintf(out, (size_t)cap, "IOVAR usage: iovar get <name> [words] | iovar set <name> <words>\n");
+	}
+	is_set = (tok[1][0] == 's');
+	nw = wifi_cmdWords(tok, 3, nt, w);
+	if ((nw < 0) || (is_set && (nw == 0))) {
+		return snprintf(out, (size_t)cap, "IOVAR error: words are 32-bit numbers (%u at most)%s\n",
+			WIFI_CMD_WORDS, is_set ? ", and a set needs one" : "");
+	}
+	memset(in, 0, sizeof(in));
+	for (k = 0; k < nw; ++k) {
+		wifi_putLe32(in + 4 * k, w[k]);
+	}
+	/* A GET's buffer is also where the answer goes: leave room for one. */
+	dlen = is_set ? (4u * (uint32_t)nw) : sizeof(in);
+	rc = diag_iovar(g_sdhci, g_sdio_core, is_set, tok[2], in, dlen,
+		g_cmd_rx, sizeof(g_cmd_rx), &rlen, wifi_cmdReqid(), g_data_seq++);
+	n = snprintf(out, (size_t)cap, "IOVAR %s %s rc=%d", tok[1], tok[2], rc);
+	if ((n > 0) && (n < cap) && !is_set && (rc == 0)) {
+		n += snprintf(out + n, (size_t)(cap - n), " len=%u:", (unsigned)rlen);
+		if (n < cap) {
+			n += wifi_fmtWords(out + n, cap - n, g_cmd_rx, (rlen < sizeof(g_cmd_rx)) ? rlen : sizeof(g_cmd_rx));
+		}
+	}
+	if ((n > 0) && (n < (cap - 1))) {
+		out[n++] = '\n';
+		out[n] = '\0';
+	}
+	return n;
+}
+
+
+/* `ioctl get <cmd> [in-words]` / `ioctl set <cmd> <words>`: a raw WLC command
+ * (BRCMF_C_*, fwil.h), e.g. 85/86 = GET/SET_PM. No list of allowed commands:
+ * this is a probe, and 2/3 (UP/DOWN) will take the link with them. */
+static int wifi_ioctlCmd(char **tok, int nt, char *out, int cap)
+{
+	uint8_t in[4u * WIFI_CMD_WORDS];
+	uint32_t w[WIFI_CMD_WORDS], cmd, rlen = 0u, dlen;
+	int is_set, nw, rc, n, k;
+
+	if ((nt < 3) || ((strcmp(tok[1], "get") != 0) && (strcmp(tok[1], "set") != 0)) ||
+			(wifi_cmdWord(tok[2], &cmd) != 0)) {
+		return snprintf(out, (size_t)cap, "IOCTL usage: ioctl get <cmd> [words] | ioctl set <cmd> <words>\n");
+	}
+	is_set = (tok[1][0] == 's');
+	nw = wifi_cmdWords(tok, 3, nt, w);
+	if ((nw < 0) || (is_set && (nw == 0))) {
+		return snprintf(out, (size_t)cap, "IOCTL error: words are 32-bit numbers (%u at most)%s\n",
+			WIFI_CMD_WORDS, is_set ? ", and a set needs one" : "");
+	}
+	memset(in, 0, sizeof(in));
+	for (k = 0; k < nw; ++k) {
+		wifi_putLe32(in + 4 * k, w[k]);
+	}
+	dlen = (nw > 0) ? (4u * (uint32_t)nw) : 4u;
+	if (!is_set && (dlen < 64u)) {
+		dlen = 64u;
+	}
+	rc = diag_bcdcCmd(g_sdhci, g_sdio_core, is_set, cmd, in, dlen,
+		g_cmd_rx, sizeof(g_cmd_rx), &rlen, wifi_cmdReqid(), g_data_seq++);
+	n = snprintf(out, (size_t)cap, "IOCTL %s %u rc=%d", tok[1], (unsigned)cmd, rc);
+	if ((n > 0) && (n < cap) && !is_set && (rc == 0)) {
+		n += snprintf(out + n, (size_t)(cap - n), " len=%u:", (unsigned)rlen);
+		if (n < cap) {
+			n += wifi_fmtWords(out + n, cap - n, g_cmd_rx, (rlen < sizeof(g_cmd_rx)) ? rlen : sizeof(g_cmd_rx));
+		}
+	}
+	if ((n > 0) && (n < (cap - 1))) {
+		out[n++] = '\n';
+		out[n] = '\0';
+	}
+	return n;
+}
+
+
+/* The queued join settings, one line. */
+static int wifi_atjoinList(char *out, int cap)
+{
+	uint32_t i, k;
+	int n, m;
+
+	n = snprintf(out, (size_t)cap, "ATJOIN country=%s (rc %d)", (g_country[0] != '\0') ? g_country : "-", g_country_rc);
+	for (i = 0u; (i < g_atjoin_n) && (n > 0) && (n < cap); ++i) {
+		m = snprintf(out + n, (size_t)(cap - n), " %s", g_atjoin[i].name);
+		for (k = 0u; (k < g_atjoin[i].nwords) && (m > 0) && ((n + m) < cap); ++k) {
+			m += snprintf(out + n + m, (size_t)(cap - n - m), "%c%d", (k == 0u) ? '=' : ',', (int)(int32_t)g_atjoin[i].w[k]);
+		}
+		if ((m > 0) && ((n + m) < cap)) {
+			m += snprintf(out + n + m, (size_t)(cap - n - m), " (rc %d)", g_atjoin[i].rc);
+		}
+		if ((m < 0) || ((n + m) >= cap)) {
+			break;
+		}
+		n += m;
+	}
+	if ((n > 0) && (n < cap)) {
+		m = snprintf(out + n, (size_t)(cap - n), "; last join WLC_DOWN rc=%d (-100: not sent)\n", g_join_down_rc);
+		if ((m > 0) && ((n + m) < cap)) {
+			n += m;
+		}
+	}
+	return n;
+}
+
+
+/* `atjoin` lists, `atjoin clear` empties (country included), `atjoin <name>
+ * <words>` queues an iovar for every following join. */
+static int wifi_atjoinCmd(char **tok, int nt, char *out, int cap)
+{
+	uint32_t w[WIFI_CMD_WORDS];
+	int nw, n;
+
+	if (nt == 1) {
+		return wifi_atjoinList(out, cap);
+	}
+	if ((nt == 2) && (strcmp(tok[1], "clear") == 0)) {
+		g_atjoin_n = 0u;
+		g_country[0] = '\0';
+		n = snprintf(out, (size_t)cap, "ATJOIN cleared: the next join sends no WLC_DOWN. ");
+		return ((n > 0) && (n < cap)) ? (n + wifi_atjoinList(out + n, cap - n)) : n;
+	}
+	nw = wifi_cmdWords(tok, 2, nt, w);
+	if ((nw <= 0) || (wifi_atjoinAdd(tok[1], w, (uint32_t)nw) != 0)) {
+		return snprintf(out, (size_t)cap, "ATJOIN error: atjoin <name> <1..%u words> (%u entries at most)\n",
+			WIFI_ATJOIN_WORDS, WIFI_ATJOIN_MAX);
+	}
+	n = snprintf(out, (size_t)cap, "ATJOIN queued for the next join (`wifi leave` makes the netif rejoin). ");
+	return ((n > 0) && (n < cap)) ? (n + wifi_atjoinList(out + n, cap - n)) : n;
+}
+
+
+/* `country` reads it, `country <CC>` sets it now and at every join, `country -`
+ * stops setting it (the firmware keeps the last one until it is reloaded). */
+static int wifi_countryCmd(char **tok, int nt, char *out, int cap)
+{
+	uint8_t cc[12];
+	uint32_t rlen = 0u;
+	int rc;
+
+	if (nt == 1) {
+		memset(cc, 0, sizeof(cc));
+		rc = diag_iovar(g_sdhci, g_sdio_core, 0, "country", cc, sizeof(cc),
+			g_cmd_rx, sizeof(g_cmd_rx), &rlen, wifi_cmdReqid(), g_data_seq++);
+		if ((rc != 0) || (rlen < 12u)) {
+			return snprintf(out, (size_t)cap, "COUNTRY get rc=%d len=%u\n", rc, (unsigned)rlen);
+		}
+		return snprintf(out, (size_t)cap, "COUNTRY abbrev=%.4s rev=%d ccode=%.4s (queued for joins: %s)\n",
+			(const char *)g_cmd_rx, (int)(int32_t)diag_le32(g_cmd_rx + 4), (const char *)(g_cmd_rx + 8),
+			(g_country[0] != '\0') ? g_country : "-");
+	}
+	if (strcmp(tok[1], "-") == 0) {
+		g_country[0] = '\0';
+		return snprintf(out, (size_t)cap, "COUNTRY no longer set at joins\n");
+	}
+	if ((strlen(tok[1]) != 2u) || (tok[1][0] < 'A') || (tok[1][0] > 'Z') || (tok[1][1] < 'A') || (tok[1][1] > 'Z')) {
+		return snprintf(out, (size_t)cap, "COUNTRY error: a two-letter upper-case ISO 3166 code, e.g. PL\n");
+	}
+	g_country[0] = tok[1][0];
+	g_country[1] = tok[1][1];
+	g_country[2] = '\0';
+	wifi_countryPayload(cc, g_country);
+	g_country_rc = diag_iovar(g_sdhci, g_sdio_core, 1, "country", cc, sizeof(cc),
+		NULL, 0u, NULL, wifi_cmdReqid(), g_data_seq++);
+	return snprintf(out, (size_t)cap, "COUNTRY set %s rev 0 rc=%d; also set at every join\n", g_country, g_country_rc);
+}
+
+
+/* `bw <2g|5g> <20|40|80>`: queue `bw_cap` for that band (80 on 5g only). */
+static int wifi_bwCmd(char **tok, int nt, char *out, int cap)
+{
+	uint32_t band;
+	int n;
+
+	if ((nt == 3) && ((strcmp(tok[1], "2g") == 0) || (strcmp(tok[1], "5g") == 0))) {
+		band = (tok[1][0] == '2') ? WLC_BAND_2G : WLC_BAND_5G;
+		if (wifi_atjoinBw(band, atoi(tok[2])) == 0) {
+			n = snprintf(out, (size_t)cap, "BW queued %s %s MHz for the next join (`wifi leave` makes the netif rejoin). ",
+				tok[1], tok[2]);
+			return ((n > 0) && (n < cap)) ? (n + wifi_atjoinList(out + n, cap - n)) : n;
+		}
+	}
+	return snprintf(out, (size_t)cap, "BW usage: bw 2g <20|40> | bw 5g <20|40|80>\n");
+}
+
+
+/* `chanspecs`: what the firmware will use under the current locale, by band
+ * and width (channel = centre channel for 40/80). */
+static int wifi_chanspecsCmd(char *out, int cap)
+{
+	static const char *const bands[2] = { "2g", "5g" };
+	static const unsigned widths[3] = { 20u, 40u, 80u };
+	uint8_t z[496];
+	uint32_t rlen = 0u, cnt, i, b, wi;
+	int rc, n, m;
+
+	memset(z, 0, sizeof(z));
+	rc = diag_iovar(g_sdhci, g_sdio_core, 0, "chanspecs", z, sizeof(z),
+		g_cmd_rx, sizeof(g_cmd_rx), &rlen, wifi_cmdReqid(), g_data_seq++);
+	if ((rc != 0) || (rlen < 4u)) {
+		return snprintf(out, (size_t)cap, "CHANSPECS rc=%d len=%u\n", rc, (unsigned)rlen);
+	}
+	cnt = diag_le32(g_cmd_rx);
+	if (cnt > ((rlen - 4u) / 4u)) {
+		cnt = (rlen - 4u) / 4u; /* what fits in the reply */
+	}
+	n = snprintf(out, (size_t)cap, "CHANSPECS count=%u (listed %u)\n", (unsigned)diag_le32(g_cmd_rx), (unsigned)cnt);
+	for (b = 0u; b < 2u; ++b) {
+		for (wi = 0u; wi < 3u; ++wi) {
+			int any = 0;
+
+			for (i = 0u; (i < cnt) && (n > 0) && (n < cap); ++i) {
+				uint32_t cs = diag_le32(g_cmd_rx + 4u + 4u * i);
+
+				if ((strcmp(wifi_chspecBand(cs), bands[b]) != 0) || (wifi_chspecMhz(cs) != widths[wi])) {
+					continue;
+				}
+				if (any) {
+					m = snprintf(out + n, (size_t)(cap - n), " %u", (unsigned)(cs & 0xffu));
+				}
+				else {
+					m = snprintf(out + n, (size_t)(cap - n), "CHANSPECS %s/%u: %u", bands[b], widths[wi], (unsigned)(cs & 0xffu));
+				}
+				if ((m < 0) || (m >= (cap - n))) {
+					break;
+				}
+				n += m;
+				any = 1;
+			}
+			if (any && (n > 0) && (n < (cap - 1))) {
+				out[n++] = '\n';
+				out[n] = '\0';
+			}
+		}
+	}
+	return n;
+}
+
+
+/* `dump <name>`: the firmware's text dump, e.g. `dump ampdu` (A-MPDU sizes and
+ * block-ack state, if this firmware build carries it). */
+static int wifi_dumpCmd(char **tok, int nt, char *out, int cap)
+{
+	uint8_t req[1280];
+	uint32_t rlen = 0u, len;
+	int rc, n;
+
+	if ((nt != 2) || (strlen(tok[1]) >= 32u)) {
+		return snprintf(out, (size_t)cap, "DUMP usage: dump <name>, e.g. dump ampdu\n");
+	}
+	memset(req, 0, sizeof(req));
+	memcpy(req, tok[1], strlen(tok[1]));
+	rc = diag_iovar(g_sdhci, g_sdio_core, 0, "dump", req, sizeof(req),
+		g_cmd_rx, sizeof(g_cmd_rx) - 1u, &rlen, wifi_cmdReqid(), g_data_seq++);
+	if (rc != 0) {
+		return snprintf(out, (size_t)cap, "DUMP %s rc=%d (not in this firmware, or not here)\n", tok[1], rc);
+	}
+	len = (rlen < (sizeof(g_cmd_rx) - 1u)) ? rlen : (sizeof(g_cmd_rx) - 1u);
+	g_cmd_rx[len] = 0u;
+	n = snprintf(out, (size_t)cap, "DUMP %s (%u bytes):\n%s\n", tok[1], (unsigned)rlen, (const char *)g_cmd_rx);
+	return (n < cap) ? n : (cap - 1);
+}
+
+
+/* The `/dev/wifi` entry for all of the above. Returns the reply length, or -1
+ * when the command is not one of them. */
+static int wifi_radioCmd(const void *data, size_t size, char *out, int cap)
+{
+	char line[192];
+	char *tok[WIFI_CMD_TOKS];
+	int nt = wifi_cmdTokens(data, size, line, sizeof(line), tok, WIFI_CMD_TOKS);
+
+	if (nt == 0) {
+		return -1;
+	}
+	if (strcmp(tok[0], "atjoin") == 0) {
+		return wifi_atjoinCmd(tok, nt, out, cap); /* only queues: no bus needed */
+	}
+	if (strcmp(tok[0], "bw") == 0) {
+		return wifi_bwCmd(tok, nt, out, cap);
+	}
+	if ((strcmp(tok[0], "iovar") != 0) && (strcmp(tok[0], "ioctl") != 0) && (strcmp(tok[0], "country") != 0) &&
+			(strcmp(tok[0], "chanspecs") != 0) && (strcmp(tok[0], "dump") != 0)) {
+		return -1;
+	}
+	if (g_sdhci == NULL) {
+		return snprintf(out, (size_t)cap, "wifi: controller not initialized\n");
+	}
+	if (strcmp(tok[0], "iovar") == 0) {
+		return wifi_iovarCmd(tok, nt, out, cap);
+	}
+	if (strcmp(tok[0], "ioctl") == 0) {
+		return wifi_ioctlCmd(tok, nt, out, cap);
+	}
+	if (strcmp(tok[0], "country") == 0) {
+		return wifi_countryCmd(tok, nt, out, cap);
+	}
+	if (strcmp(tok[0], "chanspecs") == 0) {
+		return wifi_chanspecsCmd(out, cap);
+	}
+	return wifi_dumpCmd(tok, nt, out, cap);
+}
+
+
 static void wifi_irqThread(void *arg)
 {
 	uint32_t port = (uint32_t)(uintptr_t)arg;
@@ -5777,8 +6378,9 @@ static int wifi_stats(char *out, int cap)
 	 * control command, the GET drains the shared F2 FIFO and drops the data
 	 * frames it meets, so it must not go into the periodically polled `status`. */
 	uint8_t rbuf[8] = { 0 };
-	uint32_t rlen = 0u, rate = 0u;
-	int rate_rc = -1, n, m;
+	uint8_t z[4] = { 0 };
+	uint32_t rlen = 0u, rate = 0u, cs = 0u, pm = 0xffffffffu;
+	int rate_rc = -1, cs_rc = -1, pm_rc = -1, n, m;
 
 	if ((g_sdhci != NULL) && wifi_isJoined()) {
 		rate_rc = diag_bcdcCmd(g_sdhci, g_sdio_core, 0, BRCMF_C_GET_RATE, NULL, 4u,
@@ -5786,10 +6388,25 @@ static int wifi_stats(char *out, int cap)
 		if ((rate_rc == 0) && (rlen >= 4u)) {
 			rate = diag_le32(rbuf);
 		}
+		/* The channel and width the association runs on, and the power-save
+		 * mode: with the rate, the three things the air ceiling depends on. */
+		cs_rc = diag_iovar(g_sdhci, g_sdio_core, 0, "chanspec", z, 4u,
+			rbuf, sizeof(rbuf), &rlen, 212u, g_data_seq++);
+		if ((cs_rc == 0) && (rlen >= 4u)) {
+			cs = diag_le32(rbuf);
+		}
+		pm_rc = diag_bcdcCmd(g_sdhci, g_sdio_core, 0, BRCMF_C_GET_PM, z, 4u,
+			rbuf, sizeof(rbuf), &rlen, 213u, g_data_seq++);
+		if ((pm_rc == 0) && (rlen >= 4u)) {
+			pm = diag_le32(rbuf);
+		}
 	}
 
-	n = snprintf(out, (size_t)cap, "WIFISTATS phy rate=%u.%u Mbit/s rc=%d\n",
-		(unsigned)(rate / 2u), (unsigned)((rate & 1u) * 5u), rate_rc);
+	n = snprintf(out, (size_t)cap, "WIFISTATS phy rate=%u.%u Mbit/s rc=%d\n"
+		"WIFISTATS radio chanspec=0x%04x ch=%u bw=%u band=%s rc=%d pm=%d rc=%d atjoin=%u country=%s down_rc=%d\n",
+		(unsigned)(rate / 2u), (unsigned)((rate & 1u) * 5u), rate_rc,
+		(unsigned)(cs & 0xffffu), (unsigned)(cs & 0xffu), wifi_chspecMhz(cs), wifi_chspecBand(cs), cs_rc,
+		(int)(int32_t)pm, pm_rc, (unsigned)g_atjoin_n, (g_country[0] != '\0') ? g_country : "-", g_join_down_rc);
 	if ((n < 0) || (n >= cap)) {
 		return n;
 	}
@@ -6065,7 +6682,7 @@ static void wifi_thread(void *arg)
 	uint32_t port = (uint32_t)(uintptr_t)arg;
 	msg_t msg;
 	msg_rid_t rid;
-	int err;
+	int err, radio_len;
 
 	for (;;) {
 		err = msgRecv(port, &msg, &rid);
@@ -6130,7 +6747,10 @@ static void wifi_thread(void *arg)
 				 * write("mtu") proves the data path at full MTU after that. A
 				 * client read()s the result. Any other payload is accepted but
 				 * ignored. */
-				if (msg.i.size >= 4 && memcmp(msg.i.data, "scan", 4) == 0) {
+				if ((radio_len = wifi_radioCmd(msg.i.data, msg.i.size, g_resp, (int)sizeof(g_resp))) >= 0) {
+					g_resp_len = (radio_len < (int)sizeof(g_resp)) ? radio_len : ((int)sizeof(g_resp) - 1);
+				}
+				else if (msg.i.size >= 4 && memcmp(msg.i.data, "scan", 4) == 0) {
 					g_resp_len = wifi_scan(g_resp, (int)sizeof(g_resp));
 				}
 				else if (msg.i.size >= 6 && memcmp(msg.i.data, "join ", 5) == 0) {
@@ -6304,6 +6924,19 @@ int main(int argc, char **argv)
 			}
 			else {
 				printf("rpi4-wifi: ignoring %s (64, 128, 256 or 512)\n", argv[ai]);
+			}
+		}
+		else if ((strncmp(argv[ai], "country=", 8) == 0) && (strlen(argv[ai]) == 10u) &&
+				(argv[ai][8] >= 'A') && (argv[ai][8] <= 'Z') && (argv[ai][9] >= 'A') && (argv[ai][9] <= 'Z')) {
+			/* set at every join (see diag_joinSettings), as `wifi country` does */
+			g_country[0] = argv[ai][8];
+			g_country[1] = argv[ai][9];
+			g_country[2] = '\0';
+		}
+		else if ((strncmp(argv[ai], "bw2g=", 5) == 0) || (strncmp(argv[ai], "bw5g=", 5) == 0)) {
+			/* bw_cap at every join: bw2g=20|40, bw5g=20|40|80, as `wifi bw` does */
+			if (wifi_atjoinBw((argv[ai][2] == '2') ? WLC_BAND_2G : WLC_BAND_5G, atoi(argv[ai] + 5)) != 0) {
+				printf("rpi4-wifi: ignoring %s (bw2g=20|40, bw5g=20|40|80)\n", argv[ai]);
 			}
 		}
 		else if (strcmp(argv[ai], "hispd=1") == 0) {
