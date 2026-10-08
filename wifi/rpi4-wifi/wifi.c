@@ -410,6 +410,30 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
+	if ((argc >= 2) && ((strcmp(argv[1], "iovar") == 0) || (strcmp(argv[1], "ioctl") == 0) ||
+			(strcmp(argv[1], "atjoin") == 0) || (strcmp(argv[1], "country") == 0) ||
+			(strcmp(argv[1], "bw") == 0) || (strcmp(argv[1], "chanspecs") == 0) ||
+			(strcmp(argv[1], "dump") == 0))) {
+		/* Radio probes and settings: the daemon parses the words itself. */
+		int i, n = 0, m;
+
+		for (i = 1; i < argc; ++i) {
+			m = snprintf(cmd + n, sizeof(cmd) - (size_t)n, "%s%s", (i > 1) ? " " : "", argv[i]);
+			if ((m < 0) || (m >= (int)sizeof(cmd) - n)) {
+				printf("wifi: command too long\n");
+				return 2;
+			}
+			n += m;
+		}
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		rc = cmd_run(fd, cmd, n);
+		close(fd);
+		return rc;
+	}
 	if (argc >= 2 && strcmp(argv[1], "mac") == 0) {
 		fd = open(WIFI_DEV, O_RDWR);
 		if (fd < 0) {
@@ -516,6 +540,14 @@ int main(int argc, char **argv)
 	       "  wifi netup <ssid> <psk> | wifi join <ssid> | wifi mtu |\n"
 	       "  wifi rxpoll (RX interrupt off until reboot; the netif polls) |\n"
 	       "  wifi sdclk <kHz> (SDIO data clock until reboot: 50000 = 41.67 MHz, 25000) |\n"
-	       "  wifi f2blk <64|128|256|512> (SDIO data block size until reboot)\n", WIFI_CONF);
+	       "  wifi f2blk <64|128|256|512> (SDIO data block size until reboot)\n"
+	       "radio (control commands: run them between transfers, not during one):\n"
+	       "  wifi chanspecs                (channels and widths the firmware allows now)\n"
+	       "  wifi country [<CC>|-]         (read, or set now and at every join, e.g. PL)\n"
+	       "  wifi bw <2g|5g> <20|40|80>    (bw_cap, applied at the next join)\n"
+	       "  wifi atjoin [clear | <iovar> <words>]  (iovars set at every join, radio down)\n"
+	       "  wifi iovar get|set <name> [words]  |  wifi ioctl get|set <cmd> [words]\n"
+	       "  wifi dump <name>              (firmware text dump, e.g. ampdu)\n"
+	       "  join-time settings take effect when the netif rejoins: wifi leave\n", WIFI_CONF);
 	return 2;
 }
