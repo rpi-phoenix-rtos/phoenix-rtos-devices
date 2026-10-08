@@ -1,7 +1,8 @@
 /*
  * Phoenix-RTOS
  *
- * USB HID boot mouse driver
+ * USB HID mouse driver (boot-protocol mice; report protocol when the report
+ * descriptor can be parsed, which is what carries the wheel)
  *
  * Copyright 2026 Phoenix Systems
  *
@@ -12,8 +13,9 @@
  * TODO: usbmouse.c and usbkbd.c share most of their scaffolding — driver
  * registration, idtree device management, control + interrupt-IN pipe open,
  * URB alloc/submit/completion + re-arm, the rx fifo, and the msgport/read/poll
- * loop. The device-specific part is tiny (the keyboard translates HID usages to
- * ASCII; the mouse forwards raw boot-report packets). A future cleanup should
+ * loop. The device-specific part is small (the keyboard translates HID usages to
+ * ASCII; the mouse turns boot or report-protocol reports into /dev/mouseN
+ * packets, the latter via hidmouse.c). A future cleanup should
  * factor the common part into a shared libhidboot core. Kept separate for now
  * so this lands as a small mirror of the accepted usbkbd driver without
  * regressing the working keyboard path.
@@ -40,6 +42,7 @@
 #include <usbdriver.h>
 
 #include "../libtty/fifo.h"
+#include "hidmouse.h"
 
 
 #ifndef USBMOUSE_N_MSG_THREADS
@@ -65,9 +68,22 @@
 
 enum { usbmouse_bootSubclass = 0x1, usbmouse_mouseProtocol = 0x2 };
 
-/* HID boot-mouse report: [0]=buttons (bit0 L, bit1 R, bit2 M), [1]=X int8,
- * [2]=Y int8, [3]=wheel int8. wMaxPacketSize on the Pixart 093a:2510 is 4. */
-enum { usbmouse_reportSize = 4 };
+/* SET_PROTOCOL wValue (HID 1.11, 7.2.6) */
+enum { usbmouse_protoBoot = 0, usbmouse_protoReport = 1 };
+
+/* The /dev/mouseN packet: [0]=buttons (bit0 L, bit1 R, bit2 M), [1]=X int8,
+ * [2]=Y int8, [3]=wheel int8 -- the HID boot-mouse report layout. In boot
+ * protocol it is also the interrupt transfer size (wMaxPacketSize on the Pixart
+ * 093a:2510 is 4). */
+enum { usbmouse_reportSize = HIDMOUSE_PKT_SIZE };
+
+/* Largest report-protocol interrupt transfer (a full-speed interrupt
+ * wMaxPacketSize); a device with longer input reports stays in boot protocol. */
+enum { usbmouse_urbMax = 64 };
+
+/* Bound on the descriptors fetched at insertion: a mouse needs a few hundred
+ * bytes at most. */
+enum { usbmouse_configMax = 512, usbmouse_reportDescMax = 1024 };
 
 enum { usbmouse_rxStopped = 0, usbmouse_rxRunning = 1, usbmouse_rxDisconnected = -1 };
 
@@ -85,7 +101,12 @@ typedef struct {
 	int pipeCtrl;
 	int pipeIntIn;
 	int urbIntIn[USBMOUSE_N_URBS];
-	uint8_t report[USBMOUSE_N_URBS][usbmouse_reportSize];
+	uint8_t report[USBMOUSE_N_URBS][usbmouse_urbMax];
+	size_t urbSize; /* interrupt transfer size: 4 in boot protocol */
+
+	int reportProtocol;       /* reports follow `layout`, not the boot format */
+	hidmouse_layout_t layout; /* report-protocol field positions */
+	uint8_t buttons;          /* button state latched across reports */
 
 	char path[32];
 
@@ -218,6 +239,18 @@ static void usbmouse_fifoPush(usbmouse_dev_t *dev, const uint8_t *data, size_t l
 static void usbmouse_handleReport(usbmouse_dev_t *dev, const uint8_t *report, size_t len)
 {
 	uint8_t pkt[usbmouse_reportSize];
+	uint8_t pkts[HIDMOUSE_MAX_SPLIT * HIDMOUSE_PKT_SIZE];
+	size_t n;
+
+	/* Report protocol: fields where the report descriptor put them; a delta too
+	 * large for one packet is spread over several. */
+	if (dev->reportProtocol != 0) {
+		n = hidmouse_translate(&dev->layout, &dev->buttons, report, len, pkts, sizeof(pkts));
+		if (n > 0u) {
+			usbmouse_fifoPush(dev, pkts, n);
+		}
+		return;
+	}
 
 	/* Accept 3- or 4-byte boot reports and normalise to the 4-byte /dev/mouseN
 	 * framing, padding a missing wheel byte with 0. #24: the PIXART 093a:2510 (and
@@ -237,12 +270,12 @@ static void usbmouse_handleReport(usbmouse_dev_t *dev, const uint8_t *report, si
 }
 
 
-static int usbmouse_setProtocol(usbmouse_dev_t *dev)
+static int usbmouse_setProtocol(usbmouse_dev_t *dev, uint16_t protocol)
 {
 	usb_setup_packet_t setup = {
 		.bmRequestType = REQUEST_DIR_HOST2DEV | REQUEST_TYPE_CLASS | REQUEST_RECIPIENT_INTERFACE,
 		.bRequest = CLASS_REQ_SET_PROTOCOL,
-		.wValue = 0,
+		.wValue = protocol,
 		.wIndex = dev->instance.interface,
 		.wLength = 0
 	};
@@ -265,13 +298,106 @@ static int usbmouse_setIdle(usbmouse_dev_t *dev)
 }
 
 
+static int usbmouse_getDescriptor(usbmouse_dev_t *dev, uint8_t recipient, uint8_t type, void *buf, size_t len)
+{
+	usb_setup_packet_t setup = {
+		.bmRequestType = REQUEST_DIR_DEV2HOST | REQUEST_TYPE_STANDARD | recipient,
+		.bRequest = REQ_GET_DESCRIPTOR,
+		.wValue = (uint16_t)(type << 8),
+		.wIndex = (recipient == REQUEST_RECIPIENT_INTERFACE) ? (uint16_t)dev->instance.interface : 0u,
+		.wLength = (uint16_t)len
+	};
+
+	return usb_transferControl(dev->drv, dev->pipeCtrl, &setup, buf, len, usb_dir_in);
+}
+
+
+/* Decide whether the device can run in report protocol: fetch the configuration
+ * descriptor (for the report-descriptor length and the interrupt endpoint's
+ * wMaxPacketSize) and the report descriptor, and parse it. Only standard
+ * GET_DESCRIPTOR requests are issued -- both are mandatory for a HID device,
+ * so none of them should STALL the control endpoint (which this stack does not
+ * recover). On success fills dev->layout and dev->urbSize; on failure sets
+ * *reason and leaves dev->urbSize at the boot-protocol size. */
+static int usbmouse_probeReportProtocol(usbmouse_dev_t *dev, const char **reason)
+{
+	usb_configuration_desc_t conf;
+	uint8_t *buf;
+	size_t total;
+	size_t rdescLen;
+	size_t maxPacket;
+	int ret;
+
+	ret = usbmouse_getDescriptor(dev, REQUEST_RECIPIENT_DEVICE, USB_DESC_CONFIG, &conf, sizeof(conf));
+	if ((ret != (int)sizeof(conf)) || (conf.bDescriptorType != USB_DESC_CONFIG) || (conf.wTotalLength < sizeof(conf))) {
+		*reason = "no configuration descriptor";
+		return -EIO;
+	}
+
+	total = (conf.wTotalLength < usbmouse_configMax) ? conf.wTotalLength : usbmouse_configMax;
+	buf = malloc(usbmouse_reportDescMax);
+	if (buf == NULL) {
+		*reason = "out of memory";
+		return -ENOMEM;
+	}
+
+	do {
+		ret = usbmouse_getDescriptor(dev, REQUEST_RECIPIENT_DEVICE, USB_DESC_CONFIG, buf, total);
+		if (ret != (int)total) {
+			*reason = "configuration descriptor read failed";
+			ret = -EIO;
+			break;
+		}
+
+		ret = hidmouse_findInterface(buf, total, (unsigned int)dev->instance.interface, &rdescLen, &maxPacket);
+		if (ret < 0) {
+			*reason = "no HID descriptor";
+			break;
+		}
+
+		if (rdescLen > usbmouse_reportDescMax) {
+			*reason = "report descriptor too long";
+			ret = -E2BIG;
+			break;
+		}
+
+		/* A device returning less than its HID descriptor announced gets its
+		 * bytes parsed anyway: a truncated descriptor fails the parse. */
+		ret = usbmouse_getDescriptor(dev, REQUEST_RECIPIENT_INTERFACE, USB_DESC_TYPE_HID_REPORT, buf, rdescLen);
+		if ((ret <= 0) || (ret > (int)rdescLen)) {
+			*reason = "report descriptor read failed";
+			ret = -EIO;
+			break;
+		}
+
+		ret = hidmouse_parse(buf, (size_t)ret, &dev->layout, reason);
+		if (ret < 0) {
+			break;
+		}
+
+		/* Every input report must fit one transfer: a longer one would be split
+		 * across URBs and its tail misread as a report of its own. */
+		dev->urbSize = (maxPacket < usbmouse_urbMax) ? maxPacket : usbmouse_urbMax;
+		if (dev->layout.maxReportLen > dev->urbSize) {
+			*reason = "report longer than a packet";
+			dev->urbSize = usbmouse_reportSize;
+			ret = -E2BIG;
+			break;
+		}
+	} while (0);
+
+	free(buf);
+	return (ret < 0) ? ret : EOK;
+}
+
+
 static int _usbmouse_start(usbmouse_dev_t *dev)
 {
 	int i;
 	int ret;
 
 	for (i = 0; i < USBMOUSE_N_URBS; ++i) {
-		ret = usb_transferAsync(dev->drv, dev->pipeIntIn, dev->urbIntIn[i], usbmouse_reportSize, NULL);
+		ret = usb_transferAsync(dev->drv, dev->pipeIntIn, dev->urbIntIn[i], dev->urbSize, NULL);
 		if (ret < 0) {
 			return -EIO;
 		}
@@ -288,7 +414,7 @@ static int _usbmouse_urbsAlloc(usbmouse_dev_t *dev)
 	int j;
 
 	for (i = 0; i < USBMOUSE_N_URBS; ++i) {
-		dev->urbIntIn[i] = usb_urbAlloc(dev->drv, dev->pipeIntIn, dev->report[i], usb_dir_in, usbmouse_reportSize, usb_transfer_interrupt);
+		dev->urbIntIn[i] = usb_urbAlloc(dev->drv, dev->pipeIntIn, dev->report[i], usb_dir_in, dev->urbSize, usb_transfer_interrupt);
 		if (dev->urbIntIn[i] < 0) {
 			for (j = i - 1; j >= 0; --j) {
 				usb_urbFree(dev->drv, dev->pipeIntIn, dev->urbIntIn[j]);
@@ -494,7 +620,7 @@ static int usbmouse_handleCompletion(usb_driver_t *drv, usb_completion_t *c, con
 	usbmouse_handleReport(dev, (const uint8_t *)data, len);
 
 	if (dev->rxState == usbmouse_rxRunning) {
-		usb_transferAsync(drv, dev->pipeIntIn, c->urbid, usbmouse_reportSize, NULL);
+		usb_transferAsync(drv, dev->pipeIntIn, c->urbid, dev->urbSize, NULL);
 	}
 
 	usbmouse_put(dev);
@@ -545,6 +671,7 @@ static usbmouse_dev_t *_usbmouse_devAlloc(void)
 		dev->urbIntIn[i] = -1;
 	}
 
+	dev->urbSize = usbmouse_reportSize;
 	dev->rfcnt = 1;
 	return dev;
 }
@@ -555,6 +682,8 @@ static int usbmouse_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion,
 	usbmouse_dev_t *dev;
 	oid_t oid;
 	int err;
+	const char *reason = "unknown";
+	char layout[128];
 
 	debug("usbmouse: handleInsertion fired\n");
 
@@ -588,10 +717,31 @@ static int usbmouse_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion,
 			break;
 		}
 
-		err = usbmouse_setProtocol(dev);
-		if (err < 0) {
-			fprintf(stderr, "usbmouse: failed to switch to boot protocol: %d\n", err);
-			break;
+		/* Report protocol carries the wheel (a boot-protocol report has none on
+		 * most mice); anything that fails on the way keeps the boot protocol. */
+		err = usbmouse_probeReportProtocol(dev, &reason);
+		if (err == 0) {
+			err = usbmouse_setProtocol(dev, usbmouse_protoReport);
+			if (err < 0) {
+				reason = "SET_PROTOCOL(report) failed";
+			}
+		}
+
+		if (err == 0) {
+			dev->reportProtocol = 1;
+			hidmouse_describe(&dev->layout, layout, sizeof(layout));
+			fprintf(stdout, "usbmouse: report protocol %s\n", layout);
+		}
+		else {
+			dev->reportProtocol = 0;
+			dev->urbSize = usbmouse_reportSize;
+			fprintf(stdout, "usbmouse: boot protocol (%s)\n", reason);
+
+			err = usbmouse_setProtocol(dev, usbmouse_protoBoot);
+			if (err < 0) {
+				fprintf(stderr, "usbmouse: failed to switch to boot protocol: %d\n", err);
+				break;
+			}
 		}
 
 		err = usbmouse_setIdle(dev);

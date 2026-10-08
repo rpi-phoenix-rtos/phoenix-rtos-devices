@@ -7,10 +7,10 @@
 #
 
 NAME := libusbdrv-usbmouse
-LOCAL_SRCS := usbmouse.c
+LOCAL_SRCS := usbmouse.c hidmouse.c
 include $(static-lib.mk)
 
 NAME := usbmouse
-LOCAL_SRCS := usbmouse.c srv.c
+LOCAL_SRCS := usbmouse.c hidmouse.c srv.c
 LIBS := libusb
 include $(binary.mk)
