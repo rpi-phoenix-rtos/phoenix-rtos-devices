@@ -12,8 +12,9 @@
  * At startup it runs the full firmware bring-up ONCE (power-cycle WL_ON
  * via the VideoCore mailbox, SDIO enumeration, 643 KB firmware download
  * into the CR4 TCM, NVRAM + CLM regulatory blob, ARM-CR4 reset release,
- * SDPCM function-2 enable), then serves /dev/wifi and /dev/wifidata (the
- * frame seam of the lwip wifi43455 netif, which joins the network named in
+ * SDPCM function-2 enable), then serves /dev/wifi and /dev/wifidata plus
+ * /dev/wifibatch (the frame seam of the lwip wifi43455 netif, one frame or a
+ * batch of frames per message; the netif joins the network named in
  * /etc/wifi.conf). The firmware, NVRAM and CLM come from /lib/firmware/brcm/
  * (see WIFI_FW_*). The image starts it at boot with -f; started from the shell
  * it forks and returns once /dev/wifi is up.
@@ -53,6 +54,7 @@
  * %LICENSE%
  */
 #include "libvcmbox.h"
+#include "wifibatch.h"
 
 #include <sys/mman.h>
 #include <sys/msg.h>
@@ -4019,11 +4021,28 @@ static uint32_t g_sdio_core = 0x18004000u; /* EROM-derived SDIO-DEV core base (s
  *   transmit  132 us per frame
  *   receive   178 us per frame
  *   empty probe 22 us, and there were 1.1 MILLION of them (24.9 s of bus time)
- * -- those empty probes are what the interrupt path removes. */
+ * -- those empty probes are what the interrupt path removes.
+ *
+ * Id 3, /dev/wifibatch, carries the same frames several per message (format in
+ * wifibatch.h), on the same message thread. It is always served; whether the
+ * netif uses it is the `batch` setting, which `status` reports (see "Frame
+ * batches" below). */
 
-#define WIFI_DEV_TEXT_ID 0
-#define WIFI_DEV_DATA_ID 1
-#define WIFI_DEV_IRQ_ID  2
+#define WIFI_DEV_TEXT_ID  0
+#define WIFI_DEV_DATA_ID  1
+#define WIFI_DEV_IRQ_ID   2
+#define WIFI_DEV_BATCH_ID 3
+
+/* Frame batches. `want` is only advice to the netif: `status` reports it, the
+ * netif follows it within its status poll (~3 s), and both devices keep working
+ * either way. 0 by default until the batch path is measured on hardware. The
+ * counters are the message thread's. */
+static struct {
+	int want; /* `batch=1` argument, `batch 0|1` command */
+	uint32_t tx_msgs, tx_frames, tx_max, tx_partial, tx_bad;
+	uint32_t rx_msgs, rx_empty, rx_frames, rx_max, rx_capped, rx_drained, rx_skipped;
+	uint64_t tx_ticks, rx_ticks;
+} g_bat;
 
 static char g_resp[WIFI_RESP_CAP]; /* most recent scan result text, served over mtRead */
 static int g_resp_len = 0;
@@ -5491,8 +5510,9 @@ static int wifi_status(char *out, int cap)
 	if (g_sdhci == NULL) {
 		return snprintf(out, (size_t)cap, "STATUS controller=down\n");
 	}
-	n = snprintf(out, (size_t)cap, "STATUS joined=%d ssid=%s losses=%u\n",
-		wifi_isJoined(), wifi_isJoined() ? g_join_ssid : "-", (unsigned)g_link_losses);
+	/* batch= is read by the netif (drivers/wifi43455.c in phoenix-rtos-lwip). */
+	n = snprintf(out, (size_t)cap, "STATUS joined=%d ssid=%s losses=%u batch=%d\n",
+		wifi_isJoined(), wifi_isJoined() ? g_join_ssid : "-", (unsigned)g_link_losses, g_bat.want);
 	if ((n > 0) && (n < cap) && g_txmac_valid) {
 		int m = snprintf(out + n, (size_t)(cap - n), "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
 			g_txmac[0], g_txmac[1], g_txmac[2], g_txmac[3], g_txmac[4], g_txmac[5]);
@@ -6254,6 +6274,26 @@ static int wifi_dumpCmd(char **tok, int nt, char *out, int cap)
 }
 
 
+/* `batch [0|1]`: show or set whether the netif should move frames through
+ * /dev/wifibatch. Takes effect at the netif's next status poll (~3 s); the
+ * `WIFISTATS ipc` line of `stats` shows which path the frames took. */
+static int wifi_batchCmd(char **tok, int nt, char *out, int cap)
+{
+	if (nt >= 2) {
+		if ((strcmp(tok[1], "1") == 0) || (strcmp(tok[1], "on") == 0)) {
+			g_bat.want = 1;
+		}
+		else if ((strcmp(tok[1], "0") == 0) || (strcmp(tok[1], "off") == 0)) {
+			g_bat.want = 0;
+		}
+		else {
+			return snprintf(out, (size_t)cap, "BATCH usage: batch [0|1]\n");
+		}
+	}
+	return snprintf(out, (size_t)cap, "BATCH batch=%d (the netif follows within ~3 s)\n", g_bat.want);
+}
+
+
 /* The `/dev/wifi` entry for all of the above. Returns the reply length, or -1
  * when the command is not one of them. */
 static int wifi_radioCmd(const void *data, size_t size, char *out, int cap)
@@ -6264,6 +6304,9 @@ static int wifi_radioCmd(const void *data, size_t size, char *out, int cap)
 
 	if (nt == 0) {
 		return -1;
+	}
+	if (strcmp(tok[0], "batch") == 0) {
+		return wifi_batchCmd(tok, nt, out, cap); /* a flag: no bus needed */
 	}
 	if (strcmp(tok[0], "atjoin") == 0) {
 		return wifi_atjoinCmd(tok, nt, out, cap); /* only queues: no bus needed */
@@ -6366,6 +6409,53 @@ static uint64_t diag_ticksToUs(uint64_t t)
 		return 0u;
 	}
 	return (t / g_bt_freq) * 1000000u + ((t % g_bt_freq) * 1000000u) / g_bt_freq;
+}
+
+
+/* x/y with two decimals, for a "frames per request" ratio. */
+static int wifi_fmtRatio(char *out, size_t cap, uint32_t x, uint32_t y)
+{
+	uint64_t r = (y != 0u) ? (((uint64_t)x * 100u + (y / 2u)) / y) : 0u;
+
+	return snprintf(out, cap, "%llu.%02llu", (unsigned long long)(r / 100u), (unsigned long long)(r % 100u));
+}
+
+
+/* The `batch` and `ipc` lines of `stats`. `ipc` is the A/B number: frames per
+ * frame-device request in each direction, over both /dev/wifidata (one frame
+ * per request, an empty read counts as a request) and /dev/wifibatch, since the
+ * previous `stats` -- so `wifi stats`, a transfer, `wifi stats` gives the
+ * transfer alone. /dev/wifiirq waits are not data requests and are not counted
+ * (`rxirq` has them). */
+static int wifi_statsBatch(char *out, int cap)
+{
+	static uint32_t prev_txr = 0u, prev_txf = 0u, prev_rxr = 0u, prev_rxf = 0u;
+	uint32_t txr = g_tx_calls + g_bat.tx_msgs;
+	uint32_t txf = g_tx_calls + g_bat.tx_frames;
+	uint32_t rxr = g_rx_hits + g_rx_misses + g_bat.rx_msgs;
+	uint32_t rxf = g_rx_hits + g_bat.rx_frames;
+	char tx_fpi[24], rx_fpi[24];
+	int n;
+
+	(void)wifi_fmtRatio(tx_fpi, sizeof(tx_fpi), txf - prev_txf, txr - prev_txr);
+	(void)wifi_fmtRatio(rx_fpi, sizeof(rx_fpi), rxf - prev_rxf, rxr - prev_rxr);
+	n = snprintf(out, (size_t)cap,
+		"WIFISTATS batch want=%d tx_msgs=%u tx_frames=%u tx_max=%u tx_partial=%u tx_bad=%u tx_us_avg=%llu "
+		"rx_msgs=%u rx_empty=%u rx_frames=%u rx_max=%u rx_capped=%u rx_drained=%u rx_skipped=%u rx_us_avg=%llu\n"
+		"WIFISTATS ipc tx req=%u frames=%u fpi=%s rx req=%u frames=%u fpi=%s (since the previous stats)\n",
+		g_bat.want, (unsigned)g_bat.tx_msgs, (unsigned)g_bat.tx_frames, (unsigned)g_bat.tx_max,
+		(unsigned)g_bat.tx_partial, (unsigned)g_bat.tx_bad,
+		(unsigned long long)(g_bat.tx_msgs ? diag_ticksToUs(g_bat.tx_ticks / g_bat.tx_msgs) : 0u),
+		(unsigned)g_bat.rx_msgs, (unsigned)g_bat.rx_empty, (unsigned)g_bat.rx_frames, (unsigned)g_bat.rx_max,
+		(unsigned)g_bat.rx_capped, (unsigned)g_bat.rx_drained, (unsigned)g_bat.rx_skipped,
+		(unsigned long long)(g_bat.rx_msgs ? diag_ticksToUs(g_bat.rx_ticks / g_bat.rx_msgs) : 0u),
+		(unsigned)(txr - prev_txr), (unsigned)(txf - prev_txf), tx_fpi,
+		(unsigned)(rxr - prev_rxr), (unsigned)(rxf - prev_rxf), rx_fpi);
+	prev_txr = txr;
+	prev_txf = txf;
+	prev_rxr = rxr;
+	prev_rxf = rxf;
+	return n;
 }
 
 
@@ -6479,6 +6569,15 @@ static int wifi_stats(char *out, int cap)
 		g_busy_msgs = 0u;
 		g_busy_since = now;
 	}
+	if (m < 0) {
+		return n;
+	}
+	if ((n + m) >= cap) {
+		return cap - 1;
+	}
+	n += m;
+
+	m = wifi_statsBatch(out + n, cap - n);
 	if (m < 0) {
 		return n;
 	}
@@ -6697,6 +6796,142 @@ static int wifi_frameRead(void *dst, size_t cap)
 }
 
 
+/* ---- Frame batches: /dev/wifibatch ------------------------------------------
+ *
+ * The per-frame cost of the path above is mostly not the bus: it is one IPC
+ * round trip per frame through this single message thread, on top of the bus
+ * time (~290 us per frame in all at 41.67 MHz, of which ~80-100 us is the bus).
+ * On receive the firmware already packs ~6 frames into one glom superframe,
+ * which costs one bus transfer, yet each frame still crossed to the netif in
+ * its own read(), and every drain ended with an empty read. /dev/wifibatch
+ * moves the same frames several per message, in the format of wifibatch.h,
+ * through the same per-frame functions: the credit check, the SDPCM framing,
+ * the glom walk and the event demux are exactly those of /dev/wifidata.
+ *
+ * A batch read holds this thread while it fills, and transmits wait behind it;
+ * WIFI_BATCH_RX_FRAMES and the reader's buffer bound that. */
+#define WIFI_BATCH_RX_FRAMES 32u
+
+
+/* Transmit the frames of one batch, in order, each through diag_wifiFrameTx.
+ * Stops at the first frame the credit window refuses: that frame and the rest
+ * stay with the netif, which sends them again once the window opens (a refused
+ * single write is retried by TCP the same way). A frame that fails on the bus,
+ * or has an impossible length, is consumed and lost, as a failed single write
+ * is. Returns the number of frames taken from the front, or -EINVAL for a
+ * malformed batch. */
+static int wifi_batchWrite(const void *data, size_t size)
+{
+	wifibatch_rd_t r;
+	const uint8_t *f;
+	uint32_t flen;
+	int count, taken = 0, rc;
+
+	if (g_sdhci == NULL) {
+		return -EIO;
+	}
+	count = wifibatch_open(&r, data, size);
+	if (count < 0) {
+		return -EINVAL;
+	}
+	{
+		WIFI_T0(t0);
+
+		while ((f = wifibatch_next(&r, &flen)) != NULL) {
+			if ((flen < 14u) || (flen > (F2_FRAME_MAX - 16u))) {
+				g_bat.tx_bad++;
+				taken++;
+				continue;
+			}
+			rc = diag_wifiFrameTx(g_sdhci, f, flen);
+			if (rc == -1070) {
+				break; /* window shut: g_tx_blocked counted it */
+			}
+			taken++;
+		}
+		WIFI_ACC(g_bat.tx_ticks, t0);
+	}
+	g_bat.tx_msgs++;
+	g_bat.tx_frames += (uint32_t)taken;
+	if ((uint32_t)taken > g_bat.tx_max) {
+		g_bat.tx_max = (uint32_t)taken;
+	}
+	if (taken < count) {
+		g_bat.tx_partial++;
+	}
+	return taken;
+}
+
+
+/* Fill the reader's buffer with received frames: the rest of the superframe in
+ * hand, then whatever else the FIFO holds, until it reads empty, the buffer
+ * cannot take a frame of F2_FRAME_MAX bytes, or WIFI_BATCH_RX_FRAMES. Each frame
+ * is written straight into the reader's buffer (one copy fewer than a
+ * /dev/wifidata read). Non-data frames are read past, at most WIFI_RX_DRAIN_MAX
+ * of them, in either RX mode. Returns the batch length, 0 if no frame came, or
+ * <0 on error. As for /dev/wifidata, 0 means the FIFO read empty (or failed),
+ * so an interrupt client may sleep on it. */
+static int wifi_batchRead(void *dst, size_t cap)
+{
+	wifibatch_t b;
+	uint8_t *slot;
+	uint32_t elen = 0u, flags = 0u;
+	unsigned int skipped = 0u;
+	int rc;
+
+	if (g_sdhci == NULL) {
+		return -EIO;
+	}
+	if ((cap < (WIFIBATCH_HDR + wifibatch_recSize(F2_FRAME_MAX))) || (cap > 0x7fffffffu)) {
+		return -EMSGSIZE;
+	}
+	/* As wifi_frameRead: ack the interrupt BEFORE draining. */
+	if (__atomic_exchange_n(&g_irq.need_ack, 0, __ATOMIC_SEQ_CST) != 0) {
+		wifi_irqAck(g_sdhci);
+	}
+
+	wifibatch_init(&b, dst, (uint32_t)cap);
+	{
+		WIFI_T0(t0);
+
+		for (;;) {
+			slot = wifibatch_slot(&b, F2_FRAME_MAX);
+			if ((slot == NULL) || (b.count >= WIFI_BATCH_RX_FRAMES)) {
+				g_bat.rx_capped++;
+				break;
+			}
+			rc = diag_wifiFrameRx(g_sdhci, slot, F2_FRAME_MAX, &elen);
+			if (rc == 0) {
+				wifibatch_commit(&b, elen);
+				continue;
+			}
+			if ((rc == WIFI_RX_NODATA) && (skipped < WIFI_RX_DRAIN_MAX)) {
+				skipped++;
+				g_bat.rx_skipped++;
+				continue;
+			}
+			/* Empty, failed, or too many non-data frames in a row: what makes a
+			 * /dev/wifidata read return 0. */
+			flags = WIFIBATCH_F_DRAINED;
+			g_bat.rx_drained++;
+			break;
+		}
+		WIFI_ACC(g_bat.rx_ticks, t0);
+	}
+
+	g_bat.rx_msgs++;
+	if (b.count == 0u) {
+		g_bat.rx_empty++;
+		return 0;
+	}
+	g_bat.rx_frames += b.count;
+	if (b.count > g_bat.rx_max) {
+		g_bat.rx_max = b.count;
+	}
+	return (int)wifibatch_finish(&b, flags);
+}
+
+
 static void wifi_thread(void *arg)
 {
 	uint32_t port = (uint32_t)(uintptr_t)arg;
@@ -6719,7 +6954,7 @@ static void wifi_thread(void *arg)
 		/* Text commands drive the same bus (and the same g_txf/g_rxf), so they
 		 * take the lock for their whole duration. A join legitimately holds it
 		 * for tens of seconds; that was equally true single-threaded. */
-		if (msg.oid.id == WIFI_DEV_DATA_ID) {
+		if ((msg.oid.id == WIFI_DEV_DATA_ID) || (msg.oid.id == WIFI_DEV_BATCH_ID)) {
 			switch (msg.type) {
 				case mtOpen:
 				case mtClose:
@@ -6727,11 +6962,15 @@ static void wifi_thread(void *arg)
 					break;
 
 				case mtWrite:
-					msg.o.err = wifi_frameWrite(msg.i.data, msg.i.size);
+					msg.o.err = (msg.oid.id == WIFI_DEV_BATCH_ID) ?
+						wifi_batchWrite(msg.i.data, msg.i.size) :
+						wifi_frameWrite(msg.i.data, msg.i.size);
 					break;
 
 				case mtRead:
-					msg.o.err = wifi_frameRead(msg.o.data, msg.o.size);
+					msg.o.err = (msg.oid.id == WIFI_DEV_BATCH_ID) ?
+						wifi_batchRead(msg.o.data, msg.o.size) :
+						wifi_frameRead(msg.o.data, msg.o.size);
 					break;
 
 				case mtGetAttr:
@@ -6966,6 +7205,11 @@ int main(int argc, char **argv)
 				printf("rpi4-wifi: ignoring %s (bw2g=20|40, bw5g=20|40|80)\n", argv[ai]);
 			}
 		}
+		else if ((strcmp(argv[ai], "batch=0") == 0) || (strcmp(argv[ai], "batch=1") == 0)) {
+			/* the netif's starting mode: several frames per message (/dev/wifibatch)
+			 * or one (/dev/wifidata, the default); `wifi batch 0|1` at run time */
+			g_bat.want = argv[ai][6] - '0';
+		}
 		else if (strcmp(argv[ai], "hispd=1") == 0) {
 			/* keep HOST_CONTROL HISPD set above 25 MHz too (Linux clears it) */
 			g_hs_hispd = 1;
@@ -7106,6 +7350,11 @@ int main(int argc, char **argv)
 	if (create_dev(&dev, "wifidata") < 0) {
 		/* Not fatal: the text device still works, only the netif seam is gone. */
 		printf("rpi4-wifi: WARNING could not create /dev/wifidata (frame seam unavailable)\n");
+	}
+	dev.id = WIFI_DEV_BATCH_ID;
+	if (create_dev(&dev, "wifibatch") < 0) {
+		/* Not fatal either: the netif stays on /dev/wifidata. */
+		printf("rpi4-wifi: WARNING could not create /dev/wifibatch (one frame per message only)\n");
 	}
 	printf("rpi4-wifi: registered /dev/wifi (write \"scan\", then read the AP list)\n");
 	fflush(stdout);
