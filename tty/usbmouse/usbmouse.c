@@ -684,6 +684,7 @@ static int usbmouse_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion,
 	int err;
 	const char *reason = "unknown";
 	char layout[128];
+	char line[192];
 
 	debug("usbmouse: handleInsertion fired\n");
 
@@ -730,12 +731,15 @@ static int usbmouse_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion,
 		if (err == 0) {
 			dev->reportProtocol = 1;
 			hidmouse_describe(&dev->layout, layout, sizeof(layout));
-			fprintf(stdout, "usbmouse: report protocol %s\n", layout);
+			/* debug(): the usb daemon's stdout does not reach the console */
+			(void)snprintf(line, sizeof(line), "usbmouse: report protocol %s\n", layout);
+			debug(line);
 		}
 		else {
 			dev->reportProtocol = 0;
 			dev->urbSize = usbmouse_reportSize;
-			fprintf(stdout, "usbmouse: boot protocol (%s)\n", reason);
+			(void)snprintf(line, sizeof(line), "usbmouse: boot protocol (%s)\n", reason);
+			debug(line);
 
 			err = usbmouse_setProtocol(dev, usbmouse_protoBoot);
 			if (err < 0) {
