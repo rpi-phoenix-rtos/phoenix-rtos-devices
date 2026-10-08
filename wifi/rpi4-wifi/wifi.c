@@ -413,7 +413,7 @@ int main(int argc, char **argv)
 	if ((argc >= 2) && ((strcmp(argv[1], "iovar") == 0) || (strcmp(argv[1], "ioctl") == 0) ||
 			(strcmp(argv[1], "atjoin") == 0) || (strcmp(argv[1], "country") == 0) ||
 			(strcmp(argv[1], "bw") == 0) || (strcmp(argv[1], "chanspecs") == 0) ||
-			(strcmp(argv[1], "dump") == 0))) {
+			(strcmp(argv[1], "dump") == 0) || (strcmp(argv[1], "batch") == 0))) {
 		/* Radio probes and settings: the daemon parses the words itself. */
 		int i, n = 0, m;
 
@@ -540,7 +540,9 @@ int main(int argc, char **argv)
 	       "  wifi netup <ssid> <psk> | wifi join <ssid> | wifi mtu |\n"
 	       "  wifi rxpoll (RX interrupt off until reboot; the netif polls) |\n"
 	       "  wifi sdclk <kHz> (SDIO data clock until reboot: 50000 = 41.67 MHz, 25000) |\n"
-	       "  wifi f2blk <64|128|256|512> (SDIO data block size until reboot)\n"
+	       "  wifi f2blk <64|128|256|512> (SDIO data block size until reboot) |\n"
+	       "  wifi batch [0|1] (frames per message between netif and daemon: 1 = several,\n"
+	       "              0 = one; the netif follows within ~3 s; see WIFISTATS ipc)\n"
 	       "radio (control commands: run them between transfers, not during one):\n"
 	       "  wifi chanspecs                (channels and widths the firmware allows now)\n"
 	       "  wifi country [<CC>|-]         (read, or set now and at every join, e.g. PL)\n"
