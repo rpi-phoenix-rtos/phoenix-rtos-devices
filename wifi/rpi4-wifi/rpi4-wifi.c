@@ -1385,6 +1385,10 @@ static int diag_sdioClockUp(volatile uint8_t *sdhci, unsigned khz)
 static uint64_t g_bt_freq;
 static uint64_t g_bt_tx_ticks, g_bt_rx_ticks, g_bt_empty_ticks;
 static uint32_t g_bt_tx_n, g_bt_rx_n, g_bt_empty_n;
+/* Glom superframes (SDPCM channel 3, not the descriptor): nearly all bulk RX
+ * arrives this way, so rx_big alone says nothing about RX bus time. */
+static uint64_t g_bt_glom_ticks, g_bt_glom_bytes;
+static uint32_t g_bt_glom_n;
 
 static inline uint64_t diag_ticks(void)
 {
@@ -1402,6 +1406,9 @@ static void diag_busTimeReset(void)
 	g_bt_tx_n = 0u;
 	g_bt_rx_n = 0u;
 	g_bt_empty_n = 0u;
+	g_bt_glom_ticks = 0u;
+	g_bt_glom_bytes = 0u;
+	g_bt_glom_n = 0u;
 }
 
 /* Mean of `ticks` over `n`, in tenths of a microsecond. */
@@ -1421,11 +1428,15 @@ static int diag_busTimeLine(char *out, int cap)
 	unsigned tx = diag_busTimeAvg(g_bt_tx_ticks, g_bt_tx_n);
 	unsigned rx = diag_busTimeAvg(g_bt_rx_ticks, g_bt_rx_n);
 	unsigned em = diag_busTimeAvg(g_bt_empty_ticks, g_bt_empty_n);
+	unsigned gl = diag_busTimeAvg(g_bt_glom_ticks, g_bt_glom_n);
 
 	return snprintf(out, (size_t)cap,
-		"WIFISTATS bustime sd=%u Hz tx_big=%u avg_us=%u.%u rx_big=%u avg_us=%u.%u empty=%u avg_us=%u.%u\n",
+		"WIFISTATS bustime sd=%u Hz tx_big=%u avg_us=%u.%u rx_big=%u avg_us=%u.%u empty=%u avg_us=%u.%u "
+		"glom=%u avg_us=%u.%u avg_bytes=%u\n",
 		(unsigned)g_sdhci_sd_hz, (unsigned)g_bt_tx_n, tx / 10u, tx % 10u,
-		(unsigned)g_bt_rx_n, rx / 10u, rx % 10u, (unsigned)g_bt_empty_n, em / 10u, em % 10u);
+		(unsigned)g_bt_rx_n, rx / 10u, rx % 10u, (unsigned)g_bt_empty_n, em / 10u, em % 10u,
+		(unsigned)g_bt_glom_n, gl / 10u, gl % 10u,
+		(g_bt_glom_n != 0u) ? (unsigned)(g_bt_glom_bytes / g_bt_glom_n) : 0u);
 }
 
 /* A read-only check of the bus while the firmware runs (SOCRAM may not be
@@ -3278,6 +3289,11 @@ static int diag_wifiFrameRx(volatile uint8_t *sdhci, uint8_t *eth, uint32_t cap,
 	else if ((rc == 0) && (chan == 2u) && (flen > 1024u)) {
 		g_bt_rx_ticks += dt;
 		g_bt_rx_n++;
+	}
+	else if ((rc == 0) && (chan == 3u) && ((g_glomf[5] & 0x80u) == 0u)) {
+		g_bt_glom_ticks += dt;
+		g_bt_glom_bytes += flen;
+		g_bt_glom_n++;
 	}
 	if (rc != 0) {
 		/* -31 is an inconsistent SDPCM header: either an empty FIFO (the common,
