@@ -1379,9 +1379,9 @@ static int diag_sdioClockUp(volatile uint8_t *sdhci, unsigned khz)
 
 /* The time each bus transfer takes, read from the generic timer (CNTVCT_EL0,
  * enabled for EL0 by the kernel): two register reads per frame, against the
- * syscall pair WIFI_STATS_TIMING costs. Full-size frames (> 1024 bytes) are what
- * bulk TCP moves, so they are counted apart; an empty probe is the 12-byte header
- * read that finds nothing queued. */
+ * clock_gettime pair the per-request timing once took. Full-size frames (> 1024
+ * bytes) are what bulk TCP moves, so they are counted apart; an empty probe is
+ * the 12-byte header read that finds nothing queued. */
 static uint64_t g_bt_freq;
 static uint64_t g_bt_tx_ticks, g_bt_rx_ticks, g_bt_empty_ticks;
 static uint32_t g_bt_tx_n, g_bt_rx_n, g_bt_empty_n;
@@ -6335,38 +6335,35 @@ static void wifi_irqThread(void *arg)
 }
 
 
-/* Where the per-frame time actually goes. RX measured ~10 ms/frame end to end,
- * which is far more than the poll interval explains, so the read path is timed
- * here and split into HIT (a frame came back) vs MISS (empty FIFO): the two have
- * very different costs and averaging them together hides which one dominates. */
-static uint64_t g_rx_hit_us = 0, g_rx_miss_us = 0, g_tx_us = 0;
+/* Where the per-frame time goes inside this daemon. Each /dev/wifidata request
+ * is timed from the generic timer: two register reads, no syscall. (It used to
+ * take a clock_gettime pair, which cost TX 1.73 -> 1.10 MB/s, so it was off by
+ * default and the tx/rx_us fields of `stats` read 0.) Read HITs (a frame came
+ * back) and MISSes (empty FIFO) are kept apart: their costs differ by an order
+ * of magnitude.
+ *
+ * The busy window says how much of the wall time the single message thread
+ * spends serving requests at all. Near 100 % during a transfer, this thread is
+ * the bottleneck; well below it, the time per frame goes elsewhere -- the IPC
+ * itself, lwip, the application. `stats` reports the window and restarts it. */
+static uint64_t g_rx_hit_ticks = 0, g_rx_miss_ticks = 0, g_tx_ticks = 0;
 static uint32_t g_rx_hits = 0, g_rx_misses = 0, g_tx_calls = 0;
+static uint64_t g_busy_ticks = 0, g_busy_since = 0;
+static uint32_t g_busy_msgs = 0;
 
+#define WIFI_T0(v)       uint64_t v = diag_ticks()
+#define WIFI_ACC(acc, v) ((acc) += diag_ticks() - (v))
 
-/* Timing is OFF by default: two clock_gettime calls per probe are not free at
- * ~5000 probes/s, and switching them on measurably cost TX throughput
- * (1.73 -> 1.10 MB/s). Build with -DWIFI_STATS_TIMING=1 to attribute per-frame
- * cost again; the counters below are plain increments and always on. */
-#ifndef WIFI_STATS_TIMING
-#define WIFI_STATS_TIMING 0
-#endif
-
-#if WIFI_STATS_TIMING
-static uint64_t wifi_nowUs(void)
+static uint64_t diag_ticksToUs(uint64_t t)
 {
-	struct timespec ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+	if (g_bt_freq == 0u) {
+		__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(g_bt_freq));
+	}
+	if (g_bt_freq == 0u) {
 		return 0u;
 	}
-	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+	return (t / g_bt_freq) * 1000000u + ((t % g_bt_freq) * 1000000u) / g_bt_freq;
 }
-#define WIFI_T0(v)       uint64_t v = wifi_nowUs()
-#define WIFI_ACC(acc, v) ((acc) += wifi_nowUs() - (v))
-#else
-#define WIFI_T0(v)       ((void)0)
-#define WIFI_ACC(acc, v) ((void)0)
-#endif
 
 
 /* `stats`: per-frame timing of the data path, so a throughput number can be
@@ -6425,12 +6422,12 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS sdio target=%u kHz sd=%u Hz hctl=0x%02x timeout=0x%x f2blk=%u hs_ups=%u hs_fallbacks=%u%s%s\n"
 		"WIFISTATS rxirq mode=%s%s%s waits=%u wakes=%u level=%u timeouts=%u\n"
 		"WIFISTATS rxirq isr claimed=%u declined=%u acks=%u acks_noframe=%u ack_errs=%u drained=%u\n",
-		g_tx_calls, (unsigned long long)g_tx_us,
-		(unsigned long long)(g_tx_calls ? g_tx_us / g_tx_calls : 0u),
-		g_rx_hits, (unsigned long long)g_rx_hit_us,
-		(unsigned long long)(g_rx_hits ? g_rx_hit_us / g_rx_hits : 0u),
-		g_rx_misses, (unsigned long long)g_rx_miss_us,
-		(unsigned long long)(g_rx_misses ? g_rx_miss_us / g_rx_misses : 0u),
+		g_tx_calls, (unsigned long long)diag_ticksToUs(g_tx_ticks),
+		(unsigned long long)(g_tx_calls ? diag_ticksToUs(g_tx_ticks / g_tx_calls) : 0u),
+		g_rx_hits, (unsigned long long)diag_ticksToUs(g_rx_hit_ticks),
+		(unsigned long long)(g_rx_hits ? diag_ticksToUs(g_rx_hit_ticks / g_rx_hits) : 0u),
+		g_rx_misses, (unsigned long long)diag_ticksToUs(g_rx_miss_ticks),
+		(unsigned long long)(g_rx_misses ? diag_ticksToUs(g_rx_miss_ticks / g_rx_misses) : 0u),
 		g_frame_tx_ok, g_frame_tx_err, g_frame_rx_ok, g_frame_rx_err, g_frame_rx_garbage,
 		g_data_seq, g_tx_max, (unsigned)(uint8_t)(g_tx_max - g_data_seq), g_fc_mask,
 		g_tx_blocked, g_fc_updates, g_rx_resyncs,
@@ -6459,6 +6456,26 @@ static int wifi_stats(char *out, int cap)
 	}
 	n += m;
 	m = diag_busTimeLine(out + n, cap - n);
+	if (m < 0) {
+		return n;
+	}
+	if ((n + m) >= cap) {
+		return cap - 1;
+	}
+	n += m;
+
+	{
+		uint64_t now = diag_ticks();
+		uint64_t wall = (g_busy_since != 0u) ? (now - g_busy_since) : 0u;
+		unsigned permille = (wall != 0u) ? (unsigned)((g_busy_ticks * 1000u) / wall) : 0u;
+
+		m = snprintf(out + n, (size_t)(cap - n),
+			"WIFISTATS daemon busy=%u.%u%% of %llu ms, %u requests (since the previous stats)\n",
+			permille / 10u, permille % 10u, (unsigned long long)(diag_ticksToUs(wall) / 1000u), (unsigned)g_busy_msgs);
+		g_busy_ticks = 0u;
+		g_busy_msgs = 0u;
+		g_busy_since = now;
+	}
 	if (m < 0) {
 		return n;
 	}
@@ -6617,7 +6634,7 @@ static int wifi_frameWrite(const void *data, size_t len)
 		int rc;
 
 		rc = diag_wifiFrameTx(g_sdhci, (const uint8_t *)data, (uint32_t)len);
-		WIFI_ACC(g_tx_us, t0);
+		WIFI_ACC(g_tx_ticks, t0);
 		g_tx_calls++;
 		if (rc != 0) {
 			return -EIO;
@@ -6661,11 +6678,11 @@ static int wifi_frameRead(void *dst, size_t cap)
 			g_irq.drained++;
 		}
 		if (rc != 0) {
-			WIFI_ACC(g_rx_miss_us, t0);
+			WIFI_ACC(g_rx_miss_ticks, t0);
 			g_rx_misses++;
 			return 0; /* nothing queued, or a non-data frame was drained */
 		}
-		WIFI_ACC(g_rx_hit_us, t0);
+		WIFI_ACC(g_rx_hit_ticks, t0);
 		g_rx_hits++;
 	}
 
@@ -6683,7 +6700,9 @@ static void wifi_thread(void *arg)
 	msg_t msg;
 	msg_rid_t rid;
 	int err, radio_len;
+	uint64_t t_msg;
 
+	g_busy_since = diag_ticks();
 	for (;;) {
 		err = msgRecv(port, &msg, &rid);
 		if (err < 0) {
@@ -6692,6 +6711,7 @@ static void wifi_thread(void *arg)
 			}
 			break;
 		}
+		t_msg = diag_ticks();
 
 		/* Text commands drive the same bus (and the same g_txf/g_rxf), so they
 		 * take the lock for their whole duration. A join legitimately holds it
@@ -6725,6 +6745,8 @@ static void wifi_thread(void *arg)
 					msg.o.err = -ENOSYS;
 					break;
 			}
+			g_busy_ticks += diag_ticks() - t_msg;
+			g_busy_msgs++;
 			msgRespond(port, &msg, rid);
 			continue;
 		}
@@ -6836,6 +6858,8 @@ static void wifi_thread(void *arg)
 				break;
 		}
 
+		g_busy_ticks += diag_ticks() - t_msg;
+		g_busy_msgs++;
 		msgRespond(port, &msg, rid);
 	}
 }
