@@ -3568,17 +3568,20 @@ static void wifi_countryPayload(uint8_t p[12], const char *cc)
 }
 
 
-/* Queue (or replace, by name) an iovar for every following join. 0, or -1 when
- * the list is full or the name does not fit. */
+/* Queue (or replace) an iovar for every following join. An entry is replaced by
+ * name, except `bw_cap`, which is per band: there the band (first word) is part
+ * of the key, so 2g and 5g settings can both be queued. 0, or -1 when the list
+ * is full or the name does not fit. */
 static int wifi_atjoinAdd(const char *name, const uint32_t *w, uint32_t n)
 {
 	uint32_t i, k;
+	int perband = (strcmp(name, "bw_cap") == 0);
 
 	if ((strlen(name) >= WIFI_IOVAR_NAME) || (n == 0u) || (n > WIFI_ATJOIN_WORDS)) {
 		return -1;
 	}
 	for (i = 0u; i < g_atjoin_n; ++i) {
-		if (strcmp(g_atjoin[i].name, name) == 0) {
+		if ((strcmp(g_atjoin[i].name, name) == 0) && (!perband || (g_atjoin[i].w[0] == w[0]))) {
 			break;
 		}
 	}
@@ -5855,7 +5858,7 @@ static int wifi_rxPoll(char *out, int cap)
  * the boot being measured. Like every control command they run on the message
  * thread (the bus owner), and the reply wait drains the shared F2 FIFO, dropping
  * the data frames it meets: use them between transfers, not during one. */
-#define WIFI_CMD_TOKS  12
+#define WIFI_CMD_TOKS  20
 #define WIFI_CMD_WORDS 16u
 
 static uint32_t g_cmd_reqid = 0u;
