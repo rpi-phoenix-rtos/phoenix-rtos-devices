@@ -2027,6 +2027,17 @@ static uint32_t g_fc_updates = 0;
 
 static uint8_t g_data_seq = 0;
 
+/* The sequence the next frame on the bus will carry: brcmfmac's bus->tx_seq.
+ * Every SDPCM header writer sets it, whichever counter it took its sequence
+ * from. The join and the scan number their commands from a counter of their
+ * own and hand it to g_data_seq only at the end, so g_data_seq is stale while
+ * they run. The receive path's window sanity check used to compare against
+ * g_data_seq: once a join had sent more than ~24 commands (one SET_SSID retry
+ * too many on a first boot), every credit grant during the join looked garbled,
+ * the window was clamped to the stale g_data_seq + 2, and the netif inherited a
+ * shut window. With nothing inbound to reopen it, DHCP never left the chip. */
+static uint8_t g_bus_seq = 0;
+
 
 /* Resynchronise the F2 read path after the stream has gone out of step,
  * mirroring brcmf_sdio_rxfail: abort function 2 through CCCR, terminate the
@@ -2242,9 +2253,10 @@ static int diag_f2RecvFrame(volatile uint8_t *sdhci, uint8_t *buf, uint32_t cap,
 		uint8_t tx_max = buf[9];
 
 		/* brcmf_sdio_hdparse's sanity clamp: a window more than 0x40 ahead of
-		 * our sequence is a garbled header, not a generous firmware. */
-		if ((uint8_t)(tx_max - g_data_seq) > 0x40u) {
-			tx_max = (uint8_t)(g_data_seq + 2u);
+		 * our sequence is a garbled header, not a generous firmware. "Our
+		 * sequence" is the bus's, not the data path's (see g_bus_seq). */
+		if ((uint8_t)(tx_max - g_bus_seq) > 0x40u) {
+			tx_max = (uint8_t)(g_bus_seq + 2u);
 		}
 		g_tx_max = tx_max;
 		g_fc_mask = fc;
@@ -2289,6 +2301,7 @@ static int diag_bcdcCmd(volatile uint8_t *sdhci, uint32_t sdio_core, int is_set,
 	g_txf[2] = (uint8_t)((~frlen) & 0xffu);
 	g_txf[3] = (uint8_t)(((~frlen) >> 8) & 0xffu);
 	g_txf[4] = seq;
+	g_bus_seq = (uint8_t)(seq + 1u);
 	g_txf[7] = 12u; /* data_offset */
 	g_txf[12] = (uint8_t)(cmd & 0xffu);
 	g_txf[13] = (uint8_t)((cmd >> 8) & 0xffu);
@@ -3012,6 +3025,7 @@ static void diag_wifiDataTx(volatile uint8_t *sdhci, uint32_t sdio_core, uint8_t
 		g_txf[2] = (uint8_t)((~ng_total) & 0xffu);
 		g_txf[3] = (uint8_t)(((~ng_total) >> 8) & 0xffu);
 		g_txf[4] = seq;
+		g_bus_seq = (uint8_t)(seq + 1u);
 		g_txf[5] = 0x02u; /* channel = DATA */
 		g_txf[6] = 0u;    /* nextlen */
 		g_txf[7] = 12u;   /* data_offset = SDPCM_HWHDR+SWHDR = 12 (no HWEXT) */
@@ -3046,10 +3060,11 @@ static void diag_wifiDataTx(volatile uint8_t *sdhci, uint32_t sdio_core, uint8_t
  * "send THIS frame" / "give me the next frame", so these two are the generic
  * form. They are deliberately free of printf: this is a data plane.
  */
-/* SDPCM sequence for the generic data path. NOT independent: it is the same
- * per-bus stream the control/event paths advance, and the join+DHCP flow seeds
- * it (see g_data_seq = seq there). An out-of-sequence data frame is dropped by
- * the firmware without any error surfacing to the host. */
+/* SDPCM sequence for the generic data path (g_data_seq). NOT independent: it is
+ * the same per-bus stream the control/event paths advance, and the join+DHCP
+ * flow seeds it (see g_data_seq = seq there), so it is stale while a join runs;
+ * g_bus_seq is the one that is always current. An out-of-sequence data frame is
+ * dropped by the firmware without any error surfacing to the host. */
 static uint32_t g_frame_tx_ok = 0, g_frame_tx_err = 0;
 static uint32_t g_frame_rx_ok = 0, g_frame_rx_err = 0, g_frame_rx_garbage = 0;
 
@@ -3103,6 +3118,7 @@ static int diag_wifiFrameTx(volatile uint8_t *sdhci, const uint8_t *eth, uint32_
 	g_txf[3] = (uint8_t)(((~total) >> 8) & 0xffu);
 	/* SDPCM SW header: seq, channel 2 (DATA), no nextlen, data_offset 12. */
 	g_txf[4] = g_data_seq++;
+	g_bus_seq = g_data_seq;
 	g_txf[5] = 0x02u;
 	g_txf[6] = 0u;
 	g_txf[7] = 12u;
