@@ -972,15 +972,19 @@ static void client_close(id_t id, kms_parked_t *answer, uint32_t *n)
 	}
 	kms_bo_client_gone((uint32_t)id);
 	cl->used = 0;
-	KMS_LOG("srv client %u closed planes_off=%u dropped_events=%u", (unsigned)id, off, cl->dropped);
+	if (srv.verbose) {   /* diagnostics: by default nothing is left on the console after a program exits */
+		KMS_LOG("srv client %u closed planes_off=%u dropped_events=%u", (unsigned)id, off, cl->dropped);
+	}
 	if ((srv.fst.flips != 0u) || (srv.fst.deferred != 0u)) {
 		const kms_flipstat_t *f = &srv.fst;
 		uint32_t napplied = f->flips;   /* every armed commit completed (client_close settles its own) */
-		KMS_LOG("srv flipstat client=%u flips=%u vbl1=%u vbl2=%u vbl3p=%u deferred=%u applied_gate=%u "
-			"applied_vblank=%u kicks=%u late_target=%u q2a_us_avg=%u q2a_us_max=%u kick=%d gate_us=%u",
-			(unsigned)id, f->flips, f->vbl1, f->vbl2, f->vbl3p, f->deferred, f->applied_gate, f->applied_vblank,
-			f->kicks, f->late_target, (napplied != 0u) ? (uint32_t)(f->q2a_us_sum / napplied) : 0u, f->q2a_us_max,
-			!srv.no_kick, srv.gate_us);
+		if (srv.verbose) {
+			KMS_LOG("srv flipstat client=%u flips=%u vbl1=%u vbl2=%u vbl3p=%u deferred=%u applied_gate=%u "
+				"applied_vblank=%u kicks=%u late_target=%u q2a_us_avg=%u q2a_us_max=%u kick=%d gate_us=%u",
+				(unsigned)id, f->flips, f->vbl1, f->vbl2, f->vbl3p, f->deferred, f->applied_gate, f->applied_vblank,
+				f->kicks, f->late_target, (napplied != 0u) ? (uint32_t)(f->q2a_us_sum / napplied) : 0u, f->q2a_us_max,
+				!srv.no_kick, srv.gate_us);
+		}
 		memset(&srv.fst, 0, sizeof(srv.fst));
 	}
 }

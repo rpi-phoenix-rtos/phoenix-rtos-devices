@@ -149,9 +149,12 @@ static void client_close(id_t id, v3da_wait_t **answer)
 	v3da_bo_client_gone(c->id);
 	c->used = 0;
 	srv.nclients--;
-	if (srv.verbose != 0) {
-		printf("V3DA srv client %u closed\n", (unsigned)id);
+	if (srv.verbose == 0) {
+		/* the per-client counters below are diagnostics: with them on by default, every
+		 * program that used the GPU left lines on the console after it exited */
+		return;
 	}
+	printf("V3DA srv client %u closed\n", (unsigned)id);
 	/* G6 counters, whenever a client that used cross-process sync goes */
 	g6 = srv.g6_queries + srv.g6_attach + srv.g6_attach_busy + srv.g6_implicit + srv.g6_dropped;
 	if (g6 != g6_seen) {

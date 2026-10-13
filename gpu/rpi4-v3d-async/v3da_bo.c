@@ -202,12 +202,14 @@ static void pool_note(uint64_t now)
 		return;
 	}
 	srv.pool_note_us = now + POOL_NOTE_US;
-	printf("V3DA srv pool trim freed_kb=%llu blocks=%u idle=%u cap=%u pool_kb=%llu pool_blocks=%u peak_kb=%llu "
-		"cap_kb=%llu idle_s=%llu trimmed_kb=%llu trims=%u\n", (unsigned long long)(srv.pool_note_bytes / 1024u),
-		srv.pool_note_blocks, srv.pool_note_idle, srv.pool_note_cap, (unsigned long long)(srv.pool_bytes / 1024u),
-		srv.npool, (unsigned long long)(srv.pool_peak / 1024u), (unsigned long long)(srv.pool_cap / 1024u),
-		(unsigned long long)(srv.pool_idle_us / 1000000u), (unsigned long long)(srv.pool_trimmed / 1024u),
-		srv.pool_trims);
+	if (srv.verbose != 0) {
+		printf("V3DA srv pool trim freed_kb=%llu blocks=%u idle=%u cap=%u pool_kb=%llu pool_blocks=%u peak_kb=%llu "
+			"cap_kb=%llu idle_s=%llu trimmed_kb=%llu trims=%u\n", (unsigned long long)(srv.pool_note_bytes / 1024u),
+			srv.pool_note_blocks, srv.pool_note_idle, srv.pool_note_cap, (unsigned long long)(srv.pool_bytes / 1024u),
+			srv.npool, (unsigned long long)(srv.pool_peak / 1024u), (unsigned long long)(srv.pool_cap / 1024u),
+			(unsigned long long)(srv.pool_idle_us / 1000000u), (unsigned long long)(srv.pool_trimmed / 1024u),
+			srv.pool_trims);
+	}
 	srv.pool_note_bytes = 0u;
 	srv.pool_note_blocks = 0u;
 	srv.pool_note_idle = 0u;
