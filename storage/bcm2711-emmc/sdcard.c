@@ -101,6 +101,27 @@ typedef struct {
  * kernel's dtb_armToBus(). */
 #define SDCARD_DRAM_BUS(pa) (0xc0000000u | ((uint32_t)(pa) & 0x3fffffffu))
 
+/* The EMMC2 DMA engine reaches only CPU-physical memory below 1 GiB (the
+ * dma-ranges window above). */
+#define SDCARD_DMA_LIMIT 0x40000000ull
+
+/* SDMA buffer boundary programmed in TRANSFER_BLOCK (TRANSFER_BLOCK_SDMA_BOUNDARY_512K,
+ * the largest the register can express). A staging buffer must sit inside one
+ * such window; see sdhost_isDmaReachable(). */
+#define SDCARD_SDMA_WINDOW (512u * 1024u)
+
+/* Smaller staging buffer to fall back to when no DMA-reachable SDCARD_MAX_TRANSFER
+ * block can be had. Not tried when it is not smaller than SDCARD_MAX_TRANSFER. */
+#define SDCARD_FALLBACK_TRANSFER (128u * 1024u)
+
+/* Contiguous blocks to try (and hold) per staging-buffer size before giving up. */
+#define SDCARD_DMA_ALLOC_TRIES 16u
+
+_Static_assert((SDCARD_MAX_TRANSFER & (SDCARD_MAX_TRANSFER - 1u)) == 0u, "SDCARD_MAX_TRANSFER must be a power of two");
+_Static_assert(SDCARD_MAX_TRANSFER <= SDCARD_SDMA_WINDOW, "a staging buffer must fit in one SDMA boundary window");
+_Static_assert((SDCARD_MAX_TRANSFER / SDCARD_BLOCKLEN) <= UINT16_MAX,
+	"block count is 16-bit in TRANSFER_BLOCK, CMD23 and _sdio_cmdSend()");
+
 
 /* #154: bound on the CMD13 SEND_STATUS busy-poll that detects write completion
  * (mirrors Linux MMC_BLK_TIMEOUT_MS). The card normally returns to TRAN in well
@@ -169,9 +190,12 @@ typedef struct {
 	void *dmaBuffer;
 	/* Address of DMA buffer in physical memory (for access by the SD Host Controller) */
 	addr_t dmaBufferPhys;
-	/* True once the staging buffer is confirmed DMA-reachable (< 1 GiB CPU-phys, the
-	 * BCM2711 emmc2bus dma-ranges window): enables the SDMA data path instead of the
-	 * CPU PIO FIFO loop. Set in sdhost_allocDMA. */
+	/* Size of the staging buffer, and so the largest transfer this host accepts:
+	 * SDCARD_MAX_TRANSFER, or less if sdhost_allocDMA had to fall back. */
+	size_t dmaBufferSize;
+	/* True once the staging buffer is confirmed DMA-reachable (sdhost_isDmaReachable):
+	 * enables the DMA data path (ADMA2, or SDMA) instead of the CPU PIO FIFO loop.
+	 * Set in sdhost_allocDMA. */
 	bool useDma;
 	/* ADMA2 descriptor list: CPU view and the DMA-reachable physical base. NULL when
 	 * the allocation failed or ADMA2 is compiled out, in which case SDMA is used. */
@@ -237,66 +261,153 @@ static inline bool sdcard_isWriteProtected(sdcard_hostData_t *host)
 }
 
 
-static int sdhost_allocDMA(sdcard_hostData_t *host)
+/* Can the EMMC2 DMA engine use the physically contiguous block [pa, pa + size)?
+ *  - It must end within the low 1 GiB of CPU-physical memory: that is all the
+ *    emmc2bus dma-ranges window maps (bus 0xC0000000.. -> CPU 0x0..0x3FFFFFFF).
+ *  - It must not cross a SDCARD_SDMA_WINDOW boundary. SDMA pauses at every such
+ *    boundary and waits for the driver to reload SDMA_ADDRESS, which this driver
+ *    does not do; keeping the buffer inside one window means no transfer from it
+ *    ever reaches a boundary mid-way. The bus offset 0xC0000000 is a multiple of
+ *    the window, so checking the CPU-physical address is enough. ADMA2 has no
+ *    such limit, but SDMA is the fallback whenever ADMA2 declines a transfer, so
+ *    every staging buffer has to be valid for both. */
+static bool sdhost_isDmaReachable(addr_t pa, size_t size)
 {
-	/* The staging buffer must be physically contiguous for the SDMA_ADDRESS
-	 * register (the SDMA read path programs it directly). Cap at 128 KiB
-	 * (256 blocks) so multi-block CMD18/CMD25 transfers can be large. */
-	if (SDCARD_MAX_TRANSFER > (32 * _PAGE_SIZE)) {
-		return -ENOMEM;
+	uint64_t first = (uint64_t)pa;
+	uint64_t last = first + size - 1u;
+
+	return (last < SDCARD_DMA_LIMIT) && ((first / SDCARD_SDMA_WINDOW) == (last / SDCARD_SDMA_WINDOW));
+}
+
+
+/* Map a physically contiguous, uncached block of `size` bytes that the EMMC2 DMA
+ * engine can use (sdhost_isDmaReachable). The kernel takes no placement hint, so
+ * take blocks until one qualifies, holding the rejects so the allocator cannot
+ * hand the same block back, and release them at the end. This is the scheme the
+ * KMS server uses for its scan-out pool (video/rpi4-kms/kms_bo.c). Returns the
+ * CPU address and sets *pa, or returns NULL. */
+static void *sdhost_mapDmaBlock(size_t size, addr_t *pa, unsigned int *tries)
+{
+	void *held[SDCARD_DMA_ALLOC_TRIES];
+	void *found = NULL;
+	unsigned int n, i;
+
+	for (n = 0; n < SDCARD_DMA_ALLOC_TRIES; n++) {
+		void *va = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS, -1, 0);
+		if (va == MAP_FAILED) {
+			break;
+		}
+		held[n] = va;
+
+		addr_t first = va2pa(va);
+		addr_t last = va2pa((uint8_t *)va + size - _PAGE_SIZE);
+		/* va2pa() is the only view of the pages a device gets: refuse anything that
+		 * does not look contiguous through it. */
+		if ((last == (first + size - _PAGE_SIZE)) && sdhost_isDmaReachable(first, size)) {
+			found = va;
+			*pa = first;
+			held[n] = NULL;
+			n++;
+			break;
+		}
 	}
 
-	void *p = mmap(NULL, SDCARD_MAX_TRANSFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS, -1, 0);
-	if (p == MAP_FAILED) {
-		return -ENOMEM;
+	for (i = 0; i < n; i++) {
+		if (held[i] != NULL) {
+			(void)munmap(held[i], size);
+		}
+	}
+
+	*tries = n;
+	return found;
+}
+
+
+/* Set up the staging buffer every data phase goes through, and the ADMA2
+ * descriptor page. Preference order:
+ *  1. a DMA-reachable SDCARD_MAX_TRANSFER buffer: DMA, full-size commands;
+ *  2. a DMA-reachable SDCARD_FALLBACK_TRANSFER buffer: DMA, smaller commands;
+ *  3. an ordinary SDCARD_MAX_TRANSFER buffer: PIO over the FIFO, which has no
+ *     address limit. PIO is about a third of the DMA rate, so say so loudly.
+ * The buffer size is also the largest transfer the host accepts
+ * (sdcard_getMaxTransfer), so a smaller buffer can never be overrun. */
+static int sdhost_allocDMA(sdcard_hostData_t *host)
+{
+	unsigned int tries = 0;
+	void *p = NULL;
+	addr_t pa = 0;
+	size_t size = SDCARD_MAX_TRANSFER;
+
+	host->dmaBuffer = NULL;
+	host->dmaBufferPhys = 0;
+	host->dmaBufferSize = 0;
+	host->useDma = false;
+	host->admaDesc = NULL;
+	host->admaDescPhys = 0;
+
+#ifdef SDCARD_ENABLE_DMA
+	p = sdhost_mapDmaBlock(size, &pa, &tries);
+	if ((p == NULL) && (SDCARD_FALLBACK_TRANSFER < SDCARD_MAX_TRANSFER)) {
+		unsigned int fallbackTries = 0;
+		size = SDCARD_FALLBACK_TRANSFER;
+		p = sdhost_mapDmaBlock(size, &pa, &fallbackTries);
+		tries += fallbackTries;
+		if (p != NULL) {
+			printf("sdcard: no DMA-reachable %zu KiB staging buffer, using %zu KiB (commands capped at %zu KiB)\n",
+				(size_t)SDCARD_MAX_TRANSFER / 1024u, size / 1024u, size / 1024u);
+		}
+	}
+	host->useDma = (p != NULL);
+#endif
+
+	if (p == NULL) {
+		size = SDCARD_MAX_TRANSFER;
+		p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (p == MAP_FAILED) {
+			return -ENOMEM;
+		}
+		pa = 0;
+#ifdef SDCARD_ENABLE_DMA
+		printf("sdcard: no DMA-reachable staging buffer after %u tries, data moves by PIO (slow)\n", tries);
+#endif
 	}
 
 	host->dmaBuffer = p;
-	if (host->dmaBuffer == NULL) {
-		return -ENOMEM;
-	}
-
-	host->dmaBufferPhys = va2pa(host->dmaBuffer);
-	/* The EMMC2 DMA master can only reach the low 1 GiB of CPU-physical memory (Pi 4
-	 * emmc2bus dma-ranges: bus 0xC0000000.. -> CPU 0x0..0x3FFFFFFF). Enable the SDMA
-	 * data path only when the staging buffer actually landed there; otherwise fall
-	 * back to PIO (which has no addressing limit). The MAP_CONTIGUOUS allocation for
-	 * this small early-boot buffer reliably lands low (observed ~0x03780000).
-	 *
-	 * SDCARD_ENABLE_DMA is defined: SDMA is the read data path (reads only — writes
-	 * still use PIO, see the write path). useDma additionally requires the staging
-	 * buffer to be DMA-reachable (< 1 GiB), else this read falls back to PIO. */
-#ifdef SDCARD_ENABLE_DMA
-	host->useDma = (host->dmaBufferPhys < 0x40000000ul);
-#else
-	host->useDma = false;
-#endif
+	host->dmaBufferPhys = pa;
+	host->dmaBufferSize = size;
 
 	/* ADMA2 descriptor list. Uncached like the staging buffer -- the engine fetches
 	 * these from DRAM, so a cacheable list would need maintenance on every transfer.
-	 * One page is far more than ADMA2_MAX_DESCS * 8 bytes. It must satisfy the same
-	 * < 1 GiB reach as the data, and the controller requires the table to be
-	 * 4-byte aligned (Linux stipulates 8; a page start is both).
+	 * It must satisfy the same < 1 GiB reach as the data, and the controller requires
+	 * the table to be 4-byte aligned (Linux stipulates 8; a page start is both).
 	 *
 	 * On any failure we simply leave admaDesc NULL and fall back to SDMA, so ADMA2
 	 * can never turn a working transfer into a failed one at init. */
-	host->admaDesc = NULL;
-	host->admaDescPhys = 0;
 	if ((SDCARD_DMA_ADMA2 != 0) && host->useDma) {
-		void *d = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
-			MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS, -1, 0);
-		if (d != MAP_FAILED) {
-			addr_t dphys = va2pa(d);
-			if (dphys < 0x40000000ul) {
-				host->admaDesc = (sdcard_adma2Desc_t *)d;
-				host->admaDescPhys = dphys;
-			}
-			else {
-				(void)munmap(d, _PAGE_SIZE);
-			}
+		unsigned int descTries = 0;
+		addr_t dphys = 0;
+		void *d = sdhost_mapDmaBlock(_PAGE_SIZE, &dphys, &descTries);
+		if (d != NULL) {
+			host->admaDesc = (sdcard_adma2Desc_t *)d;
+			host->admaDescPhys = dphys;
 		}
 	}
+
+	if (host->useDma) {
+		printf("sdcard: %zu KiB DMA staging buffer at pa 0x%08llx (%u %s), %s\n", size / 1024u,
+			(unsigned long long)pa, tries, (tries == 1u) ? "try" : "tries",
+			(host->admaDesc != NULL) ? "ADMA2" : "SDMA");
+	}
+
 	return 0;
+}
+
+
+size_t sdcard_getMaxTransfer(unsigned int slot)
+{
+	sdcard_hostData_t *host = sdcard_getHostForSlot(slot);
+
+	return (host == NULL) ? 0u : host->dmaBufferSize;
 }
 
 
@@ -801,12 +912,13 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 				*(host->base + SDHOST_REG_SDMA_ADDRESS) = SDCARD_DRAM_BUS(host->dmaBufferPhys);
 			}
 			sdio_dataBarrier();
-			/* SDMA boundary = 512K (the max): our staging buffer is at most
-			 * SDCARD_MAX_TRANSFER (128K), so the transfer never crosses a boundary
-			 * and the engine never raises the DMA-boundary interrupt (which the
-			 * driver does not service). A too-small boundary (the old 4K) is what
-			 * stalled SDMA after the first page — misdiagnosed as a reach limit in
-			 * #120; the buffer is in fact DMA-reachable (see sdhost_allocDMA). */
+			/* SDMA boundary = 512K (the max): sdhost_allocDMA accepts only a
+			 * staging buffer that lies inside one 512K-aligned window, so a
+			 * transfer never crosses a boundary and the engine never raises the
+			 * DMA-boundary interrupt (which the driver does not service). A
+			 * too-small boundary (the old 4K) is what stalled SDMA after the first
+			 * page — misdiagnosed as a reach limit in #120; the buffer is in fact
+			 * DMA-reachable (see sdhost_allocDMA). */
 			*(host->base + SDHOST_REG_TRANSFER_BLOCK) =
 				((uint32_t)blockCount << 16) |
 				TRANSFER_BLOCK_SDMA_BOUNDARY_512K |
@@ -1640,9 +1752,16 @@ static void _sdcard_free(sdcard_hostData_t *host)
 	}
 
 	if (host->dmaBuffer != NULL) {
-		munmap(host->dmaBuffer, SDCARD_MAX_TRANSFER);
+		munmap(host->dmaBuffer, host->dmaBufferSize);
 		host->dmaBuffer = NULL;
 		host->dmaBufferPhys = (addr_t)NULL;
+		host->dmaBufferSize = 0;
+	}
+
+	if (host->admaDesc != NULL) {
+		munmap(host->admaDesc, _PAGE_SIZE);
+		host->admaDesc = NULL;
+		host->admaDescPhys = 0;
 	}
 
 	*(host->base + SDHOST_REG_INTR_STATUS_ENABLE) = 0;
@@ -1830,15 +1949,16 @@ static int _sdcard_transferBlocks(sdcard_hostData_t *host, sdio_dir_t dir, uint3
 	uint8_t cmd;
 
 	/* Two data paths:
-	 *  - useDma: the SDMA engine moves the data to/from the low DMA-reachable
-	 *    staging buffer (uncached, so DMA-coherent); we copy across to the caller.
-	 *    The copy is cheap relative to the transfer and was measured not to bound
-	 *    throughput; it also lifts any alignment/physical-reach constraint on the
-	 *    caller's buffer.
+	 *  - useDma: the DMA engine (ADMA2, or SDMA) moves the data to/from the low
+	 *    DMA-reachable staging buffer (uncached, so DMA-coherent); we copy across
+	 *    to the caller. The copy is cheap relative to the transfer and was
+	 *    measured not to bound throughput; it also lifts any alignment/physical-
+	 *    reach constraint on the caller's buffer.
 	 *  - PIO (fallback): move the FIFO directly to/from the caller's (cacheable)
 	 *    buffer when 4-byte aligned (Linux sg_miter style, no staging copy), else
 	 *    via the staging buffer.
-	 * len is bounded by SDCARD_MAX_TRANSFER upstream (fits the staging buffer). */
+	 * len is bounded by host->dmaBufferSize in sdcard_transferBlocks (fits the
+	 * staging buffer). */
 	/* DMA reads are validated correct (0 silent-corrupt vs the PIO oracle) and
 	 * DDR50-fast. DMA *writes* were disabled here for intermittent first-block silent
 	 * corruption (firstBadBlk=0, ~1-2/10), recorded as "a write-DMA quirk on this
@@ -1938,7 +2058,7 @@ int sdcard_transferBlocks(unsigned int slot, sdio_dir_t dir, uint32_t blockOffse
 		return -ENOENT;
 	}
 
-	if ((len % SDCARD_BLOCKLEN != 0) || (len > SDCARD_MAX_TRANSFER)) {
+	if ((len % SDCARD_BLOCKLEN != 0) || (len > host->dmaBufferSize)) {
 		return -EINVAL;
 	}
 
@@ -2044,8 +2164,8 @@ int sdcard_writeFF(unsigned int slot, uint32_t blockOffset, uint32_t nBlocks)
 	}
 
 	mutexLock(host->cmdLock);
-	uint32_t erasePerIteration = SDCARD_MAX_TRANSFER / SDCARD_BLOCKLEN;
-	memset(host->dmaBuffer, 0xff, SDCARD_MAX_TRANSFER);
+	uint32_t erasePerIteration = host->dmaBufferSize / SDCARD_BLOCKLEN;
+	memset(host->dmaBuffer, 0xff, host->dmaBufferSize);
 	while (nBlocks > 0) {
 		if (nBlocks < erasePerIteration) {
 			erasePerIteration = nBlocks;

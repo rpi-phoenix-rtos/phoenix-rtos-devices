@@ -18,11 +18,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define SDCARD_MAX_TRANSFER 131072 /* Maximum size of a single (multi-block) transfer in bytes (128 KiB).
-                                    * SDMA boundary is 512 KiB and the staging buffer is contiguous, so a
-                                    * <=128 KiB transfer stays within one boundary window (a boundary cross
-                                    * would fail detectably via the completion poll, not silently). */
-#define SDCARD_BLOCKLEN     512  /* Block size in bytes used for sdcard_transferBlocks */
+/* Largest single (multi-block) transfer in bytes, and the size of the DMA staging
+ * buffer. A host that could not get a DMA-reachable buffer this large accepts less:
+ * ask sdcard_getMaxTransfer(). */
+#define SDCARD_MAX_TRANSFER 131072
+#define SDCARD_BLOCKLEN     512 /* Block size in bytes used for sdcard_transferBlocks */
 
 typedef enum {
 	sdio_read,
@@ -49,7 +49,13 @@ extern int sdcard_initCard(unsigned int slot, bool fallbackMode);
 extern void sdcard_free(unsigned int slot);
 
 
+/* len must be a multiple of SDCARD_BLOCKLEN and at most sdcard_getMaxTransfer(slot) */
 extern int sdcard_transferBlocks(unsigned int slot, sdio_dir_t dir, uint32_t blockOffset, void *data, size_t len);
+
+
+/* Largest len sdcard_transferBlocks() accepts on this slot: SDCARD_MAX_TRANSFER,
+ * or less if the host fell back to a smaller staging buffer. 0 for a bad slot. */
+extern size_t sdcard_getMaxTransfer(unsigned int slot);
 
 
 extern uint32_t sdcard_getSizeBlocks(unsigned int slot);

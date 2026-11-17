@@ -132,7 +132,7 @@ static ssize_t sdcard_readCb(uint64_t offs, void *buff, size_t len, cache_devCtx
 	}
 
 	uint32_t lba = offs / SDCARD_BLOCKLEN;
-	len = min(len, SDCARD_MAX_TRANSFER);
+	len = min(len, sdcard_getMaxTransfer(ctx->id));
 
 	/* Fast path: one multi-block CMD18 for the whole request. HW-proven under a
 	 * clean controller init (netboot): READ 0/10 fail at ~15-20 MB/s (SDDIAG-MB).
@@ -199,7 +199,7 @@ static ssize_t sdcard_writeCb(uint64_t offs, const void *buff, size_t len, cache
 	}
 
 	uint32_t lba = offs / SDCARD_BLOCKLEN;
-	len = min(len, SDCARD_MAX_TRANSFER);
+	len = min(len, sdcard_getMaxTransfer(ctx->id));
 
 	/* Fast path: one multi-block CMD25 for the whole request (proven correct +
 	 * ~10 MB/s; #154 autoCmd12 CMD13->TRAN completion). Retry; on persistent
