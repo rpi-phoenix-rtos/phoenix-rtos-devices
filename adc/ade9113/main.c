@@ -51,9 +51,6 @@
 #include "iomux_mux_enums.h"
 
 
-#define SAMPLE_SIZE 32
-
-
 /* value written to SCRATCH registers to verify reads (arbitrary unique value for each ADC chip) */
 static const uint8_t scratchValues[4] = { 0xa0, 0xa1, 0xa2, 0xa3 };
 
@@ -79,7 +76,7 @@ static int initPwm(void)
 {
 	volatile struct imx6ull_regs_pwm *pwm = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, IMX_PWM3_BASE);
 	if (pwm == MAP_FAILED) {
-		printf("Failed to map: %p\n", pwm);
+		log_error("Failed to map: %p", pwm);
 		return -1;
 	}
 
@@ -149,7 +146,7 @@ static void resetEcspi(volatile struct imx6ull_regs_ecspi *spi)
 }
 
 
-bool dmaRxCb(const uint8_t *data, size_t size)
+static bool dmaRxCb(const uint8_t *data, size_t size)
 {
 	struct adcCtx *ctx = &common_adc;
 	sample_writeStart(&ctx->samples);
@@ -253,7 +250,7 @@ static int parseStrEnum(char opt, const char *value, const struct strEnumDef *de
 	}
 	log_error("value for option `-%c` is not recognised. Allowed options:", opt);
 	for (const struct strEnumDef *def = defs; def->name != NULL; ++def) {
-		fprintf(stderr, "* \"%s\"", def->name);
+		log_error("* \"%s\"", def->name);
 	}
 	return -1;
 }
@@ -380,7 +377,7 @@ static int parseArgs(struct args *parsed, int argc, char **argv)
 }
 
 
-int gpioWrite(const char *path, uint32_t value, uint32_t mask)
+static int gpioWrite(const char *path, uint32_t value, uint32_t mask)
 {
 	int fd = open(path, O_RDWR);
 	if (fd < 0) {
@@ -393,7 +390,7 @@ int gpioWrite(const char *path, uint32_t value, uint32_t mask)
 }
 
 
-int adcInit(struct adcCtx *ctx, addr_t spiBase, unsigned bufferSize, uint16_t enabledChannels)
+static int adcInit(struct adcCtx *ctx, addr_t spiBase, unsigned bufferSize, uint16_t enabledChannels)
 {
 	ctx->spi = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, spiBase);
 	if (ctx->spi == MAP_FAILED) {
@@ -440,12 +437,14 @@ static int waitReady(struct ade9113_ctx *ctx, bool all, time_t timeout)
 }
 
 
-int adcConfigure(struct adcCtx *ctx, const struct args *args)
+static int adcConfigure(struct adcCtx *ctx, const struct args *args)
 {
 	log_info("Initializing ADC using SPI1");
 	resetEcspi(ctx->spi);
 
-	struct ade9113_ctx ade = { spiExchangeCb, NULL };
+	struct ade9113_ctx ade = { .spiExchange = spiExchangeCb, .userData = NULL };
+
+	ade.silent = true; /* avoid excessive logs during detection */
 
 	/*
 	 * NOTE: many commands below are executed without checking return values. There are explicit checkpoints later
@@ -460,11 +459,13 @@ int adcConfigure(struct adcCtx *ctx, const struct args *args)
 	ade9113_writeRegs(&ade, ADE9113_SCRATCH, magic);
 	ade9113_readRegs(&ade, ADE9113_SCRATCH, readScratch, sizeof(readScratch));
 	if (readScratch[0] != magic) {
-		log_error("Initial READ/WRITE transaction failed. Analog frontend might be broken/missing");
+		log_error("Initial READ/WRITE transaction failed. Analog frontend might be broken/missing/unpowered");
 		if (!args->ignoreErrors) {
 			return -1;
 		}
 	}
+
+	ade.silent = false; /* initial detection complete - enable error logs */
 
 	ade9113_writeRegs(&ade, ADE9113_SWRST, ADE9113_SWRST__SOFTWARE_RESET_COMMAND);
 
@@ -637,12 +638,9 @@ int main(int argc, char **argv)
 		/* GPIO */
 		{ .mux = pctl_mux_tamper2, .mode = MUX_PAD_SNVS_TAMPER2__GPIO5_IO02 }, /* ADC_RESET (connected to RESET2) */
 		{ .mux = pctl_mux_lcd_rst, .mode = MUX_PAD_LCD_RESET__GPIO3_IO04 },    /* ADC_RESET2 */
-		{ .mux = pctl_mux_lcd_hsync, .mode = MUX_PAD_LCD_HSYNC__GPIO3_IO02 },  /* ADC_IRQN */
-		{ .mux = pctl_mux_lcd_vsync, .mode = MUX_PAD_LCD_VSYNC__GPIO3_IO03 },  /* ADC_DREADY_L2 */
-		{ .mux = pctl_mux_lcd_en, .mode = MUX_PAD_LCD_ENABLE__GPIO3_IO01 },    /* ADC_IRQ1 */
-		{ .mux = pctl_mux_lcd_clk, .mode = MUX_PAD_LCD_CLK__GPIO3_IO00 },      /* ADC_IRQ2 */
-		{ .mux = pctl_mux_lcd_d0, .mode = MUX_PAD_LCD_DATA00__GPIO3_IO05 },    /* ADC_IRQ3 */
-		{ .mux = pctl_mux_lcd_d12, .mode = MUX_PAD_LCD_DATA12__ECSPI1_RDY },   /* ADC_DREADY */
+		{ .mux = pctl_mux_lcd_hsync, .mode = MUX_PAD_LCD_HSYNC__GPIO3_IO02 },  /* ADC_ZX (for future use) */
+		{ .mux = pctl_mux_lcd_en, .mode = MUX_PAD_LCD_ENABLE__GPIO3_IO01 },    /* ADC_IRQ1 (for future use) */
+		{ .mux = pctl_mux_lcd_d12, .mode = MUX_PAD_LCD_DATA12__ECSPI1_RDY },   /* ADC_DREADY_L2 */
 	};
 	for (int i = 0; i < sizeof(muxConfigs) / sizeof(*muxConfigs); ++i) {
 		const struct muxConfig *cfg = &muxConfigs[i];
@@ -690,12 +688,12 @@ int main(int argc, char **argv)
 			} });
 	}
 
-	/* IRQN pad - enable internal pullup */
+	/* IRQ1 pad - enable internal pullup */
 	platformctl(&(platformctl_t) {
 		.action = pctl_set,
 		.type = pctl_iopad,
 		.iopad = {
-			.pad = pctl_pad_lcd_hsync,
+			.pad = pctl_pad_lcd_en,
 			.hys = 1,    /* enable hysteresis */
 			.pus = 0b11, /* 22kOhm pull up */
 			.pue = 1,    /* pull on power down */
@@ -712,10 +710,6 @@ int main(int argc, char **argv)
 		return EX_OSERR;
 	};
 
-	if (adcConfigure(ctx, &args) < 0) {
-		log_error("failed to configure ADC's");
-		return EX_IOERR;
-	}
 
 	if (dma_init(_PAGE_SIZE * 2, 2, args.dmaRxCh, args.dmaTxCh, dmaRxCb) < 0) {
 		log_error("failed to init DMA");
@@ -728,49 +722,72 @@ int main(int argc, char **argv)
 	beginthread(msgThread, 2, msgStacks[0], _PAGE_SIZE, ctx);
 	beginthread(msgThread, 2, msgStacks[1], _PAGE_SIZE, ctx);
 
-	resetEcspi(ctx->spi);
-
-	/*
-	 * Configure eCSPI for DMA usage:
-	 * - TX burst will be triggered from DREADY pin
-	 * - DMA will write to TX FIFO when it reaches 0 words (empty)
-	 * - DMA will read from RX FIFO when it reaches 16 words (full 64 byte response from all chips)
-	 */
-	ctx->spi->CONREG = (ctx->spi->CONREG & ~(0b11 << 16)) | (0b01 << 16); /* TRIGGER by falling edge */
-	ctx->spi->CONREG = (ctx->spi->CONREG & ~(0b1 << 3)) | (0b1 << 3);     /* enable auto trigger */
-
-	/* clang-format off */
-	ctx->spi->DMAREG = (
-		0
-		| (0x01 << 23) /* RXDEN = 1 */
-		| (15 << 16)   /* RX_THRESHOLD = 15 */
-		| (0x01 << 7)  /* TEDEN = 1 */
-		| (0 << 0)     /* TX_THRESHOLD = 0 */
-	);
-	/* clang-format on */
-
-	dma_enable();
-
-	time_t now;
-	gettime(&now, NULL);
-	const time_t start = now;
-
+	bool first = true;
 	while (pendingTerm == 0) {
-		if (ctx->crcErrors || true) {
+		if (first) {
+			/* first init is always allowed */
+			first = false;
+		}
+		else if (msgapi_waitOpened(&ctx->msgapi, 5000) < 0) {
+			/* timeout - wait will continue after pendingTerm check */
+			continue;
+		}
+		else {
+			/* detected new session */
+			log_info("New sample session - will try to reinit ADC's");
+		}
+
+		if (adcConfigure(ctx, &args) < 0) {
+			log_error("failed to configure ADC's");
+			log_error("closing all msgapi sessions");
+			msgapi_reset(&ctx->msgapi);
+			continue;
+		}
+
+		resetEcspi(ctx->spi);
+
+		/*
+		 * Configure eCSPI for DMA usage:
+		 * - TX burst will be triggered from DREADY pin
+		 * - DMA will write to TX FIFO when it reaches 0 words (empty)
+		 * - DMA will read from RX FIFO when it reaches 16 words (full 64 byte response from all chips)
+		 */
+		ctx->spi->CONREG = (ctx->spi->CONREG & ~(0b11 << 16)) | (0b01 << 16); /* TRIGGER by falling edge */
+		ctx->spi->CONREG = (ctx->spi->CONREG & ~(0b1 << 3)) | (0b1 << 3);     /* enable auto trigger */
+
+		/* clang-format off */
+		ctx->spi->DMAREG = (
+			0
+			| (0x01 << 23) /* RXDEN = 1 */
+			| (15 << 16)   /* RX_THRESHOLD = 15 */
+			| (0x01 << 7)  /* TEDEN = 1 */
+			| (0 << 0)     /* TX_THRESHOLD = 0 */
+		);
+		/* clang-format on */
+
+		dma_enable();
+
+		time_t now;
+		gettime(&now, NULL);
+		const time_t start = now;
+
+		while (pendingTerm == 0) {
 			if ((ctx->crcErrors > 0) || (ctx->valueErrors > 0)) {
 				gettime(&now, NULL);
-				fprintf(stdout, LOG_TAG "[%llu] crcErrors:%u valueErrors:%u\n", (long long unsigned)((now - start) / 1000), ctx->crcErrors, ctx->valueErrors);
-				fflush(stderr);
+				log_error("[%llu] crcErrors:%u valueErrors:%u", (long long unsigned)((now - start) / 1000), ctx->crcErrors, ctx->valueErrors);
 			}
-		}
-		sleep(60);
-	};
+			sleep(60);
+		};
 
-	fprintf(stderr, "dma_disable()\n");
-	dma_disable();
-	usleep(200000);
-	fprintf(stderr, "resetEcspi()\n");
-	resetEcspi(ctx->spi);
+		log_info("disabling DMA");
+		dma_disable();
+		usleep(200000);
+		log_info("resetting SPI");
+		resetEcspi(ctx->spi);
+
+		log_error("closing all msgapi sessions");
+		msgapi_reset(&ctx->msgapi);
+	}
 
 	return 0;
 }

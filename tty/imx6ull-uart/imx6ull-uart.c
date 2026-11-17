@@ -80,15 +80,20 @@
 #define UCR2_CTS       (1 << 12) /* CTS pin output (inverted) */
 #define UCR2_CTSC      (1 << 13)
 #define UCR2_IRTS      (1 << 14)
+#define UCR3_INVT      (1 << 1) /* Invert TX */
 #define UCR3_RXDMUXSEL (1 << 2)
 #define UCR3_RI        (1 << 8)
 #define UCR3_DCD       (1 << 9)
 #define UCR3_DSR       (1 << 10)
 #define UCR4_TCEN      (1 << 3) /* Transmitter complete interrupt enable */
+#define UCR4_INVR      (1 << 9) /* Invert RX */
 
 #define RTS_CTS_NONE       0
 #define RTS_CTS_HWFLOW     1
 #define RTS_CTS_HALFDUPLEX 2
+
+#define INVERT_RX (1 << 0)
+#define INVERT_TX (1 << 1)
 
 #define XCAT2(a, b) a##b
 #define PCTL(x)     XCAT2(pctl_, x)
@@ -407,10 +412,7 @@ static int uart_intr(unsigned int intr, void *data)
 				}
 			}
 			else {
-				/*
-				 * TODO: here we should increment uart.counters.sw_overrun if necessary,
-				 * but lf_fifo_ow_push doesn't return information if overflow occurred
-				 */
+				/* uart_process_rx() counts overwritten bytes */
 				lf_fifo_ow_push(&uart.rx_sw_fifo, (*(uart.base + urxd)) & 0xff);
 			}
 		}
@@ -478,6 +480,7 @@ static void _uart_process_rx(void)
 		while (lf_fifo_ow_pop(&uart.rx_sw_fifo, &c) != 0) {
 			_libtty_putchar(&uart.tty_common, c, NULL);
 		}
+		uart.counters.sw_overrun += lf_fifo_ow_lost(&uart.rx_sw_fifo);
 	}
 
 	if (((*(uart.base + ucr1) & UCR1_RRDYEN) == 0) && (uart.reader_busy != 0)) {
@@ -690,13 +693,13 @@ static void set_cflag(void *_uart, tcflag_t *cflag)
 
 	/* CSIZE ony CS7 and CS8 (default) is supported */
 	if ((*cflag & CSIZE) == CS7) {
-		*(uartptr->base + ucr2) &= ~(1 << 6);
+		*(uartptr->base + ucr2) &= ~UCR2_WS;
 	}
 	else { /* CS8 */
 		*cflag &= ~CSIZE;
 		*cflag |= CS8;
 
-		*(uartptr->base + ucr2) |= (1 << 6);
+		*(uartptr->base + ucr2) |= UCR2_WS;
 	}
 
 	/* parity */
@@ -754,22 +757,30 @@ static void signal_txready(void *_uart)
 static char __attribute__((aligned(8))) stack[2048];
 static char __attribute__((aligned(8))) stack0[2048];
 
+
+/* clang-format off */
 static void print_usage(const char *progname)
 {
-	printf("Usage: %s [mode device speed parity rts_cts_mode [-t] [-e] [-s]]\n", progname);
+	printf("Usage: %s [mode device speed parity rts_cts_mode [-t] [-e] [-s] [-d] [-i invert]]\n", progname);
 	printf("\tmode: 0 - raw, 1 - cooked (default cooked)\n");
 	printf("\tdevice: 1 to 8 (default 1)\n");
 	printf("\tspeed: baud_rate (default 115200)\n");
 	printf("\tparity: 0 - none, 1 - odd, 2 - even (default none)\n");
 	printf("\trts_cts_mode (default 0):\n"
-		   "\t\t0 - RTS/CTS not used\n"
-		   "\t\t1 - RTS/CTS used for hardware flow control\n"
-		   "\t\t2 - half-duplex, CTS high when transmitting, RTS unused\n");
+		"\t\t0 - RTS/CTS not used\n"
+		"\t\t1 - RTS/CTS used for hardware flow control\n"
+		"\t\t2 - half-duplex, CTS high when transmitting, RTS unused\n");
 	printf("\t-t - make it a default console device, might be empty (default yes)\n");
 	printf("\t-e - report UART errors (default no)\n");
 	printf("\t-s - use syslog for logs (default no)\n");
 	printf("\t-d - DTE mode, swap RX and TX signals (default no)\n");
+	printf("\t-i - invert RX and TX signals (default 0):\n"
+		"\t\t0 - none inverted, i.e. both idle high\n"
+		"\t\t1 - only RX inverted\n"
+		"\t\t2 - only TX inverted\n"
+		"\t\t3 - both inverted, i.e. both idle low\n");
 }
+/* clang-format on */
 
 
 static void libklog_clbk(const char *data, size_t size)
@@ -790,6 +801,7 @@ int main(int argc, char **argv)
 	int rts_cts_mode = RTS_CTS_NONE;
 	int is_console = 0;
 	int dte_mode = 0; /* Default to DCE mode */
+	int invert = 0;
 
 	libtty_callbacks_t callbacks = {
 		.arg = &uart,
@@ -812,7 +824,7 @@ int main(int argc, char **argv)
 		uart.dev_no = 1;
 		is_console = 1;
 	}
-	else if ((argc >= 6) && (argc <= 9)) {
+	else if (argc >= 6) {
 		is_cooked = atoi(argv[1]);
 		uart.dev_no = atoi(argv[2]);
 		baud = atoi(argv[3]);
@@ -831,6 +843,10 @@ int main(int argc, char **argv)
 			}
 			else if (strcmp(argv[num], "-d") == 0) {
 				dte_mode = 1;
+			}
+			else if ((strcmp(argv[num], "-i") == 0) && ((num + 1) < argc)) {
+				num++;
+				invert = atoi(argv[num]);
 			}
 			else {
 				print_usage(argv[0]);
@@ -861,6 +877,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	uart.tty_common.term.c_ispeed = uart.tty_common.term.c_ospeed = baud;
+
+	if ((invert < 0) || (invert > (INVERT_RX | INVERT_TX))) {
+		printf("Invalid invert value!\n");
+		print_usage(argv[0]);
+		return 1;
+	}
 
 	if ((parity < 0) || (parity > 2)) {
 		printf("Invalid parity!\n");
@@ -919,7 +941,16 @@ int main(int argc, char **argv)
 	*(uart.base + ufcr) |= 0b010 << 7;
 
 	uart_mode_setup(&uart, rts_cts_mode);
+
 	*(uart.base + ucr4) = (24 << 10); /* CTS deasserted after 24 bytes in RX FIFO */
+
+	if ((invert & INVERT_RX) != 0) {
+		*(uart.base + ucr4) |= UCR4_INVR;
+	}
+
+	if ((invert & INVERT_TX) != 0) {
+		*(uart.base + ucr3) |= UCR3_INVT;
+	}
 
 	set_cflag(&uart, &uart.tty_common.term.c_cflag);
 	set_baudrate(&uart, baud);
