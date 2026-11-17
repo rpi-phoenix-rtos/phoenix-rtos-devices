@@ -677,6 +677,12 @@ int sdstorage_handleInsertion(unsigned int slot)
 		return -ENOMEM;
 	}
 
+	/* Write back only the sectors of a line that changed, not the whole line.
+	 * Without this every write-through flush moved a full cache line to the card:
+	 * a 1 KiB superblock or inode update cost a BLK_CACHE_SECSIZE write. Any
+	 * SDCARD_BLOCKLEN-aligned range is a valid sdcard_writeCb request. */
+	(void)cache_setFlushGranularity(strg->dev->ctx->cache, SDCARD_BLOCKLEN);
+
 	strg->dev->ctx->id = slot;
 	strg->parent = NULL;
 	strg->start = 0;
