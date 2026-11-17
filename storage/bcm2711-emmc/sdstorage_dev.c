@@ -42,15 +42,28 @@
 #define TRACE(str, ...)     do { if (0) fprintf(stderr, LOG_TAG " trace: " str "\n", ##__VA_ARGS__); } while (0)
 /* clang-format on */
 
-/* Cache sector = the unit libcache reads/writes per miss/flush, i.e. the size of
- * each sdcard_transferBlocks() request. 128 KiB (256 blocks) lets the proven
- * multi-block CMD18/CMD25 path move large bursts instead of the old 1 KiB
- * (2-block) requests. Must be a multiple of SDCARD_BLOCKLEN and <=
- * SDCARD_MAX_TRANSFER. Sized to SDCARD_MAX_TRANSFER (128 KiB) so a cache miss
- * issues one full-size DDR50 transfer — the throughput sweet spot (raw 128 KiB
- * reads measured ~38 MB/s vs ~24 at 16 KiB); SECNUM keeps ~4 MiB of cache/region. */
-#define BLK_CACHE_SECSIZE   SDCARD_MAX_TRANSFER    /* 128 KiB */
-#define BLK_CACHE_SECNUM    32                     /* 32 * 128 KiB = 4 MiB cache per region */
+/* Cache sector = the unit libcache reads per miss and the most it writes per
+ * flush, so it is also the largest sdcard_transferBlocks() request the cache
+ * makes. Sized to SDCARD_MAX_TRANSFER (512 KiB) so a miss or a full-line write is
+ * one full-size DDR50 command (raw 128 KiB reads measured ~38 MB/s vs ~24 at
+ * 16 KiB; see SDCARD_MAX_TRANSFER for the expected write gain). If the
+ * host fell back to a smaller staging buffer, the callbacks clamp and libcache
+ * issues several commands per line. A partial-line write still fetches the whole
+ * line first.
+ *
+ * SECNUM: libcache has 4 ways per set and needs a power-of-two set count. 16
+ * lines (8 MiB, allocated on first use) rather than 8 (the 4 MiB the old 32 x
+ * 128 KiB used): one ext2 file write touches about five lines (data, inode
+ * table, bitmaps, superblock + descriptors, indirect block). 8 lines in 2 sets
+ * leave too little room for those plus streaming data, so they would evict each
+ * other, each re-fetch costing a 512 KiB read. */
+#define BLK_CACHE_SECSIZE   SDCARD_MAX_TRANSFER    /* 512 KiB */
+#define BLK_CACHE_SECNUM    16                     /* 16 * 512 KiB = 8 MiB cache per device */
+
+_Static_assert(((BLK_CACHE_SECSIZE % SDCARD_BLOCKLEN) == 0) && ((BLK_CACHE_SECSIZE & (BLK_CACHE_SECSIZE - 1)) == 0),
+	"cache line must be a power of two and whole blocks");
+_Static_assert(((BLK_CACHE_SECNUM % 4) == 0) && (((BLK_CACHE_SECNUM / 4) & ((BLK_CACHE_SECNUM / 4) - 1)) == 0),
+	"libcache: 4 ways per set and a power-of-two set count");
 #define MTD_DEFAULT_ERASESZ 0x10000
 #define SDCARD_READ_RETRIES  5 /* TODO(#120): bounded retry of transient single-block read errors */
 #define SDCARD_WRITE_RETRIES 5 /* TODO(#120): same, for single-block CMD24 writes (idempotent on CRC reject) */

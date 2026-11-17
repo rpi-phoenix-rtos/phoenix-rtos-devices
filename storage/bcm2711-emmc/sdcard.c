@@ -92,9 +92,18 @@ typedef struct {
 /* One descriptor per chunk. 32 KiB, deliberately not 64 KiB: the length field is
  * 16-bit and the spec encodes 65536 as a written 0, which Linux notes some
  * controllers do not implement (sdhci.c "not support 'zero means 65536'"). Staying
- * under 64 KiB keeps every length explicit. 128 KiB max transfer / 32 KiB = 4. */
+ * under 64 KiB keeps every length explicit.
+ *
+ * Today every list describes the contiguous staging buffer: 512 KiB / 32 KiB = 16
+ * entries. The table is sized for the worst case instead, a full transfer
+ * scattered over separate pages (one entry per page, plus one for a start that is
+ * not page-aligned), which still fits the one descriptor page. */
 #define ADMA2_CHUNK_MAX  (32u * 1024u)
-#define ADMA2_MAX_DESCS  ((SDCARD_MAX_TRANSFER / ADMA2_CHUNK_MAX) + 2u)
+#define ADMA2_MAX_DESCS  ((SDCARD_MAX_TRANSFER / _PAGE_SIZE) + 1u)
+
+_Static_assert(ADMA2_CHUNK_MAX < 65536u, "ADMA2 length field is 16-bit; 0 would mean 65536");
+_Static_assert((ADMA2_MAX_DESCS * sizeof(sdcard_adma2Desc_t)) <= _PAGE_SIZE, "ADMA2 table must fit its one page");
+_Static_assert((SDCARD_MAX_TRANSFER / ADMA2_CHUNK_MAX) < ADMA2_MAX_DESCS, "a full staging buffer must fit the ADMA2 table");
 
 /* CPU-physical -> emmc2bus BUS address (bcm2711.dtsi dma-ranges: bus 0xC0000000+X
  * covers CPU-phys X over the low 1 GiB). Mirrors rpi4-audio's DRAM_BUS() and the
@@ -111,7 +120,8 @@ typedef struct {
 #define SDCARD_SDMA_WINDOW (512u * 1024u)
 
 /* Smaller staging buffer to fall back to when no DMA-reachable SDCARD_MAX_TRANSFER
- * block can be had. Not tried when it is not smaller than SDCARD_MAX_TRANSFER. */
+ * block can be had: 128 KiB, the command size before SDCARD_MAX_TRANSFER was
+ * raised. Not tried when it is not smaller than SDCARD_MAX_TRANSFER. */
 #define SDCARD_FALLBACK_TRANSFER (128u * 1024u)
 
 /* Contiguous blocks to try (and hold) per staging-buffer size before giving up. */
@@ -914,11 +924,14 @@ static int _sdio_cmdSend(sdcard_hostData_t *host, uint8_t cmd, uint32_t arg, uin
 			sdio_dataBarrier();
 			/* SDMA boundary = 512K (the max): sdhost_allocDMA accepts only a
 			 * staging buffer that lies inside one 512K-aligned window, so a
-			 * transfer never crosses a boundary and the engine never raises the
-			 * DMA-boundary interrupt (which the driver does not service). A
-			 * too-small boundary (the old 4K) is what stalled SDMA after the first
-			 * page — misdiagnosed as a reach limit in #120; the buffer is in fact
-			 * DMA-reachable (see sdhost_allocDMA). */
+			 * transfer never crosses a boundary mid-way and the driver need not
+			 * service the DMA-boundary interrupt (it does not). A full 512K
+			 * transfer from a 512K buffer ends exactly on a boundary; the spec
+			 * says Transfer Complete then wins over the boundary stop, but that
+			 * case is untested on this controller (ADMA2 is the normal path).
+			 * A too-small boundary (the old 4K) is what stalled SDMA after the
+			 * first page — misdiagnosed as a reach limit in #120; the buffer is in
+			 * fact DMA-reachable (see sdhost_allocDMA). */
 			*(host->base + SDHOST_REG_TRANSFER_BLOCK) =
 				((uint32_t)blockCount << 16) |
 				TRANSFER_BLOCK_SDMA_BOUNDARY_512K |

@@ -18,10 +18,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Largest single (multi-block) transfer in bytes, and the size of the DMA staging
- * buffer. A host that could not get a DMA-reachable buffer this large accepts less:
- * ask sdcard_getMaxTransfer(). */
-#define SDCARD_MAX_TRANSFER 131072
+/* Largest single (multi-block) transfer in bytes (512 KiB, 1024 blocks), and the
+ * size of the DMA staging buffer. Other drivers on the same board and card wrote
+ * about 1.4x faster with 512 KiB commands than with 128 KiB ones; this driver's
+ * gain is still to be measured. A host that could not get a DMA-reachable buffer
+ * this large accepts less: ask sdcard_getMaxTransfer(). */
+#define SDCARD_MAX_TRANSFER 524288
 #define SDCARD_BLOCKLEN     512 /* Block size in bytes used for sdcard_transferBlocks */
 
 typedef enum {
