@@ -832,6 +832,308 @@ static void diag_pioWriteWord(volatile uint8_t *sdhci, const uint8_t *buf, uint3
 		((uint32_t)buf[i * 4 + 3] << 24);
 }
 
+/* ---- Interrupt-driven data blocks -----------------------------------------
+ *
+ * The polled loops above cost a CPU core while data moves: during a TCP transfer
+ * most of the daemon's user time went to spinning on the controller until the
+ * next block of a CMD53 had arrived or left. With `pioirq=1` (or `wifi pioirq
+ * 1`) a transfer whose blocks are WIFI_XFER_IRQ_MIN bytes or more is moved by an
+ * interrupt handler instead, and the caller sleeps until it is complete:
+ *
+ *   caller    clears INT_STATUS, describes the transfer, arms Signal Enable for
+ *             buffer-ready and transfer-complete, and only THEN issues the
+ *             command, so nothing it waits for can latch before the arm. It polls
+ *             command complete as before (a response takes microseconds), then
+ *             sleeps on g_xfer.cond.
+ *   handler   acknowledges the latched buffer-ready bit first, then moves every
+ *             block the controller has ready (the PRESENT_STATE level bits, as
+ *             the polled loop), then looks for transfer complete. A block that
+ *             becomes ready during the drain latches the bit again and
+ *             interrupts again, so none is lost. On transfer complete (or an
+ *             error) it takes the data bits out of Signal Enable, so nothing
+ *             latched can hold the shared line, and wakes the caller. After an
+ *             intermediate block it returns -1, which the kernel takes as
+ *             "source silenced, nobody to wake".
+ *   fallback  the caller sleeps at most WIFI_XFER_TICK_US at a time. When a
+ *             tick runs out it takes the transfer back from the handler and
+ *             moves whatever is ready itself; a tick that found work counts as a
+ *             rescue in `stats`. No progress for SDHCI_SLOW_WAIT_US is a
+ *             timeout, as in the polled loops.
+ *
+ * Error interrupts are not signal-enabled. The command-complete poll sees a
+ * command error as before, and a data error (rare) is found by the next tick, so
+ * the handler never has to leave an error latched on the shared line.
+ *
+ * Smaller blocks stay polled: the 64-byte firmware-download blocks, the 12-byte
+ * frame headers, and block-mode TX at the default f2blk=64. Such a block crosses
+ * the bus in a few microseconds, less than an interrupt plus a wakeup costs.
+ *
+ * The handler runs at interrupt level in this address space; the kernel makes
+ * the process's memory resident when the handler is registered. It must not use
+ * FP/SIMD registers, which the kernel saves on interrupt entry only for a thread
+ * that has the FPU enabled. Everything it calls is therefore built
+ * general-regs-only, and nothing it calls uses memcpy. */
+#define WIFI_XFER_IRQ_MIN 256u  /* bytes per block from which a transfer is interrupt-driven */
+#define WIFI_XFER_TICK_US 1000u /* longest sleep before the caller looks for itself */
+#define WIFI_XFER_SIGNALS (SDHCI_INT_BUF_RD_READY | SDHCI_INT_BUF_WR_READY | SDHCI_INT_XFER_COMPLETE)
+
+/* For a function that runs at interrupt level, or is called from one. */
+#define WIFI_IRQ_CONTEXT __attribute__((target("general-regs-only")))
+
+/* SIGNAL_EN as this driver wants it. Three parties change it: the /dev/wifiirq
+ * waiter (sets and clears CARD_INT), the card-interrupt handler (clears CARD_INT)
+ * and the data path (buffer-ready, transfer-complete). They run on different
+ * CPUs, one of them at interrupt level, so none of them can lock the others out.
+ * Each changes this shadow atomically and then writes it to the register until
+ * the shadow still holds what it wrote: the last writer then always writes the
+ * final value, so the register ends equal to the shadow. */
+static uint32_t g_sigen;
+
+static WIFI_IRQ_CONTEXT void wifi_sigenUpdate(volatile uint8_t *sdhci, uint32_t set, uint32_t clr)
+{
+	volatile uint32_t *reg = (volatile uint32_t *)(sdhci + SDHCI_SIGNAL_EN);
+	uint32_t v;
+
+	(void)__atomic_and_fetch(&g_sigen, ~clr, __ATOMIC_SEQ_CST);
+	(void)__atomic_or_fetch(&g_sigen, set, __ATOMIC_SEQ_CST);
+	do {
+		v = __atomic_load_n(&g_sigen, __ATOMIC_SEQ_CST);
+		*reg = v;
+		/* The write reaches the controller before the shadow is read again. */
+		__asm__ volatile("dsb sy" ::: "memory");
+	} while (__atomic_load_n(&g_sigen, __ATOMIC_SEQ_CST) != v);
+}
+
+/* One transfer, shared by the caller and the handler. Only one of them moves
+ * blocks at a time: the handler while `armed`, the caller after
+ * wifi_xferDisarm(), which waits out a handler that is still running (`busy`). */
+typedef struct {
+	volatile uint8_t *sdhci;
+	uint8_t *dst;              /* read: destination, NULL = discard */
+	const uint8_t *src;        /* write: source */
+	uint32_t words;            /* 32-bit FIFO words per block */
+	uint32_t nblk, blk;        /* blocks in the transfer, blocks moved */
+	uint32_t ready;            /* SDHCI_INT_BUF_RD_READY or SDHCI_INT_BUF_WR_READY */
+	uint32_t level;            /* SDHCI_PRES_DATA_AVAILABLE or SDHCI_PRES_SPACE_AVAILABLE */
+	int write;
+	int armed;                 /* the handler may move blocks */
+	int busy;                  /* the handler is running */
+	int done;                  /* transfer complete or an error seen; `status` says which */
+	uint32_t status;           /* INT_STATUS when done */
+	uint32_t irqs, irq_blocks; /* handler runs with a data bit signalled, blocks they moved */
+} wifi_xfer_t;
+
+static struct {
+	wifi_xfer_t x;
+	handle_t lock, cond, inth;
+	int ready; /* the handler is registered */
+	int on;    /* `pioirq`: use it (message thread) */
+	uint32_t xfers, wakes, late, ticks, rescues, rescue_blocks, errs, timeouts;
+	char why[40]; /* why it cannot be used, for `stats` */
+} g_xfer;
+
+
+/* Acknowledge the buffer-ready bit, move every block the controller has ready,
+ * then record transfer complete or an error. Returns the blocks moved. Never
+ * waits: what is not ready yet raises another interrupt (or the next tick). */
+static WIFI_IRQ_CONTEXT uint32_t wifi_xferService(wifi_xfer_t *x)
+{
+	volatile uint8_t *sdhci = x->sdhci;
+	volatile uint32_t *port = (volatile uint32_t *)(sdhci + SDHCI_DATA_PORT);
+	uint32_t moved = 0u, st, i, w;
+
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = x->ready;
+	while ((x->blk < x->nblk) && ((*(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE) & x->level) != 0u)) {
+		if (x->write != 0) {
+			const uint8_t *p = x->src + (x->blk * x->words * 4u);
+
+			for (i = 0; i < x->words; ++i, p += 4) {
+				*port = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+			}
+		}
+		else {
+			uint8_t *p = (x->dst != NULL) ? (x->dst + (x->blk * x->words * 4u)) : NULL;
+
+			for (i = 0; i < x->words; ++i) {
+				w = *port;
+				if (p != NULL) {
+					p[0] = (uint8_t)(w & 0xffu);
+					p[1] = (uint8_t)((w >> 8) & 0xffu);
+					p[2] = (uint8_t)((w >> 16) & 0xffu);
+					p[3] = (uint8_t)((w >> 24) & 0xffu);
+					p += 4;
+				}
+			}
+		}
+		x->blk++;
+		moved++;
+	}
+
+	/* Read after the drain: a read's transfer complete follows its last block
+	 * at once, so a one-block read finishes in a single interrupt. Both bits
+	 * stay latched for the caller, which clears INT_STATUS. */
+	st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+	if ((st & (SDHCI_INT_ERR_ANY | SDHCI_INT_XFER_COMPLETE)) != 0u) {
+		x->status = st;
+		__atomic_store_n(&x->done, 1, __ATOMIC_SEQ_CST);
+	}
+	return moved;
+}
+
+
+/* Registered with interrupt() on the line the card interrupt and the SD card's
+ * EMMC2 controller share. 0 (wake the caller) on transfer complete or an error,
+ * with the data bits out of Signal Enable; -1 for anything else, including a
+ * block moved mid-transfer. */
+static WIFI_IRQ_CONTEXT int wifi_xferHandler(unsigned int n, void *arg)
+{
+	wifi_xfer_t *x = arg;
+	uint32_t pending;
+	int ret = -1;
+
+	(void)n;
+	/* With wifi_xferDisarm(): busy is published before armed is read there, and
+	 * armed is cleared before busy is read here, so at most one side proceeds. */
+	__atomic_store_n(&x->busy, 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&x->armed, __ATOMIC_SEQ_CST) != 0) {
+		pending = *(volatile uint32_t *)(x->sdhci + SDHCI_INT_STATUS) &
+			*(volatile uint32_t *)(x->sdhci + SDHCI_SIGNAL_EN) & WIFI_XFER_SIGNALS;
+		if (pending != 0u) {
+			x->irqs++;
+			x->irq_blocks += wifi_xferService(x);
+			if (__atomic_load_n(&x->done, __ATOMIC_SEQ_CST) != 0) {
+				/* What completed the transfer stays latched until the caller
+				 * clears it: stop it from signalling first. */
+				wifi_sigenUpdate(x->sdhci, 0u, WIFI_XFER_SIGNALS);
+				ret = 0;
+			}
+		}
+	}
+	__atomic_store_n(&x->busy, 0, __ATOMIC_SEQ_CST);
+	return ret;
+}
+
+
+/* Whether a transfer with blocks of `blksz` bytes goes through the handler. The
+ * legacy wait (`legacypio`) is a polled-loop A/B, so it keeps every block polled. */
+static int wifi_xferUse(uint32_t blksz)
+{
+	return (g_xfer.on != 0) && (g_pio_legacy == 0) && (blksz >= WIFI_XFER_IRQ_MIN);
+}
+
+
+/* Hand the handler a transfer. After INT_STATUS is cleared, before the command
+ * is written. */
+static void wifi_xferArm(volatile uint8_t *sdhci, int write, uint8_t *dst, const uint8_t *src,
+	uint32_t blksz, uint32_t nblk)
+{
+	wifi_xfer_t *x = &g_xfer.x;
+
+	x->sdhci = sdhci;
+	x->write = write;
+	x->dst = dst;
+	x->src = src;
+	x->words = (blksz + 3u) / 4u;
+	x->nblk = nblk;
+	x->blk = 0u;
+	x->ready = (write != 0) ? SDHCI_INT_BUF_WR_READY : SDHCI_INT_BUF_RD_READY;
+	x->level = (write != 0) ? SDHCI_PRES_SPACE_AVAILABLE : SDHCI_PRES_DATA_AVAILABLE;
+	x->status = 0u;
+	__atomic_store_n(&x->done, 0, __ATOMIC_SEQ_CST);
+	__atomic_store_n(&x->armed, 1, __ATOMIC_SEQ_CST);
+	wifi_sigenUpdate(sdhci, x->ready | SDHCI_INT_XFER_COMPLETE, 0u);
+	g_xfer.xfers++;
+}
+
+
+/* Take the transfer back: no new data interrupt, and no handler still running.
+ * The handler runs only briefly at interrupt level, so the wait is short. */
+static void wifi_xferDisarm(void)
+{
+	wifi_xfer_t *x = &g_xfer.x;
+
+	wifi_sigenUpdate(x->sdhci, 0u, WIFI_XFER_SIGNALS);
+	__atomic_store_n(&x->armed, 0, __ATOMIC_SEQ_CST);
+	while (__atomic_load_n(&x->busy, __ATOMIC_SEQ_CST) != 0) {
+	}
+}
+
+
+/* Sleep until the armed transfer completes; the command has completed. Returns
+ * what the polled loops return: 0, -4/-5 for an error/timeout before the last
+ * block, -6/-7 after it. INT_STATUS is cleared only on success, as there. */
+static int wifi_xferWait(const char *dir)
+{
+	wifi_xfer_t *x = &g_xfer.x;
+	uint64_t now, since = diag_monoUs();
+	uint32_t moved, blk, seen = 0u;
+	int rc;
+
+	/* The handler does not take this lock; it is here for condWait. A wakeup
+	 * that comes before condWait is not lost: the kernel keeps a broadcast to
+	 * an empty queue pending, and the next condWait returns at once. */
+	mutexLock(g_xfer.lock);
+	while (__atomic_load_n(&x->done, __ATOMIC_SEQ_CST) == 0) {
+		rc = condWait(g_xfer.cond, g_xfer.lock, WIFI_XFER_TICK_US);
+		if (__atomic_load_n(&x->done, __ATOMIC_SEQ_CST) != 0) {
+			if (rc == -ETIME) {
+				g_xfer.late++; /* completed, but the wakeup did not arrive in time */
+			}
+			else {
+				g_xfer.wakes++;
+			}
+			break;
+		}
+
+		if (rc == -ETIME) {
+			/* The fallback tick: take the transfer back, move what is ready,
+			 * then hand the rest back. */
+			g_xfer.ticks++;
+			wifi_xferDisarm();
+			if (__atomic_load_n(&x->done, __ATOMIC_SEQ_CST) != 0) {
+				g_xfer.late++; /* the handler completed it during the disarm */
+				break;
+			}
+			moved = wifi_xferService(x);
+			if ((moved != 0u) || (__atomic_load_n(&x->done, __ATOMIC_SEQ_CST) != 0)) {
+				g_xfer.rescues++;
+				g_xfer.rescue_blocks += moved;
+			}
+			if (__atomic_load_n(&x->done, __ATOMIC_SEQ_CST) != 0) {
+				break;
+			}
+			__atomic_store_n(&x->armed, 1, __ATOMIC_SEQ_CST);
+			wifi_sigenUpdate(x->sdhci, x->ready | SDHCI_INT_XFER_COMPLETE, 0u);
+		}
+		/* Otherwise a wakeup left over from an earlier transfer. Either way,
+		 * give up after SDHCI_SLOW_WAIT_US without a block moved. */
+		now = diag_monoUs();
+		blk = __atomic_load_n(&x->blk, __ATOMIC_RELAXED); /* the handler may be moving blocks */
+		if (blk != seen) {
+			seen = blk;
+			since = now;
+		}
+		else if ((now - since) >= SDHCI_SLOW_WAIT_US) {
+			break;
+		}
+	}
+	mutexUnlock(g_xfer.lock);
+	wifi_xferDisarm();
+
+	if (__atomic_load_n(&x->done, __ATOMIC_SEQ_CST) == 0) {
+		g_xfer.timeouts++;
+		diag_pioNoteTimeout(x->sdhci, dir, x->blk, x->nblk);
+		return (x->blk < x->nblk) ? -5 : -7;
+	}
+	if (((x->status & SDHCI_INT_ERR_ANY) != 0u) || (x->blk < x->nblk)) {
+		/* An error, or transfer complete before the last block. */
+		g_xfer.errs++;
+		return (x->blk < x->nblk) ? -4 : -6;
+	}
+	*(volatile uint32_t *)(x->sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
+	return 0;
+}
+
 /* CMD53 (IO_RW_EXTENDED) block-mode READ via SDHCI PIO. buf must point
  * to a 4-byte-aligned destination of at least block_count*block_size
  * bytes. */
@@ -846,7 +1148,7 @@ static int diag_sdioCmd53Read(volatile uint8_t *sdhci, int fn,
 	uint32_t wpb = block_size / 4u; /* words per block */
 	uint32_t bytes_in_block = 0;
 	uint32_t i, blk;
-	int deadline, rc;
+	int deadline, rc, irq;
 
 	/* Wait for CMD line idle. */
 	for (deadline = 100000; deadline > 0; --deadline) {
@@ -880,14 +1182,24 @@ static int diag_sdioCmd53Read(volatile uint8_t *sdhci, int fn,
 		((block_count > 1u ? 1u : 0u) << 5) |
 		((uint32_t)0x3Au << 16) |
 		((uint32_t)53u << 24);
+	irq = wifi_xferUse(block_size);
+	if (irq != 0) {
+		wifi_xferArm(sdhci, 0, buf, NULL, block_size, block_count);
+	}
 	*(volatile uint32_t *)(sdhci + SDHCI_TRANS_CMD) = cmd_word;
 
 	rc = diag_sdhciWaitSet(sdhci, SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
 	if (rc != 0) {
+		if (irq != 0) {
+			wifi_xferDisarm();
+		}
 		return (rc == -1) ? -2 : -3;
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
 
+	if (irq != 0) {
+		return wifi_xferWait("rd");
+	}
 	if (g_pio_legacy != 0) {
 		/* The old loop: latched ready bit before every word, cleared after each
 		 * block (see "Waiting on the controller"). */
@@ -952,7 +1264,7 @@ static int diag_sdioCmd53ReadByteMode(volatile uint8_t *sdhci, int fn,
 	uint32_t arg, cmd_word, st, data;
 	uint32_t words_total = (nbytes + 3u) / 4u;
 	uint32_t i;
-	int deadline;
+	int deadline, irq;
 
 	for (deadline = 100000; deadline > 0; --deadline) {
 		if ((*(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE) & SDHCI_PRES_CMD_INHIBIT) == 0u) {
@@ -969,21 +1281,32 @@ static int diag_sdioCmd53ReadByteMode(volatile uint8_t *sdhci, int fn,
 		((reg_addr & 0x1FFFFu) << 9) | (nbytes & 0x1FFu);
 	*(volatile uint32_t *)(sdhci + SDHCI_ARGUMENT_1) = arg;
 	cmd_word = (1u << 4) | ((uint32_t)0x3Au << 16) | ((uint32_t)53u << 24); /* read dir, no BLK_CNT_EN */
+	irq = wifi_xferUse(nbytes);
+	if (irq != 0) {
+		wifi_xferArm(sdhci, 0, buf, NULL, nbytes, 1u);
+	}
 	*(volatile uint32_t *)(sdhci + SDHCI_TRANS_CMD) = cmd_word;
 
 	for (deadline = 100000; deadline > 0; --deadline) {
 		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
 		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
-			return -2;
+			break;
 		}
 		if ((st & SDHCI_INT_CMD_COMPLETE) != 0u) {
 			break;
 		}
 	}
-	if (deadline == 0) {
-		return -3;
+	if ((deadline == 0) || ((st & SDHCI_INT_ERR_ANY) != 0u)) {
+		if (irq != 0) {
+			wifi_xferDisarm();
+		}
+		return (deadline == 0) ? -3 : -2;
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
+
+	if (irq != 0) {
+		return wifi_xferWait("rd");
+	}
 
 	for (deadline = 100000; deadline > 0; --deadline) {
 		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
@@ -1032,7 +1355,7 @@ static int diag_sdioCmd53WriteByteMode(volatile uint8_t *sdhci, int fn,
 	uint32_t arg, cmd_word, st, data;
 	uint32_t words_total = (nbytes + 3u) / 4u;
 	uint32_t i;
-	int deadline;
+	int deadline, irq;
 
 	for (deadline = 100000; deadline > 0; --deadline) {
 		if ((*(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE) & SDHCI_PRES_CMD_INHIBIT) == 0u) {
@@ -1049,21 +1372,32 @@ static int diag_sdioCmd53WriteByteMode(volatile uint8_t *sdhci, int fn,
 		((reg_addr & 0x1FFFFu) << 9) | (nbytes & 0x1FFu);
 	*(volatile uint32_t *)(sdhci + SDHCI_ARGUMENT_1) = arg;
 	cmd_word = ((uint32_t)0x3Au << 16) | ((uint32_t)53u << 24); /* write dir, no BLK_CNT_EN */
+	irq = wifi_xferUse(nbytes);
+	if (irq != 0) {
+		wifi_xferArm(sdhci, 1, NULL, buf, nbytes, 1u);
+	}
 	*(volatile uint32_t *)(sdhci + SDHCI_TRANS_CMD) = cmd_word;
 
 	for (deadline = 100000; deadline > 0; --deadline) {
 		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
 		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
-			return -2;
+			break;
 		}
 		if ((st & SDHCI_INT_CMD_COMPLETE) != 0u) {
 			break;
 		}
 	}
-	if (deadline == 0) {
-		return -3;
+	if ((deadline == 0) || ((st & SDHCI_INT_ERR_ANY) != 0u)) {
+		if (irq != 0) {
+			wifi_xferDisarm();
+		}
+		return (deadline == 0) ? -3 : -2;
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
+
+	if (irq != 0) {
+		return wifi_xferWait("wr");
+	}
 
 	for (deadline = 100000; deadline > 0; --deadline) {
 		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
@@ -1113,7 +1447,7 @@ static int diag_sdioCmd53Write(volatile uint8_t *sdhci, int fn,
 	uint32_t wpb = block_size / 4u; /* words per block */
 	uint32_t bytes_in_block = 0;
 	uint32_t i, blk;
-	int deadline, rc;
+	int deadline, rc, irq;
 
 	for (deadline = 100000; deadline > 0; --deadline) {
 		if ((*(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE) &
@@ -1142,14 +1476,24 @@ static int diag_sdioCmd53Write(volatile uint8_t *sdhci, int fn,
 		((block_count > 1u ? 1u : 0u) << 5) |
 		((uint32_t)0x3Au << 16) |
 		((uint32_t)53u << 24);
+	irq = wifi_xferUse(block_size);
+	if (irq != 0) {
+		wifi_xferArm(sdhci, 1, NULL, buf, block_size, block_count);
+	}
 	*(volatile uint32_t *)(sdhci + SDHCI_TRANS_CMD) = cmd_word;
 
 	rc = diag_sdhciWaitSet(sdhci, SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
 	if (rc != 0) {
+		if (irq != 0) {
+			wifi_xferDisarm();
+		}
 		return (rc == -1) ? -2 : -3;
 	}
 	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
 
+	if (irq != 0) {
+		return wifi_xferWait("wr");
+	}
 	if (g_pio_legacy != 0) {
 		/* The old loop: latched ready bit before every word, cleared after each
 		 * block (see "Waiting on the controller"). */
@@ -5549,11 +5893,12 @@ static int wifi_status(char *out, int cap)
  * brcmfmac:
  *
  *   handler  IRQ 158, which this controller SHARES with the SD card's EMMC2
- *            (bcm2711.dtsi: &sdhci and emmc2 are both GIC SPI 126, level).
+ *            (bcm2711.dtsi: &sdhci and emmc2 are both GIC SPI 126, level), and
+ *            with its own data interrupts (wifi_xferHandler, `pioirq`).
  *            Returns -1 unless INT_STATUS & SIGNAL_EN has CARD_INT, else masks
- *            SIGNAL_EN and wakes the waiter. It cannot ack the source: the card
- *            holds the level until intstatus is cleared, which takes an SDIO
- *            command, i.e. the bus.
+ *            CARD_INT in SIGNAL_EN and wakes the waiter. It cannot ack the
+ *            source: the card holds the level until intstatus is cleared, which
+ *            takes an SDIO command, i.e. the bus.
  *   waiter   a /dev/wifiirq read. Restarts card-interrupt detection, arms
  *            SIGNAL_EN, sleeps until the handler fires or WIFI_IRQ_WAIT_US
  *            passes, disarms. Returns 1 byte for an interrupt, 0 for a timeout.
@@ -5562,9 +5907,9 @@ static int wifi_status(char *out, int cap)
  *            intstatus BEFORE it drains the FIFO, so a frame queued during the
  *            drain raises the line again -- brcmf_sdio_dpc's order.
  *
- * SIGNAL_EN is armed only while a waiter sleeps. Without a /dev/wifiirq client
- * (a netif that polls, `rxpoll`, the `pollrx` argument) this controller never
- * drives the shared line, as before this path existed. The timeout is the idle
+ * CARD_INT is signal-enabled only while a waiter sleeps. Without a /dev/wifiirq
+ * client (a netif that polls, `rxpoll`, the `pollrx` argument) the card
+ * interrupt never drives the shared line, as before this path existed. The timeout is the idle
  * poll interval the netif used without it, so a lost interrupt costs one idle
  * poll, never a hang. */
 #define WIFI_IRQ          (32u + 126u)
@@ -5583,7 +5928,7 @@ typedef struct {
 	volatile uint8_t *sdhci;
 	volatile int fired;          /* set by the handler, cleared before each arm */
 	volatile uint32_t claimed;   /* dispatches that were this controller's */
-	volatile uint32_t declined;  /* dispatches of the shared line that were not */
+	volatile uint32_t declined;  /* dispatches that were not (EMMC2's, or data interrupts) */
 } wifi_irqHandlerState_t;
 
 static struct {
@@ -5601,20 +5946,20 @@ static struct {
 } g_irq;
 
 
-static int wifi_irqHandler(unsigned int n, void *arg)
+static WIFI_IRQ_CONTEXT int wifi_irqHandler(unsigned int n, void *arg)
 {
 	wifi_irqHandlerState_t *h = arg;
 	uint32_t st = *(volatile uint32_t *)(h->sdhci + SDHCI_INT_STATUS);
 	uint32_t en = *(volatile uint32_t *)(h->sdhci + SDHCI_SIGNAL_EN);
 
 	(void)n;
-	/* SIGNAL_EN never holds anything but CARD_INT (wifi_irqSetup clears it), so
-	 * this is exactly "this controller is driving the line". */
+	/* Only CARD_INT is this handler's; buffer-ready and transfer-complete
+	 * belong to wifi_xferHandler. */
 	if ((st & en & SDHCI_INT_CARD) == 0u) {
 		h->declined++;
 		return -1;
 	}
-	*(volatile uint32_t *)(h->sdhci + SDHCI_SIGNAL_EN) = 0u;
+	wifi_sigenUpdate(h->sdhci, 0u, SDHCI_INT_CARD);
 	h->fired = 1;
 	h->claimed++;
 	return 0;
@@ -5643,7 +5988,7 @@ static int wifi_irqSetup(int want)
 	g_irq.boot_signal_en = *(volatile uint32_t *)(sdhci + SDHCI_SIGNAL_EN);
 	/* Nothing on this controller may drive the shared line before a handler
 	 * that can take it is in place. Nothing here used its interrupts so far. */
-	*(volatile uint32_t *)(sdhci + SDHCI_SIGNAL_EN) = 0u;
+	wifi_sigenUpdate(sdhci, 0u, 0xFFFFFFFFu);
 
 	if (want == 0) {
 		(void)snprintf(g_irq.why, sizeof(g_irq.why), "pollrx");
@@ -5685,12 +6030,28 @@ static int wifi_irqSetup(int want)
 }
 
 
+/* Register the data-transfer handler (see "Interrupt-driven data blocks"). Runs
+ * once, after wifi_irqSetup() has cleared SIGNAL_EN and before the message
+ * thread starts. Independent of the RX interrupt, so `pollrx` keeps it. `on`
+ * is the starting mode; `wifi pioirq 0|1` changes it at run time. */
+static void wifi_xferSetup(int on)
+{
+	g_xfer.x.sdhci = g_sdhci;
+	if ((mutexCreate(&g_xfer.lock) != EOK) || (condCreate(&g_xfer.cond) != EOK) ||
+		(interrupt(WIFI_IRQ, wifi_xferHandler, &g_xfer.x, g_xfer.cond, &g_xfer.inth) < 0)) {
+		(void)snprintf(g_xfer.why, sizeof(g_xfer.why), "interrupt() registration failed");
+		return;
+	}
+	g_xfer.ready = 1;
+	g_xfer.on = on;
+}
+
+
 /* A /dev/wifiirq read: wait for the next frame interrupt. 1 = interrupt (one
  * byte written), 0 = timeout, -EIO once `rxpoll` has switched the path off. */
 static int wifi_irqWait(void *dst, size_t size)
 {
 	volatile uint8_t *sdhci = g_irq.h.sdhci;
-	volatile uint32_t *signal_en = (volatile uint32_t *)(sdhci + SDHCI_SIGNAL_EN);
 	volatile uint32_t *status_en = (volatile uint32_t *)(sdhci + SDHCI_INT_STATUS_EN);
 	uint32_t en;
 	int got;
@@ -5708,8 +6069,8 @@ static int wifi_irqWait(void *dst, size_t size)
 	/* Restart card-interrupt detection before sampling it. SDHCI 2.2.18 has the
 	 * host clear Card Interrupt Status Enable while it services the card and set
 	 * it again afterwards; sdhci_enable_sdio_irq does the same. Only this thread
-	 * writes STATUS_EN after setup, and SIGNAL_EN is 0 here, so the handler
-	 * cannot run in between. */
+	 * writes STATUS_EN after setup, and CARD_INT is not signal-enabled here, so
+	 * the handler cannot run in between. */
 	en = *status_en;
 	*status_en = en & ~SDHCI_INT_CARD;
 	*status_en = en | SDHCI_INT_CARD;
@@ -5724,9 +6085,9 @@ static int wifi_irqWait(void *dst, size_t size)
 		 * with nobody waiting leaves the cond pending, and condWait returns at
 		 * once. A stale pending wakeup returns with fired == 0 -- a timeout. */
 		__atomic_store_n(&g_irq.h.fired, 0, __ATOMIC_SEQ_CST);
-		*signal_en = SDHCI_INT_CARD;
+		wifi_sigenUpdate(sdhci, SDHCI_INT_CARD, 0u);
 		(void)condWait(g_irq.cond, g_irq.lock, WIFI_IRQ_WAIT_US);
-		*signal_en = 0u;
+		wifi_sigenUpdate(sdhci, 0u, SDHCI_INT_CARD);
 		got = (__atomic_load_n(&g_irq.h.fired, __ATOMIC_SEQ_CST) != 0) ? 1 : 0;
 		if (got != 0) {
 			g_irq.wakes++;
@@ -5883,6 +6244,37 @@ static int wifi_rxPoll(char *out, int cap)
 	mutexUnlock(g_irq.lock);
 	(void)snprintf(g_irq.why, sizeof(g_irq.why), "rxpoll");
 	return snprintf(out, (size_t)cap, "RXPOLL ok: /dev/wifiirq reads now fail; the netif polls\n");
+}
+
+/* `pioirq 0|1`: polled or interrupt-driven data blocks from the next transfer
+ * on, for an A/B of the two in one boot. Message thread, so no transfer is in
+ * flight. The reply carries the bus times of the mode being left, and they
+ * start again from zero. */
+static int wifi_pioIrq(const char *arg, char *out, int cap)
+{
+	int want = atoi(arg), n, m;
+
+	if (g_xfer.ready == 0) {
+		return snprintf(out, (size_t)cap, "PIOIRQ error: no data interrupt (%s)\n",
+			(g_xfer.why[0] != '\0') ? g_xfer.why : "not set up");
+	}
+	if ((want != 0) && (want != 1)) {
+		return snprintf(out, (size_t)cap, "PIOIRQ error: 0 (polled) or 1 (interrupt), now %d\n", g_xfer.on);
+	}
+	n = snprintf(out, (size_t)cap, "PIOIRQ leaving %d: ", g_xfer.on);
+	if ((n < 0) || (n >= cap)) {
+		return n;
+	}
+	m = diag_busTimeLine(out + n, cap - n);
+	if ((m < 0) || (m >= (cap - n))) {
+		return n;
+	}
+	n += m;
+	g_xfer.on = want;
+	diag_busTimeReset();
+	m = snprintf(out + n, (size_t)(cap - n), "PIOIRQ ok: %s data blocks of %u bytes and more (bus times reset)\n",
+		(want != 0) ? "interrupt-driven" : "polled", (unsigned)WIFI_XFER_IRQ_MIN);
+	return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
 }
 
 
@@ -6527,6 +6919,8 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS rxbig ok=%u max_len=%u rxglom_off_rc=%d\n"
 		"WIFISTATS glom descs=%u supers=%u subframes=%u bad=%u\n"
 		"WIFISTATS pio mode=%s slow_waits=%u slow_max_us=%u timeouts=%u\n"
+		"WIFISTATS pioirq mode=%s%s%s min=%u xfers=%u irqs=%u irq_blocks=%u wakes=%u late=%u ticks=%u "
+		"rescues=%u rescue_blocks=%u errs=%u timeouts=%u\n"
 		"WIFISTATS sbwin writes=%u skips=%u\n"
 		"WIFISTATS sdio target=%u kHz sd=%u Hz hctl=0x%02x timeout=0x%x f2blk=%u hs_ups=%u hs_fallbacks=%u%s%s\n"
 		"WIFISTATS rxirq mode=%s%s%s waits=%u wakes=%u level=%u timeouts=%u\n"
@@ -6546,6 +6940,11 @@ static int wifi_stats(char *out, int cap)
 		g_glom_descs, g_glom_supers, g_glom_subs, g_glom_bad,
 		(g_pio_legacy != 0) ? "legacy" : "level", (unsigned)g_pio_slow_waits,
 		(unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
+		((g_xfer.on != 0) && (g_pio_legacy == 0)) ? "irq" : "poll",
+		(g_xfer.why[0] != '\0') ? " off=" : "", g_xfer.why, (unsigned)WIFI_XFER_IRQ_MIN,
+		(unsigned)g_xfer.xfers, (unsigned)g_xfer.x.irqs, (unsigned)g_xfer.x.irq_blocks,
+		(unsigned)g_xfer.wakes, (unsigned)g_xfer.late, (unsigned)g_xfer.ticks, (unsigned)g_xfer.rescues,
+		(unsigned)g_xfer.rescue_blocks, (unsigned)g_xfer.errs, (unsigned)g_xfer.timeouts,
 		(unsigned)g_sbwin_writes, (unsigned)g_sbwin_skips,
 		g_sdclk_khz, (unsigned)g_sdhci_sd_hz,
 		(g_sdhci != NULL) ? (unsigned)(*(volatile uint32_t *)(g_sdhci + SDHCI_HOST_CTL) & 0xffu) : 0u,
@@ -7091,6 +7490,17 @@ static void wifi_thread(void *arg)
 				else if (msg.i.size >= 6 && memcmp(msg.i.data, "rxpoll", 6) == 0) {
 					g_resp_len = wifi_rxPoll(g_resp, (int)sizeof(g_resp));
 				}
+				else if (msg.i.size >= 8 && memcmp(msg.i.data, "pioirq ", 7) == 0) {
+					char arg[16];
+					size_t an = msg.i.size - 7u;
+
+					if (an >= sizeof(arg)) {
+						an = sizeof(arg) - 1u;
+					}
+					memcpy(arg, (const char *)msg.i.data + 7, an);
+					arg[an] = '\0';
+					g_resp_len = wifi_pioIrq(arg, g_resp, (int)sizeof(g_resp));
+				}
 				else if (msg.i.size >= 3 && memcmp(msg.i.data, "mac", 3) == 0) {
 					g_resp_len = wifi_mac(g_resp, (int)sizeof(g_resp));
 				}
@@ -7157,7 +7567,7 @@ static int wifi_fwLoadOrWait(int wait)
 
 int main(int argc, char **argv)
 {
-	int selftest = 0, jointest = 0, fwbench = 0, foreground = 0, verbose = 0, rxirq = 1, ai, rc;
+	int selftest = 0, jointest = 0, fwbench = 0, foreground = 0, verbose = 0, rxirq = 1, pioirq = 0, ai, rc;
 	uint32_t port, irqport;
 	oid_t dev;
 	pid_t pid;
@@ -7229,6 +7639,12 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[ai], "hispd=1") == 0) {
 			/* keep HOST_CONTROL HISPD set above 25 MHz too (Linux clears it) */
 			g_hs_hispd = 1;
+		}
+		else if ((strcmp(argv[ai], "pioirq=0") == 0) || (strcmp(argv[ai], "pioirq=1") == 0)) {
+			/* data blocks of WIFI_XFER_IRQ_MIN bytes and more: polled (0, the
+			 * default) or moved by the interrupt handler (1); `wifi pioirq 0|1`
+			 * at run time */
+			pioirq = argv[ai][7] - '0';
 		}
 		else if (strcmp(argv[ai], "legacypio") == 0) {
 			/* the old PIO wait, for a first-load A/B across boots */
@@ -7330,6 +7746,10 @@ int main(int argc, char **argv)
 			"Controller enables at boot: status=0x%08x signal=0x%08x\n",
 			g_irq.why, (unsigned)g_irq.boot_status_en, (unsigned)g_irq.boot_signal_en);
 	}
+	wifi_xferSetup(pioirq);
+	printf("rpi4-wifi: data blocks of %u bytes and more: %s%s%s\n", (unsigned)WIFI_XFER_IRQ_MIN,
+		(g_xfer.on != 0) ? "interrupt-driven" : "polled",
+		(g_xfer.why[0] != '\0') ? "; no data interrupt: " : "", g_xfer.why);
 
 	if (portCreate(&port) != EOK) {
 		printf("rpi4-wifi: portCreate failed\n");
