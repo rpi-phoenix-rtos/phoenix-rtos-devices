@@ -453,12 +453,13 @@ typedef struct {
 	 * found). Learned in xhci_probeProtocols. */
 	unsigned ssPortLo;
 	unsigned ssPortHi;
-	/* Per-port (bit = port number) "connect announced" latch. A device
-	 * already attached before this controller's bring-up shows CCS=1 with
-	 * no fresh CSC change bit, so the change-bit-driven hub poll never
-	 * enumerates it. We synthesize a one-shot C_CONNECTION for such ports;
-	 * this latch records the ack (ClearPortFeature C_CONNECTION) so we stop
-	 * re-synthesizing, and is cleared on disconnect to allow re-announce. */
+	/* Per-port (bit = port number) connection state the hub driver last
+	 * acknowledged, with ClearPortFeature(C_CONNECTION). Whenever CCS differs
+	 * from it, a C_CONNECTION change is reported even without CSC: a device
+	 * attached before this controller's bring-up shows CCS=1 with no fresh
+	 * CSC, and a port that loses power or its device is not guaranteed to set
+	 * CSC either. Without the second half such a device was never reported
+	 * gone and stayed on the bus as a ghost whose every command failed. */
 	uint32_t portConnAnnounced;
 	/* Per-port (bit = port number) "reset was acknowledged without being
 	 * performed" latch, for an already-enabled SuperSpeed port. See
@@ -841,6 +842,16 @@ static void xhci_roothubStatusThread(void *arg)
 static int xhci_portIsSuperSpeed(const xhci_t *xhci, unsigned port)
 {
 	return ((xhci->ssPortLo != 0u) && (port >= xhci->ssPortLo) && (port <= xhci->ssPortHi)) ? 1 : 0;
+}
+
+
+/* Does the port's connection (CCS) differ from what the hub driver last acknowledged? */
+static int xhci_portConnChanged(const xhci_t *xhci, unsigned port, uint32_t portsc)
+{
+	int connected = ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) ? 1 : 0;
+	int announced = ((xhci->portConnAnnounced & (1u << port)) != 0u) ? 1 : 0;
+
+	return (connected != announced) ? 1 : 0;
 }
 
 
@@ -2491,9 +2502,12 @@ static int xhci_cmdHubSlotFixup(xhci_t *xhci, xhci_slot_t *hubSlot, usb_dev_t *h
  * the slot and enable a new one. A fresh slot context also means the speed the
  * retry's port reset negotiated is the one the next Address Device programs.
  *
- * The slot table entry stays bound to `dev`, so the retry finds it through
- * xhci_slotForDev and addresses it again. If no new slot can be had, the entry
- * is released and the retry falls back to xhci_allocSlotForDev. */
+ * The slot table entry stays bound to `dev`, so a retry finds it through
+ * xhci_slotForDev and addresses it again. The hub driver's own retry
+ * (usb/hub.c) first tears the default control pipe down, which releases the
+ * entry (xhci_slotRelease), and so gets a fresh slot from xhci_allocSlotForDev
+ * instead. If no new slot can be had here, the entry is released and a retry
+ * falls back to xhci_allocSlotForDev. */
 static void xhci_slotRenew(xhci_t *xhci, xhci_slot_t *slot, const usb_dev_t *dev)
 {
 	uint64_t *dcbaa = (uint64_t *)xhci->dcbaa;
@@ -2660,8 +2674,8 @@ static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
 		}
 	}
 
-	/* On failure the entry stays bound to `dev` on a renewed slot, so the
-	 * framework's retry addresses it again via xhci_slotForDev. */
+	/* On failure the entry stays bound to `dev` on a renewed slot (see
+	 * xhci_slotRenew for what a retry then finds). */
 	*err = xhci_addressSlot(xhci, slot, dev);
 	if (*err < 0) {
 		return NULL;
@@ -3758,11 +3772,11 @@ static int xhci_getPortStatus(usb_dev_t *hub, int port, usb_port_status_t *statu
 		status->wPortChange |= USB_PORT_STAT_C_CONNECTION;
 	}
 
-	/* Synthesize a connect change for a device attached before this
-	 * controller's bring-up (CCS=1 with no fresh CSC) so the hub driver
-	 * enumerates it; latched off by ClearPortFeature(C_CONNECTION). */
-	if (((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) &&
-		((xhci->portConnAnnounced & (1u << (unsigned)port)) == 0u)) {
+	/* Synthesize a connect change whenever the port's state differs from the
+	 * one the hub driver acknowledged (see xhci_t.portConnAnnounced), so it
+	 * enumerates a device that was already there and tears down one that went
+	 * away without a CSC. */
+	if (xhci_portConnChanged(xhci, (unsigned)port, portsc) != 0) {
 		status->wPortChange |= USB_PORT_STAT_C_CONNECTION;
 	}
 
@@ -3876,10 +3890,14 @@ static int xhci_clearPortFeature(usb_dev_t *hub, int port, uint16_t wValue)
 
 	switch (wValue) {
 		case USB_PORT_FEAT_C_CONNECTION:
-			/* Hub driver acked the connect — latch it so getHubStatus /
-			 * getPortStatus stop synthesizing C_CONNECTION for a device
-			 * that was already attached before bring-up. */
-			xhci->portConnAnnounced |= (1u << (unsigned)port);
+			/* The hub driver has seen the port in its current state: stop
+			 * synthesizing C_CONNECTION for it (see xhci_portConnChanged). */
+			if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) {
+				xhci->portConnAnnounced |= (1u << (unsigned)port);
+			}
+			else {
+				xhci->portConnAnnounced &= ~(1u << (unsigned)port);
+			}
 			xhci_portWrite32(xhci, port, XHCI_REG_OP_PORT_PORTSC, xhci_portStateNeutral(portsc) | XHCI_REG_OP_PORT_PORTSC_CSC);
 			break;
 
@@ -4183,12 +4201,63 @@ static void xhci_transferDequeue(hcd_t *hcd, usb_transfer_t *t)
 }
 
 
+/* Give back the slot of a device that is going away.
+ *
+ * Slot table entries are matched by device pointer and there are only eight,
+ * so an entry left bound to a freed usb_dev_t is lost for good -- a few
+ * unplug/replug cycles exhaust the table -- or, worse, is handed to a new
+ * device that happens to be allocated at the same address, still holding the
+ * old device's slot context. Disable Slot is valid in every slot state but
+ * Disabled, so it also stops whatever the old device's endpoints were doing.
+ * The entry's buffers are kept and reused (xhci_allocSlotSpace). The primary
+ * entry is never claimed again once its slot is gone (xhci_slotForDev), so a
+ * later device simply gets an entry of its own. */
+static void xhci_slotRelease(xhci_t *xhci, const usb_dev_t *dev)
+{
+	uint64_t *dcbaa = (uint64_t *)xhci->dcbaa;
+	xhci_slot_t *slot;
+	unsigned s;
+
+	for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
+		slot = &xhci->slots[s];
+		if (slot->dev != dev) {
+			continue;
+		}
+
+		if ((slot->slotId != 0u) && (slot->slotId <= xhci->nslots)) {
+			(void)xhci_cmdDisableSlot(xhci, slot->slotId);
+			dcbaa[slot->slotId] = 0u;
+		}
+
+		slot->slotId = 0u;
+		slot->addressed = 0u;
+		slot->hubFixedUp = 0u;
+		slot->dev = NULL;
+		if (xhci->cur == slot) {
+			xhci->cur = NULL;
+		}
+	}
+}
+
+
 static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 {
 	xhci_pipePriv_t *priv;
 	xhci_t *xhci = (xhci_t *)hcd->priv;
 
-	if ((pipe == NULL) || (pipe->hcdpriv == NULL)) {
+	if (pipe == NULL) {
+		return;
+	}
+
+	/* The device's own default control pipe is torn down only when the device
+	 * goes away: usb_devFree(), or the hub driver before it enumerates the port
+	 * again (usb/hub.c). Release its slot then. A driver's control pipe is a
+	 * copy of it (usb/drv.c) and must not take the device's slot down. */
+	if ((xhci != NULL) && (pipe->dev != NULL) && (pipe == pipe->dev->ctrlPipe) && !usb_isRoothub(pipe->dev)) {
+		xhci_slotRelease(xhci, pipe->dev);
+	}
+
+	if (pipe->hcdpriv == NULL) {
 		return;
 	}
 
@@ -4209,9 +4278,7 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 	}
 
 	/* Only interrupt and bulk pipes get here: they are the only ones xhci_initPipe
-	 * gives a private part. The default control pipe has none, so its teardown
-	 * returns above and the device's slot is not released here; a failed Address
-	 * Device replaces its slot itself (xhci_slotRenew). */
+	 * gives a private part. */
 	if (priv->ring != NULL) {
 		usb_freeAligned(priv->ring, priv->ringSize);
 	}
@@ -4238,17 +4305,16 @@ static uint32_t xhci_getHubStatus(usb_dev_t *hub)
 
 		portsc = xhci_portRead32(xhci, i + 1, XHCI_REG_OP_PORT_PORTSC);
 		if ((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) == 0u) {
-			/* Disconnected: drop the latches so a future re-attach
-			 * re-announces and re-resets. */
-			xhci->portConnAnnounced &= ~bit;
+			/* Disconnected: a future re-attach resets again. The connect
+			 * latch is left to the hub driver's acknowledgement, so that a
+			 * device which disappeared without a CSC is still reported. */
 			xhci->portResetSynth &= ~bit;
 		}
-		/* Report a port to the hub driver on a real RW1C change OR when a
-		 * device is attached (CCS=1) that we have not yet announced — the
-		 * latter covers a device already attached before bring-up (no
-		 * fresh CSC), which the change-bit-only logic otherwise ignored. */
+		/* Report a port to the hub driver on a real RW1C change OR when its
+		 * connection state differs from the one the hub driver acknowledged:
+		 * a device attached before bring-up, or one gone without a CSC. */
 		if (((portsc & XHCI_REG_OP_PORT_PORTSC_RW1C) != 0u) ||
-			(((portsc & XHCI_REG_OP_PORT_PORTSC_CCS) != 0u) && ((xhci->portConnAnnounced & bit) == 0u))) {
+			(xhci_portConnChanged(xhci, (unsigned)(i + 1), portsc) != 0)) {
 			status |= bit;
 		}
 	}
