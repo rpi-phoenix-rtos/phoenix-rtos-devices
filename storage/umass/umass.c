@@ -482,7 +482,8 @@ static int _umass_scsiInit(umass_dev_t *dev)
 
 /* Read the MBR into the device's staging buffer and hand back a pointer to it.
  * Used to configure partition 0 only and silently ignore the rest; the caller
- * now walks all four entries. */
+ * now walks all four entries. Returns -EIO when sector 0 cannot be read and
+ * -ENOENT when it holds no partition table. */
 static int _umass_readMBR(umass_dev_t *dev, mbr_t **out)
 {
 	scsi_cdb10_t readcmd = {
@@ -492,19 +493,50 @@ static int _umass_readMBR(umass_dev_t *dev, mbr_t **out)
 	mbr_t *mbr;
 	int ret;
 
+	/* A command that failed every retry returns 0, not an error: check the length */
 	ret = _umass_transmit(dev, &readcmd, sizeof(readcmd), dev->buffer, UMASS_SECTOR_SIZE, usb_dir_in);
-	if (ret < 0) {
+	if (ret != UMASS_SECTOR_SIZE) {
 		LOG_ERROR("reading MBR failed");
-		return -1;
+		return -EIO;
 	}
 
 	mbr = (mbr_t *)dev->buffer;
 	if (mbr->magic != MBR_MAGIC) {
 		LOG_ERROR("bad MBR magic: 0x%x", mbr->magic);
-		return -1;
+		return -ENOENT;
 	}
 
 	*out = mbr;
+
+	return 0;
+}
+
+
+/* The disk's size in sectors, from READ CAPACITY(10). Only 512-byte sectors and
+ * disks below 2 TiB (what READ CAPACITY(10) can describe) are accepted. */
+static int _umass_readCapacity(umass_dev_t *dev, uint32_t *sectors)
+{
+	scsi_cdb10_t capcmd = { .opcode = 0x25 };
+	uint32_t lastLba, blockLen;
+	int ret;
+
+	ret = _umass_transmit(dev, &capcmd, sizeof(capcmd), dev->buffer, 8, usb_dir_in);
+	if (ret != 8) {
+		LOG_ERROR("READ CAPACITY failed");
+		return -EIO;
+	}
+
+	memcpy(&lastLba, dev->buffer, sizeof(lastLba));
+	memcpy(&blockLen, dev->buffer + sizeof(lastLba), sizeof(blockLen));
+	lastLba = ntohl(lastLba);
+	blockLen = ntohl(blockLen);
+
+	if ((blockLen != UMASS_SECTOR_SIZE) || (lastLba == 0xffffffffu)) {
+		LOG_ERROR("unsupported geometry: last LBA 0x%x, %u-byte sectors", lastLba, blockLen);
+		return -ENOTSUP;
+	}
+
+	*sectors = lastLba + 1u;
 
 	return 0;
 }
@@ -1323,9 +1355,13 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 	int err;
 	umass_dev_t *dev;
 	mbr_t *mbr;
+	const pentry_t *pents;
+	pentry_t whole;
 	oid_t oid;
-	unsigned i;
+	uint32_t sectors;
+	unsigned i, npents;
 	unsigned nparts = 0u;
+	bool wholeDisk = true;
 
 	mutexLock(umass_common.lock);
 
@@ -1379,10 +1415,37 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 		}
 
 		err = _umass_readMBR(dev, &mbr);
-		if (err < 0) {
+		if (err == 0) {
+			for (i = 0u; i < MBR_PARTITIONS; ++i) {
+				if ((mbr->pent[i].type != PENTRY_EMPTY) && (mbr->pent[i].sectors != 0u)) {
+					wholeDisk = false;
+				}
+			}
+		}
+		else if (err != -ENOENT) {
 			fprintf(stderr, "umass: reading the partition table failed\n");
 			_umass_devFree(dev);
 			break;
+		}
+
+		/* No partition table, or an empty one: one node for the whole disk, so
+		 * a blank or wiped stick can still be read, tested and partitioned
+		 * rather than being dropped. */
+		if (wholeDisk) {
+			err = _umass_readCapacity(dev, &sectors);
+			if (err < 0) {
+				fprintf(stderr, "umass: no partition table and no disk size\n");
+				_umass_devFree(dev);
+				break;
+			}
+			memset(&whole, 0, sizeof(whole));
+			whole.sectors = sectors;
+			pents = &whole;
+			npents = 1u;
+		}
+		else {
+			pents = mbr->pent;
+			npents = MBR_PARTITIONS;
 		}
 
 		/* One device node per NON-EMPTY partition entry. This used to take
@@ -1394,10 +1457,10 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 		 * each later one gets its own node pointing back at that owner, because
 		 * a stick has exactly one set of bulk pipes and its SCSI commands must
 		 * stay serialised across partitions. */
-		for (i = 0u; i < MBR_PARTITIONS; ++i) {
+		for (i = 0u; i < npents; ++i) {
 			umass_dev_t *pdev;
 
-			if ((mbr->pent[i].type == PENTRY_EMPTY) || (mbr->pent[i].sectors == 0u)) {
+			if (!wholeDisk && ((pents[i].type == PENTRY_EMPTY) || (pents[i].sectors == 0u))) {
 				continue;
 			}
 
@@ -1415,7 +1478,7 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 				pdev->instance = *insertion;
 			}
 
-			_umass_partSet(pdev, &mbr->pent[i], i);
+			_umass_partSet(pdev, &pents[i], i);
 			_umass_cacheInit(pdev);
 
 			oid.port = umass_common.msgport;
@@ -1428,9 +1491,16 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 				break;
 			}
 
-			printf("umass: %s = partition %u, type 0x%02x, %u sectors (%u MiB)\n",
-				pdev->path, i, mbr->pent[i].type, pdev->part.sectors,
-				(unsigned)((uint64_t)pdev->part.sectors * UMASS_SECTOR_SIZE / (1024u * 1024u)));
+			if (wholeDisk) {
+				printf("umass: %s = whole disk (no partition table), %u sectors (%u MiB)\n",
+					pdev->path, pdev->part.sectors,
+					(unsigned)((uint64_t)pdev->part.sectors * UMASS_SECTOR_SIZE / (1024u * 1024u)));
+			}
+			else {
+				printf("umass: %s = partition %u, type 0x%02x, %u sectors (%u MiB)\n",
+					pdev->path, i, pents[i].type, pdev->part.sectors,
+					(unsigned)((uint64_t)pdev->part.sectors * UMASS_SECTOR_SIZE / (1024u * 1024u)));
+			}
 
 			if (nparts == 0u) {
 				event->deviceCreated = true;
@@ -1443,7 +1513,7 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 		}
 
 		if (nparts == 0u) {
-			fprintf(stderr, "umass: no usable partition in the table\n");
+			fprintf(stderr, "umass: no device node created\n");
 			_umass_devFree(dev);
 			err = -ENOENT;
 			break;
