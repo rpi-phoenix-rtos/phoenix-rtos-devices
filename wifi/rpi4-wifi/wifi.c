@@ -410,6 +410,23 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
+	if (argc >= 3 && strcmp(argv[1], "pioirq") == 0) {
+		/* Polled (0) or interrupt-driven (1) SDIO data blocks of 256 bytes and
+		 * more until reboot, for a CPU-cost A/B within one boot. */
+		int n = snprintf(cmd, sizeof(cmd), "pioirq %s", argv[2]);
+		if (n < 0 || n >= (int)sizeof(cmd)) {
+			printf("wifi: argument too long\n");
+			return 2;
+		}
+		fd = open(WIFI_DEV, O_RDWR);
+		if (fd < 0) {
+			printf("wifi: cannot open %s (is rpi4-wifi running?)\n", WIFI_DEV);
+			return 1;
+		}
+		rc = cmd_run(fd, cmd, n);
+		close(fd);
+		return rc;
+	}
 	if ((argc >= 2) && ((strcmp(argv[1], "iovar") == 0) || (strcmp(argv[1], "ioctl") == 0) ||
 			(strcmp(argv[1], "atjoin") == 0) || (strcmp(argv[1], "country") == 0) ||
 			(strcmp(argv[1], "bw") == 0) || (strcmp(argv[1], "chanspecs") == 0) ||
@@ -541,6 +558,7 @@ int main(int argc, char **argv)
 	       "  wifi rxpoll (RX interrupt off until reboot; the netif polls) |\n"
 	       "  wifi sdclk <kHz> (SDIO data clock until reboot: 50000 = 41.67 MHz, 25000) |\n"
 	       "  wifi f2blk <64|128|256|512> (SDIO data block size until reboot) |\n"
+	       "  wifi pioirq <0|1> (SDIO data blocks >= 256 bytes polled or by interrupt) |\n"
 	       "  wifi batch [0|1] (frames per message between netif and daemon: 1 = several,\n"
 	       "              0 = one; the netif follows within ~3 s; see WIFISTATS ipc)\n"
 	       "radio (control commands: run them between transfers, not during one):\n"
