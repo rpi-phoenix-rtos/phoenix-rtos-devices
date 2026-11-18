@@ -2502,9 +2502,12 @@ static int xhci_cmdHubSlotFixup(xhci_t *xhci, xhci_slot_t *hubSlot, usb_dev_t *h
  * the slot and enable a new one. A fresh slot context also means the speed the
  * retry's port reset negotiated is the one the next Address Device programs.
  *
- * The slot table entry stays bound to `dev`, so the retry finds it through
- * xhci_slotForDev and addresses it again. If no new slot can be had, the entry
- * is released and the retry falls back to xhci_allocSlotForDev. */
+ * The slot table entry stays bound to `dev`, so a retry finds it through
+ * xhci_slotForDev and addresses it again. The hub driver's own retry
+ * (usb/hub.c) first tears the default control pipe down, which releases the
+ * entry (xhci_slotRelease), and so gets a fresh slot from xhci_allocSlotForDev
+ * instead. If no new slot can be had here, the entry is released and a retry
+ * falls back to xhci_allocSlotForDev. */
 static void xhci_slotRenew(xhci_t *xhci, xhci_slot_t *slot, const usb_dev_t *dev)
 {
 	uint64_t *dcbaa = (uint64_t *)xhci->dcbaa;
@@ -2671,8 +2674,8 @@ static xhci_slot_t *xhci_allocSlotForDev(xhci_t *xhci, usb_dev_t *dev, int *err)
 		}
 	}
 
-	/* On failure the entry stays bound to `dev` on a renewed slot, so the
-	 * framework's retry addresses it again via xhci_slotForDev. */
+	/* On failure the entry stays bound to `dev` on a renewed slot (see
+	 * xhci_slotRenew for what a retry then finds). */
 	*err = xhci_addressSlot(xhci, slot, dev);
 	if (*err < 0) {
 		return NULL;
@@ -4198,12 +4201,63 @@ static void xhci_transferDequeue(hcd_t *hcd, usb_transfer_t *t)
 }
 
 
+/* Give back the slot of a device that is going away.
+ *
+ * Slot table entries are matched by device pointer and there are only eight,
+ * so an entry left bound to a freed usb_dev_t is lost for good -- a few
+ * unplug/replug cycles exhaust the table -- or, worse, is handed to a new
+ * device that happens to be allocated at the same address, still holding the
+ * old device's slot context. Disable Slot is valid in every slot state but
+ * Disabled, so it also stops whatever the old device's endpoints were doing.
+ * The entry's buffers are kept and reused (xhci_allocSlotSpace). The primary
+ * entry is never claimed again once its slot is gone (xhci_slotForDev), so a
+ * later device simply gets an entry of its own. */
+static void xhci_slotRelease(xhci_t *xhci, const usb_dev_t *dev)
+{
+	uint64_t *dcbaa = (uint64_t *)xhci->dcbaa;
+	xhci_slot_t *slot;
+	unsigned s;
+
+	for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
+		slot = &xhci->slots[s];
+		if (slot->dev != dev) {
+			continue;
+		}
+
+		if ((slot->slotId != 0u) && (slot->slotId <= xhci->nslots)) {
+			(void)xhci_cmdDisableSlot(xhci, slot->slotId);
+			dcbaa[slot->slotId] = 0u;
+		}
+
+		slot->slotId = 0u;
+		slot->addressed = 0u;
+		slot->hubFixedUp = 0u;
+		slot->dev = NULL;
+		if (xhci->cur == slot) {
+			xhci->cur = NULL;
+		}
+	}
+}
+
+
 static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 {
 	xhci_pipePriv_t *priv;
 	xhci_t *xhci = (xhci_t *)hcd->priv;
 
-	if ((pipe == NULL) || (pipe->hcdpriv == NULL)) {
+	if (pipe == NULL) {
+		return;
+	}
+
+	/* The device's own default control pipe is torn down only when the device
+	 * goes away: usb_devFree(), or the hub driver before it enumerates the port
+	 * again (usb/hub.c). Release its slot then. A driver's control pipe is a
+	 * copy of it (usb/drv.c) and must not take the device's slot down. */
+	if ((xhci != NULL) && (pipe->dev != NULL) && (pipe == pipe->dev->ctrlPipe) && !usb_isRoothub(pipe->dev)) {
+		xhci_slotRelease(xhci, pipe->dev);
+	}
+
+	if (pipe->hcdpriv == NULL) {
 		return;
 	}
 
@@ -4224,9 +4278,7 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 	}
 
 	/* Only interrupt and bulk pipes get here: they are the only ones xhci_initPipe
-	 * gives a private part. The default control pipe has none, so its teardown
-	 * returns above and the device's slot is not released here; a failed Address
-	 * Device replaces its slot itself (xhci_slotRenew). */
+	 * gives a private part. */
 	if (priv->ring != NULL) {
 		usb_freeAligned(priv->ring, priv->ringSize);
 	}
