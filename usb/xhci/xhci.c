@@ -784,9 +784,13 @@ static void xhci_roothubStatusThread(void *arg)
 			/* Single non-blocking poll of the shared event ring (locked,
 			 * stash-aware) for this interrupt endpoint's completion. The
 			 * dispatcher owns the dequeue/ERDP/cycle and the controller keeps
-			 * running (keepRunning) — so no ERDP-reset or R/S=0 here. */
+			 * running (keepRunning) — so no ERDP-reset or R/S=0 here.
+			 * The timeout must be 0: with 1 ms the dispatcher fast-polls an idle
+			 * endpoint with 51 sleeps of 20 us on every pass, a timer wakeup
+			 * every few tens of microseconds per pending endpoint. This loop's
+			 * own 1 ms sleep is the poll period. */
 			if (xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, priv->pendingTrbPhys,
-					priv->slotId, priv->endpointId, 1u, &ev) == EOK) {
+					priv->slotId, priv->endpointId, 0u, &ev) == EOK) {
 				t = priv->pendingTransfer;
 				completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
 					XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
@@ -1741,8 +1745,8 @@ static int xhci_eventStashable(const xhci_trb_t *ev)
  *
  * Match key: (wantType, wantParam, wantEp) — see xhci_eventMatch. Returns EOK
  * with *out filled, or -ETIMEDOUT if no matching event lands within timeoutMs.
- * timeoutMs==1 makes this a single non-blocking poll pass (used by the roothub
- * thread, which has its own poll loop). */
+ * timeoutMs==0 makes this a single non-blocking pass that never sleeps (used by
+ * the roothub thread, which has its own 1 ms poll loop). */
 static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint8_t wantSlot, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out)
 {
 	xhci_trb_t *ring = (xhci_trb_t *)xhci->eventRing;
@@ -1762,7 +1766,7 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 	 * transfer lands, then fall back to the 1 ms cadence so a genuinely slow or
 	 * absent completion does not burn a core. The timeout is still expressed and
 	 * honoured in milliseconds. */
-	while (waitedUs <= budgetUs) {
+	for (;;) {
 		mutexLock(xhci->eventLock);
 
 		/* The other consumer may already have pulled our event off the ring. */
@@ -1845,6 +1849,12 @@ static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, 
 		}
 
 		mutexUnlock(xhci->eventLock);
+
+		/* Stop before sleeping once the budget is spent: a sleep after the
+		 * last look could not change the answer. */
+		if (waitedUs >= budgetUs) {
+			break;
+		}
 
 		{
 			unsigned stepUs = (waitedUs < XHCI_EVENT_FASTPOLL_US) ? XHCI_EVENT_POLL_STEP_US : 1000u;
