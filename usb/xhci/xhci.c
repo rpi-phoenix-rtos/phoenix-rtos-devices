@@ -234,6 +234,9 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_TRB_TYPE_CMD_DISABLE_SLOT 10u
 #define XHCI_TRB_TYPE_CMD_ADDRESS_DEVICE 11u
 #define XHCI_TRB_TYPE_CMD_CONFIGURE_ENDPOINT 12u
+#define XHCI_TRB_TYPE_CMD_RESET_ENDPOINT 14u
+#define XHCI_TRB_TYPE_CMD_STOP_ENDPOINT 15u
+#define XHCI_TRB_TYPE_CMD_SET_TR_DEQUEUE 16u
 #define XHCI_TRB_TYPE_CMD_NO_OP  23u
 #define XHCI_TRB_TYPE_EVENT_TRANSFER 32u
 #define XHCI_TRB_TYPE_EVENT_CMD_COMPLETION 33u
@@ -252,8 +255,16 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_CMD_TRB_ADDRESS_DEVICE_CONTROL_SLOTID__SHIFT 24u
 #define XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_DC (1u << 9)
 #define XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_SLOTID__SHIFT 24u
+/* Reset Endpoint, Stop Endpoint and Set TR Dequeue Pointer share this layout
+ * (xHCI 1.2 sections 6.4.3.7-6.4.3.9). */
+#define XHCI_CMD_TRB_ENDPOINT_CONTROL_EPID__SHIFT 16u
+#define XHCI_CMD_TRB_ENDPOINT_CONTROL_SLOTID__SHIFT 24u
+/* Reset Endpoint: Transfer State Preserve -- keep the data toggle / sequence number. */
+#define XHCI_CMD_TRB_RESET_ENDPOINT_CONTROL_TSP (1u << 9)
 #define XHCI_TRB_COMPLETION_CODE_SUCCESS 1u
+#define XHCI_TRB_COMPLETION_CODE_STALL 6u
 #define XHCI_TRB_COMPLETION_CODE_SHORT_PACKET 13u
+#define XHCI_TRB_COMPLETION_CODE_CONTEXT_STATE_ERROR 19u
 #define XHCI_REG_CAP_HCCPARAMS1_XECP__SHIFT 16u
 #define XHCI_XECP_ID_SUPPORTED_PROTOCOL 2u
 #define XHCI_PORT_SPEED_FULL     1u
@@ -273,6 +284,13 @@ static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #define XHCI_SLOT_CTX_TT_HUB_SLOT_ID__SHIFT 0u    /* word2 bits 0-7 */
 #define XHCI_SLOT_CTX_TT_PORT_NUMBER__SHIFT 8u    /* word2 bits 8-15 */
 #define XHCI_SLOT_CTX_TT_THINK_TIME__SHIFT 16u    /* word2 bits 16-17 */
+/* Endpoint Context dword 0, bits 2:0 (xHCI 1.2 section 6.2.3), as the
+ * controller reports it in the Output Device Context. */
+#define XHCI_EP_CTX_STATE__MASK  0x7u
+#define XHCI_EP_STATE_RUNNING    1u
+#define XHCI_EP_STATE_HALTED     2u
+#define XHCI_EP_STATE_STOPPED    3u
+#define XHCI_EP_STATE_ERROR      4u
 #define XHCI_EP_CTX_CERR__SHIFT  1u
 #define XHCI_EP_CTX_TYPE__SHIFT  3u
 #define XHCI_EP_CTX_TYPE_CONTROL 4u
@@ -437,7 +455,9 @@ typedef struct {
 typedef struct {
 	void *mmio;
 	size_t mapSz;
-	char statusStack[2048] __attribute__((aligned(8)));
+	/* The status thread also runs endpoint recovery (commands, and fprintf on
+	 * failure), so it gets more than a bare poll loop would need. */
+	char statusStack[4096] __attribute__((aligned(8)));
 	uint8_t caplength;
 	uint16_t version;
 	uint32_t hcsparams1;
@@ -505,6 +525,11 @@ typedef struct {
 	uint32_t eventRingTrbs;
 	uint32_t eventCycleState; /* consumer cycle state (CCS) for the shared event-ring dequeue */
 	uint32_t eventDeq;        /* shared event-ring dequeue index (xhci_eventAwait) */
+	handle_t cmdLock;         /* serialises the command ring producer (xhci_cmdRun) */
+	handle_t pipeLock;        /* guards slots[].pipes[] and the hand-off of an interrupt
+	                             pipe's pendingTransfer (see xhci_roothubStatusThread) */
+	void *epInputCtx;         /* input context private to xhci_epResetSequence */
+	uint64_t epInputCtxPhys;
 	handle_t eventLock;       /* serialises shared event-ring consumption between the
 	                             enumeration path (cmd/ep0) and the roothub status thread */
 	xhci_trb_t eventStash[XHCI_EVENT_STASH_MAX]; /* events consumed for the *other* consumer,
@@ -538,7 +563,11 @@ typedef struct xhci_pipePriv {
 	uint8_t endpointId;
 	uint8_t endpointType;
 	usb_transfer_t *pendingTransfer;
-	uint64_t pendingTrbPhys;
+	uint64_t pendingTdPhys;   /* first TRB of the TD in flight */
+	uint64_t pendingTrbPhys;  /* last TRB of the TD in flight */
+	xhci_ep_ctx_t epCtx;      /* endpoint context as configured, for xhci_epResetSequence */
+	uint8_t failed;           /* recovery failed: the ring state is unknown, refuse new TDs */
+	volatile uint8_t closing; /* xhci_pipeDestroy is tearing this pipe down */
 } xhci_pipePriv_t;
 
 
@@ -546,6 +575,9 @@ static uint32_t xhci_getHubStatus(usb_dev_t *hub);
 static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId);
 static int xhci_enterHaltedState(xhci_t *xhci);
 static xhci_slot_t *xhci_findSlotForDev(xhci_t *xhci, usb_dev_t *dev);
+static int xhci_epRecover(xhci_t *xhci, uint8_t slotId, uint8_t epId, uint64_t dequeue, int keepSequence);
+static uint64_t xhci_pipeDequeue(const xhci_pipePriv_t *priv);
+static int xhci_transferErr(uint32_t completion);
 
 
 static inline uint8_t xhci_read8(xhci_t *xhci, uintptr_t off)
@@ -722,6 +754,10 @@ static void xhci_destroy(xhci_t *xhci)
 		usb_freeAligned(xhci->inputCtx, xhci->inputCtxSize);
 	}
 
+	if (xhci->epInputCtx != NULL) {
+		usb_freeAligned(xhci->epInputCtx, xhci->inputCtxSize);
+	}
+
 	free(xhci);
 }
 
@@ -765,8 +801,19 @@ static void xhci_roothubStatusThread(void *arg)
 		 * slots[0], and no longer one pipe per slot. */
 		for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
 			for (e = 1u; e <= XHCI_MAX_ENDPOINTS; ++e) {
+			/* Unlocked look first: almost every entry is empty, and this loop
+			 * runs every millisecond while a transfer is outstanding. */
+			if (xhci->slots[s].pipes[e] == NULL) {
+				continue;
+			}
+
+			/* pipeLock keeps the pipe alive (xhci_pipeDestroy) and makes the
+			 * hand-off of pendingTransfer one-way (xhci_transferDequeue) while
+			 * this pass looks at it. */
+			mutexLock(xhci->pipeLock);
 			priv = xhci->slots[s].pipes[e];
 			if ((priv == NULL) || (priv->pendingTransfer == NULL)) {
+				mutexUnlock(xhci->pipeLock);
 				continue;
 			}
 
@@ -777,10 +824,12 @@ static void xhci_roothubStatusThread(void *arg)
 			 * and was SLOWER than the 1 ms poll this was meant to replace.
 			 * One owner per endpoint type. */
 			if (priv->endpointType != XHCI_EP_CTX_TYPE_INTERRUPT_IN) {
+				mutexUnlock(xhci->pipeLock);
 				continue;
 			}
 
 			sleepUs = 1000u;
+			t = NULL;
 			/* Single non-blocking poll of the shared event ring (locked,
 			 * stash-aware) for this interrupt endpoint's completion. The
 			 * dispatcher owns the dequeue/ERDP/cycle and the controller keeps
@@ -792,16 +841,27 @@ static void xhci_roothubStatusThread(void *arg)
 					XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
 				residual = ev.status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
 
-				if ((residual <= t->size) &&
-					((completion == XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
-					(completion == XHCI_TRB_COMPLETION_CODE_SHORT_PACKET))) {
-					ret = (int)(t->size - residual);
+				if ((completion == XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
+					(completion == XHCI_TRB_COMPLETION_CODE_SHORT_PACKET)) {
+					ret = (residual <= t->size) ? (int)(t->size - residual) : -EIO;
 				}
 				else {
-					ret = -ENODEV;
+					/* The endpoint halted (a stall, or a transaction error once
+					 * the retry count ran out): until it is reset, every later
+					 * report on it would wait forever. Done before the transfer
+					 * is released, so no new TD can be queued in the meantime. */
+					ret = xhci_transferErr(completion);
+					if (xhci_epRecover(xhci, priv->slotId, priv->endpointId, xhci_pipeDequeue(priv),
+							completion != XHCI_TRB_COMPLETION_CODE_STALL) < 0) {
+						priv->failed = 1u;
+					}
 				}
 
 				priv->pendingTransfer = NULL;
+			}
+			mutexUnlock(xhci->pipeLock);
+
+			if (t != NULL) {
 				usb_transferFinished(t, ret);
 			}
 			}
@@ -943,6 +1003,24 @@ static int xhci_map(hcd_t *hcd, xhci_t **xhcip)
 	 * enumeration path and the roothub status thread. Created before any command
 	 * is issued (the rig handoff's EnableSlot is the first event consumer). */
 	if (mutexCreate(&xhci->eventLock) != 0) {
+		free(xhci);
+		return -ENOMEM;
+	}
+
+	/* Commands are issued from the hub thread (enumeration), class driver
+	 * threads (endpoint configuration and recovery) and the roothub status
+	 * thread (interrupt endpoint recovery); the command ring has one producer
+	 * index, so they take turns. Lock order: pipeLock, then cmdLock, then
+	 * eventLock. */
+	if (mutexCreate(&xhci->cmdLock) != 0) {
+		resourceDestroy(xhci->eventLock);
+		free(xhci);
+		return -ENOMEM;
+	}
+
+	if (mutexCreate(&xhci->pipeLock) != 0) {
+		resourceDestroy(xhci->cmdLock);
+		resourceDestroy(xhci->eventLock);
 		free(xhci);
 		return -ENOMEM;
 	}
@@ -1926,13 +2004,22 @@ static int xhci_cmdRingRecover(xhci_t *xhci)
 }
 
 
-static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId)
+/* Run one command and wait for its completion. The caller holds cmdLock.
+ *
+ * `code`, when not NULL, receives the completion code (0 if none arrived) and
+ * a failed completion is left for the caller to report: the endpoint recovery
+ * path expects Context State Error in a race and handles it. */
+static int _xhci_cmdRun(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId, uint32_t *code)
 {
 	xhci_trb_t *cmd;
 	xhci_trb_t ev;
 	uint64_t cmdPhys;
 	uint32_t completion;
 	int err;
+
+	if (code != NULL) {
+		*code = 0u;
+	}
 
 	/* Persistent command-ring producer. The controller's internal command
 	 * dequeue advances past each consumed command and is NOT rewound by a
@@ -2031,6 +2118,9 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 
 	/* TRB type + parameter were already matched by xhci_eventAwait. */
 	completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >> XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+	if (code != NULL) {
+		*code = completion;
+	}
 
 	if (slotId != NULL) {
 		*slotId = (ev.control & XHCI_CMD_COMPLETION_EVENT_TRB_CONTROL_SLOTID__MASK) >>
@@ -2055,11 +2145,31 @@ static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint3
 	memset(cmd, 0, sizeof(*cmd));
 
 	if (completion != XHCI_TRB_COMPLETION_CODE_SUCCESS) {
-		fprintf(stderr, "xhci: command completion code %u\n", completion);
+		if (code == NULL) {
+			fprintf(stderr, "xhci: command completion code %u\n", completion);
+		}
 		return -ENODEV;
 	}
 
 	return EOK;
+}
+
+
+static int xhci_cmdRun(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId, uint32_t *code)
+{
+	int err;
+
+	mutexLock(xhci->cmdLock);
+	err = _xhci_cmdRun(xhci, parameter, status, control, slotId, code);
+	mutexUnlock(xhci->cmdLock);
+
+	return err;
+}
+
+
+static int xhci_cmdExec(xhci_t *xhci, uint64_t parameter, uint32_t status, uint32_t control, uint8_t *slotId)
+{
+	return xhci_cmdRun(xhci, parameter, status, control, slotId, NULL);
 }
 
 
@@ -2146,6 +2256,191 @@ static int xhci_cmdConfigureEndpoint(xhci_t *xhci, xhci_slot_t *slot, int deconf
 }
 
 
+/* Endpoint error recovery (xHCI 1.2 sections 4.6.8-4.6.10, 4.10.2).
+ *
+ * A transfer that ends in a STALL or in a transaction error past its retry
+ * count halts the endpoint, and the controller then does nothing on it until
+ * software resets it. A transfer that never completes leaves its TD on the
+ * ring, still pointing at a buffer the caller frees as soon as the transfer is
+ * reported finished. Both are cleared the same way:
+ *
+ *   1. bring the endpoint to Stopped -- Reset Endpoint if it is Halted, Stop
+ *      Endpoint if it is Running (xhci_epStop);
+ *   2. drop whatever transfer events the dead TD still produced, so they
+ *      cannot complete the next transfer on that endpoint (xhci_epDrainEvents);
+ *   3. Set TR Dequeue Pointer to the producer's own position, which skips
+ *      every TRB the producer has written.
+ *
+ * Only one TD is ever in flight per endpoint here, so the producer position is
+ * exactly "just past the failed TD". It is also never a Link TRB (the
+ * producers wrap eagerly) and its cycle bit is the producer's, never the one
+ * written back in the endpoint context -- the VL805 gets both of those wrong
+ * when it has to work them out itself. */
+
+
+/* Recovery diagnostics are worth seeing, but a device that keeps failing must
+ * not flood the UART (see the transfer-timeout reports in xhci_ep0ControlRead). */
+static int xhci_recoveryLog(void)
+{
+	static unsigned logged = 0u;
+
+	if (logged >= 32u) {
+		return 0;
+	}
+
+	if (++logged == 32u) {
+		fprintf(stderr, "xhci: endpoint recovery: suppressing further reports\n");
+		return 0;
+	}
+
+	return 1;
+}
+
+
+static xhci_slot_t *xhci_slotById(xhci_t *xhci, uint8_t slotId)
+{
+	unsigned i;
+
+	if (slotId == 0u) {
+		return NULL;
+	}
+
+	for (i = 0u; i < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++i) {
+		if ((xhci->slots[i].slotId == slotId) && (xhci->slots[i].devCtx != NULL)) {
+			return &xhci->slots[i];
+		}
+	}
+
+	return NULL;
+}
+
+
+/* The endpoint state the controller last wrote to the Output Device Context. */
+static uint32_t xhci_epState(const xhci_slot_t *slot, uint8_t epId)
+{
+	const volatile xhci_dev_ctx_t *ctx = (const volatile xhci_dev_ctx_t *)slot->devCtx;
+
+	return ctx->ep[epId - 1u].epState_mult_streams_interval & XHCI_EP_CTX_STATE__MASK;
+}
+
+
+static int xhci_cmdEndpoint(xhci_t *xhci, uint32_t type, uint32_t flags, uint8_t slotId, uint8_t epId, uint64_t parameter, uint32_t *code)
+{
+	return xhci_cmdRun(xhci, parameter, 0u,
+		(type << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) | flags |
+			((uint32_t)epId << XHCI_CMD_TRB_ENDPOINT_CONTROL_EPID__SHIFT) |
+			((uint32_t)slotId << XHCI_CMD_TRB_ENDPOINT_CONTROL_SLOTID__SHIFT),
+		NULL, code);
+}
+
+
+/* Make sure the controller is no longer working on an endpoint: bring it to the
+ * Stopped state, whatever it was doing (a Disabled endpoint is left as it is,
+ * and then fails the Set TR Dequeue Pointer that follows). Reset Endpoint
+ * is only valid on a Halted endpoint and Stop Endpoint only on a Running one, and
+ * the endpoint can change state under the command (halt while being stopped):
+ * the controller then answers Context State Error, and the state is read again.
+ *
+ * A Halted endpoint is reset with its data toggle / sequence number kept when
+ * `keepSequence` is set (xHCI 1.2 section 4.6.8.1). That is right after a
+ * transaction error: no packet of the failed transaction was acknowledged, so
+ * the device has not advanced its toggle either -- and a device that is not
+ * halted is never told to reset it. After a STALL the device resets its toggle
+ * when the class driver clears the halt (USB 2.0 section 9.4.5), so the host
+ * resets its own. */
+static int xhci_epStop(xhci_t *xhci, xhci_slot_t *slot, uint8_t epId, int keepSequence)
+{
+	uint32_t code;
+	unsigned tries;
+	int err = -EIO;
+
+	for (tries = 0u; tries < 3u; ++tries) {
+		code = 0u;
+
+		switch (xhci_epState(slot, epId)) {
+			case XHCI_EP_STATE_STOPPED:
+			case XHCI_EP_STATE_ERROR:
+				return EOK;
+
+			case XHCI_EP_STATE_HALTED:
+				err = xhci_cmdEndpoint(xhci, XHCI_TRB_TYPE_CMD_RESET_ENDPOINT,
+					(keepSequence != 0) ? XHCI_CMD_TRB_RESET_ENDPOINT_CONTROL_TSP : 0u, slot->slotId, epId, 0u, &code);
+				break;
+
+			case XHCI_EP_STATE_RUNNING:
+				err = xhci_cmdEndpoint(xhci, XHCI_TRB_TYPE_CMD_STOP_ENDPOINT, 0u, slot->slotId, epId, 0u, &code);
+				break;
+
+			default:
+				/* Disabled (or a reserved value): nothing runs on it. */
+				return EOK;
+		}
+
+		if (err == EOK) {
+			return EOK;
+		}
+
+		if (code != XHCI_TRB_COMPLETION_CODE_CONTEXT_STATE_ERROR) {
+			if (xhci_recoveryLog() != 0) {
+				fprintf(stderr, "xhci: slot %u ep %u: cannot stop endpoint (rc=%d, code %u)\n",
+					(unsigned)slot->slotId, (unsigned)epId, err, (unsigned)code);
+			}
+			return err;
+		}
+	}
+
+	return err;
+}
+
+
+/* Drop the transfer events still queued for (slot, ep): the error event of the
+ * failed TD was consumed by its waiter, but a Stopped event, or a completion that
+ * raced the stop, may still sit in the stash or on the ring. Transfer events are
+ * matched by slot and endpoint alone, so left there they would be taken as the
+ * completion of the next TD. All of them were posted before the completion of
+ * the command that stopped the endpoint, so one pass is enough. */
+static void xhci_epDrainEvents(xhci_t *xhci, uint8_t slotId, uint8_t epId)
+{
+	xhci_trb_t ev;
+	uint32_t n;
+
+	for (n = 0u; n < xhci->eventRingTrbs; ++n) {
+		if (xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, 0u, slotId, epId, 0u, &ev) != EOK) {
+			break;
+		}
+	}
+}
+
+
+/* Recover an endpoint after a failed or abandoned TD; `dequeue` is the
+ * producer's position (TRB address | DCS), `keepSequence` as for xhci_epStop.
+ * Once this returns EOK the controller no longer references any buffer of that
+ * TD and the next TD runs normally. */
+static int xhci_epRecover(xhci_t *xhci, uint8_t slotId, uint8_t epId, uint64_t dequeue, int keepSequence)
+{
+	xhci_slot_t *slot = xhci_slotById(xhci, slotId);
+	uint32_t code = 0u;
+	int err;
+
+	if (slot == NULL) {
+		/* The slot was disabled (device gone), which stopped the endpoint. */
+		return -ENODEV;
+	}
+
+	err = xhci_epStop(xhci, slot, epId, keepSequence);
+	if (err == EOK) {
+		xhci_epDrainEvents(xhci, slotId, epId);
+		err = xhci_cmdEndpoint(xhci, XHCI_TRB_TYPE_CMD_SET_TR_DEQUEUE, 0u, slotId, epId, dequeue, &code);
+		if ((err < 0) && (xhci_recoveryLog() != 0)) {
+			fprintf(stderr, "xhci: slot %u ep %u: Set TR Dequeue Pointer failed (rc=%d, code %u)\n",
+				(unsigned)slotId, (unsigned)epId, err, (unsigned)code);
+		}
+	}
+
+	return err;
+}
+
+
 static int xhci_allocSlotSpace(xhci_t *xhci, xhci_slot_t *slot)
 {
 	uint64_t *dcbaa;
@@ -2181,6 +2476,18 @@ static int xhci_allocSlotSpace(xhci_t *xhci, xhci_slot_t *slot)
 			fprintf(stderr, "xhci: failed to allocate input context\n");
 			return -ENOMEM;
 		}
+	}
+
+	/* A second input context, used only to reset an endpoint's sequence state
+	 * (xhci_epResetSequence) from a class driver's thread while the hub thread
+	 * may be filling the shared one for another device. */
+	if (xhci->epInputCtx == NULL) {
+		xhci->epInputCtx = usb_allocAligned(xhci->inputCtxSize, XHCI_CONTEXT_ALIGN);
+		if (xhci->epInputCtx == NULL) {
+			fprintf(stderr, "xhci: failed to allocate endpoint input context\n");
+			return -ENOMEM;
+		}
+		xhci->epInputCtxPhys = va2pa(xhci->epInputCtx);
 	}
 
 	if (slot->ep0Ring == NULL) {
@@ -2893,6 +3200,7 @@ static int xhci_initPipe(xhci_t *xhci, usb_pipe_t *pipe)
 		 * value for bulk is 3072; Max ESIT Payload stays 0 (non-periodic). */
 		epctx->averageTrbLen_maxEsitPayload = 3072u;
 	}
+	priv->epCtx = *epctx;
 
 	err = xhci_cmdConfigureEndpoint(xhci, slot, 0);
 	if (err < 0) {
@@ -2902,7 +3210,9 @@ static int xhci_initPipe(xhci_t *xhci, usb_pipe_t *pipe)
 	}
 
 	pipe->hcdpriv = priv;
+	mutexLock(xhci->pipeLock);
 	slot->pipes[endpointId] = priv;
+	mutexUnlock(xhci->pipeLock);
 	fprintf(stderr, "xhci: %s pipe ready slot=%u ep=%u maxpkt=%u burst=%u\n",
 		(endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) ? "interrupt-IN" :
 			((endpointType == XHCI_EP_CTX_TYPE_BULK_IN) ? "bulk-IN" : "bulk-OUT"),
@@ -2962,6 +3272,23 @@ static int xhci_bufferRuns(const void *buf, size_t size, uint64_t *phys, uint32_
 }
 
 
+/* The producer position of a pipe's ring, as a TR Dequeue Pointer (address | DCS). */
+static uint64_t xhci_pipeDequeue(const xhci_pipePriv_t *priv)
+{
+	return (priv->ringPhys + ((uint64_t)priv->enqueue * (uint64_t)XHCI_TRB_SIZE)) |
+		((priv->cycleState != 0u) ? XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS : 0u);
+}
+
+
+/* The error a failed transfer reports. A STALL is told apart because the class
+ * driver has to clear it on the device (ClearFeature(ENDPOINT_HALT)); anything
+ * else is a plain I/O error. */
+static int xhci_transferErr(uint32_t completion)
+{
+	return (completion == XHCI_TRB_COMPLETION_CODE_STALL) ? -EPIPE : -EIO;
+}
+
+
 static int xhci_submitNormal(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
 {
 	xhci_pipePriv_t *priv;
@@ -2980,6 +3307,17 @@ static int xhci_submitNormal(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
 
 	if (priv->pendingTransfer != NULL) {
 		return -EBUSY;
+	}
+
+	/* No TD on a pipe whose slot is gone, or whose last recovery failed: the
+	 * controller's view of that ring is unknown, and a new TD would only wait
+	 * out the full timeout behind it. */
+	if (priv->slotId == 0u) {
+		return -ENODEV;
+	}
+
+	if (priv->failed != 0u) {
+		return -EIO;
 	}
 
 	ring = (xhci_trb_t *)priv->ring;
@@ -3027,6 +3365,7 @@ static int xhci_submitNormal(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
 		pcs = (priv->cycleState != 0u) ? XHCI_TRB_CONTROL_C : 0u;
 		maxPacket = (pipe->maxPacketLen != 0u) ? (uint32_t)pipe->maxPacketLen : 512u;
 		consumed = 0u;
+		priv->pendingTdPhys = priv->ringPhys + (uint64_t)priv->enqueue * (uint64_t)XHCI_TRB_SIZE;
 
 		for (i = 0; i < runs; ++i) {
 			uint32_t idx = priv->enqueue + (uint32_t)i;
@@ -3112,31 +3451,64 @@ static int xhci_submitNormal(xhci_t *xhci, usb_transfer_t *t, usb_pipe_t *pipe)
 	if ((priv->endpointType == XHCI_EP_CTX_TYPE_BULK_IN) ||
 		(priv->endpointType == XHCI_EP_CTX_TYPE_BULK_OUT)) {
 		xhci_trb_t ev;
-
+		uint32_t completion = 0u;
+		unsigned stale;
+		int recover = 0;
 		int ret;
 
-		if (xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, priv->pendingTrbPhys,
-				priv->slotId, priv->endpointId, XHCI_BULK_TIMEOUT_MS, &ev) == EOK) {
-			uint32_t completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
-				XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+		/* An event whose TRB lies outside this TD belongs to one an earlier
+		 * recovery abandoned (it completed just as it was stopped); skip it. */
+		for (stale = 0u; stale < 8u; ++stale) {
+			err = xhci_eventAwait(xhci, XHCI_TRB_TYPE_EVENT_TRANSFER, priv->pendingTrbPhys,
+				priv->slotId, priv->endpointId, XHCI_BULK_TIMEOUT_MS, &ev);
+			if ((err < 0) || ((ev.parameter >= priv->pendingTdPhys) && (ev.parameter <= priv->pendingTrbPhys))) {
+				break;
+			}
+		}
+
+		if (err == EOK) {
 			uint32_t residual = ev.status & XHCI_TRANSFER_EVENT_TRB_STATUS_TRB_TRANSFER_LENGTH__MASK;
 
-			if ((residual <= t->size) &&
-				((completion == XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
-				(completion == XHCI_TRB_COMPLETION_CODE_SHORT_PACKET))) {
-				ret = (int)(t->size - residual);
+			completion = (ev.status & XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__MASK) >>
+				XHCI_EVENT_TRB_STATUS_COMPLETION_CODE__SHIFT;
+
+			if ((completion == XHCI_TRB_COMPLETION_CODE_SUCCESS) ||
+				(completion == XHCI_TRB_COMPLETION_CODE_SHORT_PACKET)) {
+				ret = (residual <= t->size) ? (int)(t->size - residual) : -EIO;
 			}
 			else {
-				ret = -ENODEV;
+				ret = xhci_transferErr(completion);
+				recover = 1;
 			}
 		}
 		else {
 			/* Nobody else will finish this one -- the roothub poller skips bulk
 			 * now -- so fail it rather than leave the caller blocked forever. */
 			ret = -ETIMEDOUT;
+			recover = 1;
 		}
 
-		priv->pendingTransfer = NULL;
+		/* Recover BEFORE reporting the transfer finished: the caller frees the
+		 * buffer the moment it is, and until the endpoint is stopped a timed-out
+		 * TD may still be moved by the controller. Recovery also clears a halt,
+		 * which would otherwise make every later transfer on this endpoint wait
+		 * out the full timeout. Skipped while xhci_pipeDestroy is stopping the
+		 * endpoint itself. */
+		if ((recover != 0) && (priv->closing == 0u)) {
+			if (xhci_recoveryLog() != 0) {
+				fprintf(stderr, "xhci: slot %u ep %u: bulk transfer %s (code %u), resetting endpoint\n",
+					(unsigned)priv->slotId, (unsigned)priv->endpointId,
+					(err == EOK) ? "failed" : "timed out", (unsigned)completion);
+			}
+
+			if (xhci_epRecover(xhci, priv->slotId, priv->endpointId, xhci_pipeDequeue(priv),
+					completion != XHCI_TRB_COMPLETION_CODE_STALL) < 0) {
+				priv->failed = 1u;
+			}
+		}
+
+		/* The last access to priv: xhci_pipeDestroy waits for this store. */
+		__atomic_store_n(&priv->pendingTransfer, NULL, __ATOMIC_RELEASE);
 		usb_transferFinished(t, ret);
 	}
 
@@ -3191,6 +3563,100 @@ static uint64_t xhci_ep0Push(xhci_t *xhci, xhci_slot_t *slot, uint64_t parameter
 
 	slot->ep0Enqueue = idx + 1u;
 	return trbPhys;
+}
+
+
+/* Skip a control transfer that failed or timed out (see xhci_epRecover).
+ *
+ * The default control endpoint halts on a STALL like any other, so without this
+ * one refused request (an unsupported class request, say) left every later
+ * control transfer to the device waiting out its timeout behind the halt -- and
+ * a timed-out one left a Data Stage TRB pointing at the caller's buffer. The
+ * result is not acted on: the enumeration path's own answer to a failed
+ * transfer, a fresh slot (usb/hub.c), does not depend on it. */
+static void xhci_ep0Recover(xhci_t *xhci, xhci_slot_t *slot)
+{
+	uint64_t dequeue;
+
+	/* A transfer that ended right before the Link TRB leaves the producer on it;
+	 * wrap first so the new dequeue is never a Link TRB. */
+	if (slot->ep0Enqueue >= (slot->ep0RingCount - 1u)) {
+		xhci_ep0Reserve(xhci, slot, 1u);
+	}
+
+	dequeue = (slot->ep0RingPhys + ((uint64_t)slot->ep0Enqueue * (uint64_t)XHCI_TRB_SIZE)) |
+		((slot->ep0CycleState != 0u) ? XHCI_EP_CTX_TR_DEQUEUE_PTR_DCS : 0u);
+
+	(void)xhci_epRecover(xhci, slot->slotId, 1u, dequeue, 0);
+}
+
+
+/* Reset the host's data toggle / sequence number of the endpoint at USB
+ * address `epAddress` on `slot`, after the device has accepted
+ * ClearFeature(ENDPOINT_HALT) for it.
+ *
+ * That request resets the DEVICE's toggle to DATA0 whether or not the endpoint
+ * was halted (USB 2.0 section 9.4.5; USB 3.2 section 9.4.5 likewise for the
+ * sequence number), so the host's has to follow, or the two disagree and the
+ * next packet is silently dropped as a retransmission. A class driver's recovery
+ * clears the halt on endpoints that never failed (mass-storage reset recovery
+ * does both bulk endpoints), and an endpoint recovered from a timeout was only
+ * stopped, which keeps its toggle. The xHCI way to reset the sequence state of
+ * an endpoint that is not Halted is to drop and re-add it with Configure
+ * Endpoint (xHCI 1.2 section 4.6.6), with the TR Dequeue Pointer at the
+ * producer's position. */
+static void xhci_epResetSequence(xhci_t *xhci, xhci_slot_t *slot, uint8_t epAddress)
+{
+	xhci_input_ctx_t *input;
+	xhci_pipePriv_t *priv;
+	uint8_t epId = (uint8_t)(((epAddress & 0xfu) * 2u) + (((epAddress & 0x80u) != 0u) ? 1u : 0u));
+	int err;
+
+	if ((epId < 2u) || (epId > XHCI_MAX_ENDPOINTS) || (xhci->epInputCtx == NULL)) {
+		return;
+	}
+
+	mutexLock(xhci->pipeLock);
+
+	/* Only an idle pipe: a TD in flight would be skipped by the new dequeue. */
+	priv = slot->pipes[epId];
+	if ((priv == NULL) || (priv->pendingTransfer != NULL) || (priv->slotId != slot->slotId)) {
+		mutexUnlock(xhci->pipeLock);
+		return;
+	}
+
+	err = xhci_epStop(xhci, slot, epId, 0);
+	if (err == EOK) {
+		xhci_epDrainEvents(xhci, slot->slotId, epId);
+		mutexLock(xhci->cmdLock);
+		memset(xhci->epInputCtx, 0, xhci->inputCtxSize);
+		input = (xhci_input_ctx_t *)xhci->epInputCtx;
+		input->control.dropContextFlags = 1u << epId;
+		input->control.addContextFlags = 1u << epId;
+		input->device.ep[epId - 1u] = priv->epCtx;
+		input->device.ep[epId - 1u].trDequeuePtr = xhci_pipeDequeue(priv);
+		err = _xhci_cmdRun(xhci, xhci->epInputCtxPhys, 0u,
+			(XHCI_TRB_TYPE_CMD_CONFIGURE_ENDPOINT << XHCI_TRB_CONTROL_TRB_TYPE__SHIFT) |
+				((uint32_t)slot->slotId << XHCI_CMD_TRB_CONFIGURE_ENDPOINT_CONTROL_SLOTID__SHIFT),
+			NULL, NULL);
+		mutexUnlock(xhci->cmdLock);
+	}
+
+	if (err < 0) {
+		/* The endpoint's state is unknown now; let the next transfer fail fast
+		 * rather than run on a ring the controller may disagree about. */
+		if (xhci_recoveryLog() != 0) {
+			fprintf(stderr, "xhci: slot %u ep %u: sequence reset after ClearFeature(HALT) failed (rc=%d)\n",
+				(unsigned)slot->slotId, (unsigned)epId, err);
+		}
+		priv->failed = 1u;
+	}
+	else {
+		/* A successful re-add also gives a failed pipe a known state again. */
+		priv->failed = 0u;
+	}
+
+	mutexUnlock(xhci->pipeLock);
 }
 
 
@@ -3270,6 +3736,7 @@ static int xhci_ep0ControlRead(xhci_t *xhci, xhci_slot_t *slot, usb_transfer_t *
 				}
 			}
 			(void)xhci_enterHaltedState(xhci);
+			xhci_ep0Recover(xhci, slot);
 			return -ETIMEDOUT;
 		}
 
@@ -3291,7 +3758,8 @@ static int xhci_ep0ControlRead(xhci_t *xhci, xhci_slot_t *slot, usb_transfer_t *
 			if (xhci->keepRunning == 0u) {
 				(void)xhci_enterHaltedState(xhci);
 			}
-			return -ENODEV;
+			xhci_ep0Recover(xhci, slot);
+			return xhci_transferErr(completion);
 		}
 
 		/* Data-stage event carries the transferred length (size - residual). */
@@ -3389,6 +3857,7 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, xhci_slot_t *slot, usb_trans
 				}
 			}
 			(void)xhci_enterHaltedState(xhci);
+			xhci_ep0Recover(xhci, slot);
 			return -ETIMEDOUT;
 		}
 
@@ -3411,7 +3880,8 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, xhci_slot_t *slot, usb_trans
 			if (xhci->keepRunning == 0u) {
 				(void)xhci_enterHaltedState(xhci);
 			}
-			return -ENODEV;
+			xhci_ep0Recover(xhci, slot);
+			return xhci_transferErr(completion);
 		}
 
 		if (ev.parameter == statusTrbPhys) {
@@ -3429,6 +3899,11 @@ static int xhci_ep0ControlWriteNoData(xhci_t *xhci, xhci_slot_t *slot, usb_trans
 		if (err < 0) {
 			return err;
 		}
+	}
+
+	if ((t->setup->bmRequestType == (REQUEST_DIR_HOST2DEV | REQUEST_TYPE_STANDARD | REQUEST_RECIPIENT_ENDPOINT)) &&
+		(t->setup->bRequest == REQ_CLEAR_FEATURE) && (t->setup->wValue == USB_ENDPOINT_HALT)) {
+		xhci_epResetSequence(xhci, slot, (uint8_t)t->setup->wIndex);
 	}
 
 	return 0;
@@ -4194,10 +4669,49 @@ static int xhci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t, usb_pipe_t *pipe)
 }
 
 
+/* Cancel a transfer in flight.
+ *
+ * Only an interrupt-IN transfer can still be in flight when this is called: a
+ * bulk transfer is completed by its own submitting thread before
+ * xhci_transferEnqueue returns, and control transfers are synchronous too. The
+ * TD is taken off the ring before the transfer is given back, so the buffer is
+ * no longer the controller's when the caller reclaims it. */
 static void xhci_transferDequeue(hcd_t *hcd, usb_transfer_t *t)
 {
-	(void)hcd;
-	(void)t;
+	xhci_t *xhci = (xhci_t *)hcd->priv;
+	xhci_pipePriv_t *priv = NULL;
+	unsigned s;
+	unsigned e;
+
+	if (xhci == NULL) {
+		return;
+	}
+
+	mutexLock(xhci->pipeLock);
+
+	for (s = 0u; (priv == NULL) && (s < (sizeof(xhci->slots) / sizeof(xhci->slots[0]))); ++s) {
+		for (e = 1u; e <= XHCI_MAX_ENDPOINTS; ++e) {
+			xhci_pipePriv_t *p = xhci->slots[s].pipes[e];
+
+			if ((p != NULL) && (p->endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) && (p->pendingTransfer == t)) {
+				priv = p;
+				break;
+			}
+		}
+	}
+
+	if (priv != NULL) {
+		if (xhci_epRecover(xhci, priv->slotId, priv->endpointId, xhci_pipeDequeue(priv), 1) < 0) {
+			priv->failed = 1u;
+		}
+		priv->pendingTransfer = NULL;
+	}
+
+	mutexUnlock(xhci->pipeLock);
+
+	if (priv != NULL) {
+		usb_transferFinished(t, -EINTR);
+	}
 }
 
 
@@ -4217,6 +4731,9 @@ static void xhci_slotRelease(xhci_t *xhci, const usb_dev_t *dev)
 	uint64_t *dcbaa = (uint64_t *)xhci->dcbaa;
 	xhci_slot_t *slot;
 	unsigned s;
+	unsigned e;
+
+	mutexLock(xhci->pipeLock);
 
 	for (s = 0u; s < (sizeof(xhci->slots) / sizeof(xhci->slots[0])); ++s) {
 		slot = &xhci->slots[s];
@@ -4229,6 +4746,18 @@ static void xhci_slotRelease(xhci_t *xhci, const usb_dev_t *dev)
 			dcbaa[slot->slotId] = 0u;
 		}
 
+		/* Pipes still open on the slot (the device's own interrupt pipe, which
+		 * the framework frees after its control pipe) now have no endpoint
+		 * behind them. Unlink them so neither the poller nor a reuse of this
+		 * entry finds them, and mark them so that xhci_pipeDestroy does not try
+		 * to stop an endpoint of a slot id that may belong to another device. */
+		for (e = 1u; e <= XHCI_MAX_ENDPOINTS; ++e) {
+			if (slot->pipes[e] != NULL) {
+				slot->pipes[e]->slotId = 0u;
+				slot->pipes[e] = NULL;
+			}
+		}
+
 		slot->slotId = 0u;
 		slot->addressed = 0u;
 		slot->hubFixedUp = 0u;
@@ -4237,6 +4766,8 @@ static void xhci_slotRelease(xhci_t *xhci, const usb_dev_t *dev)
 			xhci->cur = NULL;
 		}
 	}
+
+	mutexUnlock(xhci->pipeLock);
 }
 
 
@@ -4244,6 +4775,7 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 {
 	xhci_pipePriv_t *priv;
 	xhci_t *xhci = (xhci_t *)hcd->priv;
+	int leak = 0;
 
 	if (pipe == NULL) {
 		return;
@@ -4263,8 +4795,12 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 
 	priv = (xhci_pipePriv_t *)pipe->hcdpriv;
 	pipe->hcdpriv = NULL;
-	/* Clear the owning slot's interrupt pipe by pointer match (slots[] is indexed
-	 * by array position, not slotId, so don't index by priv->slotId here). */
+
+	mutexLock(xhci->pipeLock);
+	priv->closing = 1u;
+
+	/* Clear the owning slot's pipe by pointer match (slots[] is indexed by array
+	 * position, not slotId, so don't index by priv->slotId here). */
 	{
 		unsigned s;
 		unsigned e;
@@ -4275,6 +4811,55 @@ static void xhci_pipeDestroy(hcd_t *hcd, usb_pipe_t *pipe)
 				}
 			}
 		}
+	}
+
+	/* Driver pipes are torn down before the device's control pipe, i.e. while
+	 * the slot -- and this endpoint -- is still live. Stop the endpoint before
+	 * its ring is freed, or the controller can go on fetching TRBs from memory
+	 * that is no longer a ring. (If the slot is already disabled, so is the
+	 * endpoint.) A pending interrupt transfer is not given back: its owner
+	 * frees it together with the pipe. */
+	if (priv->slotId != 0u) {
+		xhci_slot_t *slot = xhci_slotById(xhci, priv->slotId);
+
+		if (slot != NULL) {
+			if (xhci_epStop(xhci, slot, priv->endpointId, 1) < 0) {
+				leak = 1;
+			}
+			else if ((priv->endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) || (priv->pendingTransfer == NULL)) {
+				/* Nobody else is waiting for this endpoint's events: drop them,
+				 * or they sit in the stash for good. */
+				xhci_epDrainEvents(xhci, priv->slotId, priv->endpointId);
+			}
+		}
+	}
+
+	if (priv->endpointType == XHCI_EP_CTX_TYPE_INTERRUPT_IN) {
+		priv->pendingTransfer = NULL;
+	}
+
+	mutexUnlock(xhci->pipeLock);
+
+	/* A bulk transfer can still be waiting for its completion in another
+	 * thread; the stop above wakes it with a Stopped event (or it times out),
+	 * and it lets go of priv last. */
+	{
+		unsigned waitedMs;
+
+		for (waitedMs = 0u; (__atomic_load_n(&priv->pendingTransfer, __ATOMIC_ACQUIRE) != NULL) &&
+			(waitedMs < (XHCI_BULK_TIMEOUT_MS + XHCI_CMD_TIMEOUT_MS)); ++waitedMs) {
+			usleep(1000);
+		}
+	}
+
+	if ((leak != 0) || (__atomic_load_n(&priv->pendingTransfer, __ATOMIC_ACQUIRE) != NULL)) {
+		/* The controller may still own the ring: leak it rather than hand
+		 * memory it can write to back to the allocator. */
+		if (xhci_recoveryLog() != 0) {
+			fprintf(stderr, "xhci: slot %u ep %u: endpoint not stopped, leaking its ring\n",
+				(unsigned)priv->slotId, (unsigned)priv->endpointId);
+		}
+		return;
 	}
 
 	/* Only interrupt and bulk pipes get here: they are the only ones xhci_initPipe
