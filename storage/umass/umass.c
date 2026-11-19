@@ -72,6 +72,17 @@
 
 #define UMASS_TRANSMIT_RETRIES 3
 #define UMASS_INIT_RETRIES     10
+/* Pause between start-up rounds that found the device not ready, so the
+ * UMASS_INIT_RETRIES rounds give it about a second to become ready. */
+#define UMASS_INIT_RETRY_DELAY_US 100000
+
+/* Consecutive transport failures (a transfer that failed or timed out, an
+ * invalid CSW, a phase error) after which the device is given up on. Each one
+ * can cost a full transfer timeout, so a device that has stopped answering --
+ * hung firmware, or a stick that is gone without a detach event -- would
+ * otherwise stall every request for seconds, forever. A command the device
+ * answers with a valid CSW, even "failed", resets the count. */
+#define UMASS_MAX_TRANSPORT_FAILURES 3
 
 #define UMASS_SECTOR_SIZE 512
 /* Largest single SCSI READ(10)/WRITE(10) this driver issues. Anything bigger is
@@ -90,6 +101,14 @@
 
 #define CBW_SIG 0x43425355
 #define CSW_SIG 0x53425355
+
+/* CSW bCSWStatus (USB MSC Bulk-Only Transport 1.0 section 5.2) */
+#define CSW_STATUS_PASSED      0
+#define CSW_STATUS_FAILED      1
+#define CSW_STATUS_PHASE_ERROR 2
+
+/* Bulk-Only Mass Storage Reset class request (BOT 1.0 section 3.1) */
+#define UMASS_REQ_BOMSR 0xff
 
 #define USB_SUBCLASS_SCSI 0x06
 #define USB_PROTOCOL_BULK 0x50
@@ -224,10 +243,16 @@ typedef struct umass_dev {
 	int pipeCtrl;
 	int pipeIn;
 	int pipeOut;
+	uint8_t epIn;  /* bulk endpoint addresses, for ClearFeature(ENDPOINT_HALT); 0 = unknown */
+	uint8_t epOut;
 	int fileId;
 	int tag;
 	unsigned port;
 	handle_t lock;
+
+	/* Transport health, kept on the owner (see below) and guarded by its lock. */
+	unsigned failures; /* consecutive transport failures */
+	int failed;        /* given up on: every command fails at once */
 
 	umass_part_t part;
 
@@ -304,76 +329,178 @@ static int umass_cmpfs(rbnode_t *node1, rbnode_t *node2)
 static int umass_scsiRequestSense(umass_dev_t *dev, char *odata);
 
 
-static int _umass_transmit(umass_dev_t *dev, void *cmd, size_t clen, char *data, size_t dlen, int dir)
+static int umass_clearHalt(umass_dev_t *owner, uint8_t ep)
 {
-	scsi_sense_t *sense;
+	if (ep == 0u) {
+		/* Address unknown (see _umass_findEndpoints) */
+		return -ENOENT;
+	}
+
+	return (usb_clearFeatureHalt(owner->drv, owner->pipeCtrl, ep) < 0) ? -EIO : 0;
+}
+
+
+/* Reset recovery (BOT 1.0 section 5.3.4): Bulk-Only Mass Storage Reset, then
+ * ClearFeature(ENDPOINT_HALT) on both bulk endpoints. After a transport failure,
+ * an invalid CSW or a phase error neither the device's command state nor the
+ * data toggles of its bulk endpoints are known; this brings both back to the
+ * start of a command. */
+static int umass_resetRecovery(umass_dev_t *owner)
+{
+	usb_setup_packet_t setup = {
+		.bmRequestType = REQUEST_DIR_HOST2DEV | REQUEST_TYPE_CLASS | REQUEST_RECIPIENT_INTERFACE,
+		.bRequest = UMASS_REQ_BOMSR,
+		.wValue = 0,
+		.wIndex = owner->instance.interface,
+		.wLength = 0,
+	};
+
+	if (usb_transferControl(owner->drv, owner->pipeCtrl, &setup, NULL, 0, usb_dir_out) < 0) {
+		return -EIO;
+	}
+
+	if ((umass_clearHalt(owner, owner->epIn) < 0) || (umass_clearHalt(owner, owner->epOut) < 0)) {
+		return -EIO;
+	}
+
+	return 0;
+}
+
+
+static void umass_giveUp(umass_dev_t *owner, const char *why)
+{
+	if (owner->failed == 0) {
+		owner->failed = 1;
+		fprintf(stderr, "umass: %s: %s; giving up on the device until it is re-plugged\n", owner->path, why);
+	}
+}
+
+
+/* One Bulk-Only command: CBW, optional data stage, CSW (BOT 1.0 section 5).
+ *
+ * Returns the number of bytes moved with the CSW status in *status, or a
+ * negative error when the transport failed (a transfer error, an invalid CSW,
+ * a phase error) and the device needs a reset recovery. A STALL on the data
+ * stage or on the CSW is the device's normal way of ending a command early: the
+ * halt is cleared and the CSW read (BOT 1.0 section 6.7). */
+static int _umass_command(umass_dev_t *dev, void *cmd, size_t clen, char *data, size_t dlen, int dir, int *status)
+{
+	umass_dev_t *owner = dev->owner;
 	umass_cbw_t cbw = { 0 };
 	umass_csw_t csw = { 0 };
-	int ret = -1, bytes = 0;
-	int dataPipe;
-	int i;
+	int bytes = 0;
+	int ret;
 
-	if (clen > 16)
-		return -1;
+	cbw.sig = CBW_SIG;
+	cbw.tag = owner->tag++;
+	cbw.dlen = dlen;
+	cbw.flags = (dir == usb_dir_out) ? UMASS_WRITE : UMASS_READ;
+	cbw.lun = 0;
+	cbw.clen = clen;
+	memcpy(cbw.cmd, cmd, clen);
 
-	for (i = 0; ret < 0 && i < UMASS_TRANSMIT_RETRIES; i++) {
-		dataPipe = (dir == usb_dir_out) ? dev->owner->pipeOut : dev->owner->pipeIn;
-		cbw.sig = CBW_SIG;
-		cbw.tag = dev->owner->tag++;
-		cbw.dlen = dlen;
-		cbw.flags = (dir == usb_dir_out) ? UMASS_WRITE : UMASS_READ;
-		cbw.lun = 0;
-		cbw.clen = clen;
-		memcpy(cbw.cmd, cmd, clen);
+	ret = usb_transferBulk(owner->drv, owner->pipeOut, &cbw, sizeof(cbw), usb_dir_out);
+	if (ret != sizeof(cbw)) {
+		DEBUG("CBW transfer failed: %d", ret);
+		return (ret < 0) ? ret : -EIO;
+	}
 
-		ret = usb_transferBulk(dev->owner->drv, dev->owner->pipeOut, &cbw, sizeof(cbw), usb_dir_out);
-		if (ret != sizeof(cbw)) {
-			fprintf(stderr, "umass_transmit: usb_transferBulk OUT failed\n");
-			return -EIO;
-		}
-
-		/* Optional data transfer */
-		if (dlen > 0) {
-			ret = usb_transferBulk(dev->owner->drv, dataPipe, data, dlen, dir);
+	if (dlen > 0) {
+		ret = usb_transferBulk(owner->drv, (dir == usb_dir_out) ? owner->pipeOut : owner->pipeIn, data, dlen, dir);
+		if (ret == -EPIPE) {
+			ret = umass_clearHalt(owner, (dir == usb_dir_out) ? owner->epOut : owner->epIn);
 			if (ret < 0) {
-				fprintf(stderr, "umass_transmit: umass_transmit data transfer failed\n");
 				return ret;
 			}
+		}
+		else if (ret < 0) {
+			DEBUG("data transfer failed: %d", ret);
+			return ret;
+		}
+		else {
 			bytes = ret;
-		}
-
-		ret = usb_transferBulk(dev->owner->drv, dev->owner->pipeIn, &csw, sizeof(csw), usb_dir_in);
-		if (ret != sizeof(csw)) {
-			fprintf(stderr, "umass_transmit: usb_transferBulk IN transfer failed\n");
-			return -EIO;
-		}
-
-		/* Transfer finished, check transfer correctness */
-		if (csw.sig != CSW_SIG || csw.tag != cbw.tag || csw.status != 0) {
-			if (csw.status == 1) {
-				ret = umass_scsiRequestSense(dev, dev->buffer);
-				if (ret < 0) {
-					DEBUG("REQUEST SENSE failed: %d", ret);
-				}
-				else {
-					sense = (scsi_sense_t *)dev->buffer;
-					DEBUG("REQUEST SENSE code=0x%x, sense key code=0x%x", sense->errorcode, (sense->misc0_sensekey & 0xf));
-				}
-
-				/* Retry transfer */
-				ret = -1;
-				bytes = 0;
-				continue;
-			}
-			else {
-				DEBUG("transfer incorrect.\n csw.sig=0x%x, csw.tag=0x%x, cbw.tag=0x%x, csw.status=%d\n", csw.sig, csw.tag,
-						cbw.tag, csw.status);
-				return -EIO;
-			}
 		}
 	}
 
+	ret = usb_transferBulk(owner->drv, owner->pipeIn, &csw, sizeof(csw), usb_dir_in);
+	if (ret == -EPIPE) {
+		/* A STALLed CSW is read once more after the halt is cleared (BOT 1.0
+		 * section 5.3.3, figure 2) */
+		ret = umass_clearHalt(owner, owner->epIn);
+		if (ret == 0) {
+			ret = usb_transferBulk(owner->drv, owner->pipeIn, &csw, sizeof(csw), usb_dir_in);
+		}
+	}
+
+	if (ret != sizeof(csw)) {
+		DEBUG("CSW transfer failed: %d", ret);
+		return (ret < 0) ? ret : -EIO;
+	}
+
+	/* A CSW that is not valid and meaningful (BOT 1.0 section 6.3), or a phase
+	 * error, means host and device disagree about where the command is. */
+	if ((csw.sig != CSW_SIG) || (csw.tag != cbw.tag) ||
+			((csw.status != CSW_STATUS_PASSED) && (csw.status != CSW_STATUS_FAILED))) {
+		DEBUG("bad CSW: sig=0x%x tag=0x%x (cbw 0x%x) status=%d", csw.sig, csw.tag, cbw.tag, csw.status);
+		return -EIO;
+	}
+
+	*status = csw.status;
+
 	return bytes;
+}
+
+
+static int _umass_transmit(umass_dev_t *dev, void *cmd, size_t clen, char *data, size_t dlen, int dir)
+{
+	umass_dev_t *owner = dev->owner;
+	int ret = -EIO;
+	int status;
+	int i;
+
+	if (clen > 16) {
+		return -EINVAL;
+	}
+
+	for (i = 0; i < UMASS_TRANSMIT_RETRIES; i++) {
+		if (owner->failed != 0) {
+			return -ENODEV;
+		}
+
+		status = CSW_STATUS_PASSED;
+		ret = _umass_command(dev, cmd, clen, data, dlen, dir, &status);
+		if (ret >= 0) {
+			/* A valid CSW: the transport works, whatever the command did */
+			owner->failures = 0;
+
+			if (status == CSW_STATUS_PASSED) {
+				return ret;
+			}
+
+			/* Command Failed: REQUEST SENSE reports (and clears) the reason,
+			 * e.g. a unit attention after a reset or a medium change; retry. */
+			ret = umass_scsiRequestSense(dev, dev->buffer);
+			if (ret >= 0) {
+				ret = -EIO;
+				continue;
+			}
+		}
+
+		/* Transport failure */
+		if (++owner->failures >= UMASS_MAX_TRANSPORT_FAILURES) {
+			umass_giveUp(owner, "too many transport failures");
+			return -ENODEV;
+		}
+
+		if (umass_resetRecovery(owner) < 0) {
+			/* Not even the control endpoint answers: the escalation left (a
+			 * port reset) is not available to a class driver. */
+			umass_giveUp(owner, "reset recovery failed");
+			return -ENODEV;
+		}
+	}
+
+	return (ret < 0) ? ret : -EIO;
 }
 
 
@@ -414,18 +541,30 @@ static int umass_scsiTest(umass_dev_t *dev)
 }
 
 
+/* Issued once, straight through _umass_command: it runs inside
+ * _umass_transmit's retry loop, and a sense request that failed would otherwise
+ * request sense again, without bound. Returns a negative error only for a
+ * transport failure. */
 static int umass_scsiRequestSense(umass_dev_t *dev, char *odata)
 {
 	uint8_t len = sizeof(scsi_sense_t);
-	int ret;
+	int ret, status = CSW_STATUS_PASSED;
 	scsi_cdb6_t requestSenseCmd = {
 		.opcode = SCSI_REQUEST_SENSE,
 		.length = htons(len),
 	};
 
-	ret = _umass_transmit(dev, &requestSenseCmd, sizeof(requestSenseCmd), (char *)odata, len, usb_dir_in);
+	ret = _umass_command(dev, &requestSenseCmd, sizeof(requestSenseCmd), odata, len, usb_dir_in, &status);
+	if (ret < 0) {
+		return ret;
+	}
 
-	return ret == sizeof(scsi_sense_t) ? 0 : -EIO;
+	if ((status == CSW_STATUS_PASSED) && (ret == sizeof(scsi_sense_t))) {
+		DEBUG("REQUEST SENSE code=0x%x, sense key=0x%x", ((scsi_sense_t *)odata)->errorcode,
+			(((scsi_sense_t *)odata)->misc0_sensekey & 0xf));
+	}
+
+	return 0;
 }
 
 
@@ -444,6 +583,71 @@ static int umass_scsiInquiry(umass_dev_t *dev, char *odata)
 }
 
 
+/* Learn the addresses of this interface's bulk endpoints: a pipe id does not
+ * carry one, and ClearFeature(ENDPOINT_HALT) needs it. They come from the
+ * configuration descriptor, interface `instance.interface`, alternate setting 0. */
+static int _umass_findEndpoints(umass_dev_t *dev)
+{
+	usb_setup_packet_t setup = {
+		.bmRequestType = REQUEST_DIR_DEV2HOST | REQUEST_TYPE_STANDARD | REQUEST_RECIPIENT_DEVICE,
+		.bRequest = REQ_GET_DESCRIPTOR,
+		.wValue = USB_DESC_CONFIG << 8,
+		.wIndex = 0,
+		.wLength = sizeof(usb_configuration_desc_t),
+	};
+	const usb_configuration_desc_t *conf = (const usb_configuration_desc_t *)dev->buffer;
+	const char *ptr = dev->buffer;
+	const char *end;
+	int inIface = 0;
+	int ret;
+
+	/* The header first, for the total length */
+	ret = usb_transferControl(dev->drv, dev->pipeCtrl, &setup, dev->buffer, setup.wLength, usb_dir_in);
+	if (ret != (int)sizeof(usb_configuration_desc_t)) {
+		return -EIO;
+	}
+
+	setup.wLength = min(conf->wTotalLength, sizeof(dev->buffer));
+	ret = usb_transferControl(dev->drv, dev->pipeCtrl, &setup, dev->buffer, setup.wLength, usb_dir_in);
+	if (ret < (int)sizeof(usb_configuration_desc_t)) {
+		return -EIO;
+	}
+
+	end = dev->buffer + ret;
+	while ((ptr + sizeof(struct usb_desc_header)) <= end) {
+		const struct usb_desc_header *hdr = (const struct usb_desc_header *)ptr;
+
+		if ((hdr->bLength < sizeof(*hdr)) || ((ptr + hdr->bLength) > end)) {
+			break;
+		}
+
+		if ((hdr->bDescriptorType == USB_DESC_INTERFACE) && (hdr->bLength >= sizeof(usb_interface_desc_t))) {
+			const usb_interface_desc_t *iface = (const usb_interface_desc_t *)ptr;
+
+			inIface = (iface->bInterfaceNumber == dev->instance.interface) && (iface->bAlternateSetting == 0);
+		}
+		else if ((inIface != 0) && (hdr->bDescriptorType == USB_DESC_ENDPOINT) && (hdr->bLength >= sizeof(usb_endpoint_desc_t))) {
+			const usb_endpoint_desc_t *ep = (const usb_endpoint_desc_t *)ptr;
+
+			if ((ep->bmAttributes & 0x3) == USB_ENDPT_TYPE_BULK) {
+				if ((ep->bEndpointAddress & 0x80) != 0) {
+					if (dev->epIn == 0) {
+						dev->epIn = ep->bEndpointAddress;
+					}
+				}
+				else if (dev->epOut == 0) {
+					dev->epOut = ep->bEndpointAddress;
+				}
+			}
+		}
+
+		ptr += hdr->bLength;
+	}
+
+	return ((dev->epIn != 0) && (dev->epOut != 0)) ? 0 : -ENOENT;
+}
+
+
 static int _umass_scsiInit(umass_dev_t *dev)
 {
 	int ret;
@@ -451,6 +655,9 @@ static int _umass_scsiInit(umass_dev_t *dev)
 	scsi_inquiry_t *inquiry;
 
 	for (i = 0, ok = 0; ok < 2 && i < UMASS_INIT_RETRIES; i++) {
+		if (i > 0) {
+			usleep(UMASS_INIT_RETRY_DELAY_US);
+		}
 		ok = 0;
 
 		ret = umass_scsiTest(dev);
@@ -493,7 +700,7 @@ static int _umass_readMBR(umass_dev_t *dev, mbr_t **out)
 	mbr_t *mbr;
 	int ret;
 
-	/* A command that failed every retry returns 0, not an error: check the length */
+	/* A short read is a failure too, not only an error */
 	ret = _umass_transmit(dev, &readcmd, sizeof(readcmd), dev->buffer, UMASS_SECTOR_SIZE, usb_dir_in);
 	if (ret != UMASS_SECTOR_SIZE) {
 		LOG_ERROR("reading MBR failed");
@@ -626,8 +833,11 @@ static int umass_readFromDev(umass_dev_t *dev, off_t offs, char *buf, size_t len
 		mutexUnlock(dev->owner->lock);
 
 		if (ret <= 0) {
-			fprintf(stderr, "umass: read failed at offs %jd (+%zu of %zu): %d\n",
-				(intmax_t)offs, done, len, ret);
+			if (ret != -ENODEV) {
+				/* -ENODEV: given up on, and said so once (umass_giveUp) */
+				fprintf(stderr, "umass: read failed at offs %jd (+%zu of %zu): %d\n",
+					(intmax_t)offs, done, len, ret);
+			}
 			/* Report what was actually transferred rather than claiming the
 			 * whole request: a partial result the caller can see is far better
 			 * than a short one it cannot. */
@@ -676,8 +886,10 @@ static int umass_writeToDev(umass_dev_t *dev, off_t offs, const char *buf, size_
 		mutexUnlock(dev->owner->lock);
 
 		if (ret <= 0) {
-			fprintf(stderr, "umass: write failed at offs %jd (+%zu of %zu): %d\n",
-				(intmax_t)offs, done, len, ret);
+			if (ret != -ENODEV) {
+				fprintf(stderr, "umass: write failed at offs %jd (+%zu of %zu): %d\n",
+					(intmax_t)offs, done, len, ret);
+			}
 			return (done > 0u) ? (int)done : ret;
 		}
 
@@ -1308,6 +1520,10 @@ static umass_dev_t *_umass_devAlloc(void)
 	/* malloc, not calloc -- the unmount drain reads this before any request has
 	 * run, so it has to start at a known 0 rather than whatever was on the heap. */
 	dev->part.nreqs = 0;
+	dev->epIn = 0;
+	dev->epOut = 0;
+	dev->failures = 0;
+	dev->failed = 0;
 	rv = mutexCreate(&dev->lock);
 	if (rv < 0) {
 		free(dev);
@@ -1406,6 +1622,12 @@ static int umass_handleInsertion(usb_driver_t *drv, usb_devinfo_t *insertion, us
 			break;
 		}
 		dev->tag = 0;
+
+		/* Not fatal: the device works without it, it just cannot be recovered
+		 * from a transport error (which then gives up on it). */
+		if (_umass_findEndpoints(dev) < 0) {
+			fprintf(stderr, "umass: %s: bulk endpoint addresses unknown, no error recovery\n", dev->path);
+		}
 
 		err = _umass_scsiInit(dev);
 		if (err < 0) {
