@@ -410,10 +410,11 @@ int main(int argc, char **argv)
 		close(fd);
 		return rc;
 	}
-	if (argc >= 3 && strcmp(argv[1], "pioirq") == 0) {
+	if (argc >= 3 && ((strcmp(argv[1], "pioirq") == 0) || (strcmp(argv[1], "pioirqmin") == 0))) {
 		/* Polled (0) or interrupt-driven (1) SDIO data blocks of 256 bytes and
-		 * more until reboot, for a CPU-cost A/B within one boot. */
-		int n = snprintf(cmd, sizeof(cmd), "pioirq %s", argv[2]);
+		 * more, and the shortest transfer the interrupt path takes, until
+		 * reboot, for a CPU-cost A/B within one boot. */
+		int n = snprintf(cmd, sizeof(cmd), "%s %s", argv[1], argv[2]);
 		if (n < 0 || n >= (int)sizeof(cmd)) {
 			printf("wifi: argument too long\n");
 			return 2;
@@ -559,6 +560,7 @@ int main(int argc, char **argv)
 	       "  wifi sdclk <kHz> (SDIO data clock until reboot: 50000 = 41.67 MHz, 25000) |\n"
 	       "  wifi f2blk <64|128|256|512> (SDIO data block size until reboot) |\n"
 	       "  wifi pioirq <0|1> (SDIO data blocks >= 256 bytes polled or by interrupt) |\n"
+	       "  wifi pioirqmin <bytes> (with pioirq 1: shorter transfers stay polled; 0 = none) |\n"
 	       "  wifi batch [0|1] (frames per message between netif and daemon: 1 = several,\n"
 	       "              0 = one; the netif follows within ~3 s; see WIFISTATS ipc)\n"
 	       "radio (control commands: run them between transfers, not during one):\n"

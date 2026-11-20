@@ -869,6 +869,10 @@ static void diag_pioWriteWord(volatile uint8_t *sdhci, const uint8_t *buf, uint3
  * Smaller blocks stay polled: the 64-byte firmware-download blocks, the 12-byte
  * frame headers, and block-mode TX at the default f2blk=64. Such a block crosses
  * the bus in a few microseconds, less than an interrupt plus a wakeup costs.
+ * `wifi pioirqmin <bytes>` also keeps transfers shorter than that in all polled
+ * (default 0, none): with byte-mode receive, a 9 kB superframe is read in 512-byte
+ * transfers, and a sleep and a wakeup on each made every superframe read ~28 %
+ * slower (bustime glom 660 -> 843 us), which is what receive lost.
  *
  * The handler runs at interrupt level in this address space; the kernel makes
  * the process's memory resident when the handler is registered. It must not use
@@ -928,8 +932,9 @@ typedef struct {
 static struct {
 	wifi_xfer_t x;
 	handle_t lock, cond, inth;
-	int ready; /* the handler is registered */
-	int on;    /* `pioirq`: use it (message thread) */
+	int ready;          /* the handler is registered */
+	int on;             /* `pioirq`: use it (message thread) */
+	uint32_t min_bytes; /* `pioirqmin`: shorter transfers stay polled (message thread) */
 	uint32_t xfers, wakes, late, ticks, rescues, rescue_blocks, errs, timeouts;
 	char why[40]; /* why it cannot be used, for `stats` */
 } g_xfer;
@@ -1020,11 +1025,15 @@ static WIFI_IRQ_CONTEXT int wifi_xferHandler(unsigned int n, void *arg)
 }
 
 
-/* Whether a transfer with blocks of `blksz` bytes goes through the handler. The
- * legacy wait (`legacypio`) is a polled-loop A/B, so it keeps every block polled. */
-static int wifi_xferUse(uint32_t blksz)
+/* Whether a transfer of `nblk` blocks of `blksz` bytes goes through the handler.
+ * Below `pioirqmin` bytes in all it stays polled: a transfer that crosses the bus
+ * in less time than a sleep and a wakeup take is cheaper to poll, and polling
+ * it keeps that wakeup off the bus owner's critical path. The legacy wait
+ * (`legacypio`) is a polled-loop A/B, so it keeps every block polled. */
+static int wifi_xferUse(uint32_t blksz, uint32_t nblk)
 {
-	return (g_xfer.on != 0) && (g_pio_legacy == 0) && (blksz >= WIFI_XFER_IRQ_MIN);
+	return (g_xfer.on != 0) && (g_pio_legacy == 0) && (blksz >= WIFI_XFER_IRQ_MIN) &&
+		((blksz * nblk) >= g_xfer.min_bytes);
 }
 
 
@@ -1202,7 +1211,7 @@ static int diag_sdioCmd53Read(volatile uint8_t *sdhci, int fn,
 		((block_count > 1u ? 1u : 0u) << 5) |
 		((uint32_t)0x3Au << 16) |
 		((uint32_t)53u << 24);
-	irq = wifi_xferUse(block_size);
+	irq = wifi_xferUse(block_size, block_count);
 	if (irq != 0) {
 		wifi_xferArm(sdhci, 0, buf, NULL, block_size, block_count);
 	}
@@ -1301,7 +1310,7 @@ static int diag_sdioCmd53ReadByteMode(volatile uint8_t *sdhci, int fn,
 		((reg_addr & 0x1FFFFu) << 9) | (nbytes & 0x1FFu);
 	*(volatile uint32_t *)(sdhci + SDHCI_ARGUMENT_1) = arg;
 	cmd_word = (1u << 4) | ((uint32_t)0x3Au << 16) | ((uint32_t)53u << 24); /* read dir, no BLK_CNT_EN */
-	irq = wifi_xferUse(nbytes);
+	irq = wifi_xferUse(nbytes, 1u);
 	if (irq != 0) {
 		wifi_xferArm(sdhci, 0, buf, NULL, nbytes, 1u);
 	}
@@ -1392,7 +1401,7 @@ static int diag_sdioCmd53WriteByteMode(volatile uint8_t *sdhci, int fn,
 		((reg_addr & 0x1FFFFu) << 9) | (nbytes & 0x1FFu);
 	*(volatile uint32_t *)(sdhci + SDHCI_ARGUMENT_1) = arg;
 	cmd_word = ((uint32_t)0x3Au << 16) | ((uint32_t)53u << 24); /* write dir, no BLK_CNT_EN */
-	irq = wifi_xferUse(nbytes);
+	irq = wifi_xferUse(nbytes, 1u);
 	if (irq != 0) {
 		wifi_xferArm(sdhci, 1, NULL, buf, nbytes, 1u);
 	}
@@ -1496,7 +1505,7 @@ static int diag_sdioCmd53Write(volatile uint8_t *sdhci, int fn,
 		((block_count > 1u ? 1u : 0u) << 5) |
 		((uint32_t)0x3Au << 16) |
 		((uint32_t)53u << 24);
-	irq = wifi_xferUse(block_size);
+	irq = wifi_xferUse(block_size, block_count);
 	if (irq != 0) {
 		wifi_xferArm(sdhci, 1, NULL, buf, block_size, block_count);
 	}
@@ -6297,6 +6306,34 @@ static int wifi_pioIrq(const char *arg, char *out, int cap)
 	return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
 }
 
+/* `pioirqmin <bytes>`: with `pioirq 1`, transfers shorter than this in all stay
+ * polled (0: none do). 513 leaves only multi-block transfers to the handler.
+ * Message thread, so no transfer is in flight. The reply carries the bus times
+ * of the setting being left, and they start again from zero. */
+static int wifi_pioIrqMin(const char *arg, char *out, int cap)
+{
+	int want = atoi(arg), n, m;
+
+	if ((want < 0) || (want > 65536)) {
+		return snprintf(out, (size_t)cap, "PIOIRQMIN error: 0..65536 bytes, now %u\n",
+			(unsigned)g_xfer.min_bytes);
+	}
+	n = snprintf(out, (size_t)cap, "PIOIRQMIN leaving %u: ", (unsigned)g_xfer.min_bytes);
+	if ((n < 0) || (n >= cap)) {
+		return n;
+	}
+	m = diag_busTimeLine(out + n, cap - n);
+	if ((m < 0) || (m >= (cap - n))) {
+		return n;
+	}
+	n += m;
+	g_xfer.min_bytes = (uint32_t)want;
+	diag_busTimeReset();
+	m = snprintf(out + n, (size_t)(cap - n), "PIOIRQMIN ok: transfers under %u bytes stay polled (bus times reset)\n",
+		(unsigned)g_xfer.min_bytes);
+	return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
+}
+
 
 /* ---- Radio probes and settings (`iovar`, `ioctl`, `atjoin`, `country`, `bw`,
  * `chanspecs`, `dump`) ------------------------------------------------------
@@ -6939,7 +6976,7 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS rxbig ok=%u max_len=%u rxglom_off_rc=%d\n"
 		"WIFISTATS glom descs=%u supers=%u subframes=%u bad=%u\n"
 		"WIFISTATS pio mode=%s slow_waits=%u slow_max_us=%u timeouts=%u\n"
-		"WIFISTATS pioirq mode=%s%s%s min=%u xfers=%u irqs=%u irq_blocks=%u wakes=%u late=%u ticks=%u "
+		"WIFISTATS pioirq mode=%s%s%s min=%u minxfer=%u xfers=%u irqs=%u irq_blocks=%u wakes=%u late=%u ticks=%u "
 		"rescues=%u rescue_blocks=%u errs=%u timeouts=%u\n"
 		"WIFISTATS sbwin writes=%u skips=%u\n"
 		"WIFISTATS sdio target=%u kHz sd=%u Hz hctl=0x%02x timeout=0x%x f2blk=%u hs_ups=%u hs_fallbacks=%u%s%s\n"
@@ -6962,7 +6999,7 @@ static int wifi_stats(char *out, int cap)
 		(unsigned)g_pio_slow_max_us, (unsigned)g_pio_timeouts,
 		((g_xfer.on != 0) && (g_pio_legacy == 0)) ? "irq" : "poll",
 		(g_xfer.why[0] != '\0') ? " off=" : "", g_xfer.why, (unsigned)WIFI_XFER_IRQ_MIN,
-		(unsigned)g_xfer.xfers, (unsigned)g_xfer.x.irqs, (unsigned)g_xfer.x.irq_blocks,
+		(unsigned)g_xfer.min_bytes, (unsigned)g_xfer.xfers, (unsigned)g_xfer.x.irqs, (unsigned)g_xfer.x.irq_blocks,
 		(unsigned)g_xfer.wakes, (unsigned)g_xfer.late, (unsigned)g_xfer.ticks, (unsigned)g_xfer.rescues,
 		(unsigned)g_xfer.rescue_blocks, (unsigned)g_xfer.errs, (unsigned)g_xfer.timeouts,
 		(unsigned)g_sbwin_writes, (unsigned)g_sbwin_skips,
@@ -7509,6 +7546,17 @@ static void wifi_thread(void *arg)
 				}
 				else if (msg.i.size >= 6 && memcmp(msg.i.data, "rxpoll", 6) == 0) {
 					g_resp_len = wifi_rxPoll(g_resp, (int)sizeof(g_resp));
+				}
+				else if (msg.i.size >= 11 && memcmp(msg.i.data, "pioirqmin ", 10) == 0) {
+					char arg[16];
+					size_t an = msg.i.size - 10u;
+
+					if (an >= sizeof(arg)) {
+						an = sizeof(arg) - 1u;
+					}
+					memcpy(arg, (const char *)msg.i.data + 10, an);
+					arg[an] = '\0';
+					g_resp_len = wifi_pioIrqMin(arg, g_resp, (int)sizeof(g_resp));
 				}
 				else if (msg.i.size >= 8 && memcmp(msg.i.data, "pioirq ", 7) == 0) {
 					char arg[16];
