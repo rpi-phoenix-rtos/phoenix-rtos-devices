@@ -867,7 +867,7 @@ static void diag_pioWriteWord(volatile uint8_t *sdhci, const uint8_t *buf, uint3
  * the handler never has to leave an error latched on the shared line.
  *
  * Smaller blocks stay polled: the 64-byte firmware-download blocks, the 12-byte
- * frame headers, and block-mode TX at the default f2blk=64. Such a block crosses
+ * frame headers, and all blocks when f2blk is set below 256. Such a block crosses
  * the bus in a few microseconds, less than an interrupt plus a wakeup costs.
  * `wifi pioirqmin <bytes>` also keeps transfers shorter than that in all polled
  * (default 0, none): with byte-mode receive, a 9 kB superframe is read in 512-byte
@@ -2330,13 +2330,15 @@ static int diag_chipWake(volatile uint8_t *sdhci, int *ok)
  * us of data), so a 1536-byte TX frame spends ~38 us of its ~160 us on 24 block
  * trailers; at 512 it has 3.
  *
- * Only TX is affected on this side unless `rxblk` is on: by default the receive
- * path reads F2 in byte mode (see diag_f2Read). What the firmware does with the
- * value is not known here -- it may align what it sends us to it -- so 512 is
- * opt-in until measured:
- * `f2blk=512` sets it at bring-up (Linux's order), `wifi f2blk <n>` at run time.
- * The glom/garbage/resync counters in `stats` are the ones to watch. */
-#define F2_BLKSZ_DEFAULT 64u
+ * With `rxblk` on (the default) the receive path also reads F2 in blocks of this
+ * size (see diag_f2Read). 512 is the default, set at bring-up (Linux's order):
+ * on the Pi (2.4 GHz, 72 Mbit/s, 2026-11-20) 512 with `pioirq 1` and `rxblk 1`
+ * moved TX 5.10 / RX 5.07 MB/s against 4.94 / 4.81 polled at 64, with half the
+ * daemon's CPU time and no glom, garbage or resync errors. `f2blk=<n>` sets
+ * another size at bring-up, `wifi f2blk <n>` at run time. If the size does not
+ * read back, bring-up falls back to 64, the size used before. */
+#define F2_BLKSZ_DEFAULT 512u
+#define F2_BLKSZ_SAFE    64u /* the bring-up fallback */
 static uint32_t g_f2_blksz = F2_BLKSZ_DEFAULT;      /* what FBR 0x210 holds */
 static uint32_t g_f2_blksz_want = F2_BLKSZ_DEFAULT; /* `f2blk=<n>` */
 static int g_evt_seen = 0;             /* chan-1 (event) frames demuxed past */
@@ -2513,11 +2515,13 @@ static int diag_f2Write(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t le
  * instead of eighteen. Its blocks also follow each other on the bus while the
  * previous one is drained, and on the interrupt path (`pioirq 1`, at f2blk 256
  * and more) the bus owner sleeps once per frame instead of once per 512 bytes.
- * Byte mode stays the default until a hardware A/B; the glom/garbage/resync
- * counters in `stats` are the ones to watch, `rxblk_reads` says it is in use. */
+ * Block mode is the default (measured in the F2_BLKSZ_DEFAULT note): with byte
+ * mode the interrupt path lost ~9 % of receive, with block mode it gains ~5 %
+ * over polled byte mode. `rxblk=0` or `wifi rxblk 0` restores byte mode;
+ * `rxblk_reads` in `stats` says block mode is in use. */
 #define F2_RX_BLK_MAX 511u /* the block count field of CMD53 */
 
-static int g_f2_rxblk = 0;            /* `rxblk`: whole blocks of a read in block mode (message thread) */
+static int g_f2_rxblk = 1;            /* `rxblk`: whole blocks of a read in block mode (message thread) */
 static uint32_t g_f2_rxblk_reads = 0; /* block-mode reads it made */
 
 static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
@@ -4665,10 +4669,10 @@ static int wifi_bringup(void)
 		 * F2's never was, because nothing used block mode on the data path --
 		 * which is precisely why data frames were stuck under the 512-byte
 		 * byte-mode cap. FBR2's block size lives at 0x210/0x211. */
-		if ((diag_f2SetBlockSize(sdhci, g_f2_blksz_want) != 0) && (g_f2_blksz_want != F2_BLKSZ_DEFAULT)) {
+		if ((diag_f2SetBlockSize(sdhci, g_f2_blksz_want) != 0) && (g_f2_blksz_want != F2_BLKSZ_SAFE)) {
 			printf("rpi4-wifi: F2 block size %u did not read back; using %u\n",
-				(unsigned)g_f2_blksz_want, (unsigned)F2_BLKSZ_DEFAULT);
-			(void)diag_f2SetBlockSize(sdhci, F2_BLKSZ_DEFAULT);
+				(unsigned)g_f2_blksz_want, (unsigned)F2_BLKSZ_SAFE);
+			(void)diag_f2SetBlockSize(sdhci, F2_BLKSZ_SAFE);
 		}
 
 		/* #91: enumerate cores over the backplane (read-only) now that the
@@ -7688,7 +7692,7 @@ static int wifi_fwLoadOrWait(int wait)
 
 int main(int argc, char **argv)
 {
-	int selftest = 0, jointest = 0, fwbench = 0, foreground = 0, verbose = 0, rxirq = 1, pioirq = 0, ai, rc;
+	int selftest = 0, jointest = 0, fwbench = 0, foreground = 0, verbose = 0, rxirq = 1, pioirq = 1, ai, rc;
 	uint32_t port, irqport;
 	oid_t dev;
 	pid_t pid;
@@ -7762,14 +7766,14 @@ int main(int argc, char **argv)
 			g_hs_hispd = 1;
 		}
 		else if ((strcmp(argv[ai], "pioirq=0") == 0) || (strcmp(argv[ai], "pioirq=1") == 0)) {
-			/* data blocks of WIFI_XFER_IRQ_MIN bytes and more: polled (0, the
-			 * default) or moved by the interrupt handler (1); `wifi pioirq 0|1`
+			/* data blocks of WIFI_XFER_IRQ_MIN bytes and more: polled (0) or
+			 * moved by the interrupt handler (1, the default); `wifi pioirq 0|1`
 			 * at run time */
 			pioirq = argv[ai][7] - '0';
 		}
 		else if ((strcmp(argv[ai], "rxblk=0") == 0) || (strcmp(argv[ai], "rxblk=1") == 0)) {
-			/* frames over 512 bytes: byte-mode transfers (0, the default) or whole
-			 * blocks plus a byte-mode tail (1); `wifi rxblk 0|1` at run time */
+			/* frames over 512 bytes: byte-mode transfers (0) or whole blocks plus
+			 * a byte-mode tail (1, the default); `wifi rxblk 0|1` at run time */
 			g_f2_rxblk = argv[ai][6] - '0';
 		}
 		else if (strcmp(argv[ai], "legacypio") == 0) {

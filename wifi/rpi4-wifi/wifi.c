@@ -394,8 +394,8 @@ int main(int argc, char **argv)
 		return rc;
 	}
 	if (argc >= 3 && strcmp(argv[1], "f2blk") == 0) {
-		/* Change the SDIO function-2 (data) block size until reboot: 64 (the
-		 * default) .. 512 (brcmfmac's value), for a TX A/B within one boot. */
+		/* Change the SDIO function-2 (data) block size until reboot: 64 ..
+		 * 512 (the default, and brcmfmac's value), for an A/B within one boot. */
 		int n = snprintf(cmd, sizeof(cmd), "f2blk %s", argv[2]);
 		if (n < 0 || n >= (int)sizeof(cmd)) {
 			printf("wifi: argument too long\n");
