@@ -849,9 +849,11 @@ static void diag_pioWriteWord(volatile uint8_t *sdhci, const uint8_t *buf, uint3
  *             block the controller has ready (the PRESENT_STATE level bits, as
  *             the polled loop), then looks for transfer complete. A block that
  *             becomes ready during the drain latches the bit again and
- *             interrupts again, so none is lost. On transfer complete (or an
- *             error) it takes the data bits out of Signal Enable, so nothing
- *             latched can hold the shared line, and wakes the caller. After an
+ *             interrupts again, so none is lost. On transfer complete, an error,
+ *             or the last block of a read (whose transfer complete the caller
+ *             then polls: it follows within microseconds) it takes the data bits
+ *             out of Signal Enable, so nothing latched can hold the shared line,
+ *             and wakes the caller. After an
  *             intermediate block it returns -1, which the kernel takes as
  *             "source silenced, nobody to wake".
  *   fallback  the caller sleeps at most WIFI_XFER_TICK_US at a time. When a
@@ -969,11 +971,15 @@ static WIFI_IRQ_CONTEXT uint32_t wifi_xferService(wifi_xfer_t *x)
 		moved++;
 	}
 
-	/* Read after the drain: a read's transfer complete follows its last block
-	 * at once, so a one-block read finishes in a single interrupt. Both bits
-	 * stay latched for the caller, which clears INT_STATUS. */
+	/* A read is the caller's again once its last block is out of the buffer.
+	 * Its transfer complete follows within microseconds, but not within this
+	 * pass: waiting for it took a second interrupt for every one-block read
+	 * (`irqs` was exactly twice `xfers`), so the caller polls for it instead.
+	 * A write is not done at its last block, which still has to cross the bus.
+	 * What is latched stays latched for the caller, which clears INT_STATUS. */
 	st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
-	if ((st & (SDHCI_INT_ERR_ANY | SDHCI_INT_XFER_COMPLETE)) != 0u) {
+	if (((st & (SDHCI_INT_ERR_ANY | SDHCI_INT_XFER_COMPLETE)) != 0u) ||
+		((x->write == 0) && (x->blk == x->nblk))) {
 		x->status = st;
 		__atomic_store_n(&x->done, 1, __ATOMIC_SEQ_CST);
 	}
@@ -1129,6 +1135,20 @@ static int wifi_xferWait(const char *dir)
 		/* An error, or transfer complete before the last block. */
 		g_xfer.errs++;
 		return (x->blk < x->nblk) ? -4 : -6;
+	}
+	if ((x->status & SDHCI_INT_XFER_COMPLETE) == 0u) {
+		/* A read handed back at its last block (see wifi_xferService). */
+		rc = diag_sdhciWaitSet(x->sdhci, SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE);
+		if (rc != 0) {
+			if (rc == -1) {
+				g_xfer.errs++;
+			}
+			else {
+				g_xfer.timeouts++;
+				diag_pioNoteTimeout(x->sdhci, dir, x->blk, x->nblk);
+			}
+			return (rc == -1) ? -6 : -7;
+		}
 	}
 	*(volatile uint32_t *)(x->sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
 	return 0;
