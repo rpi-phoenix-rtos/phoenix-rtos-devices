@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/file.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/threads.h>
 #include <posix/utils.h>
@@ -352,6 +353,41 @@ static int sdstorage_optsParse(int argc, char **argv, options_parsed_t *opts)
 }
 
 
+/* How long the root waits for the mount table to be writable (devfs mounted
+ * on /dev, done by the boot script after the root is up): 300 x 100 ms = 30 s.
+ * Any failure is retried, not only EAGAIN: the mounters of a boot all write
+ * the table at about the moment devfs is mounted. */
+#define RECORD_WAIT_TRIES 300
+#define RECORD_WAIT_US    100000
+
+
+static struct {
+	char stack[8192] __attribute__((aligned(8)));
+	char dev[32];
+	char fstype[32];
+} sdstorage_record;
+
+
+/* Lists the root in the mount table so that df and mount show it. Runs on its
+ * own thread: writing the table looks up through "/", which is this server, and
+ * it has to wait until the boot script mounts devfs on /dev. Best effort. */
+static void sdstorage_recordThread(void *arg)
+{
+	int i;
+
+	(void)arg;
+
+	for (i = 0; i < RECORD_WAIT_TRIES; i++) {
+		if (mount_record(sdstorage_record.dev, "/", sdstorage_record.fstype, "rw") == 0) {
+			break;
+		}
+		usleep(RECORD_WAIT_US);
+	}
+
+	endthread();
+}
+
+
 static int sdstorage_mountRootFs(options_parsed_t *opts)
 {
 	if (opts->rootDev[0] == '\0') {
@@ -391,6 +427,13 @@ static int sdstorage_mountRootFs(options_parsed_t *opts)
 	err = portRegister(oid.port, "/", &oid);
 	fprintf(stderr, LOG_TAG ": mounted %s (%s, id=%u) as / after %d tr%s, portRegister=%d\n",
 		opts->rootDev, opts->rootFsName, rootId, tries, (tries == 1) ? "y" : "ies", err);
+
+	if (err == EOK) {
+		(void)snprintf(sdstorage_record.dev, sizeof(sdstorage_record.dev), "%s", opts->rootDev);
+		(void)snprintf(sdstorage_record.fstype, sizeof(sdstorage_record.fstype), "%s", opts->rootFsName);
+		(void)beginthread(sdstorage_recordThread, 4, sdstorage_record.stack, sizeof(sdstorage_record.stack), NULL);
+	}
+
 	return err;
 }
 
