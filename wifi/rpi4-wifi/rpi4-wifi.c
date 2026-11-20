@@ -2330,9 +2330,10 @@ static int diag_chipWake(volatile uint8_t *sdhci, int *ok)
  * us of data), so a 1536-byte TX frame spends ~38 us of its ~160 us on 24 block
  * trailers; at 512 it has 3.
  *
- * Only TX is affected on this side: the receive path reads F2 in byte mode (see
- * F2_RX_ONE_CMD). What the firmware does with the value is not known here --
- * it may align what it sends us to it -- so 512 is opt-in until measured:
+ * Only TX is affected on this side unless `rxblk` is on: by default the receive
+ * path reads F2 in byte mode (see diag_f2Read). What the firmware does with the
+ * value is not known here -- it may align what it sends us to it -- so 512 is
+ * opt-in until measured:
  * `f2blk=512` sets it at bring-up (Linux's order), `wifi f2blk <n>` at run time.
  * The glom/garbage/resync counters in `stats` are the ones to watch. */
 #define F2_BLKSZ_DEFAULT 64u
@@ -2495,41 +2496,53 @@ static int diag_f2Write(volatile uint8_t *sdhci, const uint8_t *buf, uint32_t le
 }
 
 
-/* RX transfer mode is a measured throughput decision.
+/* RX transfer mode.
  *
  * Byte mode caps at 512 bytes, so a 1514-byte frame needs three chunk transfers
- * on top of the header read -- four commands per frame, each spinning on SDHCI
- * status in PIO. Block mode moves the whole remainder in ONE command.
+ * on top of the header read, and a 9 kB glom superframe eighteen: one command,
+ * one card access time and one PIO wait each.
  *
- * So one command per frame should be faster. It is not, and the decisive
- * evidence is a COUNTER, not a rate: switching to one block-mode command took
- * rx_err from 1 to 433 in the same test. Block mode must move whole blocks, so
- * it pops ceil(len/64)*64 bytes, reads past the end of the frame and
- * desynchronises the stream -- those errors are that desync. (Throughput also
- * looked worse, but see the WIFI_RX_* note: run-to-run throughput on this link
- * varies 2.6x, so rates alone prove nothing here.)
+ * Reading the whole remainder as ceil(len / block size) blocks is WRONG: it
+ * pops past the end of the frame and desynchronises the F2 stream (measured:
+ * rx_err 1 -> 433 in one test at 64-byte blocks).
  *
- * Byte mode pops exactly what is asked for, so a frame is consumed precisely.
- * Keep it. F2_RX_ONE_CMD stays only so the comparison can be re-run. */
-#define F2_RX_ONE_CMD 0
+ * `rxblk` (`wifi rxblk 1`, or `rxblk=1` on the command line) instead splits
+ * the read exactly, as SDIO hosts generally do: the whole blocks of the
+ * remainder in one block-mode CMD53, then what is left (less than one block) in
+ * byte mode. That pops exactly `len` bytes, and a superframe takes two commands
+ * instead of eighteen. Its blocks also follow each other on the bus while the
+ * previous one is drained, and on the interrupt path (`pioirq 1`, at f2blk 256
+ * and more) the bus owner sleeps once per frame instead of once per 512 bytes.
+ * Byte mode stays the default until a hardware A/B; the glom/garbage/resync
+ * counters in `stats` are the ones to watch, `rxblk_reads` says it is in use. */
+#define F2_RX_BLK_MAX 511u /* the block count field of CMD53 */
+
+static int g_f2_rxblk = 0;            /* `rxblk`: whole blocks of a read in block mode (message thread) */
+static uint32_t g_f2_rxblk_reads = 0; /* block-mode reads it made */
 
 static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
 {
-#if !F2_RX_ONE_CMD
-	uint32_t done = 0u;
-#endif
+	uint32_t done = 0u, nblk;
+	int rc;
 
 	if (len <= 512u) {
 		return diag_sdioCmd53ReadByteMode(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
 			(len + 3u) & ~3u, buf);
 	}
-#if F2_RX_ONE_CMD
-	return diag_sdioCmd53Read(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR,
-		(len + g_f2_blksz - 1u) / g_f2_blksz, g_f2_blksz, buf);
-#else
+	if (g_f2_rxblk != 0) {
+		nblk = len / g_f2_blksz;
+		if (nblk > F2_RX_BLK_MAX) {
+			nblk = F2_RX_BLK_MAX;
+		}
+		rc = diag_sdioCmd53Read(sdhci, 2, /*incr=*/0, IOCTL_F2_ADDR, nblk, g_f2_blksz, buf);
+		if (rc != 0) {
+			return rc;
+		}
+		g_f2_rxblk_reads++;
+		done = nblk * g_f2_blksz;
+	}
 	while (done < len) {
 		uint32_t chunk = len - done;
-		int rc;
 
 		if (chunk > 512u) {
 			chunk = 512u;
@@ -2543,7 +2556,6 @@ static int diag_f2Read(volatile uint8_t *sdhci, uint8_t *buf, uint32_t len)
 		done += chunk;
 	}
 	return 0;
-#endif
 }
 
 
@@ -2607,9 +2619,11 @@ static int diag_f2RecvFrame(volatile uint8_t *sdhci, uint8_t *buf, uint32_t cap,
 		 * roundup(len, blocksize), so padding to the F2 block size looks right --
 		 * and measured on hardware it is WRONG here: with it, receive dies within
 		 * a handful of frames (rx_ok 5, no glom frame ever seen). That padding
-		 * belongs to block-mode transfers; this driver reads the FIFO in byte
-		 * mode, which pops exactly what is asked for, so rounding up to 64 reads
-		 * past the frame and desynchronises the stream. */
+		 * belongs to reads that are block mode to the end; this driver ends
+		 * every read in byte mode (`rxblk` moves only the whole blocks before
+		 * the tail in block mode), which pops exactly what is asked for, so
+		 * rounding up to 64 reads past the frame and desynchronises the
+		 * stream. */
 		uint32_t rest = ((uint32_t)len - F2_HDR_LEN + 3u) & ~3u;
 		/* diag_f2Read, not the byte-mode helper: a frame over 524 bytes
 		 * total needs block mode. Requesting it in byte mode is what
@@ -6306,6 +6320,34 @@ static int wifi_pioIrq(const char *arg, char *out, int cap)
 	return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
 }
 
+/* `rxblk 0|1`: receive frames over 512 bytes in byte-mode transfers of 512 (0)
+ * or as whole blocks plus a byte-mode tail (1), from the next frame on (see
+ * diag_f2Read). Message thread, so no transfer is in flight. The reply carries
+ * the bus times of the mode being left, and they start again from zero. */
+static int wifi_rxBlk(const char *arg, char *out, int cap)
+{
+	int want = atoi(arg), n, m;
+
+	if ((want != 0) && (want != 1)) {
+		return snprintf(out, (size_t)cap, "RXBLK error: 0 (byte mode) or 1 (block mode), now %d\n", g_f2_rxblk);
+	}
+	n = snprintf(out, (size_t)cap, "RXBLK leaving %d: ", g_f2_rxblk);
+	if ((n < 0) || (n >= cap)) {
+		return n;
+	}
+	m = diag_busTimeLine(out + n, cap - n);
+	if ((m < 0) || (m >= (cap - n))) {
+		return n;
+	}
+	n += m;
+	g_f2_rxblk = want;
+	diag_busTimeReset();
+	m = snprintf(out + n, (size_t)(cap - n), "RXBLK ok: frames over 512 bytes read %s (f2blk %u; bus times reset)\n",
+		(want != 0) ? "as whole blocks plus a byte-mode tail" : "in byte-mode transfers of 512",
+		(unsigned)g_f2_blksz);
+	return ((m > 0) && (m < (cap - n))) ? (n + m) : n;
+}
+
 /* `pioirqmin <bytes>`: with `pioirq 1`, transfers shorter than this in all stay
  * polled (0: none do). 513 leaves only multi-block transfers to the handler.
  * Message thread, so no transfer is in flight. The reply carries the bus times
@@ -6979,7 +7021,7 @@ static int wifi_stats(char *out, int cap)
 		"WIFISTATS pioirq mode=%s%s%s min=%u minxfer=%u xfers=%u irqs=%u irq_blocks=%u wakes=%u late=%u ticks=%u "
 		"rescues=%u rescue_blocks=%u errs=%u timeouts=%u\n"
 		"WIFISTATS sbwin writes=%u skips=%u\n"
-		"WIFISTATS sdio target=%u kHz sd=%u Hz hctl=0x%02x timeout=0x%x f2blk=%u hs_ups=%u hs_fallbacks=%u%s%s\n"
+		"WIFISTATS sdio target=%u kHz sd=%u Hz hctl=0x%02x timeout=0x%x f2blk=%u rxblk=%d rxblk_reads=%u hs_ups=%u hs_fallbacks=%u%s%s\n"
 		"WIFISTATS rxirq mode=%s%s%s waits=%u wakes=%u level=%u timeouts=%u\n"
 		"WIFISTATS rxirq isr claimed=%u declined=%u acks=%u acks_noframe=%u ack_errs=%u drained=%u\n",
 		g_tx_calls, (unsigned long long)diag_ticksToUs(g_tx_ticks),
@@ -7006,7 +7048,7 @@ static int wifi_stats(char *out, int cap)
 		g_sdclk_khz, (unsigned)g_sdhci_sd_hz,
 		(g_sdhci != NULL) ? (unsigned)(*(volatile uint32_t *)(g_sdhci + SDHCI_HOST_CTL) & 0xffu) : 0u,
 		(g_sdhci != NULL) ? (unsigned)((*(volatile uint32_t *)(g_sdhci + SDHCI_CLK_TIMEOUT_RESET) >> 16) & 0xfu) : 0u,
-		(unsigned)g_f2_blksz, (unsigned)g_hs_ups, (unsigned)g_hs_fallbacks,
+		(unsigned)g_f2_blksz, g_f2_rxblk, (unsigned)g_f2_rxblk_reads, (unsigned)g_hs_ups, (unsigned)g_hs_fallbacks,
 		(g_hs_why[0] != '\0') ? " last_fail=" : "", g_hs_why,
 		((g_irq.ready != 0) && (g_irq.disabled == 0)) ? "irq" : "poll",
 		(g_irq.why[0] != '\0') ? " off=" : "", g_irq.why,
@@ -7547,6 +7589,17 @@ static void wifi_thread(void *arg)
 				else if (msg.i.size >= 6 && memcmp(msg.i.data, "rxpoll", 6) == 0) {
 					g_resp_len = wifi_rxPoll(g_resp, (int)sizeof(g_resp));
 				}
+				else if (msg.i.size >= 7 && memcmp(msg.i.data, "rxblk ", 6) == 0) {
+					char arg[16];
+					size_t an = msg.i.size - 6u;
+
+					if (an >= sizeof(arg)) {
+						an = sizeof(arg) - 1u;
+					}
+					memcpy(arg, (const char *)msg.i.data + 6, an);
+					arg[an] = '\0';
+					g_resp_len = wifi_rxBlk(arg, g_resp, (int)sizeof(g_resp));
+				}
 				else if (msg.i.size >= 11 && memcmp(msg.i.data, "pioirqmin ", 10) == 0) {
 					char arg[16];
 					size_t an = msg.i.size - 10u;
@@ -7713,6 +7766,11 @@ int main(int argc, char **argv)
 			 * default) or moved by the interrupt handler (1); `wifi pioirq 0|1`
 			 * at run time */
 			pioirq = argv[ai][7] - '0';
+		}
+		else if ((strcmp(argv[ai], "rxblk=0") == 0) || (strcmp(argv[ai], "rxblk=1") == 0)) {
+			/* frames over 512 bytes: byte-mode transfers (0, the default) or whole
+			 * blocks plus a byte-mode tail (1); `wifi rxblk 0|1` at run time */
+			g_f2_rxblk = argv[ai][6] - '0';
 		}
 		else if (strcmp(argv[ai], "legacypio") == 0) {
 			/* the old PIO wait, for a first-load A/B across boots */
