@@ -24,6 +24,7 @@
 #include <phoenix/fbcon.h>
 #include <posix/utils.h>
 #include <sys/file.h>
+#include <sys/interrupt.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
 #include <sys/platform.h>
@@ -59,6 +60,17 @@
 #define PL011_TTY_POLL_US 1000
 #endif
 
+/* With PL011_TTY_IRQ set (the board's PL011 interrupt, as interrupt() numbers it), the
+ * idle thread sleeps until a receive interrupt, new TX data (signal_txready) or
+ * PL011_TTY_IDLE_US, instead of polling every PL011_TTY_POLL_US. 0 keeps the polling. */
+#ifndef PL011_TTY_IRQ
+#define PL011_TTY_IRQ 0u
+#endif
+
+#ifndef PL011_TTY_IDLE_US
+#define PL011_TTY_IDLE_US 100000u
+#endif
+
 #ifndef PL011_TTY_KBD_PATH
 #define PL011_TTY_KBD_PATH ((const char *)NULL)
 #endif
@@ -75,7 +87,10 @@
 #endif
 
 
-enum { dr = 0x00, fr = 0x18, ibrd = 0x24, fbrd = 0x28, lcrh = 0x2c, cr = 0x30, imsc = 0x38, icr = 0x44 };
+enum { dr = 0x00, fr = 0x18, ibrd = 0x24, fbrd = 0x28, lcrh = 0x2c, cr = 0x30, imsc = 0x38, mis = 0x40, icr = 0x44 };
+
+/* receive (FIFO level) and receive timeout interrupts */
+enum { im_rx = 1 << 4, im_rt = 1 << 6 };
 
 enum { fr_rxfe = 1 << 4, fr_txff = 1 << 5 };
 
@@ -126,6 +141,12 @@ typedef struct {
 	 * drivers do the same; it lets the HW path hold one lock rather than two. */
 	handle_t ttyLock;
 	handle_t fbLock;
+	/* PL011_TTY_IRQ: the thread's idle wait (irqCond under irqLock, signalled by the
+	 * interrupt and by signal_txready); irqOn says the interrupt is registered. */
+	handle_t irqLock;
+	handle_t irqCond;
+	handle_t irqHandle;
+	int irqOn;
 	/* TD-15 Stage 4 phase 1c: the POINTER itself is volatile (not just
 	 * the pointed-to data). pl011_thr starts before pl011_fbcon_init
 	 * (line 995 vs the fbcon_init call ~15 lines later) and reads
@@ -712,7 +733,29 @@ static void set_cflag(void *arg, tcflag_t *cflag)
 
 static void signal_txready(void *arg)
 {
-	(void)arg;
+	pl011_t *uart = (pl011_t *)arg;
+
+	/* New TX data: wake the thread if it is in its idle wait. A signal that comes before
+	 * the wait is not lost (the kernel keeps it pending for the next wait). */
+	if (uart->irqOn != 0) {
+		(void)condSignal(uart->irqCond);
+	}
+}
+
+
+/* Receive interrupt. Shared line (the BCM2711's PL011s share one): claim only our own
+ * receive sources, and mask them so the level does not hold the line until the thread has
+ * drained the FIFO; the thread unmasks them before it waits again. */
+static int __attribute__((target("general-regs-only"))) pl011_isr(unsigned int n, void *arg)
+{
+	pl011_t *uart = (pl011_t *)arg;
+
+	(void)n;
+	if ((pl011_read(uart, mis) & (uint32_t)(im_rx | im_rt)) == 0u) {
+		return -1;
+	}
+	pl011_write(uart, imsc, 0u);
+	return 1;
 }
 
 
@@ -897,6 +940,16 @@ static int pl011_init(pl011_t *uart, unsigned int port)
 
 	uart->speed = uart->tty.term.c_ospeed;
 	uart->cflag = uart->tty.term.c_cflag;
+	uart->irqOn = 0;
+	if (PL011_TTY_IRQ != 0u) {
+		if ((mutexCreate(&uart->irqLock) == EOK) && (condCreate(&uart->irqCond) == EOK) &&
+			(interrupt(PL011_TTY_IRQ, pl011_isr, uart, uart->irqCond, &uart->irqHandle) >= 0)) {
+			uart->irqOn = 1;
+		}
+		else {
+			fprintf(stderr, "pl011-tty: receive interrupt %u unavailable, polling\n", PL011_TTY_IRQ);
+		}
+	}
 	uart->oid.port = port;
 	uart->oid.id = 0;
 
@@ -1128,7 +1181,18 @@ static void pl011_thr(void *arg)
 		if ((wake_reader == 0) && (wake_writer == 0) &&
 			(txPending == 0) &&
 			((pl011_read(uart, fr) & fr_rxfe) != 0)) {
-			usleep(PL011_TTY_POLL_US);
+			if (uart->irqOn != 0) {
+				/* Unmask receive, then sleep until it fires, TX data is queued or the
+				 * backstop runs out. A byte that arrived after the check above raises
+				 * the (level) interrupt as soon as it is unmasked. */
+				(void)mutexLock(uart->irqLock);
+				pl011_write(uart, imsc, (uint32_t)(im_rx | im_rt));
+				(void)condWait(uart->irqCond, uart->irqLock, PL011_TTY_IDLE_US);
+				(void)mutexUnlock(uart->irqLock);
+			}
+			else {
+				usleep(PL011_TTY_POLL_US);
+			}
 		}
 	}
 }
