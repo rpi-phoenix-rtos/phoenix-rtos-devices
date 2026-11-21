@@ -132,6 +132,7 @@ typedef struct {
 	uint32_t refs;               /* user_ref + one per plane showing it or about to */
 	uint32_t bo;                 /* index into srv.bos */
 	uint32_t w, h, format, pitch, offset;
+	uint32_t sand_colh;          /* NV12 SAND128: column height in lines (0 = linear RGB) */
 } kms_fb_t;
 
 typedef struct {

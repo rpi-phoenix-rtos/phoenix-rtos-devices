@@ -795,8 +795,11 @@ int kms_fb_add(uint32_t client, const kms_addfb2_req_t *rq, uint32_t *fb_id)
 	if (b == NULL) {
 		return -ENOENT;
 	}
-	if ((rq->format != KMS_FMT_XRGB8888) && (rq->format != KMS_FMT_ARGB8888) && (rq->format != KMS_FMT_XBGR8888) &&
-			(rq->format != KMS_FMT_ABGR8888)) {
+	uint32_t coff = 0u;
+	uint64_t sand = kms_sand_layout(rq, &coff);
+
+	if ((sand == 0u) && (rq->format != KMS_FMT_XRGB8888) && (rq->format != KMS_FMT_ARGB8888) &&
+			(rq->format != KMS_FMT_XBGR8888) && (rq->format != KMS_FMT_ABGR8888)) {
 		return -EINVAL;
 	}
 	if ((b->kind == KMS_BOK_IMPORT) || (b->kind == KMS_BOK_ALIAS)) {
@@ -811,7 +814,12 @@ int kms_fb_add(uint32_t client, const kms_addfb2_req_t *rq, uint32_t *fb_id)
 			return -EINVAL;
 		}
 	}
-	if ((rq->modifier != KMS_MOD_LINEAR) || (rq->width == 0u) || (rq->height == 0u) || (rq->pitch < rq->width * 4u) ||
+	if (sand != 0u) {
+		if ((uint64_t)rq->offset + sand > b->size) {
+			return -EINVAL;
+		}
+	}
+	else if ((rq->modifier != KMS_MOD_LINEAR) || (rq->width == 0u) || (rq->height == 0u) || (rq->pitch < rq->width * 4u) ||
 			((uint64_t)rq->offset + (uint64_t)rq->pitch * rq->height > b->size)) {
 		return -EINVAL;
 	}
@@ -836,6 +844,7 @@ int kms_fb_add(uint32_t client, const kms_addfb2_req_t *rq, uint32_t *fb_id)
 	f->format = rq->format;
 	f->pitch = rq->pitch;
 	f->offset = rq->offset;
+	f->sand_colh = (sand != 0u) ? KMS_MOD_SAND128_COLH(rq->modifier) : 0u;
 	b->refs++;
 	*fb_id = f->id;
 	return 0;
