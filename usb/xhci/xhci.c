@@ -762,6 +762,10 @@ static void xhci_destroy(xhci_t *xhci)
 }
 
 
+/* Interrupt-IN polling when idle (xhci_roothubStatusThread) */
+#define XHCI_INTR_IDLE_PASSES   200u
+#define XHCI_INTR_IDLE_POLL_US 8000u
+
 static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint8_t wantSlot, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out);
 
 
@@ -779,10 +783,12 @@ static void xhci_roothubStatusThread(void *arg)
 	unsigned sleepUs;
 	unsigned s;
 	unsigned e;
-	int ret;
+	unsigned quiet = 0u; /* passes in a row with no interrupt-IN completion */
+	int ret, completed;
 
 	for (;;) {
 		sleepUs = 100000u;
+		completed = 0;
 		hub = hcd->roothub;
 		if ((hub != NULL) && (hub->statusTransfer != NULL) && !usb_transferCheck(hub->statusTransfer)) {
 			status = xhci_getHubStatus(hub);
@@ -828,7 +834,13 @@ static void xhci_roothubStatusThread(void *arg)
 				continue;
 			}
 
-			sleepUs = 1000u;
+			/* An interrupt-IN report (keyboard, mouse) is polled every 1 ms while
+			 * reports come, and every XHCI_INTR_IDLE_POLL_US once the pipes have been
+			 * quiet for XHCI_INTR_IDLE_PASSES passes: an idle keyboard and mouse no
+			 * longer wake this thread 1 000 times a second. The first report after a
+			 * quiet spell waits at most that long, within a HID device's own report
+			 * interval (bInterval, typically 8-10 ms for a keyboard). */
+			sleepUs = (quiet < XHCI_INTR_IDLE_PASSES) ? 1000u : XHCI_INTR_IDLE_POLL_US;
 			t = NULL;
 			/* Single non-blocking poll of the shared event ring (locked,
 			 * stash-aware) for this interrupt endpoint's completion. The
@@ -866,11 +878,18 @@ static void xhci_roothubStatusThread(void *arg)
 			mutexUnlock(xhci->pipeLock);
 
 			if (t != NULL) {
+				completed = 1;
 				usb_transferFinished(t, ret);
 			}
 			}
 		}
 
+		if (completed != 0) {
+			quiet = 0u;
+		}
+		else if (quiet < XHCI_INTR_IDLE_PASSES) {
+			quiet++;
+		}
 		usleep(sleepUs);
 	}
 }
