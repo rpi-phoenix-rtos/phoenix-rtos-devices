@@ -106,6 +106,7 @@ typedef struct {
 	volatile uint8_t *va;        /* server's uncached view */
 	uint32_t w, h, bpp, pitch;
 	int exported;
+	int held;          /* freed, but a client may still map it: range kept until kms_pool_reclaim() */
 	int prime;                   /* PRIME_EXPORT'ed: any process may open its /kmsbuf name */
 	/* KMS_BOK_IMPORT (G7) and KMS_BOK_ALIAS */
 	int imp_fd;                  /* IMPORT: the exporter's name, open: holds the exporter's reference */

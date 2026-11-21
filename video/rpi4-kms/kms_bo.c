@@ -112,7 +112,7 @@ void kms_pool_fini(void)
 	oid_t oid;
 
 	for (i = 0u; i < KMS_MAX_BOS; i++) {
-		if (srv.bos[i].used && srv.bos[i].exported) {
+		if (srv.bos[i].used && (srv.bos[i].exported || srv.bos[i].held)) {
 			srv.bos[i].exported = 0;   /* before memUnexport: see kms_bo_unref (G3) */
 			oid.port = srv.buf_port;
 			oid.id = srv.bos[i].handle;
@@ -182,14 +182,47 @@ static void memref_fill(const kms_bo_t *b, kms_memref_t *m)
 /* Dumb BOs                                                                   */
 /* ========================================================================= */
 
+/* Give back held pool BOs that no client maps any more (see kms_bo_unref).
+ * Returns how many were released. */
+static uint32_t kms_pool_reclaim(void)
+{
+	uint32_t i, n = 0u;
+	oid_t oid;
+
+	for (i = 0u; i < KMS_MAX_BOS; i++) {
+		kms_bo_t *b = &srv.bos[i];
+		if (!b->used || !b->held) {
+			continue;
+		}
+		oid.port = srv.buf_port;
+		oid.id = b->handle;
+		if (memExportMapped(&oid) > 0) {
+			continue;
+		}
+		(void)memUnexport(&oid);
+		srv.st.exports_live--;
+		srv.st.bos_live--;
+		memset(b, 0, sizeof(*b));
+		n++;
+	}
+	return n;
+}
+
+
 static kms_bo_t *bo_slot_free(uint32_t *idx)
 {
 	uint32_t i;
+	int pass;
 
-	for (i = 0u; i < KMS_MAX_BOS; i++) {
-		if (!srv.bos[i].used) {
-			*idx = i;
-			return &srv.bos[i];
+	for (pass = 0; pass < 2; pass++) {
+		for (i = 0u; i < KMS_MAX_BOS; i++) {
+			if (!srv.bos[i].used) {
+				*idx = i;
+				return &srv.bos[i];
+			}
+		}
+		if ((pass != 0) || (kms_pool_reclaim() == 0u)) {
+			break;
 		}
 	}
 	return NULL;
@@ -258,6 +291,9 @@ static int bo_from_pool(kms_bo_t *b, uint32_t w, uint32_t h, uint32_t bpp)
 	b->pitch = ((w * ((bpp + 7u) / 8u)) + 63u) & ~63u;   /* 64-byte rows [inferred: safe for the HVS] */
 	b->size = KMS_PAGE_ROUND((size_t)b->pitch * h);
 	rc = pool_find(b->size, &off);
+	if ((rc != 0) && (kms_pool_reclaim() != 0u)) {
+		rc = pool_find(b->size, &off);
+	}
 	if (rc != 0) {
 		return rc;
 	}
@@ -376,6 +412,18 @@ void kms_bo_unref(uint32_t idx)
 		b->exported = 0;
 		oid.port = srv.buf_port;
 		oid.id = b->handle;
+		if ((b->kind == KMS_BOK_POOL) && (memExportMapped(&oid) > 0)) {
+			/* A client still maps it, and withdrawing the export unmaps nobody: the
+			 * range must not go to another BO while that mapping exists. Keep it (and
+			 * the window, so the mappings can be counted) until kms_pool_reclaim()
+			 * finds it unmapped; the name stays withdrawn (exported = 0). */
+			b->held = 1;
+			b->handle_open = 0;
+			if (srv.verbose) {
+				KMS_LOG("bo held handle=%u size=%zu (still mapped)", b->handle, b->size);
+			}
+			return;
+		}
 		(void)memUnexport(&oid);
 		srv.st.exports_live--;
 	}
