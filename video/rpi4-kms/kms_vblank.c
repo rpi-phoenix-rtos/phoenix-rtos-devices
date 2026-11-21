@@ -298,10 +298,14 @@ static int vbl_wait(uint32_t max_us, uint32_t kick, uint64_t *stamp, uint32_t *n
 		case KMS_VBL_IRQ:
 			(void)mutexLock(srv.vbl_lock);
 			while ((vb.head == vb.seen) && !kicked(kick) && ((kms_cnt() - t0) < lim)) {
-				/* Neither the ISR nor commit() takes the mutex, so a wake-up can land
-				 * between the check and the wait: a <= 2 ms timeout bounds that. */
+				/* Neither the ISR nor commit() takes the mutex, so a wake-up can land between the
+				 * check and the wait. It is not lost: a cond signalled with nobody waiting on it
+				 * leaves a pending wake-up in the kernel, and the next wait returns at once (the
+				 * interrupt broadcasts the cond, commit() signals it). So wait for the whole
+				 * remaining time; the loop re-checks after every return. (This used to wait in
+				 * 2 ms slices, ~8 wake-ups per frame at 60 Hz.) */
 				uint64_t left = kms_cnt_us(lim - (kms_cnt() - t0));
-				(void)condWait(srv.vbl_cond, srv.vbl_lock, (left > 2000u) ? 2000u : ((left == 0u) ? 1u : left));
+				(void)condWait(srv.vbl_cond, srv.vbl_lock, (left == 0u) ? 1u : left);
 			}
 			(void)mutexUnlock(srv.vbl_lock);
 			if (vb.head == vb.seen) {
