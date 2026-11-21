@@ -86,6 +86,18 @@
 #define PL011_TTY_KBD_POLL_US 8000
 #endif
 
+/* After PL011_TTY_KBD_ACTIVE_US without a key the bridge polls every
+ * PL011_TTY_KBD_IDLE_POLL_US instead: an idle console otherwise costs 125
+ * wake-ups a second here plus as many in usbkbd. usbkbd buffers the keys, so
+ * none is lost; the first key after a pause waits at most one idle period. */
+#ifndef PL011_TTY_KBD_IDLE_POLL_US
+#define PL011_TTY_KBD_IDLE_POLL_US 50000
+#endif
+
+#ifndef PL011_TTY_KBD_ACTIVE_US
+#define PL011_TTY_KBD_ACTIVE_US 2000000
+#endif
+
 
 enum { dr = 0x00, fr = 0x18, ibrd = 0x24, fbrd = 0x28, lcrh = 0x2c, cr = 0x30, imsc = 0x38, mis = 0x40, icr = 0x44 };
 
@@ -1198,12 +1210,27 @@ static void pl011_thr(void *arg)
 }
 
 
+/* Sleep one poll period of the keyboard bridge: short while keys arrive, long
+ * once the keyboard has been quiet for PL011_TTY_KBD_ACTIVE_US. */
+static void pl011_kbdIdle(unsigned int *quiet_us)
+{
+	if (*quiet_us < PL011_TTY_KBD_ACTIVE_US) {
+		usleep(PL011_TTY_KBD_POLL_US);
+		*quiet_us += PL011_TTY_KBD_POLL_US;
+	}
+	else {
+		usleep(PL011_TTY_KBD_IDLE_POLL_US);
+	}
+}
+
+
 static void pl011_kbdthr(void *arg)
 {
 	pl011_t *uart = (pl011_t *)arg;
 	const char *path = PL011_TTY_KBD_PATH;
 	char buf[64];
 	ssize_t len;
+	unsigned int quiet_us = 0u;
 	int fd;
 
 	if (path == NULL) {
@@ -1222,7 +1249,8 @@ static void pl011_kbdthr(void *arg)
 				close(fd);
 				fd = -1;
 			}
-			usleep(PL011_TTY_KBD_POLL_US);
+			usleep(PL011_TTY_KBD_IDLE_POLL_US);
+			quiet_us = 0u;
 			continue;
 		}
 
@@ -1244,7 +1272,7 @@ static void pl011_kbdthr(void *arg)
 		len = read(fd, buf, sizeof(buf));
 		if (len < 0) {
 			if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) {
-				usleep(PL011_TTY_KBD_POLL_US);   /* no data this tick */
+				pl011_kbdIdle(&quiet_us);   /* no data this tick */
 				continue;
 			}
 			close(fd);   /* real error (e.g. device gone) — reopen */
@@ -1253,9 +1281,10 @@ static void pl011_kbdthr(void *arg)
 			continue;
 		}
 		if (len == 0) {
-			usleep(PL011_TTY_KBD_POLL_US);
+			pl011_kbdIdle(&quiet_us);
 			continue;
 		}
+		quiet_us = 0u;
 
 		libtty_lock(&uart->tty);
 		for (i = 0u; i < (size_t)len; ++i) {

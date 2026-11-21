@@ -554,11 +554,13 @@ static uint32_t next_timeout_us(uint64_t now)
 		t = 1000u;   /* a fence-gated flip: re-check soon (completions also kick us) */
 	}
 	/* IRQ mode: the handler's broadcast can land between our "no events" check and
-	 * condWait (it does not take srv.lock), so a lost wake-up must be bounded even
-	 * when nothing is in flight - the self-test raises interrupts on idle queues.
-	 * The same bound keeps the 125 ms job watchdog honest. */
+	 * condWait (it does not take srv.lock). It is not lost: the kernel leaves a
+	 * pending wake-up on a cond broadcast with nobody waiting, and the next wait
+	 * returns at once. The short bound is kept while the GPU has work in flight, to
+	 * keep the 125 ms job watchdog honest; an idle server waits IDLE_TIMEOUT_US
+	 * (it used to wake every 10 ms, 100 times a second, with nothing to do). */
 	if (srv.hw.irq_on != 0) {
-		if (IRQ_BACKSTOP_US < t) {
+		if ((v3da_jobs_hw_busy() != 0) && (IRQ_BACKSTOP_US < t)) {
 			t = IRQ_BACKSTOP_US;
 		}
 	}
