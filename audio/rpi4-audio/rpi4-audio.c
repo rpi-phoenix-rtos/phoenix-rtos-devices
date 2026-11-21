@@ -1055,8 +1055,12 @@ static uint32_t audio_dmaChannel(void)
 	uint32_t mask = 0u, ch;
 	int rc = vcmbox_prop(RPI_PROP_GET_DMA_CHANNELS, 0u, &mask);
 
-	if (rc < 0) {
-		printf("rpi4-audio: firmware DMA channel mask unavailable (%d); using channel %u\n", rc, DMA_CHAN);
+	if ((rc < 0) || ((mask & 0xffffu) == 0u)) {
+		/* No answer, or an empty mask: the firmware drives DMA channels itself, so an
+		 * empty mask means the property is not reported here (seen on the Pi 4), not
+		 * that no channel is free. Keep DMA_CHAN, which has worked on every boot. */
+		printf("rpi4-audio: firmware DMA channel mask unavailable (rc=%d mask=0x%04x); using channel %u\n", rc,
+			mask & 0xffffu, DMA_CHAN);
 		return DMA_CHAN;
 	}
 	if ((mask & (1u << DMA_CHAN)) != 0u) {
