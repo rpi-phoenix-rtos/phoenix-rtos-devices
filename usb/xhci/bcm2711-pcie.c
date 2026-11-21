@@ -143,6 +143,15 @@ uint64_t bcm2711_pcie_getXhciMmioSize(void)
 }
 
 
+int bcm2711_pcie_getXhciIrq(void)
+{
+	/* The VL805 is the only device on the bus and signals legacy INTA, which the
+	 * root complex routes straight to the GIC (DT pcie@7d500000 interrupt-map:
+	 * pin 1 -> GIC SPI 143). No MSI is set up, so INTx is what the device uses. */
+	return 32 + 143;
+}
+
+
 static inline uint16_t pcie_cfgRead16(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off)
 {
 	uint32_t value_u32 = cfgio->read32(cfgio->ctx, bus, dev, fn, off);

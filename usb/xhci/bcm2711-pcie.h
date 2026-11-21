@@ -75,6 +75,10 @@ volatile void *bcm2711_pcie_getXhciMmio(void);
 uint64_t bcm2711_pcie_getXhciMmioSize(void);
 
 
+/* GIC interrupt number of the VL805's legacy INTA (no MSI is configured). */
+int bcm2711_pcie_getXhciIrq(void);
+
+
 /* Re-program the BCM2711 PCIe outbound window 0 with the same address
  * mapping bcm2711_pcie_initVL805 set up at boot. Idempotent; safe to
  * call any time after bring-up. Intended for the xHCI driver to call

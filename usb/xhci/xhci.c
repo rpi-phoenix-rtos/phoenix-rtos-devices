@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/debug.h>
+#include <sys/interrupt.h>
 #include <sys/mman.h>
 #include <sys/minmax.h>
 #include <sys/threads.h>
@@ -30,6 +31,7 @@
 static inline int bcm2711_pcie_initVL805(void) { return 0; }
 static inline volatile void *bcm2711_pcie_getXhciMmio(void) { return NULL; }
 static inline uint64_t bcm2711_pcie_getXhciMmioSize(void) { return 0; }
+static inline int bcm2711_pcie_getXhciIrq(void) { return -1; }
 static inline int bcm2711_pcie_resettleOutboundWindow(void) { return 0; }
 #endif
 
@@ -544,6 +546,11 @@ typedef struct {
 	uint32_t erdpHi;
 	uint64_t erstba;
 	uint64_t erdp;
+	handle_t irqLock;         /* condWait pairing for irqCond */
+	handle_t irqCond;         /* signalled by the kernel when xhci_irqHandler() claims an interrupt */
+	handle_t irqHandle;
+	volatile uint32_t irqCount; /* interrupts claimed (the roothub thread checks they arrive) */
+	uint8_t irqOn;            /* the roothub thread may sleep on irqCond instead of polling */
 	uint8_t crcrPublished;    /* CRCR re-published once before the first command */
 	uint8_t keepRunning;      /* run the controller continuously (rig-handoff path) — never R/S=0 between ops */
 	uint8_t running;          /* controller is in R/S=1: enterRunState is then a no-op (skip per-command re-settle) */
@@ -766,6 +773,69 @@ static void xhci_destroy(xhci_t *xhci)
 #define XHCI_INTR_IDLE_PASSES   200u
 #define XHCI_INTR_IDLE_POLL_US 8000u
 
+/* With the interrupter on, an idle roothub thread sleeps until an event lands
+ * instead of polling every XHCI_INTR_IDLE_POLL_US; this bounds a lost interrupt. */
+#define XHCI_IRQ_BACKSTOP_US 100000u
+
+/* Interrupt moderation, in 250 ns units: at most one interrupt per millisecond
+ * while bulk transfers complete back to back (their waiters poll anyway). */
+#define XHCI_IRQ_IMODI 4000u
+
+/* Completions found after a backstop timeout with no interrupt in between, in a
+ * row, before the thread concludes interrupts do not arrive and polls again. */
+#define XHCI_IRQ_MISSES_MAX 3u
+
+
+/* Claim interrupter 0's interrupt. The event ring itself is consumed by the
+ * threads (xhci_eventAwait); this only acknowledges IMAN.IP, which drops the
+ * level INTx line, and lets the kernel signal irqCond. */
+static int xhci_irqHandler(unsigned int n, void *arg)
+{
+	xhci_t *xhci = (xhci_t *)arg;
+	uint32_t iman;
+
+	(void)n;
+
+	iman = xhci_rtRead32(xhci, XHCI_REG_RT_IR_IMAN);
+	if ((iman & XHCI_REG_RT_IR_IMAN_IP) == 0u) {
+		return -1;
+	}
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMAN, iman | XHCI_REG_RT_IR_IMAN_IP); /* IP is write-1-to-clear */
+	(void)xhci_rtRead32(xhci, XHCI_REG_RT_IR_IMAN); /* flush the posted write before the line is sampled again */
+	xhci->irqCount++;
+
+	return 0;
+}
+
+
+/* Route interrupter 0 to an interrupt where the board provides one. On failure
+ * the driver keeps polling, exactly as before. */
+static void xhci_irqInit(xhci_t *xhci)
+{
+	int irq = bcm2711_pcie_getXhciIrq();
+
+	if (irq < 0) {
+		return;
+	}
+	if (mutexCreate(&xhci->irqLock) != 0) {
+		return;
+	}
+	if (condCreate(&xhci->irqCond) != 0) {
+		resourceDestroy(xhci->irqLock);
+		return;
+	}
+	if (interrupt((unsigned int)irq, xhci_irqHandler, xhci, xhci->irqCond, &xhci->irqHandle) < 0) {
+		resourceDestroy(xhci->irqCond);
+		resourceDestroy(xhci->irqLock);
+		return;
+	}
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMOD, XHCI_IRQ_IMODI);
+	xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMAN, XHCI_REG_RT_IR_IMAN_IE | XHCI_REG_RT_IR_IMAN_IP);
+	xhci->irqOn = 1u;
+	fprintf(stderr, "xhci: interrupter on, irq %d\n", irq);
+	fflush(stderr); /* the usb daemon buffers stderr (TD-12) */
+}
+
 static int xhci_eventAwait(xhci_t *xhci, uint32_t wantType, uint64_t wantParam, uint8_t wantSlot, uint32_t wantEp, unsigned timeoutMs, xhci_trb_t *out);
 
 
@@ -784,7 +854,9 @@ static void xhci_roothubStatusThread(void *arg)
 	unsigned s;
 	unsigned e;
 	unsigned quiet = 0u; /* passes in a row with no interrupt-IN completion */
-	int ret, completed;
+	unsigned misses = 0u; /* see XHCI_IRQ_MISSES_MAX */
+	uint32_t irqSeen = 0u;
+	int ret, completed, timedOut = 0, irqReported = 0;
 
 	for (;;) {
 		sleepUs = 100000u;
@@ -885,12 +957,45 @@ static void xhci_roothubStatusThread(void *arg)
 		}
 
 		if (completed != 0) {
+			/* A report that waited out a whole backstop with no interrupt in between:
+			 * after a few of those in a row, interrupts are not arriving - poll. */
+			if ((timedOut != 0) && (xhci->irqCount == irqSeen)) {
+				if (++misses >= XHCI_IRQ_MISSES_MAX) {
+					xhci_rtWrite32(xhci, XHCI_REG_RT_IR_IMAN, XHCI_REG_RT_IR_IMAN_IP);
+					xhci->irqOn = 0u;
+					fprintf(stderr, "xhci: no interrupts from the controller, polling\n");
+					fflush(stderr); /* the usb daemon buffers stderr (TD-12) */
+				}
+			}
+			else {
+				misses = 0u;
+			}
 			quiet = 0u;
 		}
 		else if (quiet < XHCI_INTR_IDLE_PASSES) {
 			quiet++;
 		}
-		usleep(sleepUs);
+
+		if ((irqReported == 0) && (xhci->irqCount != 0u)) {
+			irqReported = 1;
+			fprintf(stderr, "xhci: first interrupt received\n");
+			fflush(stderr); /* the usb daemon buffers stderr (TD-12) */
+		}
+
+		timedOut = 0;
+		if ((xhci->irqOn != 0u) && (sleepUs >= XHCI_INTR_IDLE_POLL_US)) {
+			/* Idle: sleep until the controller posts an event (a report, a port
+			 * change, a completion of another thread's transfer) or the backstop.
+			 * A wake-up landing before the wait is not lost: the kernel keeps it
+			 * pending on the cond. */
+			irqSeen = xhci->irqCount;
+			mutexLock(xhci->irqLock);
+			timedOut = (condWait(xhci->irqCond, xhci->irqLock, XHCI_IRQ_BACKSTOP_US) == -ETIME) ? 1 : 0;
+			mutexUnlock(xhci->irqLock);
+		}
+		else {
+			usleep(sleepUs);
+		}
 	}
 }
 
@@ -4097,6 +4202,10 @@ static int xhci_init(hcd_t *hcd)
 			}
 		}
 	}
+	}
+
+	if (err == 0) {
+		xhci_irqInit(xhci);
 	}
 
 	if (err != 0) {
