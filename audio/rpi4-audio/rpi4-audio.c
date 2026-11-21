@@ -54,6 +54,7 @@
 #include <sys/time.h>
 #include <posix/utils.h>
 
+#include "libvcmbox.h"
 #include "rpi4-audio.h"
 #include "rpi4-audio-ring.h"
 
@@ -155,7 +156,9 @@ _Static_assert((32768u * PWM_RANGE) / 65536u == DUTY_SILENCE,
  * 0xC0000000 legacy uncached alias for the low 1 GB; audio_dmaStart falls back to
  * PIO if a DMA buffer lands at/above 1 GB (the alias can't reach it). */
 #define DMA_BASE        0xfe007000u
-#define DMA_CHAN        5u             /* avoid VPU-reserved 0..4; revisit via the firmware mask */
+#define DMA_CHAN        5u             /* preferred channel, if the firmware leaves it to the ARM */
+#define DMA_CHAN_NONE   0xffffffffu
+#define RPI_PROP_GET_DMA_CHANNELS 0x00060001u /* bit n set: DMA channel n is free for the ARM */
 #define DMA_CS          (0x00u / 4u)
 #define DMA_CONBLK_AD   (0x04u / 4u)
 #define DMA_SOURCE_AD   (0x0cu / 4u)   /* live source address (the ring read cursor) */
@@ -247,7 +250,7 @@ static struct {
 	volatile uint32_t *pwm;
 	volatile uint32_t *cprman;
 	volatile uint32_t *gpio;
-	volatile uint32_t *dma;        /* DMA channel DMA_CHAN registers */
+	volatile uint32_t *dma;        /* registers of the DMA channel in use (audio_dmaChannel()) */
 	volatile uint32_t *ring;       /* persistent duty-word ring the DMA plays */
 	uintptr_t ring_pa;             /* ring physical base (for the read-cursor math) */
 	audioring_t rs;                /* ring bookkeeping: write position, pending words */
@@ -1040,6 +1043,38 @@ static void audio_dmaStart(void)
 }
 
 
+/* The DMA channel to pace the PWM FIFO with. The VideoCore firmware owns some channels and
+ * tells the ARM which ones it may use (the mask Linux gets as the DTB's brcm,dma-channel-mask).
+ * Taking a channel the firmware also uses would leave ours parked or stolen, which is what a
+ * channel that waits for a DREQ that never comes (KNOWN-ISSUES C5) would look like. Keep
+ * DMA_CHAN when it is free, else the first free full channel (1-6; 7-10 are DMA Lite, 11-14
+ * DMA4, both programmed differently); DMA_CHAN_NONE means PIO. If the firmware does not
+ * answer, keep DMA_CHAN, as before. */
+static uint32_t audio_dmaChannel(void)
+{
+	uint32_t mask = 0u, ch;
+	int rc = vcmbox_prop(RPI_PROP_GET_DMA_CHANNELS, 0u, &mask);
+
+	if (rc < 0) {
+		printf("rpi4-audio: firmware DMA channel mask unavailable (%d); using channel %u\n", rc, DMA_CHAN);
+		return DMA_CHAN;
+	}
+	if ((mask & (1u << DMA_CHAN)) != 0u) {
+		printf("rpi4-audio: firmware DMA channel mask 0x%04x; using channel %u\n", mask & 0xffffu, DMA_CHAN);
+		return DMA_CHAN;
+	}
+	for (ch = 1u; ch <= 6u; ch++) {
+		if ((mask & (1u << ch)) != 0u) {
+			printf("rpi4-audio: firmware DMA channel mask 0x%04x excludes channel %u; using channel %u\n",
+				mask & 0xffffu, DMA_CHAN, ch);
+			return ch;
+		}
+	}
+	printf("rpi4-audio: firmware DMA channel mask 0x%04x has no free full channel (PIO)\n", mask & 0xffffu);
+	return DMA_CHAN_NONE;
+}
+
+
 int main(int argc, char **argv)
 {
 	uint32_t port;
@@ -1059,9 +1094,10 @@ int main(int argc, char **argv)
 	ad.gpio = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
 		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (off_t)GPIO_BASE);
 	{
-		volatile uint32_t *dmapage = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		uint32_t ch = audio_dmaChannel();
+		volatile uint32_t *dmapage = (ch == DMA_CHAN_NONE) ? MAP_FAILED : mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
 			MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS, -1, (off_t)DMA_BASE);
-		ad.dma = (dmapage == MAP_FAILED) ? MAP_FAILED : (dmapage + (DMA_CHAN * 0x100u) / 4u);
+		ad.dma = (dmapage == MAP_FAILED) ? MAP_FAILED : (dmapage + (ch * 0x100u) / 4u);
 	}
 	if ((ad.pwm == MAP_FAILED) || (ad.cprman == MAP_FAILED) || (ad.gpio == MAP_FAILED)) {
 		printf("rpi4-audio: mmap of PWM/CPRMAN/GPIO failed\n");

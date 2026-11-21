@@ -9,5 +9,8 @@
 
 NAME := rpi4-audio
 LOCAL_SRCS := rpi4-audio.c
+# The firmware's free DMA channel mask comes through the serializing mailbox server.
+DEPS := libvcmbox
+DEP_LIBS := libvcmbox
 
 include $(binary.mk)
