@@ -948,6 +948,9 @@ static void scanFunc(pcie_cfgio_t *cfgio, uint8_t bus, uint8_t *next_bus, uint8_
 		}
 
 		int err = 0;
+		/* One line per boot: which path this boot took (the notify is this process's only one) */
+		fprintf(stderr, "pcie: VL805 firmware 0x%08x, reset notify %s\n", (unsigned int)fw_ver_pre,
+			skip_mailbox ? "skipped (EEPROM firmware loaded)" : "sent");
 		if (!skip_mailbox) {
 			err = bcm2711NotifyXhciReset(bus, dev, fun);
 			if (err < 0) {
