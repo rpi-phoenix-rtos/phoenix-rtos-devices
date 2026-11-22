@@ -782,6 +782,41 @@ void kms_on_vblank(kms_crtc_state_t *c, uint64_t cnt, uint32_t nvbl, kms_parked_
 }
 
 
+/* A commit that never leaves flight turns every later commit into EBUSY (KNOWN-ISSUES
+ * C21). When a refused commit finds one pending for half a second (an ordinary flip
+ * completes within two vblanks), say once what it waits for. Lock held. */
+static void busy_note(const kms_crtc_state_t *c, uint32_t client)
+{
+	static uint64_t noted_cnt;
+	const v3da_fence_page_t *fp = (const v3da_fence_page_t *)srv.v3d_fp;
+	uint32_t p;
+
+	if ((c->seq < (c->pqueued_seq + 30u)) || (noted_cnt == c->pqueued_cnt)) {
+		return;
+	}
+	noted_cnt = c->pqueued_cnt;
+	KMS_LOG("commit stuck crtc=%d pend=%d client=%u pmask=0x%x seq=%llu queued_seq=%llu target_seq=%llu vbl_age_us=%llu "
+		"refused_client=%u", c->idx, c->pend, c->pclient, c->pmask, (unsigned long long)c->seq,
+		(unsigned long long)c->pqueued_seq, (unsigned long long)c->ptarget_seq,
+		(unsigned long long)kms_cnt_us(kms_cnt() - c->last_vbl_cnt), client);
+	for (p = 0u; p < KMS_PLANES_PER_CRTC; p++) {
+		const kms_fence_t *f = &c->pst[p].in_fence;
+		uint64_t done = 0u;
+		uint32_t gen = 0u;
+
+		if ((c->pmask & (1u << p)) == 0u) {
+			continue;
+		}
+		if ((fp != NULL) && (f->seqno != 0u) && (f->slot < V3DA_FENCE_NSLOTS) && (f->queue < V3DA_Q_COUNT)) {
+			gen = (uint32_t)__atomic_load_n(&fp->slot[f->slot].gen, __ATOMIC_ACQUIRE);
+			done = __atomic_load_n(&fp->slot[f->slot].completed[f->queue], __ATOMIC_ACQUIRE);
+		}
+		KMS_LOG("commit stuck plane=%u fb=%u fence slot=%u gen=%u now_gen=%u queue=%u seqno=%llu completed=%llu", p,
+			c->pst[p].fb_id, f->slot, f->gen, gen, f->queue, (unsigned long long)f->seqno, (unsigned long long)done);
+	}
+}
+
+
 /* Accept a commit (lock held). Returns 0 (queued/applied) or -errno.
  * newmode (M9): NULL = keep the CRTC's mode, else {w, h} of the mode to set
  * ({0, 0} = native). A lower mode never outlives the primary plane: a commit that
@@ -840,7 +875,11 @@ static int commit(uint32_t client, kms_crtc_state_t *c, const kms_atomic_plane_t
 	}
 	if (((flags & KMS_ATOMIC_TEST_ONLY) != 0u) || (c->pend != KMS_PEND_NONE)) {
 		c->fit = fit0;
-		return ((flags & KMS_ATOMIC_TEST_ONLY) != 0u) ? 0 : -EBUSY;   /* one commit in flight per CRTC, as DRM */
+		if ((flags & KMS_ATOMIC_TEST_ONLY) != 0u) {
+			return 0;
+		}
+		busy_note(c, client);
+		return -EBUSY;   /* one commit in flight per CRTC, as DRM */
 	}
 	for (i = 0u; i < nst; i++) {
 		p = idx[i];
