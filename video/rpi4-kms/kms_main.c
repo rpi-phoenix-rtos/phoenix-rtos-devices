@@ -571,6 +571,9 @@ static int validate(uint32_t client, const kms_crtc_state_t *c, uint32_t p, cons
 			return -ENODEV;   /* an in-fence needs the render server's fence page (-G) */
 		}
 	}
+	if ((st->color_encoding > 3u) || (st->color_range > 2u)) {
+		return -EINVAL;   /* COLOR_ENCODING / COLOR_RANGE + 1, see kms_atomic_plane_t */
+	}
 	return srv.be->check(c, p, st, fb, bo);
 }
 
@@ -998,6 +1001,8 @@ static const kms_prop_enum_t en_type[] = { { 0, "Overlay" }, { 1, "Primary" }, {
 static const kms_prop_enum_t en_dpms[] = { { 0, "On" }, { 1, "Standby" }, { 2, "Suspend" }, { 3, "Off" } };
 static const kms_prop_enum_t en_link[] = { { 0, "Good" }, { 1, "Bad" } };
 static const kms_prop_enum_t en_rot[] = { { 0, "rotate-0" }, { 2, "rotate-180" }, { 4, "reflect-x" }, { 5, "reflect-y" } };
+static const kms_prop_enum_t en_cenc[] = { { 0, "ITU-R BT.601 YCbCr" }, { 1, "ITU-R BT.709 YCbCr" }, { 2, "ITU-R BT.2020 YCbCr" } };
+static const kms_prop_enum_t en_crange[] = { { 0, "YCbCr limited range" }, { 1, "YCbCr full range" } };
 
 typedef struct {
 	uint32_t id;
@@ -1029,6 +1034,8 @@ static const propdesc_t props[] = {
 	{ KMS_PROP_ZPOS, "zpos", RANGE, 0, 7, NULL, 0 },
 	{ KMS_PROP_ALPHA, "alpha", RANGE, 0, 0xffffu, NULL, 0 },
 	{ KMS_PROP_ROTATION, "rotation", KMS_PROP_FLAG_BITMASK, 0, 0, en_rot, 4 },
+	{ KMS_PROP_COLOR_ENCODING, "COLOR_ENCODING", KMS_PROP_FLAG_ENUM, 0, 0, en_cenc, 3 },
+	{ KMS_PROP_COLOR_RANGE, "COLOR_RANGE", KMS_PROP_FLAG_ENUM, 0, 0, en_crange, 2 },
 	{ KMS_PROP_ACTIVE, "ACTIVE", RANGE | ATOM, 0, 1, NULL, 0 },
 	{ KMS_PROP_MODE_ID, "MODE_ID", KMS_PROP_FLAG_BLOB | ATOM, 0, 0, NULL, 0 },
 	{ KMS_PROP_OUT_FENCE_PTR, "OUT_FENCE_PTR", RANGE | ATOM, 0, ~0ull, NULL, 0 },
@@ -1093,6 +1100,10 @@ static uint32_t obj_props(uint32_t obj, kms_prop_value_t *out, uint32_t max)
 			PV(KMS_PROP_ZPOS, (p == 7u) ? 7u : p);
 			PV(KMS_PROP_ALPHA, (s->fb_id != 0u) ? s->alpha : 0xffffu);
 			PV(KMS_PROP_ROTATION, (s->rotation != 0u) ? s->rotation : 1u);
+			if ((p != 0u) && (p != 7u)) {   /* overlays: the planes that take YUV */
+				PV(KMS_PROP_COLOR_ENCODING, (s->color_encoding != 0u) ? s->color_encoding - 1u : 1u);
+				PV(KMS_PROP_COLOR_RANGE, (s->color_range != 0u) ? s->color_range - 1u : 0u);
+			}
 		}
 	}
 #undef PV

@@ -118,6 +118,8 @@ enum kms_prop {
 	KMS_PROP_ZPOS,           /* range */
 	KMS_PROP_ALPHA,          /* range 0..0xffff */
 	KMS_PROP_ROTATION,       /* bitmask: rotate-0, rotate-180, reflect-x, reflect-y */
+	KMS_PROP_COLOR_ENCODING, /* enum (DRM names): BT.601 0, BT.709 1, BT.2020 2 (YUV framebuffers) */
+	KMS_PROP_COLOR_RANGE,    /* enum (DRM names): limited 0, full 1 */
 	/* crtc */
 	KMS_PROP_ACTIVE = 0x140,
 	KMS_PROP_MODE_ID,        /* blob */
@@ -587,7 +589,8 @@ typedef struct {
 	int32_t zpos;
 	uint32_t alpha;         /* 0..0xffff */
 	uint32_t rotation;      /* DRM_MODE_ROTATE_0 (1) / ROTATE_180 (4) | REFLECT_X (16) | REFLECT_Y (32) */
-	uint32_t pad[2];
+	uint32_t color_encoding; /* COLOR_ENCODING + 1; 0 = not set (BT.709) -- these were padding */
+	uint32_t color_range;    /* COLOR_RANGE + 1; 0 = not set (limited) */
 	kms_fence_t in_fence;
 } kms_atomic_plane_t;
 

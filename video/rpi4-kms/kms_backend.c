@@ -216,6 +216,24 @@ static uint32_t plane_formats(uint32_t plane, uint32_t *out, uint32_t max)
 }
 
 
+/* SET_PLANE's color_encoding for a YUV plane, from COLOR_ENCODING / COLOR_RANGE
+ * (vc4_firmware_kms.c; values probed on the HVS: 1 BT.601 limited, 2 BT.709 limited,
+ * 3 BT.601 full, 9 BT.2020; 0 is the firmware's default, BT.709 limited). -1: no matrix
+ * for that pair (full-range BT.709 or BT.2020). */
+static int plane_csc(const kms_atomic_plane_t *st)
+{
+	uint32_t enc = (st->color_encoding != 0u) ? st->color_encoding - 1u : 1u;   /* unset: BT.709 */
+	uint32_t full = ((st->color_range != 0u) && (st->color_range - 1u == 1u)) ? 1u : 0u;
+
+	switch (enc) {
+		case 0u: return (full != 0u) ? 3 : 1;
+		case 1u: return (full != 0u) ? -1 : ((st->color_encoding != 0u) ? 2 : 0);
+		case 2u: return (full != 0u) ? -1 : 9;
+		default: return -1;
+	}
+}
+
+
 /* Bytes a framebuffer spans from its offset: linear rows, or whole SAND128 columns. */
 static size_t plane_fb_span(const kms_fb_t *fb)
 {
@@ -246,6 +264,9 @@ static int plane_check(const kms_crtc_state_t *c, uint32_t p, const kms_atomic_p
 	if (fb->sand_colh != 0u) {
 		if ((p == 0u) || (p == 7u)) {
 			return -EINVAL;   /* video on an overlay; the primary stays the RGB desktop */
+		}
+		if (plane_csc(st) < 0) {
+			return -EINVAL;   /* full-range BT.709 / BT.2020: the firmware has no such matrix */
 		}
 	}
 	else if ((fb->format != KMS_FMT_XRGB8888) && (fb->format != KMS_FMT_ARGB8888)) {
@@ -357,6 +378,7 @@ static int plane_apply(kms_crtc_state_t *c, uint32_t p, const kms_atomic_plane_t
 			fp.planes[1] = bus + ((fb->h + 15u) & ~15u) * 128u;
 			fp.pitch = (uint16_t)fb->sand_colh;
 			fp.vpitch = 0u;
+			fp.color_encoding = (uint8_t)plane_csc(st);
 		}
 		if ((st->rotation & DRM_ROTATE_180) != 0u) {
 			fp.transform |= FW_XFORM_ROT180;
