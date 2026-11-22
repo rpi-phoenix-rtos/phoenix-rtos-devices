@@ -233,6 +233,17 @@ typedef struct {
 #define KMS_FMT_ABGR8888 KMS_FOURCC('A', 'B', '2', '4')
 #define KMS_MOD_LINEAR   0ull
 
+/* NV12 (Y plane, then interleaved CbCr at half resolution). Scanned out only as one
+ * Broadcom SAND128 buffer: 128-byte columns, each holding the whole picture's luma
+ * (H16 = height rounded up to 16 lines) and then its chroma (H16 / 2 lines). */
+#define KMS_FMT_NV12 KMS_FOURCC('N', 'V', '1', '2')
+
+/* DRM_FORMAT_MOD_BROADCOM_SAND128(v) (drm_fourcc.h: vendor 0x07, code 4, parameter in
+ * bits 8..55): the parameter is the column height in lines. */
+#define KMS_MOD_SAND128_BASE   ((0x07ull << 56) | 4ull)
+#define KMS_MOD_IS_SAND128(m)  (((m) & 0xff000000000000ffull) == KMS_MOD_SAND128_BASE)
+#define KMS_MOD_SAND128_COLH(m) ((uint32_t)(((m) >> 8) & 0xffffffffull))
+
 
 /* ------------------------------------------------------------------------- */
 /* Memory references and fences (same layouts as rpi4-v3d-async)              */

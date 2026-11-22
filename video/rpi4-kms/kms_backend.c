@@ -147,6 +147,7 @@ const kms_backend_t kms_backend_pan = {
 #define VC_IMAGE_MIN      0u
 #define VC_IMAGE_ARGB8888 43u
 #define VC_IMAGE_XRGB8888 44u
+#define VC_IMAGE_YUV_UV   19u   /* NV12 in SAND128 columns (vc4_firmware_kms.c: DRM_FORMAT_MOD_BROADCOM_SAND128) */
 
 #define FW_XFORM_ROT180 (1u << 1)
 #define FW_XFORM_HFLIP  (1u << 16)
@@ -202,14 +203,26 @@ static uint32_t plane_formats(uint32_t plane, uint32_t *out, uint32_t max)
 {
 	uint32_t n = 0u;
 
-	(void)plane;
 	if (n < max) {
 		out[n++] = KMS_FMT_XRGB8888;
 	}
 	if (n < max) {
 		out[n++] = KMS_FMT_ARGB8888;
 	}
+	if ((plane != 0u) && (plane != 7u) && (n < max)) {
+		out[n++] = KMS_FMT_NV12;   /* overlays only, SAND128 (video pictures) */
+	}
 	return n;
+}
+
+
+/* Bytes a framebuffer spans from its offset: linear rows, or whole SAND128 columns. */
+static size_t plane_fb_span(const kms_fb_t *fb)
+{
+	if (fb->sand_colh != 0u) {
+		return (size_t)((fb->w + 127u) / 128u) * 128u * fb->sand_colh;
+	}
+	return (size_t)fb->pitch * fb->h;
 }
 
 
@@ -230,13 +243,18 @@ static int plane_check(const kms_crtc_state_t *c, uint32_t p, const kms_atomic_p
 	if (fb == NULL) {
 		return 0;
 	}
-	if ((fb->format != KMS_FMT_XRGB8888) && (fb->format != KMS_FMT_ARGB8888)) {
+	if (fb->sand_colh != 0u) {
+		if ((p == 0u) || (p == 7u)) {
+			return -EINVAL;   /* video on an overlay; the primary stays the RGB desktop */
+		}
+	}
+	else if ((fb->format != KMS_FMT_XRGB8888) && (fb->format != KMS_FMT_ARGB8888)) {
 		return -EINVAL;
 	}
-	if ((fb->w > 0xffffu) || (fb->h > 0xffffu) || (fb->pitch > 0xffffu)) {
+	if ((fb->w > 0xffffu) || (fb->h > 0xffffu) || (fb->pitch > 0xffffu) || (fb->sand_colh > 0xffffu)) {
 		return -ERANGE;
 	}
-	if (kms_bus_addr(bo->pa + fb->offset, (size_t)fb->pitch * fb->h, &bus) != 0) {
+	if (kms_bus_addr(bo->pa + fb->offset, plane_fb_span(fb), &bus) != 0) {
 		return -ERANGE;   /* outside what the chosen bus convention reaches */
 	}
 	sw = st->src_w >> 16;
@@ -306,7 +324,7 @@ static int plane_apply(kms_crtc_state_t *c, uint32_t p, const kms_atomic_plane_t
 	fp.display = (uint8_t)c->fw_display_id;
 	fp.plane_id = (uint8_t)(p + (uint32_t)c->idx * KMS_PLANES_PER_CRTC);
 	if (fb != NULL) {
-		rc = kms_bus_addr(bo->pa + fb->offset, (size_t)fb->pitch * fb->h, &bus);
+		rc = kms_bus_addr(bo->pa + fb->offset, plane_fb_span(fb), &bus);
 		if (rc != 0) {
 			return rc;
 		}
@@ -330,6 +348,16 @@ static int plane_apply(kms_crtc_state_t *c, uint32_t p, const kms_atomic_plane_t
 		fp.alpha = (uint8_t)((st->alpha > 0xffffu ? 0xffffu : st->alpha) >> 8);
 		fp.num_planes = 1u;
 		fp.planes[0] = bus;
+		if (fb->sand_colh != 0u) {
+			/* As vc4_firmware_kms.c programs NV12 + SAND128: both planes in one buffer,
+			 * chroma H16 lines down each column, and the pitch is the column height in
+			 * lines. color_encoding 0 = the firmware's default (BT.709 limited). */
+			fp.vc_image_type = VC_IMAGE_YUV_UV;
+			fp.num_planes = 2u;
+			fp.planes[1] = bus + ((fb->h + 15u) & ~15u) * 128u;
+			fp.pitch = (uint16_t)fb->sand_colh;
+			fp.vpitch = 0u;
+		}
 		if ((st->rotation & DRM_ROTATE_180) != 0u) {
 			fp.transform |= FW_XFORM_ROT180;
 		}
